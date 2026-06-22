@@ -1,4 +1,4 @@
-# Super Mario Sunshine Online (SMSO)
+# Better Super Mario Sunshine Online (BSMSO)
 
 Online multiplayer mod for Super Mario Sunshine via Dolphin Emulator and Better Sunshine Engine (BSE).
 
