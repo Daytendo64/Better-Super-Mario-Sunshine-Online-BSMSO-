@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\SMSO.Net\SMSO.Net.csproj" />
+    <ProjectReference Include="..\SMSO.Bridge\SMSO.Bridge.csproj" />
+    <ProjectReference Include="..\SMSO.Server\SMSO.Server.csproj" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net7.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <UseWPF>true</UseWPF>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Content Include="..\..\assets\levels.ntsc-u.json">
+      <Link>assets\levels.ntsc-u.json</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="..\..\assets\episode-names.ntsc-u.json">
+      <Link>assets\episode-names.ntsc-u.json</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+</Project>

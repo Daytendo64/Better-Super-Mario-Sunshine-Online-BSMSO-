@@ -1,0 +1,120 @@
+<Window x:Class="SMSO.Launcher.ColorPickerWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Color"
+        Width="460"
+        SizeToContent="Height"
+        WindowStartupLocation="CenterOwner"
+        ResizeMode="NoResize"
+        Background="{StaticResource SmsBackground}"
+        Foreground="{StaticResource SmsForeground}"
+        UseLayoutRounding="True"
+        SnapsToDevicePixels="True">
+    <Border Margin="14"
+            Padding="1"
+            CornerRadius="13"
+            BorderBrush="#55EF4444"
+            BorderThickness="1">
+        <Border Background="{StaticResource SmsCard}"
+                BorderBrush="{StaticResource SmsBorderGlow}"
+                BorderThickness="1"
+                CornerRadius="12"
+                Padding="16">
+            <Border.Effect>
+                <DropShadowEffect Color="#EF4444" BlurRadius="18" ShadowDepth="0" Opacity="0.28"/>
+            </Border.Effect>
+            <StackPanel>
+                <TextBlock Text="Pick a color"
+                           FontWeight="SemiBold"
+                           FontSize="14"
+                           Foreground="{StaticResource SmsAccent}"
+                           Margin="0,0,0,12"/>
+
+                <Grid Margin="0,0,0,12">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="12"/>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="*"/>
+                    </Grid.ColumnDefinitions>
+
+                    <Border Grid.Column="0"
+                            BorderBrush="{StaticResource SmsBorder}"
+                            BorderThickness="1"
+                            CornerRadius="6"
+                            ClipToBounds="True"
+                            Cursor="Cross">
+                        <Image x:Name="SatValImage"
+                               Width="220"
+                               Height="220"
+                               Stretch="Fill"
+                               MouseLeftButtonDown="SatValImage_MouseLeftButtonDown"
+                               MouseMove="SatValImage_MouseMove"/>
+                    </Border>
+
+                    <Border Grid.Column="2"
+                            BorderBrush="{StaticResource SmsBorder}"
+                            BorderThickness="1"
+                            CornerRadius="6"
+                            ClipToBounds="True"
+                            Cursor="Hand">
+                        <Image x:Name="HueImage"
+                               Width="24"
+                               Height="220"
+                               Stretch="Fill"
+                               MouseLeftButtonDown="HueImage_MouseLeftButtonDown"
+                               MouseMove="HueImage_MouseMove"/>
+                    </Border>
+
+                    <StackPanel Grid.Column="3" Margin="12,0,0,0" VerticalAlignment="Top">
+                        <TextBlock Text="New" Foreground="{StaticResource SmsForegroundDim}" FontSize="11" Margin="0,0,0,4"/>
+                        <Border x:Name="NewColorSwatch"
+                                Width="72" Height="36"
+                                CornerRadius="6"
+                                BorderBrush="{StaticResource SmsBorderGlow}"
+                                BorderThickness="1"
+                                Margin="0,0,0,10"/>
+                        <TextBlock Text="Current" Foreground="{StaticResource SmsForegroundDim}" FontSize="11" Margin="0,0,0,4"/>
+                        <Border x:Name="CurrentColorSwatch"
+                                Width="72" Height="36"
+                                CornerRadius="6"
+                                BorderBrush="{StaticResource SmsBorder}"
+                                BorderThickness="1"
+                                Margin="0,0,0,12"/>
+                        <TextBlock x:Name="HexLabel"
+                                   FontFamily="Consolas"
+                                   FontSize="12"
+                                   Foreground="{StaticResource SmsForegroundMuted}"/>
+                    </StackPanel>
+                </Grid>
+
+                <Grid Margin="0,0,0,10">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="52"/>
+                        <ColumnDefinition Width="12"/>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="52"/>
+                        <ColumnDefinition Width="12"/>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="52"/>
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Grid.Column="0" Text="Red" VerticalAlignment="Center" Foreground="{StaticResource SmsForegroundDim}" Margin="0,0,6,0"/>
+                    <TextBox x:Name="RedBox" Grid.Column="1" MaxLength="3"/>
+                    <TextBlock Grid.Column="3" Text="Green" VerticalAlignment="Center" Foreground="{StaticResource SmsForegroundDim}" Margin="0,0,6,0"/>
+                    <TextBox x:Name="GreenBox" Grid.Column="4" MaxLength="3"/>
+                    <TextBlock Grid.Column="6" Text="Blue" VerticalAlignment="Center" Foreground="{StaticResource SmsForegroundDim}" Margin="0,0,6,0"/>
+                    <TextBox x:Name="BlueBox" Grid.Column="7" MaxLength="3"/>
+                </Grid>
+
+                <TextBlock Text="Basic colors" Foreground="{StaticResource SmsForegroundDim}" FontSize="11" Margin="0,0,0,6"/>
+                <WrapPanel x:Name="BasicColorsPanel" Width="256" Margin="0,0,0,14"/>
+
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                    <Button Content="Cancel" IsCancel="True" Margin="0,0,8,0"/>
+                    <Button Content="OK" IsDefault="True" Style="{StaticResource SmsPrimaryButton}" Click="Ok_Click"/>
+                </StackPanel>
+            </StackPanel>
+        </Border>
+    </Border>
+</Window>

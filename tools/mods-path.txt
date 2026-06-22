@@ -1,0 +1,3 @@
+# Optional override for Kuribo Mods deploy target (one path per line).
+# Leave blank to auto-detect from %AppData%\SMSO\config.json IsoPath.
+C:\Users\young\OneDrive\Desktop\sms online files\files\Kuribo!\Mods

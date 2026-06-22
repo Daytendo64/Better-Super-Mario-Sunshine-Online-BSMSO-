@@ -1,0 +1,662 @@
+<Window x:Class="SMSO.Launcher.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:controls="clr-namespace:SMSO.Launcher.Controls"
+        Title="Better Super Mario Sunshine Online"
+        Height="820" Width="1080"
+        MinHeight="680" MinWidth="920"
+        UseLayoutRounding="True"
+        SnapsToDevicePixels="True"
+        TextOptions.TextFormattingMode="Display"
+        TextOptions.TextRenderingMode="ClearType">
+    <Grid Background="{StaticResource SmsWindowBackdrop}">
+        <Grid IsHitTestVisible="False" ClipToBounds="True">
+            <Ellipse Width="420" Height="280"
+                     HorizontalAlignment="Left"
+                     VerticalAlignment="Top"
+                     Margin="-120,-90,0,0"
+                     Fill="{StaticResource SmsAuroraGlowSoft}"
+                     Opacity="0.55"/>
+            <Ellipse Width="420" Height="280"
+                     HorizontalAlignment="Right"
+                     VerticalAlignment="Top"
+                     Margin="0,-90,-120,0"
+                     Fill="{StaticResource SmsAuroraGlowSoft}"
+                     Opacity="0.55"/>
+            <Ellipse Width="420" Height="280"
+                     HorizontalAlignment="Left"
+                     VerticalAlignment="Bottom"
+                     Margin="-120,0,0,-90"
+                     Fill="{StaticResource SmsAuroraGlowSoft}"
+                     Opacity="0.55"/>
+            <Ellipse Width="420" Height="280"
+                     HorizontalAlignment="Right"
+                     VerticalAlignment="Bottom"
+                     Margin="0,0,-120,-90"
+                     Fill="{StaticResource SmsAuroraGlowSoft}"
+                     Opacity="0.55"/>
+            <Ellipse Width="720" Height="120"
+                     HorizontalAlignment="Center"
+                     VerticalAlignment="Top"
+                     Margin="0,-50,0,0"
+                     Fill="{StaticResource SmsAuroraGlow}"
+                     Opacity="0.35"/>
+            <Ellipse Width="720" Height="120"
+                     HorizontalAlignment="Center"
+                     VerticalAlignment="Bottom"
+                     Margin="0,0,0,-50"
+                     Fill="{StaticResource SmsAuroraGlow}"
+                     Opacity="0.35"/>
+            <Ellipse Width="120" Height="720"
+                     HorizontalAlignment="Left"
+                     VerticalAlignment="Center"
+                     Margin="-50,0,0,0"
+                     Fill="{StaticResource SmsAuroraGlow}"
+                     Opacity="0.3"/>
+            <Ellipse Width="120" Height="720"
+                     HorizontalAlignment="Right"
+                     VerticalAlignment="Center"
+                     Margin="0,0,-50,0"
+                     Fill="{StaticResource SmsAuroraGlow}"
+                     Opacity="0.3"/>
+        </Grid>
+
+        <Grid Background="Transparent">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <!-- Header -->
+        <Border Grid.Row="0" Background="{StaticResource SmsHeaderGradient}" Padding="24,18,24,16">
+            <Border BorderBrush="{StaticResource SmsBorderGlow}" BorderThickness="0,0,0,1">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+
+                    <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                        <Border CornerRadius="10" Padding="12,8" Margin="0,0,16,0">
+                            <Border.Background>
+                                <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">
+                                    <GradientStop Color="#DC2626" Offset="0"/>
+                                    <GradientStop Color="#7F1D1D" Offset="1"/>
+                                </LinearGradientBrush>
+                            </Border.Background>
+                            <StackPanel>
+                                <TextBlock Text="BSMSO" FontSize="20" FontWeight="Bold" Foreground="White"/>
+                                <TextBlock Text="Better Super Mario Sunshine Online" FontSize="9" Foreground="#FFCCCC" Opacity="0.9"/>
+                            </StackPanel>
+                        </Border>
+
+                        <Border Style="{StaticResource SmsStatusPill}">
+                            <StackPanel Orientation="Horizontal">
+                                <Ellipse x:Name="StatusDot" Width="8" Height="8" Fill="{StaticResource SmsStatusBad}" Margin="0,0,8,0" VerticalAlignment="Center"/>
+                                <TextBlock Text="Session" VerticalAlignment="Center" Foreground="{StaticResource SmsForegroundDim}" Margin="0,0,8,0" FontSize="11"/>
+                                <TextBlock x:Name="StatusBadge" Text="Disconnected" VerticalAlignment="Center" Foreground="{StaticResource SmsStatusBad}" FontWeight="SemiBold"/>
+                            </StackPanel>
+                        </Border>
+                    </StackPanel>
+
+                    <StackPanel Grid.Column="2" VerticalAlignment="Center" HorizontalAlignment="Right">
+                        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                            <Border Style="{StaticResource SmsStatusPill}">
+                                <StackPanel Orientation="Horizontal">
+                                    <TextBlock Text="Dolphin" VerticalAlignment="Center" Foreground="{StaticResource SmsForegroundDim}" Margin="0,0,8,0" FontSize="11"/>
+                                    <TextBlock x:Name="DolphinProcessBadge" Text="Not running" VerticalAlignment="Center" Foreground="{StaticResource SmsStatusBad}" FontWeight="SemiBold"/>
+                                </StackPanel>
+                            </Border>
+                            <Border Style="{StaticResource SmsStatusPill}" Margin="0,0,0,0">
+                                <StackPanel Orientation="Horizontal">
+                                    <TextBlock Text="Link" VerticalAlignment="Center" Foreground="{StaticResource SmsForegroundDim}" Margin="0,0,8,0" FontSize="11"/>
+                                    <TextBlock x:Name="DolphinLinkBadge" Text="Disconnected" VerticalAlignment="Center" Foreground="{StaticResource SmsStatusBad}" FontWeight="SemiBold"/>
+                                </StackPanel>
+                            </Border>
+                        </StackPanel>
+                        <TextBlock x:Name="DolphinDetailText"
+                                   Text="Launch Dolphin with _SMSO.kxe installed to enable warps and roster sync."
+                                   Style="{StaticResource SmsHintText}"
+                                   HorizontalAlignment="Right"
+                                   Margin="0,8,0,0"
+                                   MaxWidth="420"/>
+                    </StackPanel>
+                </Grid>
+            </Border>
+        </Border>
+
+        <TabControl Grid.Row="1" BorderThickness="0" Margin="0,0,0,0">
+            <TabItem Header="Settings">
+                <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="20,12,20,20">
+                    <StackPanel MaxWidth="980" HorizontalAlignment="Stretch">
+
+                        <GroupBox Header="Player Settings" Padding="14,8,14,10">
+                            <StackPanel>
+                                <Grid Margin="0,0,0,6">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Grid.Column="0"
+                                               Text="Display name"
+                                               Style="{StaticResource SmsSectionLabel}"
+                                               VerticalAlignment="Center"
+                                               Margin="0,0,10,0"/>
+                                    <TextBox x:Name="UsernameBox"
+                                             Grid.Column="1"
+                                             MaxLength="16"
+                                             Margin="0"/>
+                                    <TextBlock x:Name="UsernameCharCount"
+                                               Grid.Column="2"
+                                               Text="0 / 16 characters"
+                                               Foreground="{StaticResource SmsForegroundMuted}"
+                                               FontSize="11"
+                                               VerticalAlignment="Center"
+                                               Margin="10,0,0,0"/>
+                                </Grid>
+
+                                <TextBlock Text="Nametag colors"
+                                           Style="{StaticResource SmsSectionLabel}"
+                                           Margin="0,0,0,6"/>
+
+                                <Grid x:Name="NameTagColorRow">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="8"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="8"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+
+                                    <Border Grid.Column="0" Background="{StaticResource SmsSurfaceAlt}" CornerRadius="8" Padding="10,6">
+                                        <Grid>
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="Auto"/>
+                                                <ColumnDefinition Width="Auto"/>
+                                                <ColumnDefinition Width="Auto"/>
+                                                <ColumnDefinition Width="*"/>
+                                            </Grid.ColumnDefinitions>
+                                            <TextBlock Grid.Column="0" Text="Text" FontWeight="SemiBold" FontSize="12" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                            <Border x:Name="NameTagTextPreview"
+                                                    Grid.Column="1"
+                                                    Width="26" Height="26"
+                                                    Margin="0,0,6,0"
+                                                    BorderBrush="{StaticResource SmsBorder}"
+                                                    BorderThickness="1"
+                                                    CornerRadius="6"
+                                                    Background="White"
+                                                    Cursor="Hand"
+                                                    MouseLeftButtonUp="NameTagTextPreview_MouseLeftButtonUp"
+                                                    ToolTip="Click to pick text color"/>
+                                            <Button x:Name="PickNameTagTextColorButton" Grid.Column="2" Content="Pick" Click="PickNameTagTextColor_Click" Padding="8,2" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                            <StackPanel Grid.Column="3" Orientation="Horizontal" VerticalAlignment="Center">
+                                                <TextBlock Text="R" VerticalAlignment="Center" Foreground="{StaticResource SmsForegroundDim}" Margin="0,0,3,0" FontSize="12"/>
+                                                <TextBox x:Name="NameTagTextRBox" Width="34" MaxLength="3" Margin="0"/>
+                                                <TextBlock Text="G" VerticalAlignment="Center" Foreground="{StaticResource SmsForegroundDim}" Margin="4,0,3,0" FontSize="12"/>
+                                                <TextBox x:Name="NameTagTextGBox" Width="34" MaxLength="3" Margin="0"/>
+                                                <TextBlock Text="B" VerticalAlignment="Center" Foreground="{StaticResource SmsForegroundDim}" Margin="4,0,3,0" FontSize="12"/>
+                                                <TextBox x:Name="NameTagTextBBox" Width="34" MaxLength="3" Margin="0"/>
+                                            </StackPanel>
+                                        </Grid>
+                                    </Border>
+
+                                    <Border x:Name="NameTagGradientColumn"
+                                            Grid.Column="2"
+                                            Background="{StaticResource SmsSurfaceAlt}"
+                                            CornerRadius="8"
+                                            Padding="10,6"
+                                            Visibility="Collapsed">
+                                        <Grid>
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="Auto"/>
+                                                <ColumnDefinition Width="Auto"/>
+                                                <ColumnDefinition Width="Auto"/>
+                                                <ColumnDefinition Width="*"/>
+                                            </Grid.ColumnDefinitions>
+                                            <TextBlock Grid.Column="0" Text="Gradient" FontWeight="SemiBold" FontSize="12" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                            <Border x:Name="NameTagGradientPreview"
+                                                    Grid.Column="1"
+                                                    Width="26" Height="26"
+                                                    Margin="0,0,6,0"
+                                                    BorderBrush="{StaticResource SmsBorder}"
+                                                    BorderThickness="1"
+                                                    CornerRadius="6"
+                                                    Background="#888888"
+                                                    Cursor="Hand"
+                                                    MouseLeftButtonUp="NameTagGradientPreview_MouseLeftButtonUp"
+                                                    ToolTip="Click to pick gradient bottom color"/>
+                                            <Button x:Name="PickNameTagGradientColorButton" Grid.Column="2" Content="Pick" Click="PickNameTagGradientColor_Click" Padding="8,2" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                            <StackPanel Grid.Column="3" Orientation="Horizontal" VerticalAlignment="Center">
+                                                <TextBlock Text="R" VerticalAlignment="Center" Foreground="{StaticResource SmsForegroundDim}" Margin="0,0,3,0" FontSize="12"/>
+                                                <TextBox x:Name="NameTagGradientRBox" Width="34" MaxLength="3" Margin="0"/>
+                                                <TextBlock Text="G" VerticalAlignment="Center" Foreground="{StaticResource SmsForegroundDim}" Margin="4,0,3,0" FontSize="12"/>
+                                                <TextBox x:Name="NameTagGradientGBox" Width="34" MaxLength="3" Margin="0"/>
+                                                <TextBlock Text="B" VerticalAlignment="Center" Foreground="{StaticResource SmsForegroundDim}" Margin="4,0,3,0" FontSize="12"/>
+                                                <TextBox x:Name="NameTagGradientBBox" Width="34" MaxLength="3" Margin="0"/>
+                                            </StackPanel>
+                                        </Grid>
+                                    </Border>
+
+                                    <Border x:Name="NameTagOutlineColumn"
+                                            Grid.Column="2"
+                                            Background="{StaticResource SmsSurfaceAlt}"
+                                            CornerRadius="8"
+                                            Padding="10,6">
+                                        <Grid>
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="Auto"/>
+                                                <ColumnDefinition Width="Auto"/>
+                                                <ColumnDefinition Width="Auto"/>
+                                                <ColumnDefinition Width="*"/>
+                                            </Grid.ColumnDefinitions>
+                                            <TextBlock Grid.Column="0" Text="Outline" FontWeight="SemiBold" FontSize="12" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                            <Border x:Name="NameTagOutlinePreview"
+                                                    Grid.Column="1"
+                                                    Width="26" Height="26"
+                                                    Margin="0,0,6,0"
+                                                    BorderBrush="{StaticResource SmsBorder}"
+                                                    BorderThickness="1"
+                                                    CornerRadius="6"
+                                                    Background="Black"
+                                                    Cursor="Hand"
+                                                    MouseLeftButtonUp="NameTagOutlinePreview_MouseLeftButtonUp"
+                                                    ToolTip="Click to pick outline color"/>
+                                            <Button x:Name="PickNameTagOutlineColorButton" Grid.Column="2" Content="Pick" Click="PickNameTagOutlineColor_Click" Padding="8,2" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                            <StackPanel Grid.Column="3" Orientation="Horizontal" VerticalAlignment="Center">
+                                                <TextBlock Text="R" VerticalAlignment="Center" Foreground="{StaticResource SmsForegroundDim}" Margin="0,0,3,0" FontSize="12"/>
+                                                <TextBox x:Name="NameTagOutlineRBox" Width="34" MaxLength="3" Margin="0"/>
+                                                <TextBlock Text="G" VerticalAlignment="Center" Foreground="{StaticResource SmsForegroundDim}" Margin="4,0,3,0" FontSize="12"/>
+                                                <TextBox x:Name="NameTagOutlineGBox" Width="34" MaxLength="3" Margin="0"/>
+                                                <TextBlock Text="B" VerticalAlignment="Center" Foreground="{StaticResource SmsForegroundDim}" Margin="4,0,3,0" FontSize="12"/>
+                                                <TextBox x:Name="NameTagOutlineBBox" Width="34" MaxLength="3" Margin="0"/>
+                                            </StackPanel>
+                                        </Grid>
+                                    </Border>
+                                </Grid>
+
+                                <ToggleButton x:Name="NameTagGradientToggle"
+                                              Content="Gradient text"
+                                              Style="{StaticResource SmsRedToggleButton}"
+                                              Margin="0,6,0,0"
+                                              HorizontalAlignment="Left"
+                                              Checked="NameTagGradientToggle_Changed"
+                                              Unchecked="NameTagGradientToggle_Changed"/>
+
+                                <controls:NameTagPreviewControl x:Name="LiveNameTagPreview"
+                                                                  Margin="0,6,0,0"
+                                                                  HorizontalAlignment="Stretch"/>
+                            </StackPanel>
+                        </GroupBox>
+
+                        <GroupBox Header="Connection" Padding="14,8,14,10">
+                            <StackPanel>
+                                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                                    <TextBlock Text="Server IP" Style="{StaticResource SmsSectionLabel}" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                                    <TextBox x:Name="ServerIpBox" Width="220" Margin="0,0,14,0"/>
+                                    <TextBlock Text="Port" Style="{StaticResource SmsSectionLabel}" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                                    <TextBox x:Name="ServerPortBox"
+                                             Style="{StaticResource SmsCompactTextBox}"
+                                             Width="84"
+                                             Margin="0,0,14,0"/>
+                                    <TextBlock Text="Max players" Style="{StaticResource SmsSectionLabel}" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                                    <TextBox x:Name="MaxPlayersBox"
+                                             Style="{StaticResource SmsCompactTextBox}"
+                                             Width="56"
+                                             Margin="0"/>
+                                </StackPanel>
+                                <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
+                                    <Grid Margin="0,0,8,0">
+                                        <StackPanel Orientation="Horizontal">
+                                            <Button x:Name="HostButton" Content="Host Server" Style="{StaticResource SmsPrimaryButton}" Click="Host_Click" Margin="0,0,8,0"/>
+                                            <Button x:Name="ConnectButton" Content="Connect" Style="{StaticResource SmsPrimaryButton}" Click="Connect_Click"/>
+                                        </StackPanel>
+                                        <Border x:Name="GameLinkOverlay"
+                                                Panel.ZIndex="1"
+                                                Background="#E0080810"
+                                                BorderBrush="{StaticResource SmsBorderGlow}"
+                                                BorderThickness="1"
+                                                CornerRadius="12"
+                                                IsHitTestVisible="True">
+                                            <TextBlock Text="Launch Dolphin from this launcher (not a desktop shortcut). Dolphin and the game need to be linked before you can host or connect."
+                                                       Style="{StaticResource SmsHintText}"
+                                                       HorizontalAlignment="Center"
+                                                       VerticalAlignment="Center"
+                                                       TextAlignment="Center"
+                                                       TextWrapping="Wrap"
+                                                       MaxWidth="280"
+                                                       Margin="16,10"/>
+                                        </Border>
+                                    </Grid>
+                                    <Button x:Name="DisconnectButton" Content="Disconnect" Style="{StaticResource SmsDangerButton}" Click="Disconnect_Click" IsEnabled="False" Margin="0,0,8,0"/>
+                                    <Button x:Name="LaunchDolphinButton" Content="Launch Dolphin" Style="{StaticResource SmsPrimaryButton}" Click="LaunchDolphin_Click"/>
+                                </StackPanel>
+                            </StackPanel>
+                        </GroupBox>
+
+                        <GroupBox Header="Paths" Padding="14,8,14,10">
+                            <StackPanel>
+                                <TextBlock Style="{StaticResource SmsHintText}"
+                                           Margin="0,0,0,6"
+                                           FontSize="11"
+                                           Text="Launch Dolphin from Connection — not a desktop shortcut — so the launcher can link to your game."/>
+                                <Grid Margin="0,0,0,6">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Grid.Column="0"
+                                               Text="Dolphin"
+                                               Style="{StaticResource SmsSectionLabel}"
+                                               VerticalAlignment="Center"
+                                               Margin="0,0,8,0"/>
+                                    <TextBox x:Name="DolphinPathBox"
+                                             Grid.Column="1"
+                                             Style="{StaticResource SmsCompactTextBox}"
+                                             Margin="0,0,8,0"/>
+                                    <Button Grid.Column="2" Content="Browse…" Click="BrowseDolphin_Click" Padding="10,4"/>
+                                </Grid>
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Grid.Column="0"
+                                               Text="Game ISO"
+                                               Style="{StaticResource SmsSectionLabel}"
+                                               VerticalAlignment="Center"
+                                               Margin="0,0,8,0"/>
+                                    <TextBox x:Name="IsoPathBox"
+                                             Grid.Column="1"
+                                             Style="{StaticResource SmsCompactTextBox}"
+                                             Margin="0,0,8,0"/>
+                                    <Button Grid.Column="2" Content="Browse…" Click="BrowseIso_Click" Padding="10,4"/>
+                                </Grid>
+                            </StackPanel>
+                        </GroupBox>
+                    </StackPanel>
+                </ScrollViewer>
+            </TabItem>
+
+            <TabItem Header="Client Actions">
+                <Grid Margin="20,12,20,20">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*" MinHeight="240"/>
+                    </Grid.RowDefinitions>
+                    <Grid Grid.Row="0">
+                        <GroupBox x:Name="ClientTeleportPanel" Header="Teleport" Padding="14,8,14,10" Margin="0">
+                            <StackPanel>
+                                <WrapPanel VerticalAlignment="Center">
+                                    <TextBlock Text="Destination" Style="{StaticResource SmsSectionLabel}" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                    <controls:FastSelector x:Name="ClientLevelCombo" Width="220" DisplayMemberPath="DisplayName" Margin="0,0,8,0"/>
+                                    <controls:FastSelector x:Name="ClientEpisodeCombo" Width="240" DisplayMemberPath="DisplayName" Margin="0,0,8,0"/>
+                                    <Button x:Name="ClientWarpButton" Content="Warp" Style="{StaticResource SmsPrimaryButton}" Click="ClientWarp_Click" VerticalAlignment="Center"/>
+                                </WrapPanel>
+                                <WrapPanel Margin="0,8,0,0">
+                                    <TextBlock Text="Warp target" Style="{StaticResource SmsSectionLabel}" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                    <controls:FastSelector x:Name="ClientWarpTargetCombo" Width="200" DisplayMemberPath="Username" Margin="0,0,8,0"/>
+                                    <Button x:Name="ClientTeleportToPlayerButton" Content="Teleport to Player" ToolTip="Teleport to the selected player's exact position" Click="ClientTeleportToPlayer_Click"/>
+                                </WrapPanel>
+                            </StackPanel>
+                        </GroupBox>
+                        <Border x:Name="ClientTeleportOverlay"
+                                Panel.ZIndex="1"
+                                HorizontalAlignment="Stretch"
+                                VerticalAlignment="Stretch"
+                                Background="#E0080810"
+                                BorderBrush="{StaticResource SmsBorderGlow}"
+                                BorderThickness="1"
+                                CornerRadius="12"
+                                IsHitTestVisible="True"
+                                Visibility="Collapsed">
+                            <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Margin="24">
+                                <Border Width="48" Height="48" CornerRadius="24"
+                                        Background="{StaticResource SmsAccentSoft}"
+                                        BorderBrush="{StaticResource SmsBorderGlow}"
+                                        BorderThickness="1"
+                                        HorizontalAlignment="Center"
+                                        Margin="0,0,0,12">
+                                    <TextBlock Text="—" FontSize="22" FontWeight="Bold"
+                                               Foreground="{StaticResource SmsAccent}"
+                                               HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                </Border>
+                                <TextBlock x:Name="ClientTeleportOverlayText"
+                                           Text="The host needs to enable client teleporting to use this."
+                                           HorizontalAlignment="Center"
+                                           Foreground="{StaticResource SmsForegroundDim}"
+                                           FontSize="14"
+                                           TextAlignment="Center"
+                                           TextWrapping="Wrap"
+                                           MaxWidth="360"
+                                           Margin="24,8,24,0"/>
+                            </StackPanel>
+                        </Border>
+                    </Grid>
+                    <GroupBox Grid.Row="1" Header="Connected Players">
+                        <ListView x:Name="ClientRosterList"
+                                  MinHeight="220"
+                                  VerticalAlignment="Stretch"
+                                  ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                                  SelectionMode="Single">
+                            <ListView.View>
+                                <GridView>
+                                    <GridViewColumn Header="Name" DisplayMemberBinding="{Binding Username}" Width="140"/>
+                                    <GridViewColumn Header="Level" DisplayMemberBinding="{Binding LevelName}" Width="220"/>
+                                    <GridViewColumn Header="Episode" DisplayMemberBinding="{Binding EpisodeName}" Width="220"/>
+                                    <GridViewColumn Header="Status" DisplayMemberBinding="{Binding Status}" Width="100"/>
+                                </GridView>
+                            </ListView.View>
+                        </ListView>
+                    </GroupBox>
+                </Grid>
+            </TabItem>
+
+            <TabItem x:Name="ServerTab" Header="Server Actions">
+                <Grid Margin="20,12,20,20">
+                    <Grid x:Name="ServerActionsPanel">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="*" MinHeight="240"/>
+                        </Grid.RowDefinitions>
+                        <Grid Grid.Row="0">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="16"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+                        <GroupBox Header="Host Teleport">
+                            <StackPanel>
+                                <TextBlock Text="Destination" Style="{StaticResource SmsSectionLabel}"/>
+                                <WrapPanel Margin="0,0,0,8">
+                                    <controls:FastSelector x:Name="ServerLevelCombo" Width="240" DisplayMemberPath="DisplayName" Margin="0,0,8,8"/>
+                                    <controls:FastSelector x:Name="ServerEpisodeCombo" Width="280" DisplayMemberPath="DisplayName" Margin="0,0,8,8"/>
+                                </WrapPanel>
+                                <TextBlock Text="Warp target" Style="{StaticResource SmsSectionLabel}"/>
+                                <WrapPanel Margin="0,0,0,8">
+                                    <controls:FastSelector x:Name="WarpTargetCombo" Width="200" DisplayMemberPath="Username" Margin="0,0,8,8"/>
+                                    <Button Content="Warp Selected" Style="{StaticResource SmsPrimaryButton}" Click="ServerWarpSelected_Click" Margin="0,0,8,8"/>
+                                    <Button Content="Warp Everyone" Click="ServerWarpAll_Click" Margin="0,0,8,8"/>
+                                    <Button x:Name="ServerTeleportToPlayerButton" Content="Teleport to Player" ToolTip="Teleport yourself to the warp target player's exact position" Click="ServerTeleportToPlayer_Click" Margin="0,0,0,8"/>
+                                </WrapPanel>
+                                <TextBlock Text="Multi-select players" Style="{StaticResource SmsSectionLabel}"/>
+                                <ListBox x:Name="MultiSelectPlayers" SelectionMode="Multiple" MaxHeight="100" Margin="0,0,0,8"
+                                         DisplayMemberPath="Username" ScrollViewer.VerticalScrollBarVisibility="Auto"/>
+                                <TextBlock x:Name="ClientTeleportStatusText"
+                                           Style="{StaticResource SmsHintText}"
+                                           Margin="0,0,0,8"/>
+                                <ToggleButton x:Name="AllowClientTeleportToggle"
+                                              Content="Allow client teleporting"
+                                              Style="{StaticResource SmsRedToggleButton}"
+                                              HorizontalAlignment="Left"
+                                              Checked="AllowClientTeleport_Changed"
+                                              Unchecked="AllowClientTeleport_Changed"/>
+                            </StackPanel>
+                        </GroupBox>
+                        <GroupBox Grid.Column="2" Header="Game Modes">
+                            <StackPanel>
+                                <TextBlock Text="Mode" Style="{StaticResource SmsSectionLabel}"/>
+                                <ComboBox x:Name="GameModeCombo" Margin="0,0,0,8"
+                                          SelectionChanged="GameModeCombo_SelectionChanged"
+                                          PreviewMouseWheel="GameModeCombo_PreviewMouseWheel">
+                                    <ComboBoxItem Content="Normal" Tag="Normal"/>
+                                    <ComboBoxItem Content="Hide and Seek" Tag="HideSeek"/>
+                                </ComboBox>
+                                <StackPanel x:Name="HideSeekPanel" Visibility="Collapsed">
+                                    <Grid Margin="0,0,0,8">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="8"/>
+                                            <ColumnDefinition Width="*"/>
+                                        </Grid.ColumnDefinitions>
+                                        <StackPanel Grid.Column="0">
+                                            <TextBlock Text="Hiders" Style="{StaticResource SmsSectionLabel}"/>
+                                            <Border BorderBrush="{StaticResource SmsBorder}" BorderThickness="1" CornerRadius="6" MinHeight="120">
+                                                <ListBox x:Name="HideSeekHidersList" AllowDrop="True"
+                                                         PreviewMouseLeftButtonDown="HideSeekRoleList_PreviewMouseLeftButtonDown"
+                                                         PreviewMouseMove="HideSeekRoleList_MouseMove"
+                                                         DragOver="HideSeekRoleList_DragOver"
+                                                         Drop="HideSeekHidersList_Drop"
+                                                         DisplayMemberPath="Username"/>
+                                            </Border>
+                                        </StackPanel>
+                                        <StackPanel Grid.Column="2">
+                                            <TextBlock Text="Seekers" Style="{StaticResource SmsSectionLabel}"/>
+                                            <Border BorderBrush="{StaticResource SmsBorder}" BorderThickness="1" CornerRadius="6" MinHeight="120">
+                                                <ListBox x:Name="HideSeekSeekersList" AllowDrop="True"
+                                                         PreviewMouseLeftButtonDown="HideSeekRoleList_PreviewMouseLeftButtonDown"
+                                                         PreviewMouseMove="HideSeekRoleList_MouseMove"
+                                                         DragOver="HideSeekRoleList_DragOver"
+                                                         Drop="HideSeekSeekersList_Drop"
+                                                         DisplayMemberPath="Username"/>
+                                            </Border>
+                                        </StackPanel>
+                                    </Grid>
+                                    <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                                        <Button x:Name="StartStopTagButton" Content="Start Tag"
+                                                Style="{StaticResource SmsPrimaryButton}" Margin="0,0,8,0"
+                                                Click="StartStopTagButton_Click"/>
+                                        <Button x:Name="ResetTagButton" Content="Reset Tag"
+                                                Style="{StaticResource SmsSecondaryButton}"
+                                                Click="ResetTagButton_Click"/>
+                                    </StackPanel>
+                                    <TextBlock x:Name="HideSeekStatusText" Style="{StaticResource SmsHintText}" TextWrapping="Wrap"/>
+                                </StackPanel>
+                            </StackPanel>
+                        </GroupBox>
+                        </Grid>
+                        <GroupBox Grid.Row="1" Header="Connected Players">
+                            <ListView x:Name="ServerRosterList"
+                                      MinHeight="220"
+                                      VerticalAlignment="Stretch"
+                                      ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+                                <ListView.View>
+                                    <GridView>
+                                        <GridViewColumn Header="Name" DisplayMemberBinding="{Binding Username}" Width="120"/>
+                                        <GridViewColumn Header="Level" DisplayMemberBinding="{Binding LevelName}" Width="200"/>
+                                        <GridViewColumn Header="Episode" DisplayMemberBinding="{Binding EpisodeName}" Width="200"/>
+                                        <GridViewColumn Header="Ping" DisplayMemberBinding="{Binding PingMs}" Width="60"/>
+                                        <GridViewColumn Header="Status" DisplayMemberBinding="{Binding Status}" Width="100"/>
+                                    </GridView>
+                                </ListView.View>
+                            </ListView>
+                        </GroupBox>
+                    </Grid>
+                    <Border x:Name="ServerActionsOverlay"
+                            Panel.ZIndex="1"
+                            Background="#E0080810"
+                            BorderBrush="{StaticResource SmsBorderGlow}"
+                            BorderThickness="1"
+                            CornerRadius="12"
+                            IsHitTestVisible="True">
+                        <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Margin="24">
+                            <Border Width="48" Height="48" CornerRadius="24"
+                                    Background="{StaticResource SmsAccentSoft}"
+                                    BorderBrush="{StaticResource SmsBorderGlow}"
+                                    BorderThickness="1"
+                                    HorizontalAlignment="Center"
+                                    Margin="0,0,0,12">
+                                <TextBlock Text="—" FontSize="22" FontWeight="Bold"
+                                           Foreground="{StaticResource SmsAccent}"
+                                           HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                            </Border>
+                            <TextBlock Text="Host and connect to enable server actions"
+                                       HorizontalAlignment="Center"
+                                       Foreground="{StaticResource SmsForegroundDim}"
+                                       FontSize="14"
+                                       TextAlignment="Center"
+                                       Margin="24,8,24,0"/>
+                        </StackPanel>
+                    </Border>
+                </Grid>
+            </TabItem>
+
+            <TabItem Header="Help">
+                <ScrollViewer Margin="20,12,20,20" VerticalScrollBarVisibility="Auto">
+                    <StackPanel MaxWidth="720">
+                        <Border Background="{StaticResource SmsCard}" CornerRadius="12" Padding="18" Margin="0,0,0,12"
+                                BorderBrush="{StaticResource SmsBorder}" BorderThickness="1">
+                            <StackPanel>
+                                <TextBlock Text="Setup" FontWeight="SemiBold" FontSize="14" Foreground="{StaticResource SmsAccent}" Margin="0,0,0,8"/>
+                                <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap">
+                                    Install BetterSunshineEngine.kxe and _SMSO.kxe in files/Kuribo!/Mods/ on your BSE ISO.
+                                    Configure Dolphin and ISO paths in Settings, launch Dolphin from the launcher, then Host or Connect.
+                                </TextBlock>
+                            </StackPanel>
+                        </Border>
+                        <Border Background="{StaticResource SmsCard}" CornerRadius="12" Padding="18" Margin="0,0,0,12"
+                                BorderBrush="{StaticResource SmsBorder}" BorderThickness="1">
+                            <StackPanel>
+                                <TextBlock Text="Port forwarding" FontWeight="SemiBold" FontSize="14" Foreground="{StaticResource SmsAccent}" Margin="0,0,0,8"/>
+                                <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap"
+                                           Text="Forward TCP and UDP port 27015 to your host machine for WAN play."/>
+                            </StackPanel>
+                        </Border>
+                        <Border Background="{StaticResource SmsCard}" CornerRadius="12" Padding="18" Margin="0,0,0,16"
+                                BorderBrush="{StaticResource SmsBorder}" BorderThickness="1">
+                            <StackPanel>
+                                <TextBlock Text="Troubleshooting" FontWeight="SemiBold" FontSize="14" Foreground="{StaticResource SmsAccent}" Margin="0,0,0,8"/>
+                                <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap">
+                                    Ensure Dolphin is running before connecting. Duplicate usernames are rejected.
+                                    Warps are blocked while a player is loading. Do not use SMSCoop alongside SMSOBB.
+                                </TextBlock>
+                            </StackPanel>
+                        </Border>
+                        <TextBlock x:Name="VersionText" Foreground="{StaticResource SmsForegroundMuted}" Margin="0,0,0,12"/>
+                        <StackPanel Orientation="Horizontal">
+                            <Button Content="Open Logs Folder" Click="OpenLogs_Click"/>
+                            <Button Content="Export Diagnostics" Click="ExportDiagnostics_Click"/>
+                        </StackPanel>
+                        <TextBox x:Name="DiagnosticsBox" Height="180" Margin="0,12,0,0" IsReadOnly="True"
+                                 VerticalScrollBarVisibility="Auto" TextWrapping="Wrap"/>
+                    </StackPanel>
+                </ScrollViewer>
+            </TabItem>
+        </TabControl>
+
+        <!-- Status bar -->
+        <Border Grid.Row="2"
+                Background="{StaticResource SmsSurface}"
+                Padding="20,10"
+                BorderBrush="{StaticResource SmsBorderGlow}"
+                BorderThickness="0,1,0,0">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <Border Width="4" Height="4" CornerRadius="2" Background="{StaticResource SmsAccent}" VerticalAlignment="Center" Margin="0,0,10,0"/>
+                <TextBlock x:Name="LogLine" Grid.Column="1" Text=""
+                           Foreground="{StaticResource SmsForegroundDim}"
+                           TextTrimming="CharacterEllipsis"
+                           FontSize="11"
+                           VerticalAlignment="Center"/>
+            </Grid>
+        </Border>
+        </Grid>
+    </Grid>
+</Window>

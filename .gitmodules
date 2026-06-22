@@ -1,0 +1,3 @@
+[submodule "module/lib/BetterSunshineEngine"]
+	path = module/lib/BetterSunshineEngine
+	url = https://github.com/DotKuribo/BetterSunshineEngine.git

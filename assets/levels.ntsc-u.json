@@ -1,0 +1,257 @@
+{
+  "region": "NTSC-U",
+  "courses": [
+    {
+      "courseId": 0,
+      "displayName": "Delfino Airstrip",
+      "warpable": true,
+      "episodes": [{ "episodeId": 0, "displayName": "Episode 1 \u2014 Delfino Airstrip Dilemma" }]
+    },
+    {
+      "courseId": 1,
+      "displayName": "Delfino Plaza",
+      "warpable": true,
+      "episodes": [
+        { "episodeId": 0, "displayName": "Main Hub" },
+        { "episodeId": 1, "displayName": "Introduction" },
+        { "episodeId": 2, "displayName": "After Plaza Cleanup" },
+        { "episodeId": 3, "displayName": "After 3 Shines" },
+        { "episodeId": 4, "displayName": "Bianco Hills Gate Open" },
+        { "episodeId": 5, "displayName": "Expanded Hub (10 Shines)" },
+        { "episodeId": 6, "displayName": "Flooded Plaza" },
+        { "episodeId": 7, "displayName": "Post-Flood Plaza" }
+      ]
+    },
+    {
+      "courseId": 2,
+      "displayName": "Bianco Hills",
+      "warpable": true,
+      "episodes": [
+        { "episodeId": 0, "displayName": "Episode 1 \u2014 Road to the Big Windmill" },
+        { "episodeId": 1, "displayName": "Episode 2 \u2014 Down with Petey Piranha!" },
+        { "episodeId": 2, "displayName": "Episode 3 \u2014 The Hillside Cave Secret" },
+        { "episodeId": 3, "displayName": "Episode 4 \u2014 Red Coins of Windmill Village" },
+        { "episodeId": 4, "displayName": "Episode 5 \u2014 Petey Piranha Strikes Back" },
+        { "episodeId": 5, "displayName": "Episode 6 \u2014 The Secret of the Dirty Lake" },
+        { "episodeId": 6, "displayName": "Episode 7 \u2014 Shadow Mario on the Loose" },
+        { "episodeId": 7, "displayName": "Episode 8 \u2014 The Red Coins of the Lake" }
+      ]
+    },
+    {
+      "courseId": 3,
+      "displayName": "Ricco Harbor",
+      "warpable": true,
+      "episodes": [
+        { "episodeId": 0, "displayName": "Episode 1 \u2014 Gooper Blooper Breaks Out" },
+        { "episodeId": 1, "displayName": "Episode 2 \u2014 Blooper Surfing Safari" },
+        { "episodeId": 2, "displayName": "Episode 3 \u2014 The Caged Shine Sprite" },
+        { "episodeId": 3, "displayName": "Episode 4 \u2014 The Secret of Ricco Tower" },
+        { "episodeId": 4, "displayName": "Episode 5 \u2014 Gooper Blooper Returns" },
+        { "episodeId": 5, "displayName": "Episode 6 \u2014 Red Coins on the Water" },
+        { "episodeId": 6, "displayName": "Episode 7 \u2014 Shadow Mario Revisited" },
+        { "episodeId": 7, "displayName": "Episode 8 \u2014 Yoshi's Fruit Adventure" }
+      ]
+    },
+    {
+      "courseId": 4,
+      "displayName": "Gelato Beach",
+      "warpable": true,
+      "episodes": [
+        { "episodeId": 0, "displayName": "Episode 1 \u2014 Dune Bud Sand Castle Secret" },
+        { "episodeId": 1, "displayName": "Episode 2 \u2014 Mirror Madness! Tilt, Slam, Bam!" },
+        { "episodeId": 2, "displayName": "Episode 3 \u2014 Wiggler Ahoy! Full Steam Ahead!" },
+        { "episodeId": 3, "displayName": "Episode 4 \u2014 The Sand Bird is Born" },
+        { "episodeId": 4, "displayName": "Episode 5 \u2014 Il Piantissimo's Sand Sprint" },
+        { "episodeId": 5, "displayName": "Episode 6 \u2014 Red Coins in the Coral Reef" },
+        { "episodeId": 6, "displayName": "Episode 7 \u2014 It's Shadow Mario! After Him!" },
+        { "episodeId": 7, "displayName": "Episode 8 \u2014 The Watermelon Festival" }
+      ]
+    },
+    {
+      "courseId": 5,
+      "displayName": "Pinna Park",
+      "warpable": true,
+      "episodes": [
+        { "episodeId": 0, "displayName": "Episode 1 \u2014 Mecha-Bowser Appears!" },
+        { "episodeId": 1, "displayName": "Episode 2 \u2014 The Beach Cannon's Secret" },
+        { "episodeId": 2, "displayName": "Episode 3 \u2014 Red Coins of the Pirate Ships" },
+        { "episodeId": 3, "displayName": "Episode 4 \u2014 The Wilted Sunflowers" },
+        { "episodeId": 4, "displayName": "Episode 5 \u2014 The Runaway Ferris Wheel" },
+        { "episodeId": 5, "displayName": "Episode 6 \u2014 The Yoshi-Go-Round's Secret" },
+        { "episodeId": 6, "displayName": "Episode 7 \u2014 Shadow Mario in the Park" },
+        { "episodeId": 7, "displayName": "Episode 8 \u2014 Roller Coaster Balloons" }
+      ]
+    },
+    {
+      "courseId": 6,
+      "displayName": "Sirena Beach",
+      "warpable": true,
+      "episodes": [
+        { "episodeId": 0, "displayName": "Episode 1 \u2014 The Manta Storm" },
+        { "episodeId": 1, "displayName": "Episode 2 \u2014 The Hotel Lobby's Secret" },
+        { "episodeId": 2, "displayName": "Episode 3 \u2014 Mysterious Hotel Delfino" },
+        { "episodeId": 3, "displayName": "Episode 4 \u2014 The Secret of Casino Delfino" },
+        { "episodeId": 4, "displayName": "Episode 5 \u2014 King Boo Down Below" },
+        { "episodeId": 5, "displayName": "Episode 6 \u2014 Scrubbing Sirena Beach" },
+        { "episodeId": 6, "displayName": "Episode 7 \u2014 Shadow Mario Checks In" },
+        { "episodeId": 7, "displayName": "Episode 8 \u2014 Red Coins in the Hotel" }
+      ]
+    },
+    {
+      "courseId": 8,
+      "displayName": "Pianta Village",
+      "warpable": true,
+      "episodes": [
+        { "episodeId": 0, "displayName": "Episode 1 \u2014 Chain Chomplets Unchained" },
+        { "episodeId": 1, "displayName": "Episode 2 \u2014 Il Piantissimo's Crazy Climb" },
+        { "episodeId": 2, "displayName": "Episode 3 \u2014 The Goopy Inferno" },
+        { "episodeId": 3, "displayName": "Episode 4 \u2014 Chain Chomp's Bath" },
+        { "episodeId": 4, "displayName": "Episode 5 \u2014 Secret of the Village Underside" },
+        { "episodeId": 5, "displayName": "Episode 6 \u2014 Piantas in Need" },
+        { "episodeId": 6, "displayName": "Episode 7 \u2014 Shadow Mario Runs Wild" },
+        { "episodeId": 7, "displayName": "Episode 8 \u2014 Fluff Festival Coin Hunt" }
+      ]
+    },
+    {
+      "courseId": 9,
+      "displayName": "Noki Bay",
+      "warpable": true,
+      "episodes": [
+        { "episodeId": 0, "displayName": "Episode 1 \u2014 Uncork the Waterfall" },
+        { "episodeId": 1, "displayName": "Episode 2 \u2014 The Boss of Tricky Ruins" },
+        { "episodeId": 2, "displayName": "Episode 3 \u2014 Red Coins in a Bottle" },
+        { "episodeId": 3, "displayName": "Episode 4 \u2014 Eely-Mouth's Dentist" },
+        { "episodeId": 4, "displayName": "Episode 5 \u2014 Il Piantissimo's Surf Swim" },
+        { "episodeId": 5, "displayName": "Episode 6 \u2014 The Shell's Secret" },
+        { "episodeId": 6, "displayName": "Episode 7 \u2014 Hold It, Shadow Mario!" },
+        { "episodeId": 7, "displayName": "Episode 8 \u2014 The Red Coin Fish" }
+      ]
+    },
+    {
+      "courseId": 52,
+      "displayName": "Corona Mountain",
+      "warpable": true,
+      "episodes": [{ "episodeId": 0, "displayName": "Episode 1 \u2014 Father and Son Shine!" }]
+    },
+    {
+      "courseId": 47,
+      "displayName": "Bianco Hills \u2014 Hillside Cave Secret",
+      "warpable": true,
+      "episodes": [{ "episodeId": 0, "displayName": "Episode 1 \u2014 Red Coins of the Hillside Cave" }]
+    },
+    {
+      "courseId": 46,
+      "displayName": "Bianco Hills \u2014 Dirty Lake Secret",
+      "warpable": true,
+      "episodes": [{ "episodeId": 0, "displayName": "Episode 1 \u2014 Red Coins of the Dirty Lake" }]
+    },
+    {
+      "courseId": 48,
+      "displayName": "Ricco Harbor \u2014 Ricco Tower Secret",
+      "warpable": true,
+      "episodes": [{ "episodeId": 0, "displayName": "Episode 1 \u2014 The Secret of Ricco Tower" }]
+    },
+    {
+      "courseId": 13,
+      "displayName": "Pinna Park \u2014 Park Area",
+      "warpable": true,
+      "episodes": [{ "episodeId": 0, "displayName": "Episode 1 \u2014 Mecha-Bowser Appears!" }]
+    },
+    {
+      "courseId": 7,
+      "displayName": "Sirena Beach \u2014 Hotel Interior",
+      "warpable": true,
+      "episodes": [{ "episodeId": 0, "displayName": "Episode 1 \u2014 Mysterious Hotel Delfino" }]
+    },
+    {
+      "courseId": 14,
+      "displayName": "Sirena Beach \u2014 Casino Delfino",
+      "warpable": true,
+      "episodes": [{ "episodeId": 0, "displayName": "Episode 1 \u2014 The Secret of Casino Delfino" }]
+    },
+    {
+      "courseId": 50,
+      "displayName": "Pinna Park \u2014 Beach Cannon Secret",
+      "warpable": true,
+      "episodes": [{ "episodeId": 0, "displayName": "Episode 1 \u2014 The Beach Cannon's Secret" }]
+    },
+    {
+      "courseId": 51,
+      "displayName": "Sirena Beach \u2014 Hotel Lobby Secret",
+      "warpable": true,
+      "episodes": [{ "episodeId": 0, "displayName": "Episode 1 \u2014 The Hotel Lobby's Secret" }]
+    },
+    {
+      "courseId": 40,
+      "displayName": "Sirena Beach \u2014 Casino Delfino Secret",
+      "warpable": true,
+      "episodes": [{ "episodeId": 0, "displayName": "Episode 1 \u2014 The Secret of Casino Delfino" }]
+    },
+    {
+      "courseId": 41,
+      "displayName": "Pinna Park \u2014 Yoshi-Go-Round Secret",
+      "warpable": true,
+      "episodes": [{ "episodeId": 0, "displayName": "Episode 1 \u2014 The Yoshi-Go-Round's Secret" }]
+    },
+    {
+      "courseId": 42,
+      "displayName": "Pianta Village \u2014 Village Underside Secret",
+      "warpable": true,
+      "episodes": [{ "episodeId": 0, "displayName": "Episode 1 \u2014 Red Coin Chucksters" }]
+    },
+    {
+      "courseId": 31,
+      "displayName": "Noki Bay \u2014 Shell's Secret",
+      "warpable": true,
+      "episodes": [{ "episodeId": 0, "displayName": "Episode 1 \u2014 The Shell's Secret" }]
+    },
+    {
+      "courseId": 32,
+      "displayName": "Gelato Beach \u2014 Sand Castle Secret",
+      "warpable": true,
+      "episodes": [{ "episodeId": 0, "displayName": "Episode 1 \u2014 Dune Bud Sand Castle Secret" }]
+    },
+    {
+      "courseId": 20,
+      "displayName": "Delfino Plaza \u2014 Delfino Airstrip (return)",
+      "warpable": true,
+      "episodes": [{ "episodeId": 0, "displayName": "Episode 1 \u2014 Delfino Airstrip Dilemma" }]
+    },
+    {
+      "courseId": 21,
+      "displayName": "Delfino Plaza \u2014 Super Slide",
+      "warpable": true,
+      "episodes": [{ "episodeId": 0, "displayName": "Episode 1 \u2014 Super Slide" }]
+    },
+    {
+      "courseId": 22,
+      "displayName": "Delfino Plaza \u2014 Pachinko Game",
+      "warpable": true,
+      "episodes": [{ "episodeId": 0, "displayName": "Episode 1 \u2014 Pachinko Game" }]
+    },
+    {
+      "courseId": 23,
+      "displayName": "Delfino Plaza \u2014 Red Coin Field",
+      "warpable": true,
+      "episodes": [{ "episodeId": 0, "displayName": "Episode 1 \u2014 Red Coin Field" }]
+    },
+    {
+      "courseId": 24,
+      "displayName": "Delfino Plaza \u2014 Lily Pad Ride",
+      "warpable": true,
+      "episodes": [{ "episodeId": 0, "displayName": "Episode 1 \u2014 Lily Pad Ride" }]
+    },
+    {
+      "courseId": 29,
+      "displayName": "Delfino Plaza \u2014 Turbo Track",
+      "warpable": true,
+      "episodes": [{ "episodeId": 0, "displayName": "Episode 1 \u2014 Turbo Track" }]
+    },
+    {
+      "courseId": 30,
+      "displayName": "Ricco Harbor \u2014 Blooper Surfing Safari",
+      "warpable": true,
+      "episodes": [{ "episodeId": 0, "displayName": "Episode 1 \u2014 Blooper Surfing Safari" }]
+    }
+  ]
+}

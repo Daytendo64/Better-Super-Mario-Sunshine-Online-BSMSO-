@@ -1,0 +1,33 @@
+# Build outputs
+dist/*
+!dist/
+!dist/_SMSO.kxe
+module/build/
+module/out/
+launcher/**/bin/
+launcher/**/obj/
+launcher/**/publish/
+
+# IDE
+.vs/
+.idea/
+*.user
+*.suo
+
+# OS
+Thumbs.db
+Desktop.ini
+
+# Logs
+*.log
+debug-*.log
+
+# Cursor
+.cursor/
+
+# Windows artifacts
+nul
+
+# BSE build artifacts
+*.kxe
+!dist/_SMSO.kxe
