@@ -5,16 +5,17 @@ namespace SMSO.Server;
 
 public sealed class HideSeekService
 {
-    public const float TagRadius = 65f;
-    public const float TagVerticalTolerance = 65f;
+    public const float TagRadius = HideSeekTagConstants.MaxHorizontalReach;
+    public const float TagVerticalTolerance = HideSeekTagConstants.MaxVerticalSeparation;
+    internal const float TagLagCompensationMaxSeconds = 0.12f;
+    // Half a UDP tick for the fresh snapshot; stale peers extrapolate by packet age up to the cap.
+    private const float TagFreshExtrapolationSeconds = 1f / (ProtocolConstants.SnapshotRateHz * 2f);
     private const int TagCooldownMs = 500;
-    private const int TagStartGraceMs = 2500;
 
     private readonly GameServer _server;
     private GameModeStatePacket _state = GameModeStatePacket.CreateDefault();
     private readonly Dictionary<(byte seeker, byte hider), long> _tagCooldowns = new();
     private readonly HashSet<byte> _assignedRoleSlots = new();
-    private long _tagGraceEndsAtMs;
     private byte _tagEventId;
 
     public HideSeekService(GameServer server) => _server = server;
@@ -26,7 +27,6 @@ public sealed class HideSeekService
         _state = GameModeStatePacket.CreateDefault();
         _tagCooldowns.Clear();
         _assignedRoleSlots.Clear();
-        _tagGraceEndsAtMs = 0;
         _tagEventId = 0;
     }
 
@@ -42,7 +42,6 @@ public sealed class HideSeekService
                 _state.Roles[i] = HideSeekRole.Hider;
             _tagCooldowns.Clear();
             _assignedRoleSlots.Clear();
-            _tagGraceEndsAtMs = 0;
             _tagEventId = 0;
         }
 
@@ -72,7 +71,6 @@ public sealed class HideSeekService
         {
             _state.Flags &= ~GameModeFlags.TagActive;
             _state.RoundStartMs = 0;
-            _tagGraceEndsAtMs = 0;
         }
 
         _state.Flags &= ~GameModeFlags.RoundComplete;
@@ -99,13 +97,12 @@ public sealed class HideSeekService
         }
 
         _state.Flags = GameModeFlags.TagActive;
-        _state.Flags &= ~GameModeFlags.RoundComplete;
+        _state.Flags &= ~(GameModeFlags.RoundComplete | GameModeFlags.RoundFanfare);
         _state.RoundStartMs = (uint)Environment.TickCount64;
         _state.LastTaggedSlot = 0xFF;
         _state.TagEventId = 0;
         _tagEventId = 0;
         _tagCooldowns.Clear();
-        _tagGraceEndsAtMs = Environment.TickCount64 + TagStartGraceMs;
         BumpAndBroadcast();
         _server.LogMessage("Hide & Seek tag started.");
         return true;
@@ -116,17 +113,16 @@ public sealed class HideSeekService
         if (_state.GameMode != GameMode.HideSeek)
             return;
 
-        _state.Flags &= ~(GameModeFlags.TagActive | GameModeFlags.RoundComplete);
+        _state.Flags &= ~(GameModeFlags.TagActive | GameModeFlags.RoundComplete | GameModeFlags.RoundFanfare);
         _state.RoundStartMs = 0;
         _state.LastTaggedSlot = 0xFF;
         _state.TagEventId = 0;
         _tagCooldowns.Clear();
-        _tagGraceEndsAtMs = 0;
         BumpAndBroadcast();
         _server.LogMessage("Hide & Seek tag stopped.");
     }
 
-    public void ResetTag()
+    public void ResetTag(bool playRoundFanfare = false)
     {
         if (_state.GameMode != GameMode.HideSeek)
             return;
@@ -134,13 +130,14 @@ public sealed class HideSeekService
         foreach (var slot in GetActiveRoleSlots())
             _state.SetRole(slot, HideSeekRole.Hider);
 
-        _state.Flags &= ~(GameModeFlags.TagActive | GameModeFlags.RoundComplete);
+        _state.Flags &= ~(GameModeFlags.TagActive | GameModeFlags.RoundComplete | GameModeFlags.RoundFanfare);
         _state.RoundStartMs = 0;
         _state.LastTaggedSlot = 0xFF;
         _state.TagEventId = 0;
         _tagEventId = 0;
         _tagCooldowns.Clear();
-        _tagGraceEndsAtMs = 0;
+        if (playRoundFanfare)
+            _state.Flags |= GameModeFlags.RoundFanfare;
         _state.Flags |= GameModeFlags.TimerReset;
         BumpAndBroadcast();
         _state.Flags &= ~GameModeFlags.TimerReset;
@@ -157,12 +154,15 @@ public sealed class HideSeekService
         BumpAndBroadcast();
     }
 
-    public void ProcessSnapshot(byte seekerSlot, in PlayerSnapshot seekerSnap, byte hiderSlot, in PlayerSnapshot hiderSnap)
+    public void ProcessSnapshot(
+        byte seekerSlot,
+        in PlayerSnapshot seekerSnap,
+        byte hiderSlot,
+        in PlayerSnapshot hiderSnap,
+        float seekerLagSeconds = 0f,
+        float hiderLagSeconds = 0f)
     {
         if (!_state.TagActive || _state.GameMode != GameMode.HideSeek)
-            return;
-
-        if (Environment.TickCount64 < _tagGraceEndsAtMs)
             return;
 
         if (_state.GetRole(seekerSlot) != (byte)HideSeekRole.Seeker)
@@ -184,15 +184,41 @@ public sealed class HideSeekService
         if (_tagCooldowns.TryGetValue(key, out var last) && now - last < TagCooldownMs)
             return;
 
-        var dx = seekerSnap.Position.X - hiderSnap.Position.X;
-        var dy = seekerSnap.Position.Y - hiderSnap.Position.Y;
-        var dz = seekerSnap.Position.Z - hiderSnap.Position.Z;
-        var xz = MathF.Sqrt(dx * dx + dz * dz);
-        if (xz > TagRadius || MathF.Abs(dy) > TagVerticalTolerance)
+        if (!IsWithinTagRange(seekerSnap, hiderSnap, seekerLagSeconds, hiderLagSeconds))
             return;
 
         _tagCooldowns[key] = now;
         ApplyTag(hiderSlot, seekerSlot);
+    }
+
+    internal static bool IsWithinTagRange(
+        in PlayerSnapshot seekerSnap,
+        in PlayerSnapshot hiderSnap,
+        float seekerLagSeconds = 0f,
+        float hiderLagSeconds = 0f)
+    {
+        var seekerPos = ExtrapolatePosition(seekerSnap, seekerLagSeconds);
+        var hiderPos = ExtrapolatePosition(hiderSnap, hiderLagSeconds);
+
+        var dx = seekerPos.X - hiderPos.X;
+        var dy = seekerPos.Y - hiderPos.Y;
+        var dz = seekerPos.Z - hiderPos.Z;
+        var horizontal = MathF.Sqrt(dx * dx + dz * dz);
+
+        // Compare pivot-to-pivot distance against two Mario body radii plus touch slack.
+        return horizontal <= HideSeekTagConstants.MaxHorizontalReach &&
+               MathF.Abs(dy) <= HideSeekTagConstants.MaxVerticalSeparation;
+    }
+
+    private static Vec3 ExtrapolatePosition(in PlayerSnapshot snap, float lagSeconds)
+    {
+        var seconds = MathF.Min(lagSeconds + TagFreshExtrapolationSeconds, TagLagCompensationMaxSeconds);
+        return new Vec3
+        {
+            X = snap.Position.X + snap.Velocity.X * seconds,
+            Y = snap.Position.Y + snap.Velocity.Y * seconds,
+            Z = snap.Position.Z + snap.Velocity.Z * seconds,
+        };
     }
 
     private void ApplyTag(byte hiderSlot, byte seekerSlot)
@@ -209,7 +235,6 @@ public sealed class HideSeekService
         {
             _state.Flags &= ~GameModeFlags.TagActive;
             _state.Flags |= GameModeFlags.RoundComplete;
-            _tagGraceEndsAtMs = 0;
         }
 
         BumpAndBroadcast();
@@ -218,18 +243,13 @@ public sealed class HideSeekService
         if (roundComplete)
         {
             _server.LogMessage("Hide & Seek round complete — all hiders found.");
-            ResetTag();
+            ResetTag(playRoundFanfare: true);
         }
     }
 
     public void ConsumeTagPulse()
     {
         ClearTagPulse();
-    }
-
-    internal void EndTagGraceForTesting()
-    {
-        _tagGraceEndsAtMs = 0;
     }
 
     private IReadOnlyList<byte> GetActiveRoleSlots()

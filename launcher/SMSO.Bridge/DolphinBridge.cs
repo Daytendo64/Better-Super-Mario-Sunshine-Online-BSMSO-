@@ -18,9 +18,17 @@ public sealed class DolphinBridge : IDisposable
     private DateTime _nextAttachAttemptUtc = DateTime.MinValue;
     private DateTime _lastAttachStatusLogUtc = DateTime.MinValue;
     private bool _loggedMailboxFound;
+    private int _aliveCheckCounter;
+    private readonly byte[] _readScratch = new byte[ProtocolConstants.CommBufferSize];
+    private readonly byte[] _remoteSnapScratch = new byte[ProtocolConstants.CommRemoteSnapshotsSize];
+    private readonly byte[] _nameTagScratch = new byte[ProtocolConstants.CommNameTagAppearancesSize];
+    private readonly byte[] _remoteVoiceScratch =
+        new byte[ProtocolConstants.MarioVoiceEventSize * ProtocolConstants.MaxRemoteSlots];
+    private readonly byte[] _gameModeScratch = new byte[ProtocolConstants.CommGameModeStateSize];
 
     private const int AttachFailureBackoffMs = 500;
     private const int AttachStatusLogCooldownMs = 6000;
+    private const int AliveCheckIntervalReads = 60;
 
     public event Action<string>? Log;
     public bool IsAttached
@@ -180,7 +188,7 @@ public sealed class DolphinBridge : IDisposable
 
         if (!TryResolveMailboxAddressLocked(force: true))
         {
-            LogThrottled($"Attached to Dolphin PID {_processId} — waiting for _SMSO.kxe mailbox");
+            LogThrottled($"Attached to Dolphin PID {_processId} — waiting for {ModuleVersionMessages.ModuleFileName} mailbox");
             return true;
         }
 
@@ -273,6 +281,35 @@ public sealed class DolphinBridge : IDisposable
 
     private UIntPtr MailboxHost => _mailbox.HostAddress;
 
+    private static readonly byte[] CommMagicBytes = { 0x53, 0x4D, 0x53, 0x4F };
+
+    /// <summary>
+    /// Write Dolphin comm memory without discarding a still-valid mailbox on transient failures.
+    /// </summary>
+    private bool TryWriteProcessMemoryLocked(UIntPtr address, byte[] bytes)
+    {
+        if (NativeMethods.WriteProcessMemory(_processHandle, address, bytes, bytes.Length, out int written) &&
+            written == bytes.Length)
+            return true;
+
+        if (IsMailboxHostStillValidLocked())
+            return false;
+
+        _mailbox.Invalidate();
+        return false;
+    }
+
+    private bool IsMailboxHostStillValidLocked()
+    {
+        if (_mailbox.HostAddress == UIntPtr.Zero)
+            return false;
+
+        var magic = new byte[4];
+        return NativeMethods.ReadProcessMemory(_processHandle, MailboxHost, magic, magic.Length, out int read) &&
+               read == magic.Length &&
+               magic.AsSpan().SequenceEqual(CommMagicBytes);
+    }
+
     public bool TryReadBuffer(out CommBuffer buffer)
     {
         buffer = CommBuffer.CreateDefault();
@@ -293,26 +330,46 @@ public sealed class DolphinBridge : IDisposable
 
         try
         {
-            if (!_mailbox.IsResolved && !TryResolveMailboxAddressLocked())
-                return false;
-
-            var bytes = new byte[ProtocolConstants.CommBufferSize];
-            if (!NativeMethods.ReadProcessMemory(_processHandle, MailboxHost, bytes, bytes.Length, out int read) ||
-                read != bytes.Length)
+            _aliveCheckCounter++;
+            if (_aliveCheckCounter >= AliveCheckIntervalReads)
             {
-                _mailbox.Invalidate();
-                if (!TryResolveMailboxAddressLocked(force: true))
-                    return false;
-
-                if (!NativeMethods.ReadProcessMemory(_processHandle, MailboxHost, bytes, bytes.Length, out read) ||
-                    read != bytes.Length)
+                _aliveCheckCounter = 0;
+                if (!IsTrackedProcessAlive())
                 {
                     DetachLocked();
                     return false;
                 }
             }
 
-            buffer = CommBufferEndian.FromDolphinBytes(bytes);
+            if (!_mailbox.IsResolved && !TryResolveMailboxAddressLocked())
+                return false;
+
+            if (!NativeMethods.ReadProcessMemory(
+                    _processHandle,
+                    MailboxHost,
+                    _readScratch,
+                    _readScratch.Length,
+                    out int read) ||
+                read != _readScratch.Length)
+            {
+                _mailbox.Invalidate();
+                if (!TryResolveMailboxAddressLocked(force: true))
+                    return false;
+
+                if (!NativeMethods.ReadProcessMemory(
+                        _processHandle,
+                        MailboxHost,
+                        _readScratch,
+                        _readScratch.Length,
+                        out read) ||
+                    read != _readScratch.Length)
+                {
+                    DetachLocked();
+                    return false;
+                }
+            }
+
+            buffer = CommBufferEndian.FromDolphinBytes(_readScratch);
             if (buffer.Magic != ProtocolConstants.Magic)
             {
                 _mailbox.Invalidate();
@@ -342,12 +399,8 @@ public sealed class DolphinBridge : IDisposable
             buffer.Magic = ProtocolConstants.Magic;
             buffer.Version = ProtocolConstants.CommVersion;
             var bytes = CommBufferEndian.ToDolphinBytes(buffer);
-            if (!NativeMethods.WriteProcessMemory(_processHandle, MailboxHost, bytes, bytes.Length, out int written) ||
-                written != bytes.Length)
-            {
-                _mailbox.Invalidate();
+            if (!TryWriteProcessMemoryLocked(MailboxHost, bytes))
                 return false;
-            }
 
             return true;
         }
@@ -404,19 +457,53 @@ public sealed class DolphinBridge : IDisposable
                 warpPosZ,
                 warpFacingY);
 
-            if (!NativeMethods.WriteProcessMemory(
-                    _processHandle,
-                    controlAddress,
-                    control,
-                    control.Length,
-                    out int written) ||
-                written != control.Length)
-            {
-                _mailbox.Invalidate();
+            if (!TryWriteProcessMemoryLocked(controlAddress, control))
                 return false;
-            }
 
             return true;
+        }
+    }
+
+    public bool TryWriteRemoteSyncPayload(
+        PlayerSnapshot[] remotes,
+        NameTagAppearance localAppearance,
+        NameTagAppearance[] remoteAppearances,
+        MarioVoiceEvent[] remoteVoiceEvents,
+        in CommGameModeState gameMode)
+    {
+        lock (_processLock)
+        {
+            if (_processHandle == IntPtr.Zero)
+                return false;
+
+            if (!_mailbox.IsResolved && !TryResolveMailboxAddressLocked())
+                return false;
+
+            CommBufferEndian.WriteRemoteSnapshotsInto(_remoteSnapScratch, remotes);
+            CommBufferEndian.WriteNameTagAppearancesInto(_nameTagScratch, localAppearance, remoteAppearances);
+            CommBufferEndian.WriteRemoteMarioVoiceEventsInto(_remoteVoiceScratch, remoteVoiceEvents);
+            CommBufferEndian.WriteGameModeStateInto(_gameModeScratch, gameMode);
+
+            var host = MailboxHost.ToUInt64();
+            if (!TryWriteProcessMemoryLocked(
+                    new UIntPtr(host + ProtocolConstants.CommRemoteSnapshotsOffset),
+                    _remoteSnapScratch))
+                return false;
+
+            if (!TryWriteProcessMemoryLocked(
+                    new UIntPtr(host + ProtocolConstants.CommNameTagAppearancesOffset),
+                    _nameTagScratch))
+                return false;
+
+            if (!TryWriteProcessMemoryLocked(
+                    new UIntPtr(host + ProtocolConstants.CommMarioVoiceEventsOffset +
+                                ProtocolConstants.MarioVoiceEventSize),
+                    _remoteVoiceScratch))
+                return false;
+
+            return TryWriteProcessMemoryLocked(
+                new UIntPtr(host + ProtocolConstants.CommGameModeStateOffset),
+                _gameModeScratch);
         }
     }
 
@@ -432,14 +519,7 @@ public sealed class DolphinBridge : IDisposable
 
             var bytes = CommBufferEndian.ToRemoteSnapshotsDolphinBytes(remotes);
             var address = new UIntPtr(MailboxHost.ToUInt64() + ProtocolConstants.CommRemoteSnapshotsOffset);
-            if (!NativeMethods.WriteProcessMemory(_processHandle, address, bytes, bytes.Length, out int written) ||
-                written != bytes.Length)
-            {
-                _mailbox.Invalidate();
-                return false;
-            }
-
-            return true;
+            return TryWriteProcessMemoryLocked(address, bytes);
         }
     }
 
@@ -455,14 +535,7 @@ public sealed class DolphinBridge : IDisposable
 
             var bytes = CommBufferEndian.ToNameTagAppearancesDolphinBytes(local, remotes);
             var address = new UIntPtr(MailboxHost.ToUInt64() + ProtocolConstants.CommNameTagAppearancesOffset);
-            if (!NativeMethods.WriteProcessMemory(_processHandle, address, bytes, bytes.Length, out int written) ||
-                written != bytes.Length)
-            {
-                _mailbox.Invalidate();
-                return false;
-            }
-
-            return true;
+            return TryWriteProcessMemoryLocked(address, bytes);
         }
     }
 
@@ -480,14 +553,7 @@ public sealed class DolphinBridge : IDisposable
             var address = new UIntPtr(
                 MailboxHost.ToUInt64() + ProtocolConstants.CommMarioVoiceEventsOffset +
                 ProtocolConstants.MarioVoiceEventSize);
-            if (!NativeMethods.WriteProcessMemory(_processHandle, address, bytes, bytes.Length, out int written) ||
-                written != bytes.Length)
-            {
-                _mailbox.Invalidate();
-                return false;
-            }
-
-            return true;
+            return TryWriteProcessMemoryLocked(address, bytes);
         }
     }
 
@@ -503,14 +569,7 @@ public sealed class DolphinBridge : IDisposable
 
             var bytes = CommBufferEndian.ToGameModeStateDolphinBytes(state);
             var address = new UIntPtr(MailboxHost.ToUInt64() + ProtocolConstants.CommGameModeStateOffset);
-            if (!NativeMethods.WriteProcessMemory(_processHandle, address, bytes, bytes.Length, out int written) ||
-                written != bytes.Length)
-            {
-                _mailbox.Invalidate();
-                return false;
-            }
-
-            return true;
+            return TryWriteProcessMemoryLocked(address, bytes);
         }
     }
 

@@ -21,6 +21,7 @@ public enum GameModeFlags : byte
     TagActive = 1 << 0,
     RoundComplete = 1 << 1,
     TimerReset = 1 << 2,
+    RoundFanfare = 1 << 3,
 }
 
 public sealed class GameModeStatePacket

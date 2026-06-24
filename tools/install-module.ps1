@@ -1,4 +1,4 @@
-# Copy dist/_SMSO.kxe into your extracted ISO Mods folder.
+# Copy dist/_BSMSO.kxe into your extracted ISO Mods folder.
 param(
     [string]$ModsDir = "",
     [string]$IsoFolder = ""
@@ -6,7 +6,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
-$Source = Join-Path $Root "dist\_SMSO.kxe"
+$Source = Join-Path $Root "dist\_BSMSO.kxe"
 
 function Resolve-ModsDirectory {
     param([string]$ExplicitModsDir, [string]$ExplicitIsoFolder)
@@ -75,7 +75,7 @@ function Resolve-ModsDirectory {
 }
 
 $ModsDir = Resolve-ModsDirectory -ExplicitModsDir $ModsDir -ExplicitIsoFolder $IsoFolder
-$Dest = Join-Path $ModsDir "_SMSO.kxe"
+$Dest = Join-Path $ModsDir "_BSMSO.kxe"
 
 if (-not (Test-Path $Source)) {
     Write-Error "Build first: .\tools\build.ps1"
@@ -89,8 +89,8 @@ $srcSize = (Get-Item $Source).Length
 Copy-Item $Source $Dest -Force
 $dstSize = (Get-Item $Dest).Length
 
-Write-Host "Installed _SMSO.kxe"
+Write-Host "Installed _BSMSO.kxe"
 Write-Host "  From: $Source - $srcSize bytes"
 Write-Host "  To:   $Dest - $dstSize bytes"
 Write-Host ""
-Write-Host "Restart Dolphin to load the latest SMSO module."
+Write-Host "Restart Dolphin to load the latest BSMSO module."

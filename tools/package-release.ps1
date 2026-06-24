@@ -10,17 +10,21 @@ $ErrorActionPreference = "Stop"
 
 $Root = Split-Path -Parent $PSScriptRoot
 $DistDir = Join-Path $Root "dist"
-$PackageName = "SMSO_but_better_$Version"
+$ProductName = "Better Super Mario Sunshine"
+$ProductShort = "BSMSO"
+$PackageName = "${ProductShort}_$Version"
 $PackageDir = Join-Path $DistDir $PackageName
 $ZipPath = Join-Path $DistDir "$PackageName.zip"
 $ZipRoot = "$PackageName/"
+$LauncherExeName = "$ProductShort.Launcher.exe"
+$ServerExeName = "$ProductShort.ServerHost.exe"
 if ([string]::IsNullOrWhiteSpace($LauncherDir)) {
     $LauncherDir = Join-Path $DistDir "launcher"
 }
 if ([string]::IsNullOrWhiteSpace($ServerDir)) {
     $ServerDir = Join-Path $DistDir "server"
 }
-$ModulePath = Join-Path $DistDir "_SMSO.kxe"
+$ModulePath = Join-Path $DistDir "_BSMSO.kxe"
 $ReleaseBseCache = Join-Path $DistDir "BetterSunshineEngine.release.kxe"
 $BseReleaseZipUrl = "https://github.com/DotKuribo/BetterSunshineEngine/releases/download/v4.0.0/BetterSunshineEngine_RELEASE.zip"
 
@@ -60,12 +64,12 @@ if ([string]::IsNullOrWhiteSpace($BseKxePath)) {
 }
 
 if (-not (Test-Path $ModulePath)) {
-    Write-Error "Missing dist\_SMSO.kxe. Run .\tools\build.ps1 first."
+    Write-Error "Missing dist\_BSMSO.kxe. Run .\tools\build.ps1 first."
 }
 if (-not (Test-Path $BseKxePath)) {
     Write-Error "Missing release BetterSunshineEngine.kxe at $BseKxePath"
 }
-if (-not (Test-Path (Join-Path $LauncherDir "SMSO.Launcher.exe"))) {
+if (-not (Test-Path (Join-Path $LauncherDir "BSMSO.Launcher.exe"))) {
     Write-Error "Missing published launcher. Run .\tools\publish.ps1 first."
 }
 
@@ -79,35 +83,56 @@ if (Test-Path $ZipPath) {
 New-Item -ItemType Directory -Force -Path $PackageDir | Out-Null
 
 $readme = @"
-Super Mario Sunshine Online (SMSO) v$Version
+$ProductName ($ProductShort) v$Version
+
+Better Super Mario Sunshine (BSMSO) is online multiplayer for Super Mario Sunshine
+via Dolphin Emulator and Better Sunshine Engine (BSE).
 
 Quick start:
-1. Copy BetterSunshineEngine.kxe and _SMSO.kxe into your extracted ISO folder at files\Kuribo!\Mods\.
-   BetterSunshineEngine.kxe must load before _SMSO.kxe.
-2. Run SMSO.Launcher.exe.
-3. In Settings, select Dolphin and your game ISO paths.
+1. Copy BetterSunshineEngine.kxe and _BSMSO.kxe into your extracted ISO folder at files\Kuribo!\Mods\.
+   BetterSunshineEngine.kxe must load before _BSMSO.kxe.
+2. Run $LauncherExeName.
+3. In Settings, set your username, Dolphin path, and game ISO path.
 4. Launch Dolphin, enter a stage, then Host Server or Connect.
 
 Important files:
-- SMSO.Launcher.exe: main app
-- BetterSunshineEngine.kxe: official BSE release module (required parent)
-- _SMSO.kxe: Dolphin/BSE module
-- assets\: level data used by the launcher/server
-- server\: optional dedicated server host
-- docs\: setup and networking guides
+- $LauncherExeName - main BSMSO launcher app
+- $ServerExeName - optional dedicated server host (in server\)
+- BetterSunshineEngine.kxe - official BSE release module (required parent)
+- _BSMSO.kxe - BSMSO game module (loads after BSE)
+- assets\ - level data used by the launcher and server
+- server\ - headless dedicated server host
+- docs\ - setup, networking, and troubleshooting guides
+
+Default port: 27015 (TCP + UDP).
+Do not run SMSCoop alongside BSMSO.
 "@
 
-Set-Content -Path (Join-Path $PackageDir "README_FIRST.txt") -Value $readme -Encoding ASCII
+Set-Content -Path (Join-Path $PackageDir "README_FIRST.txt") -Value $readme -Encoding UTF8
 Copy-Item $BseKxePath (Join-Path $PackageDir "BetterSunshineEngine.kxe") -Force
-Copy-Item $ModulePath (Join-Path $PackageDir "_SMSO.kxe") -Force
-Copy-Item (Join-Path $LauncherDir "SMSO.Launcher.exe") $PackageDir -Force
+Copy-Item $ModulePath (Join-Path $PackageDir "_BSMSO.kxe") -Force
+Copy-Item (Join-Path $LauncherDir "BSMSO.Launcher.exe") (Join-Path $PackageDir $LauncherExeName) -Force
 Get-ChildItem $LauncherDir -File |
-    Where-Object { $_.Name -ne "SMSO.Launcher.exe" } |
+    Where-Object { $_.Name -ne "BSMSO.Launcher.exe" -and $_.Extension -ne ".pdb" } |
     ForEach-Object { Copy-Item $_.FullName (Join-Path $PackageDir $_.Name) -Force }
 Copy-Item (Join-Path $LauncherDir "assets") (Join-Path $PackageDir "assets") -Recurse -Force
 
 if (Test-Path $ServerDir) {
-    Copy-Item $ServerDir (Join-Path $PackageDir "server") -Recurse -Force
+    $serverPackageDir = Join-Path $PackageDir "server"
+    New-Item -ItemType Directory -Force -Path $serverPackageDir | Out-Null
+    Get-ChildItem $ServerDir -File |
+        Where-Object { $_.Extension -ne ".pdb" } |
+        ForEach-Object {
+        if ($_.Name -eq "SMSO.ServerHost.exe") {
+            Copy-Item $_.FullName (Join-Path $serverPackageDir $ServerExeName) -Force
+        } else {
+            Copy-Item $_.FullName (Join-Path $serverPackageDir $_.Name) -Force
+        }
+    }
+    $serverAssets = Join-Path $ServerDir "assets"
+    if (Test-Path $serverAssets) {
+        Copy-Item $serverAssets (Join-Path $serverPackageDir "assets") -Recurse -Force
+    }
 }
 if (Test-Path (Join-Path $Root "docs")) {
     Copy-Item (Join-Path $Root "docs") (Join-Path $PackageDir "docs") -Recurse -Force
@@ -115,6 +140,15 @@ if (Test-Path (Join-Path $Root "docs")) {
 if (Test-Path (Join-Path $Root "README.md")) {
     Copy-Item (Join-Path $Root "README.md") (Join-Path $PackageDir "PROJECT_README.md") -Force
 }
+
+$bsmsoReadme = @"
+# $ProductName ($ProductShort)
+
+Online multiplayer for Super Mario Sunshine — built on Better Sunshine Engine.
+
+See README_FIRST.txt for install steps. Full docs are in docs\.
+"@
+Set-Content -Path (Join-Path $PackageDir "BSMSO_README.md") -Value $bsmsoReadme -Encoding UTF8
 
 Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -163,12 +197,13 @@ try {
         $false)
     try {
         Add-ZipFile $archive (Join-Path $PackageDir "README_FIRST.txt") ($ZipRoot + "README_FIRST.txt")
-        Add-ZipFile $archive (Join-Path $PackageDir "SMSO.Launcher.exe") ($ZipRoot + "SMSO.Launcher.exe")
+        Add-ZipFile $archive (Join-Path $PackageDir $LauncherExeName) ($ZipRoot + $LauncherExeName)
         Add-ZipFile $archive (Join-Path $PackageDir "BetterSunshineEngine.kxe") ($ZipRoot + "BetterSunshineEngine.kxe")
-        Add-ZipFile $archive (Join-Path $PackageDir "_SMSO.kxe") ($ZipRoot + "_SMSO.kxe")
+        Add-ZipFile $archive (Join-Path $PackageDir "_BSMSO.kxe") ($ZipRoot + "_BSMSO.kxe")
+        Add-ZipFile $archive (Join-Path $PackageDir "BSMSO_README.md") ($ZipRoot + "BSMSO_README.md")
         Add-ZipFile $archive (Join-Path $PackageDir "PROJECT_README.md") ($ZipRoot + "PROJECT_README.md")
         Get-ChildItem $PackageDir -File |
-            Where-Object { $_.Name -notin @("README_FIRST.txt", "SMSO.Launcher.exe", "BetterSunshineEngine.kxe", "_SMSO.kxe", "PROJECT_README.md") } |
+            Where-Object { $_.Name -notin @("README_FIRST.txt", $LauncherExeName, "BetterSunshineEngine.kxe", "_BSMSO.kxe", "PROJECT_README.md") } |
             Sort-Object Name |
             ForEach-Object { Add-ZipFile $archive $_.FullName ($ZipRoot + $_.Name) }
         Add-ZipDirectory $archive (Join-Path $PackageDir "assets") ($ZipRoot + "assets")

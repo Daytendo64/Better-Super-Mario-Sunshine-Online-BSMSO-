@@ -332,19 +332,31 @@ public sealed class GameServer : IDisposable
         if (!_hideSeek.CurrentState.TagActive)
             return;
 
+        var updatedRole = _hideSeek.CurrentState.GetRole(updatedSlot);
+        if (updatedRole != (byte)HideSeekRole.Seeker && updatedRole != (byte)HideSeekRole.Hider)
+            return;
+
         ClientSession[] peers;
         lock (_lock)
             peers = _sessions.Values.ToArray();
 
+        var nowMs = Environment.TickCount64;
+        var updatedIsSeeker = updatedRole == (byte)HideSeekRole.Seeker;
+
         foreach (var other in peers)
         {
-            if (other.Slot == updatedSlot)
-                continue;
-            if (other.LastSnapshot.Connected == 0)
+            if (other.Slot == updatedSlot || other.LastSnapshot.Connected == 0)
                 continue;
 
-            _hideSeek.ProcessSnapshot(updatedSlot, snap, other.Slot, other.LastSnapshot);
-            _hideSeek.ProcessSnapshot(other.Slot, other.LastSnapshot, updatedSlot, snap);
+            var otherRole = _hideSeek.CurrentState.GetRole(other.Slot);
+            var otherLagSeconds = other.LastSnapshotReceivedMs == 0
+                ? 0f
+                : MathF.Min((nowMs - other.LastSnapshotReceivedMs) / 1000f, HideSeekService.TagLagCompensationMaxSeconds);
+
+            if (updatedIsSeeker && otherRole == (byte)HideSeekRole.Hider)
+                _hideSeek.ProcessSnapshot(updatedSlot, snap, other.Slot, other.LastSnapshot, 0f, otherLagSeconds);
+            else if (!updatedIsSeeker && otherRole == (byte)HideSeekRole.Seeker)
+                _hideSeek.ProcessSnapshot(other.Slot, other.LastSnapshot, updatedSlot, snap, otherLagSeconds, 0f);
         }
     }
 
@@ -425,6 +437,10 @@ public sealed class GameServer : IDisposable
         }
 
         try { session.Tcp.Close(); } catch { }
+
+        if (_hideSeek.CurrentState.GameMode == GameMode.HideSeek)
+            _hideSeek.SetGameMode(GameMode.Normal);
+
         BroadcastRoster();
         Log?.Invoke($"Player left slot {session.Slot}");
     }
@@ -555,6 +571,7 @@ public sealed class GameServer : IDisposable
         session.State = DolphinState.Active;
         session.LastSeen = DateTime.UtcNow;
         session.LastSnapshot = snap;
+        session.LastSnapshotReceivedMs = Environment.TickCount64;
         ProcessHideSeekTagsForSnapshot(slot, snap);
         MaybeBroadcastRoster(force: locationChanged);
         return true;
@@ -613,6 +630,7 @@ public sealed class GameServer : IDisposable
         public DolphinState State { get; set; }
         public ushort PingMs { get; set; }
         public DateTime LastSeen { get; set; }
+        public long LastSnapshotReceivedMs { get; set; }
         public PlayerSnapshot LastSnapshot { get; set; }
         public uint LastSnapshotSeq { get; set; }
         public IPEndPoint? UdpEndPoint { get; set; }

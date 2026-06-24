@@ -47,7 +47,7 @@ internal static class DolphinConfigService
             var dolphinChanged = EnsureRamOverrideIni(dolphinIni);
             var gameChanged = EnsureRamOverrideIni(sunshineIni);
             var verb = dolphinChanged || gameChanged ? "Configured" : "Dolphin RAM override already configured for";
-            log?.Invoke($"{verb} SMSO: MEM1={TargetMem1Size}, MEM2={TargetMem2Size} ({dolphinIni}; {sunshineIni})");
+            log?.Invoke($"{verb} BSMSO: MEM1={TargetMem1Size}, MEM2={TargetMem2Size} ({dolphinIni}; {sunshineIni})");
 
             return true;
         }

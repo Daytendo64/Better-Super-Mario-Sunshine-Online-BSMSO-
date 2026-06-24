@@ -27,6 +27,7 @@ enum GameModeFlags : u8 {
     GMF_TAG_ACTIVE = 1 << 0,
     GMF_ROUND_COMPLETE = 1 << 1,
     GMF_TIMER_RESET = 1 << 2,
+    GMF_ROUND_FANFARE = 1 << 3,
 };
 
 constexpr u32 COMM_GAME_MODE_STATE_SIZE = 13;

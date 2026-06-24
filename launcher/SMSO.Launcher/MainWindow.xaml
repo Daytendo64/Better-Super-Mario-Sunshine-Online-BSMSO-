@@ -2,7 +2,7 @@
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:controls="clr-namespace:SMSO.Launcher.Controls"
-        Title="Better Super Mario Sunshine Online"
+        Title="BSMSO — Better Super Mario Sunshine Online"
         Height="820" Width="1080"
         MinHeight="680" MinWidth="920"
         UseLayoutRounding="True"
@@ -117,7 +117,7 @@
                             </Border>
                         </StackPanel>
                         <TextBlock x:Name="DolphinDetailText"
-                                   Text="Launch Dolphin with _SMSO.kxe installed to enable warps and roster sync."
+                                   Text="Launch Dolphin with _BSMSO.kxe installed to enable warps and roster sync."
                                    Style="{StaticResource SmsHintText}"
                                    HorizontalAlignment="Right"
                                    Margin="0,8,0,0"
@@ -388,7 +388,7 @@
                         <RowDefinition Height="Auto"/>
                         <RowDefinition Height="*" MinHeight="240"/>
                     </Grid.RowDefinitions>
-                    <Grid Grid.Row="0">
+                    <Grid Grid.Row="0" ClipToBounds="True">
                         <GroupBox x:Name="ClientTeleportPanel" Header="Teleport" Padding="14,8,14,10" Margin="0">
                             <StackPanel>
                                 <WrapPanel VerticalAlignment="Center">
@@ -483,9 +483,6 @@
                                     <Button Content="Warp Everyone" Click="ServerWarpAll_Click" Margin="0,0,8,8"/>
                                     <Button x:Name="ServerTeleportToPlayerButton" Content="Teleport to Player" ToolTip="Teleport yourself to the warp target player's exact position" Click="ServerTeleportToPlayer_Click" Margin="0,0,0,8"/>
                                 </WrapPanel>
-                                <TextBlock Text="Multi-select players" Style="{StaticResource SmsSectionLabel}"/>
-                                <ListBox x:Name="MultiSelectPlayers" SelectionMode="Multiple" MaxHeight="100" Margin="0,0,0,8"
-                                         DisplayMemberPath="Username" ScrollViewer.VerticalScrollBarVisibility="Auto"/>
                                 <TextBlock x:Name="ClientTeleportStatusText"
                                            Style="{StaticResource SmsHintText}"
                                            Margin="0,0,0,8"/>
@@ -602,9 +599,23 @@
                                 BorderBrush="{StaticResource SmsBorder}" BorderThickness="1">
                             <StackPanel>
                                 <TextBlock Text="Setup" FontWeight="SemiBold" FontSize="14" Foreground="{StaticResource SmsAccent}" Margin="0,0,0,8"/>
+                                <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,8">
+                                    BSMSO (Better Super Mario Sunshine Online) requires a Better Sunshine Engine (BSE) patched NTSC-U ISO.
+                                    Install both modules into files/Kuribo!/Mods/ on your extracted ISO:
+                                    BetterSunshineEngine.kxe first, then _BSMSO.kxe (child module).
+                                </TextBlock>
                                 <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap">
-                                    Install BetterSunshineEngine.kxe and _SMSO.kxe in files/Kuribo!/Mods/ on your BSE ISO.
-                                    Configure Dolphin and ISO paths in Settings, launch Dolphin from the launcher, then Host or Connect.
+                                    <Hyperlink NavigateUri="https://github.com/DotKuribo/BetterSunshineEngine" RequestNavigate="HelpLink_RequestNavigate">Better Sunshine Engine</Hyperlink>
+                                    <Run Text=" — download the release, patch your ISO, then add the BSMSO module from this project (tools\build.ps1 → dist\_BSMSO.kxe)."/>
+                                </TextBlock>
+                            </StackPanel>
+                        </Border>
+                        <Border Background="{StaticResource SmsCard}" CornerRadius="12" Padding="18" Margin="0,0,0,12"
+                                BorderBrush="{StaticResource SmsBorder}" BorderThickness="1">
+                            <StackPanel>
+                                <TextBlock Text="Module updates" FontWeight="SemiBold" FontSize="14" Foreground="{StaticResource SmsAccent}" Margin="0,0,0,8"/>
+                                <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap">
+                                    Copy the latest _BSMSO.kxe into your ISO Mods folder, then restart Dolphin.
                                 </TextBlock>
                             </StackPanel>
                         </Border>
@@ -621,8 +632,8 @@
                             <StackPanel>
                                 <TextBlock Text="Troubleshooting" FontWeight="SemiBold" FontSize="14" Foreground="{StaticResource SmsAccent}" Margin="0,0,0,8"/>
                                 <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap">
-                                    Ensure Dolphin is running before connecting. Duplicate usernames are rejected.
-                                    Warps are blocked while a player is loading. Do not use SMSCoop alongside SMSOBB.
+                                    Launch Dolphin from BSMSO before hosting or connecting. Duplicate usernames are rejected.
+                                    Warps are blocked while a player is loading. Do not use SMSCoop alongside BSMSO.
                                 </TextBlock>
                             </StackPanel>
                         </Border>

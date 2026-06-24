@@ -3,19 +3,23 @@
 #include "comm_buffer.hpp"
 #include "puppets.hpp"
 
+#include <BetterSMS/area.hxx>
 #include <BetterSMS/module.hxx>
+#include <BetterSMS/player.hxx>
 #include <Dolphin/OS.h>
 #include <JSystem/J3D/J3DShape.hxx>
 #include <SMS/GC2D/GCConsole2.hxx>
 #include <SMS/MSound/MSound.hxx>
 #include <SMS/MSound/MSoundSESystem.hxx>
 #include <SMS/Player/Mario.hxx>
+#include <SMS/System/Application.hxx>
 #include <SMS/System/MarDirector.hxx>
 #include <SMS/raw_fn.hxx>
 
 extern TMarDirector *gpMarDirector;
 extern TMario *gpMarioAddress;
 extern MSound *gpMSound;
+extern TApplication gpApplication;
 
 namespace smso {
 
@@ -28,6 +32,11 @@ using StartMoveTimerFn = void (*)(TGCConsole2 *, int);
 using StopMoveTimerFn = void (*)(TGCConsole2 *);
 using SetTimerFn = void (*)(TGCConsole2 *, s32);
 using FloorDamageFn = void (*)(TMario *, int, int, int, int);
+using CountShineFn = void (*)(TGCConsole2 *);
+using StartBgmFn = void (*)(u32);
+
+// gc-forever asset list / OST track 42: demo BGM index 0x26 = Race Fanfare (Il Piantissimo).
+constexpr u32 kRaceFanfareBgm = 0x80010026u;
 
 constexpr u16 kTaggedDeathTimeoutFrames = 420u;
 constexpr u16 kMinTaggedDeathFrames = 90u;
@@ -47,12 +56,64 @@ static bool s_retailTimerMoving = false;
 static bool s_localWasHider = false;
 static bool s_localWasSeeker = false;
 static bool s_localSeekerLook = false;
+static bool s_roundFanfareWas = false;
+static bool s_roundCompleteWas = false;
+static bool s_timerResetWas = false;
+static bool s_roundEndFanfarePlayed = false;
 static bool s_taggedDeathActive = false;
 static bool s_hiderTimerRunning = false;
 static u8 s_handledTagEventId = 0;
+static u8 s_deathAreaId = 0;
+static u8 s_deathEpisodeId = 0;
+static bool s_deathStageCaptured = false;
 static u16 s_taggedDeathElapsed = 0;
 static u16 s_taggedDeathTimeout = 0;
 static s32 s_frozenTimerCentiseconds = 0;
+static bool s_resumeDeathRecoveryAfterReload = false;
+static bool s_hideSeekHooksInstalled = false;
+static bool s_tagRoundPinActive = false;
+static bool s_allowTagRoundStageTransition = false;
+static bool s_updatePinOnNextStageInit = false;
+static u8 s_tagRoundPinArea = 0;
+static u8 s_tagRoundPinEpisode = 0;
+
+static void clampTagRoundStage(TMarDirector *director) {
+    if (!s_tagRoundPinActive || !director)
+        return;
+
+    gpApplication.mNextScene.mAreaID = s_tagRoundPinArea;
+    gpApplication.mNextScene.mEpisodeID = s_tagRoundPinEpisode;
+}
+
+static bool isHideSeekTagRoundActive(const CommBuffer *buf) {
+    if (!buf)
+        return false;
+
+    const GameModeState &gm = buf->gameModeState;
+    return gm.mode == GM_HIDE_SEEK && (gm.flags & GMF_TAG_ACTIVE) != 0;
+}
+
+static void pinHideSeekTagRoundStage(TMarDirector *director) {
+    if (!director)
+        return;
+
+    s_tagRoundPinArea = director->mAreaID;
+    s_tagRoundPinEpisode = director->mEpisodeID;
+    s_tagRoundPinActive = true;
+}
+
+static bool enforceHideSeekTagRoundStage(TMarDirector *director) {
+    if (!director || !isHideSeekTagRoundActive(getCommBuffer()) || !s_tagRoundPinActive)
+        return false;
+
+    if (director->mAreaID == s_tagRoundPinArea && director->mEpisodeID == s_tagRoundPinEpisode) {
+        clampTagRoundStage(director);
+        return false;
+    }
+
+    reloadLocalStage(director, s_tagRoundPinArea, s_tagRoundPinEpisode);
+    return true;
+}
 
 static StartAppearTimerFn startAppearTimerFn() {
     return reinterpret_cast<StartAppearTimerFn>(SMS_PORT_REGION(0x8014AFCC, 0x8013FC5C, 0, 0));
@@ -80,6 +141,14 @@ static SetTimerFn setTimerFn() {
 
 static FloorDamageFn floorDamageExecFn() {
     return reinterpret_cast<FloorDamageFn>(SMS_PORT_REGION(0x8024303C, 0x8023ADC8, 0, 0));
+}
+
+static CountShineFn countShineFn() {
+    return reinterpret_cast<CountShineFn>(SMS_PORT_REGION(0x80147A0C, 0x8013C690, 0, 0));
+}
+
+static StartBgmFn startBgmFn() {
+    return reinterpret_cast<StartBgmFn>(SMS_PORT_REGION(0x80016978, 0x800169D4, 0, 0));
 }
 
 static TGCConsole2 *getConsole(TMarDirector *director) {
@@ -157,6 +226,34 @@ static void playTagStartSound(TMario *mario) {
 
     const Vec pos = {mario->mTranslation.x, mario->mTranslation.y, mario->mTranslation.z};
     MSoundSESystem::MSoundSE::startSoundActor(soundId, &pos, 0, nullptr, 0, 4);
+}
+
+static void playRoundCompleteFanfare(TMarDirector *director, TMario *mario) {
+    if (!mario)
+        return;
+
+    TGCConsole2 *console = getConsole(director);
+    if (console)
+        countShineFn()(console);
+
+    if (gpMSound && gpMSound->gateCheck(MSD_SE_SY_RACE_FIRE)) {
+        const Vec pos = {mario->mTranslation.x, mario->mTranslation.y, mario->mTranslation.z};
+        MSoundSESystem::MSoundSE::startSoundActor(MSD_SE_SY_RACE_FIRE, &pos, 0, nullptr, 0, 4);
+    }
+
+    startBgmFn()(kRaceFanfareBgm);
+}
+
+static void applyLocalSeekerLookEdge(TMario *mario, bool wantSeekerLook) {
+    if (!mario || wantSeekerLook == s_localSeekerLook)
+        return;
+
+    applyHideSeekPlayerCosmetics(mario, wantSeekerLook, false);
+    if (wantSeekerLook)
+        mario->wearGlass();
+    else
+        mario->takeOffGlass();
+    s_localSeekerLook = wantSeekerLook;
 }
 
 static void stopRetailTimerMovement(TGCConsole2 *console) {
@@ -277,33 +374,164 @@ static void resetHiderTimerAtZero(TMarDirector *director, TGCConsole2 *console) 
         setTimerCentiseconds(console, 0);
 }
 
-static void beginTaggedDeath(TMario *mario) {
+static void clampGameOverToDeathStage() {
+    if (!s_taggedDeathActive || !s_deathStageCaptured)
+        return;
+
+    gpApplication.mNextScene.mAreaID = s_deathAreaId;
+    gpApplication.mNextScene.mEpisodeID = s_deathEpisodeId;
+}
+
+static void captureHideSeekDeathStage(TMarDirector *director) {
+    if (!director)
+        return;
+
+    s_deathAreaId = director->mAreaID;
+    s_deathEpisodeId = director->mEpisodeID;
+    s_deathStageCaptured = true;
+    s_tagRoundPinArea = s_deathAreaId;
+    s_tagRoundPinEpisode = s_deathEpisodeId;
+    s_tagRoundPinActive = true;
+}
+
+static void ensureHideSeekDeathStage(TMarDirector *director) {
+    if (!director || !s_deathStageCaptured)
+        return;
+
+    if (director->mAreaID == s_deathAreaId && director->mEpisodeID == s_deathEpisodeId)
+        return;
+
+    reloadLocalStage(director, s_deathAreaId, s_deathEpisodeId);
+}
+
+static bool isLocalMarioInDeathState(const TMario *mario) {
+    if (!mario)
+        return false;
+
+    return mario->mState == TMario::STATE_DEATH || mario->mAttributes.mIsGameOver ||
+           mario->mHealth <= 0;
+}
+
+static void beginHideSeekDeathRecovery(TMarDirector *director, TMario *mario, bool forceDeathAnim) {
     if (!mario || s_taggedDeathActive)
         return;
 
-    mario->mInvincibilityFrames = 0;
-    floorDamageExecFn()(mario, 8, 0, 0, 0);
-    if (mario->mState != TMario::STATE_DEATH)
-        mario->changePlayerDropping(TMario::STATE_DEATH, 0);
+    captureHideSeekDeathStage(director);
+
+    if (forceDeathAnim) {
+        mario->mInvincibilityFrames = 0;
+        floorDamageExecFn()(mario, 8, 0, 0, 0);
+        if (mario->mState != TMario::STATE_DEATH)
+            mario->changePlayerDropping(TMario::STATE_DEATH, 0);
+    }
 
     s_taggedDeathActive = true;
     s_taggedDeathElapsed = 0;
     s_taggedDeathTimeout = kTaggedDeathTimeoutFrames;
+    clampGameOverToDeathStage();
 }
 
-static void finishTaggedDeath(TMarDirector *director, TMario *mario) {
+static void beginTaggedDeath(TMarDirector *director, TMario *mario) {
+    beginHideSeekDeathRecovery(director, mario, true);
+}
+
+static void finishHideSeekDeathRecovery(TMarDirector *director, TMario *mario) {
     if (!director || !mario)
         return;
+
+    CommBuffer *buf = getCommBuffer();
+    ensureHideSeekDeathStage(director);
+    if (!s_deathStageCaptured || director->mAreaID != s_deathAreaId ||
+        director->mEpisodeID != s_deathEpisodeId) {
+        return;
+    }
+    if (director->mCurState < TMarDirector::STATE_NORMAL) {
+        return;
+    }
 
     respawnLocalMarioAtStageSpawn(director, mario);
     while (mario->mHealth < 8)
         mario->incHP(1);
 
+    mario->mAttributes.mIsGameOver = false;
+    clampGameOverToDeathStage();
+
+    const bool localIsSeeker = buf->gameModeState.localRole == HSR_SEEKER;
+    s_localWasSeeker = localIsSeeker;
+    s_localWasHider = !localIsSeeker;
+
     s_taggedDeathActive = false;
     s_taggedDeathElapsed = 0;
     s_taggedDeathTimeout = 0;
-    s_localWasSeeker = true;
-    s_localWasHider = false;
+    s_deathStageCaptured = false;
+}
+
+static void finishTaggedDeath(TMarDirector *director, TMario *mario) {
+    finishHideSeekDeathRecovery(director, mario);
+}
+
+static void installHideSeekDeathHooks() {
+    if (s_hideSeekHooksInstalled)
+        return;
+
+    s_hideSeekHooksInstalled = true;
+    BetterSMS::Player::addUpdateCallback(
+        [](TMario *player, bool isLocal) {
+            if (!isLocal || !gpMarDirector || !player)
+                return;
+
+            CommBuffer *buf = getCommBuffer();
+            if (!isHideSeekTagRoundActive(buf))
+                return;
+
+            player->mAttributes.mIsGameOver = false;
+            clampTagRoundStage(gpMarDirector);
+
+            if (s_taggedDeathActive) {
+                clampGameOverToDeathStage();
+                if (s_deathStageCaptured &&
+                    (gpMarDirector->mAreaID != s_deathAreaId ||
+                     gpMarDirector->mEpisodeID != s_deathEpisodeId))
+                    ensureHideSeekDeathStage(gpMarDirector);
+                return;
+            }
+
+            if (isLocalMarioInDeathState(player))
+                beginHideSeekDeathRecovery(gpMarDirector, player, false);
+        });
+    BetterSMS::Stage::setNextStageHandler([](TMarDirector *director) {
+        if (!director)
+            return;
+
+        if (enforceHideSeekTagRoundStage(director))
+            return;
+
+        CommBuffer *buf = getCommBuffer();
+        if (isHideSeekTagRoundActive(buf) && s_tagRoundPinActive) {
+            if (s_allowTagRoundStageTransition) {
+                s_allowTagRoundStageTransition = false;
+                director->moveStage();
+                return;
+            }
+
+            const u8 keepArea = s_tagRoundPinArea;
+            const u8 keepEp = s_tagRoundPinEpisode;
+            const u8 nextArea = gpApplication.mNextScene.mAreaID;
+            const u8 nextEp = gpApplication.mNextScene.mEpisodeID;
+            if (nextArea != keepArea || nextEp != keepEp) {
+                gpApplication.mNextScene.mAreaID = keepArea;
+                gpApplication.mNextScene.mEpisodeID = keepEp;
+                if (gpMarioAddress) {
+                    gpMarioAddress->mAttributes.mIsGameOver = false;
+                    if (isLocalMarioInDeathState(gpMarioAddress))
+                        beginHideSeekDeathRecovery(director, gpMarioAddress, false);
+                }
+                return;
+            }
+        }
+
+        director->moveStage();
+    });
 }
 
 static void resetHideSeekTransientState() {
@@ -314,6 +542,9 @@ static void resetHideSeekTransientState() {
     s_taggedDeathElapsed = 0;
     s_taggedDeathTimeout = 0;
     s_frozenTimerCentiseconds = 0;
+    s_deathAreaId = 0;
+    s_deathEpisodeId = 0;
+    s_deathStageCaptured = false;
 }
 
 static void recoverTaggedSeekerAfterStageReload(TMarDirector *director) {
@@ -337,8 +568,14 @@ static void recoverTaggedSeekerAfterStageReload(TMarDirector *director) {
         return;
     }
 
-    applyHideSeekPlayerCosmetics(mario, true, false);
-    s_localSeekerLook = true;
+    applyLocalSeekerLookEdge(mario, true);
+}
+
+static void syncLocalSeekerLookAfterTag(TMario *mario) {
+    if (!mario || s_localSeekerLook)
+        return;
+
+    applyLocalSeekerLookEdge(mario, true);
 }
 
 static bool isNewLocalTagEvent(const GameModeState &gm, u8 localSlot, bool localIsSeeker) {
@@ -373,7 +610,21 @@ static void updateTimerDisplay(TMarDirector *director, TGCConsole2 *console, boo
         setTimerCentiseconds(console, s_frozenTimerCentiseconds);
 }
 
+static void setAllowTagRoundStageTransition(bool allow) {
+    s_allowTagRoundStageTransition = allow;
+    if (allow)
+        s_updatePinOnNextStageInit = true;
+}
+
 } // namespace
+
+void playHideSeekSeekerCosmeticVfx(TMario *mario) {
+    if (!mario)
+        return;
+
+    // doldecomp MarioDraw.cpp wearGlass -> emitGetEffect (one-shot burst, no lingering aura).
+    mario->emitGetEffect();
+}
 
 void applyHideSeekPlayerCosmetics(TMario *mario, bool isSeeker, bool isRemote) {
     if (!mario)
@@ -384,23 +635,52 @@ void applyHideSeekPlayerCosmetics(TMario *mario, bool isSeeker, bool isRemote) {
         mario->mPrevAttributes.mIsShineShirt = true;
         setShineShirtShapeVisible(mario, true);
         setSeekerGlassesFlag(mario, true);
-        if (!isRemote)
-            mario->wearGlass();
     } else {
         mario->mAttributes.mIsShineShirt = false;
         mario->mPrevAttributes.mIsShineShirt = false;
         setShineShirtShapeVisible(mario, false);
         setSeekerGlassesFlag(mario, false);
-        if (!isRemote)
-            mario->takeOffGlass();
     }
 }
 
 void initHideSeek() {
+    installHideSeekDeathHooks();
+
+    if (s_taggedDeathActive && s_deathStageCaptured) {
+        s_resumeDeathRecoveryAfterReload = true;
+        s_timerPanelVisible = false;
+        s_retailTimerMoving = false;
+        s_hiderTimerRunning = false;
+        return;
+    }
+
+    if (isHideSeekTagRoundActive(getCommBuffer()) && gpMarDirector) {
+        if (s_updatePinOnNextStageInit) {
+            s_updatePinOnNextStageInit = false;
+            pinHideSeekTagRoundStage(gpMarDirector);
+        } else if (s_tagRoundPinActive) {
+            if (enforceHideSeekTagRoundStage(gpMarDirector)) {
+                s_timerPanelVisible = false;
+                s_retailTimerMoving = false;
+                s_hiderTimerRunning = false;
+                return;
+            }
+        } else {
+            pinHideSeekTagRoundStage(gpMarDirector);
+        }
+    }
+
     resetHideSeekTransientState();
 }
 
 void onHideSeekStageExit() {
+    if (s_taggedDeathActive && s_deathStageCaptured) {
+        s_timerPanelVisible = false;
+        s_retailTimerMoving = false;
+        s_hiderTimerRunning = false;
+        return;
+    }
+
     resetHideSeekTransientState();
 }
 
@@ -412,12 +692,24 @@ void clearHideSeek() {
     s_localWasHider = false;
     s_localWasSeeker = false;
     s_localSeekerLook = false;
+    s_roundFanfareWas = false;
+    s_roundCompleteWas = false;
+    s_timerResetWas = false;
+    s_roundEndFanfarePlayed = false;
     s_taggedDeathActive = false;
     s_hiderTimerRunning = false;
     s_handledTagEventId = 0;
     s_taggedDeathElapsed = 0;
     s_taggedDeathTimeout = 0;
     s_frozenTimerCentiseconds = 0;
+    s_deathAreaId = 0;
+    s_deathEpisodeId = 0;
+    s_deathStageCaptured = false;
+    s_tagRoundPinActive = false;
+}
+
+void setHideSeekAllowStageTransition(bool allow) {
+    setAllowTagRoundStageTransition(allow);
 }
 
 bool isHideSeekActive() {
@@ -467,14 +759,15 @@ void updateHideSeek(TMarDirector *director) {
     const bool hideSeekMode = gm.mode == GM_HIDE_SEEK;
     const bool tagActive = hideSeekMode && (gm.flags & GMF_TAG_ACTIVE) != 0;
     const bool roundComplete = hideSeekMode && (gm.flags & GMF_ROUND_COMPLETE) != 0;
+    const bool roundFanfare = hideSeekMode && (gm.flags & GMF_ROUND_FANFARE) != 0;
+    const bool timerReset = hideSeekMode && (gm.flags & GMF_TIMER_RESET) != 0;
     const bool localIsHider = hideSeekMode && gm.localRole == HSR_HIDER;
     const bool localIsSeeker = hideSeekMode && gm.localRole == HSR_SEEKER;
     const bool timerShouldRun = tagActive && localIsHider && !roundComplete;
 
     if (!hideSeekMode) {
         if (s_localSeekerLook)
-            applyHideSeekPlayerCosmetics(gpMarioAddress, false, false);
-        s_localSeekerLook = false;
+            applyLocalSeekerLookEdge(gpMarioAddress, false);
         stopRetailTimerMovement(console);
         hideTimerPanel(console);
         clearHideSeek();
@@ -483,8 +776,25 @@ void updateHideSeek(TMarDirector *director) {
 
     s_hideSeekModeActive = true;
 
-    if ((gm.flags & GMF_TIMER_RESET) != 0)
+    if (tagActive && s_tagRoundPinActive) {
+        if (enforceHideSeekTagRoundStage(director))
+            return;
+        clampTagRoundStage(director);
+        gpMarioAddress->mAttributes.mIsGameOver = false;
+    }
+
+    if (timerReset && !s_timerResetWas)
         resetHiderTimerAtZero(director, console);
+
+    const bool roundEndSignal =
+        (roundFanfare && !s_roundFanfareWas) || (roundComplete && !s_roundCompleteWas);
+    if (hideSeekMode && roundEndSignal && !s_roundEndFanfarePlayed) {
+        playRoundCompleteFanfare(director, gpMarioAddress);
+        s_roundEndFanfarePlayed = true;
+    }
+
+    if (tagActive && !s_tagActive)
+        s_roundEndFanfarePlayed = false;
 
     if (localIsSeeker && gm.tagEventId != 0 && gm.lastTaggedSlot == buf->localSlot &&
         s_handledTagEventId != gm.tagEventId && !s_taggedDeathActive) {
@@ -492,6 +802,16 @@ void updateHideSeek(TMarDirector *director) {
     }
 
     if (s_taggedDeathActive) {
+        gpMarioAddress->mAttributes.mIsGameOver = false;
+        clampGameOverToDeathStage();
+        ensureHideSeekDeathStage(director);
+
+        if (s_resumeDeathRecoveryAfterReload) {
+            s_resumeDeathRecoveryAfterReload = false;
+            if (director->mCurState >= TMarDirector::STATE_NORMAL)
+                finishTaggedDeath(director, gpMarioAddress);
+        }
+
         ++s_taggedDeathElapsed;
         if (s_taggedDeathTimeout > 0)
             --s_taggedDeathTimeout;
@@ -505,24 +825,41 @@ void updateHideSeek(TMarDirector *director) {
         s_tagActive = tagActive;
         s_localWasSeeker = localIsSeeker;
         s_localWasHider = localIsHider;
+        s_roundFanfareWas = roundFanfare;
+        s_roundCompleteWas = roundComplete;
+        s_timerResetWas = timerReset;
         return;
+    }
+
+    if (tagActive && !s_taggedDeathActive && gpMarioAddress) {
+        TMario *mario = gpMarioAddress;
+        if (isLocalMarioInDeathState(mario)) {
+            beginHideSeekDeathRecovery(director, mario, false);
+            s_tagActive = tagActive;
+            s_localWasSeeker = localIsSeeker;
+            s_localWasHider = localIsHider;
+            s_roundFanfareWas = roundFanfare;
+            s_roundCompleteWas = roundComplete;
+            s_timerResetWas = timerReset;
+            return;
+        }
     }
 
     if (isNewLocalTagEvent(gm, buf->localSlot, localIsSeeker)) {
         s_handledTagEventId = gm.tagEventId;
-        beginTaggedDeath(gpMarioAddress);
+        beginTaggedDeath(director, gpMarioAddress);
         freezeHiderTimer(director, console);
         s_localWasSeeker = true;
         s_localWasHider = false;
         s_tagActive = tagActive;
+        s_roundFanfareWas = roundFanfare;
+        s_roundCompleteWas = roundComplete;
+        s_timerResetWas = timerReset;
         return;
     }
 
     const bool wantSeekerLook = localIsSeeker;
-    if (wantSeekerLook != s_localSeekerLook) {
-        applyHideSeekPlayerCosmetics(gpMarioAddress, wantSeekerLook, false);
-        s_localSeekerLook = wantSeekerLook;
-    }
+    applyLocalSeekerLookEdge(gpMarioAddress, wantSeekerLook);
 
     if (tagActive && !s_tagActive)
         playTagStartSound(gpMarioAddress);
@@ -533,13 +870,15 @@ void updateHideSeek(TMarDirector *director) {
     if (tagActive && !s_tagActive) {
         s_handledTagEventId = 0;
         resetHiderTimerAtZero(director, console);
+        pinHideSeekTagRoundStage(director);
     }
 
+    if (!tagActive)
+        s_tagRoundPinActive = false;
+
     if (localIsSeeker && gm.tagEventId != 0 && gm.lastTaggedSlot == buf->localSlot &&
-        s_handledTagEventId == gm.tagEventId && !s_localSeekerLook) {
-        applyHideSeekPlayerCosmetics(gpMarioAddress, true, false);
-        s_localSeekerLook = true;
-    }
+        s_handledTagEventId == gm.tagEventId && !s_localSeekerLook)
+        syncLocalSeekerLookAfterTag(gpMarioAddress);
 
     if (localIsHider && !s_timerPanelVisible)
         showTimerPanelAtZero(director, console);
@@ -549,6 +888,9 @@ void updateHideSeek(TMarDirector *director) {
     s_tagActive = tagActive;
     s_localWasHider = localIsHider;
     s_localWasSeeker = localIsSeeker;
+    s_roundFanfareWas = roundFanfare;
+    s_roundCompleteWas = roundComplete;
+    s_timerResetWas = timerReset;
 }
 
 } // namespace smso

@@ -1,4 +1,4 @@
-# SMSO Installation Guide
+# BSMSO Installation Guide
 
 ## Prerequisites
 
@@ -7,12 +7,12 @@
 - CMake 3.16+ and Ninja
 - Git + Git LFS
 - Dolphin Emulator x64
-- BSE-patched Super Mario Sunshine NTSC-U ISO
+- [Better Sunshine Engine](https://github.com/DotKuribo/BetterSunshineEngine) patched Super Mario Sunshine NTSC-U ISO
 
 ## Build from Source
 
 ```powershell
-cd SMSO
+cd BSMSO
 git submodule update --init --recursive
 cd module\lib\BetterSunshineEngine
 git lfs pull
@@ -24,9 +24,9 @@ dotnet build launcher\SMSO.sln -c Release
 
 ## Install Game Module
 
-1. Copy `dist\_SMSO.kxe` into your ISO folder at `files\Kuribo!\Mods\`
-2. Ensure `BetterSunshineEngine.kxe` is in the same folder and loads first
-3. Load order: `BetterSunshineEngine.kxe` → `_SMSO.kxe` (underscore prefix = child module)
+1. Download and install **BetterSunshineEngine.kxe** from the [BSE releases page](https://github.com/DotKuribo/BetterSunshineEngine/releases).
+2. Copy `dist\_BSMSO.kxe` into your ISO folder at `files\Kuribo!\Mods\`
+3. Load order: `BetterSunshineEngine.kxe` → `_BSMSO.kxe` (underscore prefix = child module)
 
 Or use:
 
@@ -36,9 +36,11 @@ Or use:
 
 ## Launcher Setup
 
-1. Run `dist\launcher\SMSO.Launcher.exe`
+1. Run the BSMSO launcher
 2. Settings tab: set username, Dolphin path, ISO path
 3. Click **Launch Dolphin** manually
 4. Click **Host Server** or **Connect**
 
-**Do not** use SMSCoop alongside SMSO.
+If the launcher reports an outdated module, rebuild with `tools\build.ps1` and reinstall `_BSMSO.kxe`.
+
+**Do not** use SMSCoop alongside BSMSO.

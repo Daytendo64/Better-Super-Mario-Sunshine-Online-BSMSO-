@@ -1,7 +1,7 @@
 # Build outputs
 dist/*
 !dist/
-!dist/_SMSO.kxe
+!dist/_BSMSO.kxe
 module/build/
 module/out/
 launcher/**/bin/
@@ -30,4 +30,4 @@ nul
 
 # BSE build artifacts
 *.kxe
-!dist/_SMSO.kxe
+!dist/_BSMSO.kxe

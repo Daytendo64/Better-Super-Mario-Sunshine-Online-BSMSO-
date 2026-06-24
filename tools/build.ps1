@@ -1,4 +1,4 @@
-# Build SMSO BSE module -> dist/_SMSO.kxe
+# Build BSMSO BSE module -> dist/_BSMSO.kxe
 
 param(
 
@@ -96,11 +96,11 @@ $kxe = Join-Path $BuildDir "_SMSO.kxe"
 
 if (Test-Path $kxe) {
 
-    Copy-Item $kxe (Join-Path $DistDir "_SMSO.kxe") -Force
+    Copy-Item $kxe (Join-Path $DistDir "_BSMSO.kxe") -Force
 
-    $size = (Get-Item (Join-Path $DistDir "_SMSO.kxe")).Length
+    $size = (Get-Item (Join-Path $DistDir "_BSMSO.kxe")).Length
 
-    Write-Host "Built dist/_SMSO.kxe ($size bytes)"
+    Write-Host "Built dist/_BSMSO.kxe ($size bytes)"
 
     $InstallScript = Join-Path $PSScriptRoot "install-module.ps1"
     if (Test-Path $InstallScript) {

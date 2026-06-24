@@ -79,6 +79,7 @@ public sealed class BridgeWorker : IDisposable
         _dolphinRunning = running;
         if (!running)
         {
+            _bridge.Detach();
             lock (_bufferLock)
             {
                 _hasWorkingBuffer = false;
@@ -130,11 +131,15 @@ public sealed class BridgeWorker : IDisposable
 
     public void SetConnected(bool connected, byte slot, string username, bool isHost)
     {
+        var prefetched = _bridge.TryReadBuffer(out var live) && live.Magic == ProtocolConstants.Magic
+            ? live
+            : (CommBuffer?)null;
+
         lock (_bufferLock)
         {
-            if (_bridge.TryReadBuffer(out var live))
+            if (prefetched.HasValue)
             {
-                _workingBuffer = live;
+                _workingBuffer = prefetched.Value;
                 _hasWorkingBuffer = true;
             }
             else
@@ -205,31 +210,30 @@ public sealed class BridgeWorker : IDisposable
         if (slot >= ProtocolConstants.MaxRemoteSlots || voiceEvent.IsEmpty)
             return;
 
-        MarioVoiceEvent[] remoteCopy;
         lock (_bufferLock)
         {
             if (!_remoteRaw.ContainsKey(slot))
                 return;
 
             _remoteMarioVoiceEvents[slot] = voiceEvent;
-            remoteCopy = (MarioVoiceEvent[])_remoteMarioVoiceEvents.Clone();
             if (_hasWorkingBuffer && _workingBuffer.RemoteMarioVoiceEvents != null)
                 _workingBuffer.RemoteMarioVoiceEvents[slot] = voiceEvent;
         }
-
-        if (!_bridge.TryWriteRemoteMarioVoiceEventsOnly(remoteCopy))
-            Log?.Invoke("Failed to write remote Mario voice events to Dolphin");
     }
 
     public void FlushRemoteSnapshotsToDolphin() => FlushInterpolatedRemotes(force: true);
 
     public void ApplyLocalNameTagAppearance(string username, in NameTagAppearance appearance)
     {
+        var prefetched = _bridge.TryReadBuffer(out var live) && live.Magic == ProtocolConstants.Magic
+            ? live
+            : (CommBuffer?)null;
+
         lock (_bufferLock)
         {
-            if (_bridge.TryReadBuffer(out var live))
+            if (prefetched.HasValue)
             {
-                _workingBuffer = live;
+                _workingBuffer = prefetched.Value;
                 _hasWorkingBuffer = true;
             }
             else if (!EnsureWorkingBuffer())
@@ -256,15 +260,7 @@ public sealed class BridgeWorker : IDisposable
             _lastGameModeSeq = packet.Seq;
             _gameModeState = packet.Clone();
 
-            if (_bridge.TryReadBuffer(out var live))
-            {
-                _workingBuffer = live;
-                _hasWorkingBuffer = true;
-            }
-            else
-            {
-                EnsureWorkingBuffer();
-            }
+            EnsureWorkingBuffer();
 
             if (_gameModeState.GameMode == GameMode.HideSeek)
             {
@@ -286,13 +282,29 @@ public sealed class BridgeWorker : IDisposable
             _workingBuffer.GameModeState = GameModeStatePacket.ToCommGameMode(localSlot, _gameModeState);
         }
 
-        if (!_bridge.TryWriteGameModeStateOnly(GameModeStatePacket.ToCommGameMode(localSlot, _gameModeState)))
-            Log?.Invoke("Failed to write game mode state to Dolphin");
-
         if (_gameModeState.GameMode == GameMode.HideSeek)
             FlushInterpolatedRemotes(force: true);
         else
             TryWriteWorkingBuffer();
+    }
+
+    public void ForceResetGameModeToNormal(byte localSlot)
+    {
+        lock (_bufferLock)
+        {
+            var wasHideSeek = _gameModeState.GameMode == GameMode.HideSeek;
+            _gameModeState = GameModeStatePacket.CreateDefault();
+            _lastGameModeSeq = 0;
+
+            EnsureWorkingBuffer();
+
+            if (wasHideSeek)
+                RestoreSavedNameTagColors();
+
+            _workingBuffer.GameModeState = GameModeStatePacket.ToCommGameMode(localSlot, _gameModeState);
+        }
+
+        TryWriteWorkingBuffer();
     }
 
     private void ApplyHideSeekNameTagColors(byte localSlot)
@@ -350,10 +362,14 @@ public sealed class BridgeWorker : IDisposable
         FlushInterpolatedRemotes();
     }
 
-    private void FlushInterpolatedRemotes(bool force = false)
+    private void FlushInterpolatedRemotes(bool force = false, CommBuffer? prefetchedLive = null)
     {
         if (!_bridge.IsAttached)
             return;
+
+        CommBuffer? liveBuffer = prefetchedLive;
+        if (!liveBuffer.HasValue && _bridge.TryReadBuffer(out var live) && live.Magic == ProtocolConstants.Magic)
+            liveBuffer = live;
 
         PlayerSnapshot[] remoteCopy;
         NameTagAppearance localAppearance;
@@ -365,9 +381,9 @@ public sealed class BridgeWorker : IDisposable
             if (!force && _remoteRaw.Count == 0 && _gameModeState.GameMode != GameMode.HideSeek)
                 return;
 
-            if (_bridge.TryReadBuffer(out var live))
+            if (liveBuffer.HasValue)
             {
-                _workingBuffer = live;
+                _workingBuffer = liveBuffer.Value;
                 _hasWorkingBuffer = true;
             }
             else if (!EnsureWorkingBuffer())
@@ -422,20 +438,18 @@ public sealed class BridgeWorker : IDisposable
             localAppearance = _workingBuffer.LocalNameTagAppearance;
             remoteAppearances = _workingBuffer.RemoteNameTagAppearances
                 ?? CommBuffer.CreateRemoteAppearanceArray();
-            remoteVoiceEvents = (MarioVoiceEvent[])_remoteMarioVoiceEvents.Clone();
+            remoteVoiceEvents = _remoteMarioVoiceEvents;
         }
 
-        if (!_bridge.TryWriteRemoteSnapshotsOnly(remoteCopy))
-            Log?.Invoke("Failed to write remote player snapshots to Dolphin");
-
-        if (!_bridge.TryWriteNameTagAppearancesOnly(localAppearance, remoteAppearances))
-            Log?.Invoke("Failed to write remote name tag appearances to Dolphin");
-
-        if (!_bridge.TryWriteGameModeStateOnly(commGameMode))
-            Log?.Invoke("Failed to write game mode state to Dolphin");
-
-        if (!_bridge.TryWriteRemoteMarioVoiceEventsOnly(remoteVoiceEvents))
-            Log?.Invoke("Failed to write remote Mario voice events to Dolphin");
+        if (!_bridge.TryWriteRemoteSyncPayload(
+                remoteCopy,
+                localAppearance,
+                remoteAppearances,
+                remoteVoiceEvents,
+                commGameMode))
+        {
+            Log?.Invoke("Failed to write remote sync payload to Dolphin");
+        }
     }
 
     private void MaybeRestoreRemoteSnapshotsAfterStageChange(CommBuffer buffer)
@@ -490,10 +504,10 @@ public sealed class BridgeWorker : IDisposable
                         if (!_bridge.IsAttached)
                             _bridge.TryAttach();
 
-                        UpdateLinkStateFromBridge();
-
+                        CommBuffer? liveBuffer = null;
                         if (_bridge.TryReadBuffer(out var buffer) && buffer.Magic == ProtocolConstants.Magic)
                         {
+                            liveBuffer = buffer;
                             lock (_bufferLock)
                             {
                                 _workingBuffer = buffer;
@@ -508,7 +522,8 @@ public sealed class BridgeWorker : IDisposable
                             MaybeRestoreRemoteSnapshotsAfterStageChange(buffer);
                         }
 
-                        FlushInterpolatedRemotes();
+                        UpdateLinkStateFromBridge(liveBuffer);
+                        FlushInterpolatedRemotes(prefetchedLive: liveBuffer);
                         TryApplyPendingWarp();
                     }
                 }
@@ -530,7 +545,7 @@ public sealed class BridgeWorker : IDisposable
         }
     }
 
-    private void UpdateLinkStateFromBridge()
+    private void UpdateLinkStateFromBridge(CommBuffer? liveBuffer = null)
     {
         if (!_dolphinRunning)
         {
@@ -555,7 +570,7 @@ public sealed class BridgeWorker : IDisposable
             }
         }
 
-        if (_bridge.TryReadBuffer(out var buffer) && buffer.Magic == ProtocolConstants.Magic)
+        if (liveBuffer.HasValue && liveBuffer.Value.Magic == ProtocolConstants.Magic)
             SetLinkState(DolphinLinkState.ModuleReady);
         else
             SetLinkState(DolphinLinkState.Attached);
@@ -624,11 +639,6 @@ public sealed class BridgeWorker : IDisposable
         lock (_bufferLock)
         {
             _pendingWarp = false;
-            if (_bridge.TryReadBuffer(out var live))
-            {
-                _workingBuffer = live;
-                _hasWorkingBuffer = true;
-            }
         }
 
         Log?.Invoke($"Warp sent to Dolphin: course={courseId} episode={episodeId}");
@@ -637,13 +647,8 @@ public sealed class BridgeWorker : IDisposable
 
     private bool EnsureWorkingBuffer()
     {
-        if (_hasWorkingBuffer) return true;
-        if (_bridge.TryReadBuffer(out var buffer))
-        {
-            _workingBuffer = buffer;
-            _hasWorkingBuffer = true;
+        if (_hasWorkingBuffer)
             return true;
-        }
 
         _workingBuffer = CommBuffer.CreateDefault();
         _workingBuffer.Magic = ProtocolConstants.Magic;
@@ -673,7 +678,6 @@ public sealed class BridgeWorker : IDisposable
         if (!_bridge.TryWriteBuffer(copy))
             return false;
 
-        UpdateLinkStateFromBridge();
         return true;
     }
 

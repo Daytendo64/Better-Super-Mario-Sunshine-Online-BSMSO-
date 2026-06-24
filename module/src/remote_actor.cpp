@@ -44,6 +44,10 @@ extern TMap *gpMap;
 extern MSound *gpMSound;
 extern TModelWaterManager *gpModelWaterManager;
 
+// doldecomp MoveBG/MapObjManager.hpp — shared surf-blooper MActor templates (Ricco / global patch).
+struct TMapObjManager;
+extern TMapObjManager *gpMapObjManager;
+
 using namespace smso;
 
 namespace {
@@ -98,11 +102,114 @@ constexpr u32 kStateSideFlipEnd = 0x0C000233u;
 constexpr u16 kAnimSideFlipAir = 0xBF;  // ANIM_TJMP1
 constexpr u16 kAnimSideFlipLand = 0xBE; // ANIM_TJMP2
 constexpr s16 kModelFaceHalfTurn = 0x8000;
-constexpr u8 kFluddSprayEmitHz = 60; // remote FLUDD spray particles: every perform frame (~60 Hz)
+constexpr u8 kFluddSprayEmitHz = 30; // remote FLUDD spray + turbo dash particles (~30 Hz)
 constexpr u8 kFluddSprayEmitInterval = 60 / kFluddSprayEmitHz;
 constexpr u8 kFluddSpraySoundHz = 30;
 constexpr u8 kFluddSpraySoundInterval = 60 / kFluddSpraySoundHz;
 constexpr u8 kRemoteDismissInvalidStreak = 3;
+
+// doldecomp MarioStatus.hpp status type+id mask (low 9 bits of mState).
+constexpr u32 kStatusTypeAndIdMask = 0x1FFu;
+constexpr u32 kStatusIdSurf = 0x046u;
+constexpr u32 kStatusIdSurfJump = 0x09Au;
+// doldecomp MarioStatus.hpp — blooper surf draw + lean (calcBaseMtx / calcAnim / calcView).
+constexpr u32 kMarioStatusFlagSurfDraw = 0x10000u;
+constexpr u32 kMapObjManagerRedGessoOffset = 0x9Cu;
+constexpr u32 kMapObjManagerYellowGessoOffset = 0xA0u;
+constexpr u32 kMapObjManagerGreenGessoOffset = 0xA4u;
+
+static u32 remoteStatusId(u32 state) {
+    return state & kStatusTypeAndIdMask;
+}
+
+// doldecomp MARIO_STATUS_SURF (0x810446) and jump-off substate (0x281089A).
+static bool isBlooperSurfState(u32 state) {
+    if ((state & kMarioStatusFlagSurfDraw) == 0)
+        return false;
+    const u32 id = remoteStatusId(state);
+    return id == kStatusIdSurf || id == kStatusIdSurfJump;
+}
+
+static void *resolveSurfGessoTemplate(u8 gessoType) {
+    if (!gpMapObjManager)
+        return nullptr;
+
+    const u8 *mgr = reinterpret_cast<const u8 *>(gpMapObjManager);
+    switch (gessoType) {
+    default:
+    case 0:
+        return *reinterpret_cast<void *const *>(mgr + kMapObjManagerRedGessoOffset);
+    case 1:
+        return *reinterpret_cast<void *const *>(mgr + kMapObjManagerYellowGessoOffset);
+    case 2:
+        return *reinterpret_cast<void *const *>(mgr + kMapObjManagerGreenGessoOffset);
+    }
+}
+
+// doldecomp M3DUtil/MActor.hpp — only fields needed to mirror Mario base mtx onto the surf mesh.
+struct RemoteSurfGessoActor {
+    void *anmData;
+    J3DModel *model;
+};
+
+using RemoteSurfGessoSetBckFn = void (*)(void *, const char *);
+using RemoteSurfGessoSetFrameRateFn = void (*)(void *, f32, int);
+using RemoteSurfGessoPerformFn = void (*)(void *, u32, JDrama::TGraphics *);
+
+static RemoteSurfGessoSetBckFn sSurfGessoSetBck =
+    reinterpret_cast<RemoteSurfGessoSetBckFn>(SMS_PORT_REGION(0x80238E40, 0, 0, 0));
+static RemoteSurfGessoSetFrameRateFn sSurfGessoSetFrameRate =
+    reinterpret_cast<RemoteSurfGessoSetFrameRateFn>(SMS_PORT_REGION(0x80238E7C, 0, 0, 0));
+static RemoteSurfGessoPerformFn sSurfGessoPerform =
+    reinterpret_cast<RemoteSurfGessoPerformFn>(SMS_PORT_REGION(0x802391BC, 0, 0, 0));
+
+static void syncSurfGessoBaseMtx(TMario *mario, void *gesso) {
+    auto *actor = reinterpret_cast<RemoteSurfGessoActor *>(gesso);
+    if (!actor || !actor->model || !mario->mModelData || !mario->mModelData->mModel)
+        return;
+
+    MTXCopy(mario->mModelData->mModel->mBaseMtx, actor->model->mBaseMtx);
+}
+
+// doldecomp TMario::getGesso — remotes reuse the stage MActor template, not live TSurfGesso actors.
+static void bindRemoteSurfGesso(TMario *body, u8 gessoType, bool active) {
+    if (!body)
+        return;
+
+    if (!active) {
+        body->mSurfGesso = nullptr;
+        body->mSurfGessoID = 0;
+        return;
+    }
+
+    void *gesso = resolveSurfGessoTemplate(gessoType);
+    if (!gesso) {
+        body->mSurfGesso = nullptr;
+        body->mSurfGessoID = 0;
+        return;
+    }
+
+    body->mSurfGessoID = gessoType;
+    body->mSurfGesso = gesso;
+    sSurfGessoSetBck(gesso, "surfgeso_run1");
+    sSurfGessoSetFrameRate(gesso, 0.5f, 0);
+}
+
+static u32 stripSurfDrawFlag(u32 state) {
+    return state & ~kMarioStatusFlagSurfDraw;
+}
+
+static bool remoteMarioInWater(const TMario *mario) {
+    if (!mario)
+        return false;
+    if (mario->mState == TMario::STATE_SWIM)
+        return true;
+    if ((mario->mState & TMario::STATE_WATERBORN) != 0)
+        return true;
+    if (mario->mAttributes.mIsWater || mario->mAttributes.mIsShallowWater)
+        return true;
+    return remoteStatusId(mario->mState) == kStatusIdSurf;
+}
 
 static bool isSideFlipSequenceAnim(u16 animId) {
     return animId == kAnimSideFlipAir || animId == kAnimSideFlipLand;
@@ -132,7 +239,6 @@ constexpr u16 kAnimDiveWait = 0x137;   // ANIM_DIVE_WAIT — deep underwater div
 constexpr u16 kAnimDiveLand = 0x138;   // ANIM_DIVE_LAND
 constexpr f32 kCatchSlideMaxFrame = 50.0f; // doldecomp catching() clamps grounded slide here
 constexpr u32 kStatusJumpCatch = 0x08Au;   // MARIO_STATUS_JUMP_CATCH / STATE_DIVE
-constexpr u32 kStatusTypeAndIdMask = 0x1FFu;
 constexpr u32 kStatusIdCatchSlide = 0x056u; // MARIO_STATUS_CATCH / belly slide
 // doldecomp demo warp / load states (full mState values).
 constexpr u32 kStateWarpIn = 0x00001336u;
@@ -198,6 +304,11 @@ static void syncRemoteShadowGround(TMario *mario) {
     if (!mario || !gpMap)
         return;
 
+    // doldecomp TWaterGun::emit skips model-water when emit mtx is below the surface;
+    // probing dry ground while swimming leaves stale triangles that crash FLUDD emit.
+    if (remoteMarioInWater(mario))
+        return;
+
     const TBGCheckData *plane = nullptr;
     const f32 x = mario->mTranslation.x;
     const f32 y = mario->mTranslation.y;
@@ -249,6 +360,7 @@ struct RemoteActorSlot {
     bool visible;
     u8 rosterSlot;
     bool hideSeekSeekerLook;
+    bool hideSeekSeekerLookWas;
     bool wasYCam;
     bool turnRootLatched;
     bool sideFlipOffsetLatched;
@@ -266,6 +378,7 @@ struct RemoteActorSlot {
     u8 lastMovementState;
     u8 fluddSecondNozzle;
     u16 vfxFlags;
+    u8 surfGessoType;
     u8 lastHealth;
     u16 lastVfxFlags;
     u32 lastState;
@@ -345,6 +458,12 @@ static bool snapshotPacksWaistPitch(u16 vfxFlags, u16 animId) {
     if (vfxFlags & VFX_Y_CAM)
         return false;
     return animId == kAnimRun1 || animId == kAnimRun2 || animId == kAnimRideShell;
+}
+
+static bool snapshotPacksWaistPitchForState(u16 vfxFlags, u16 animId, u32 state) {
+    if (snapshotPacksWaistPitch(vfxFlags, animId))
+        return true;
+    return isBlooperSurfState(state);
 }
 
 static bool isRemoteBody(const TMario *mario) {
@@ -606,7 +725,7 @@ static void syncRemoteAnimation(TMario *body, RemoteActorSlot *slot, const Playe
     const bool yCam = (snap.vfxFlags & VFX_Y_CAM) != 0;
     const bool pumpUpper = netUpperState <= kUpperStateHoldingPump;
     const bool packedAux = snapshotPacksHeadLook(snap.vfxFlags) ||
-                           snapshotPacksWaistPitch(snap.vfxFlags, snap.animId);
+                           snapshotPacksWaistPitchForState(snap.vfxFlags, snap.animId, body->mState);
     const bool spinJump = isSpinJumpPlayback(snap.animId, body->mState);
     const bool animChanged =
         slot && (slot->lastAnimId != snap.animId || snap.animId != body->mAnimationID);
@@ -682,7 +801,7 @@ static void syncRemoteHeadWaist(TMario *body, RemoteActorSlot &slot, const Playe
         return;
     }
 
-    if (snapshotPacksWaistPitch(snap.vfxFlags, snap.animId)) {
+    if (snapshotPacksWaistPitchForState(snap.vfxFlags, snap.animId, body->mState)) {
         slot.syncWaistPitch = static_cast<f32>(decodeSnapshotAngle(highEnc));
         body->_3DC = slot.syncWaistPitch;
 
@@ -1046,7 +1165,8 @@ static void applySyncedHeadWaist(TMario *mario, const RemoteActorSlot *slot) {
         return;
     }
 
-    if (isRunningAnim(mario) || mario->mAnimationID == kAnimRideShell) {
+    if (isRunningAnim(mario) || mario->mAnimationID == kAnimRideShell ||
+        isBlooperSurfState(mario->mState)) {
         mario->_3DC = slot->syncWaistPitch;
         mario->_3D8 = slot->syncWaistRoll;
     }
@@ -1088,6 +1208,13 @@ static void remoteCalcAnim(TMario *mario, RemoteActorSlot *slot, JDrama::TGraphi
 
     applyRemoteRunHandBlend(mario);
     remoteBindHandsAndCap(mario, graphics, slot && slot->hideSeekSeekerLook);
+
+    // doldecomp TMario::calcAnim — ride_shell blooper mesh follows Mario base mtx.
+    if (isBlooperSurfState(mario->mState) && mario->mSurfGesso && mario->mModelData &&
+        mario->mModelData->mModel) {
+        syncSurfGessoBaseMtx(mario, mario->mSurfGesso);
+        sSurfGessoPerform(mario->mSurfGesso, 2, graphics);
+    }
 }
 
 static Mtx *getFluddChestMtx(TMario *mario) {
@@ -1351,13 +1478,8 @@ static void updateRemoteFluddSounds(TMario *body, TWaterGun *fludd, RemoteActorS
 }
 
 // doldecomp MarioStatus.hpp status type+id mask (low 9 bits of mState).
-constexpr u32 kStatusIdSurf = 0x046u;
 constexpr u32 kStatusIdTurnMid = 0x043u;
 constexpr u32 kStatusIdTurnEnd = 0x044u;
-
-static u32 remoteStatusId(u32 state) {
-    return state & kStatusTypeAndIdMask;
-}
 
 static bool isWetSlideState(u32 state, u16 vfxFlags) {
     return remoteStatusId(state) == kStatusIdCatchSlide && (vfxFlags & VFX_WET_SLIDE) != 0;
@@ -1473,14 +1595,22 @@ static void syncRemoteContinuousParticles(TMario *body, const RemoteActorSlot *s
     const u16 animId = body->mAnimationID;
     const u16 vfxFlags = slot ? slot->vfxFlags : static_cast<u16>(0);
     const bool turboDashActive =
-        slot && (vfxFlags & VFX_TURBO) != 0 && body->mFludd &&
+        slot && (vfxFlags & VFX_TURBO) != 0 && (vfxFlags & VFX_WATER_SPRAY) != 0 && body->mFludd &&
         body->mFludd->mCurrentNozzle == TWaterGun::Turbo;
+
+    if (turboDashActive && remoteMarioInWater(body)) {
+        if (isWaterSurfaceRun(state))
+            emitRemoteSurfVfx(body);
+        else if ((vfxFlags & VFX_WET_SLIDE) != 0)
+            emitRemoteWetSlideVfx(body);
+        return;
+    }
 
     if (isDrySlideState(state, vfxFlags) && !turboDashActive) {
         emitRemoteDrySlideVfx(body);
-    } else if (isWetSlideState(state, vfxFlags)) {
+    } else if (isWetSlideState(state, vfxFlags) && !turboDashActive) {
         emitRemoteWetSlideVfx(body);
-    } else if (isWaterSurfaceRun(state)) {
+    } else if (isWaterSurfaceRun(state) && !turboDashActive) {
         emitRemoteSurfVfx(body);
     } else if (isSpinJumpPlayback(animId, state)) {
         // doldecomp rotating()/rotateJumping() call emitBlurSpinJump() every frame.
@@ -1556,6 +1686,12 @@ static void applyRemoteNozzlePressure(TWaterGun *fludd, f32 pressure) {
     const u8 nozzleType = fludd->mCurrentNozzle;
     if (isTriggerNozzleType(nozzleType)) {
         TNozzleTrigger *trigger = static_cast<TNozzleTrigger *>(nozzle);
+        // Turbo dash is Mario-bound smoke/ripple only — never drive trigger emitCommon().
+        if (nozzleType == TWaterGun::Turbo) {
+            trigger->mTriggerFill = 0.0f;
+            trigger->mSprayState = TNozzleTrigger::INACTIVE;
+            return;
+        }
         const f32 maxPressure = trigger->mEmitParams.mInsidePressureMax.get();
         trigger->mTriggerFill = pressure * maxPressure;
         if (pressure > 0.01f)
@@ -1573,6 +1709,12 @@ static void applyRemoteNozzlePressure(TWaterGun *fludd, f32 pressure) {
 static void syncRemoteSprayPressure(TWaterGun *fludd, RemoteActorSlot &slot, u16 vfxFlags) {
     if (!fludd)
         return;
+
+    if (fludd->mCurrentNozzle == TWaterGun::Turbo) {
+        slot.remoteSprayPressure = 0.0f;
+        applyRemoteNozzlePressure(fludd, 0.0f);
+        return;
+    }
 
     if (!(vfxFlags & VFX_WATER_SPRAY)) {
         slot.remoteSprayPressure = 0.0f;
@@ -1729,8 +1871,8 @@ static void *remoteSprayParticleOwner(TNozzleBase *nozzle, int emitterIndex) {
                                   emitterIndex * sizeof(TNozzleTrigger));
 }
 
-static void emitRemoteWaterDroplets(TWaterGun *fludd, RemoteActorSlot &slot) {
-    if (!fludd || !gpModelWaterManager || !shouldEmitRemoteSprayThisFrame(slot))
+static void emitRemoteWaterDroplets(TWaterGun *fludd, RemoteActorSlot &slot, bool emitThisFrame) {
+    if (!emitThisFrame || !fludd || !gpModelWaterManager)
         return;
 
     TNozzleBase *nozzle = fludd->mNozzleList[fludd->mCurrentNozzle];
@@ -1738,10 +1880,6 @@ static void emitRemoteWaterDroplets(TWaterGun *fludd, RemoteActorSlot &slot) {
         return;
 
     const u8 nozzleType = fludd->mCurrentNozzle;
-    // Turbo dash smoke is visual-only on Mario's root; don't run trigger emitCommon().
-    if (nozzleType == TWaterGun::Turbo)
-        return;
-
     const int emitterCount = remoteFluddEmitterCount(nozzleType);
 
     for (int i = 0; i < emitterCount; ++i) {
@@ -1761,28 +1899,68 @@ static void emitRemoteWaterDroplets(TWaterGun *fludd, RemoteActorSlot &slot) {
     }
 }
 
-static void emitRemoteTurboDashVfx(TMario *body) {
-    if (!body || !gpMarioParticleManager)
-        return;
-
-    Mtx *mtx = body->getRootAnmMtx();
-    if (!mtx)
-        return;
-
-    // Retail turbo dash uses foot slip-smoke bound to Mario, not FLUDD emit matrices.
-    gpMarioParticleManager->emitAndBindToMtxPtr(particles::kTurboTrail, *mtx, 1, body);
+static bool emitMtxTranslationValid(const Mtx &mtx) {
+    const f32 x = mtx[0][3];
+    const f32 y = mtx[1][3];
+    const f32 z = mtx[2][3];
+    return x == x && y == y && z == z;
 }
 
-static void emitRemoteSprayVfx(TWaterGun *fludd, u16 vfxFlags, TMario *body) {
+static void emitRemoteTurboNozzleSpray(TWaterGun *fludd) {
+    if (!fludd || !gpMarioParticleManager)
+        return;
+
+    TNozzleBase *nozzle = fludd->mNozzleList[TWaterGun::Turbo];
+    if (!nozzle)
+        return;
+
+    Mtx *emitMtx = fludd->getEmitMtx(0);
+    if (!emitMtx || !emitMtxTranslationValid(*emitMtx))
+        return;
+
+    // doldecomp TNozzleTrigger::animation — 0x10D from getEmitMtx(); manual emit avoids
+    // retail owner binding (&this[i]) on network puppets which crashes in water.
+    gpMarioParticleManager->emitAndBindToMtxPtr(particles::kWaterSpray, *emitMtx, 1, nozzle);
+}
+
+static void emitRemoteTurboDashBoostVfx(TWaterGun *fludd) {
+    if (!fludd || !gpMarioParticleManager)
+        return;
+
+    TNozzleBase *nozzle = fludd->mNozzleList[TWaterGun::Turbo];
+    if (!nozzle)
+        return;
+
+    Mtx *emitMtx = fludd->getEmitMtx(0);
+    if (!emitMtx || !emitMtxTranslationValid(*emitMtx))
+        return;
+
+    // doldecomp MarioEffect.cpp — dash boost particles while MARIO_FLAG_FLUDD_EMITTING.
+    gpMarioParticleManager->emitAndBindToMtxPtr(particles::kTurboDashBoostA, *emitMtx, 1, nozzle);
+    gpMarioParticleManager->emitAndBindToMtxPtr(particles::kTurboDashBoostB, *emitMtx, 1, nozzle);
+}
+
+static void emitRemoteTurboRunningRipple(TMario *body) {
+    if (!body || !gpMarioParticleManager)
+        return;
+    if (body->mForwardSpeed <= 30.0f)
+        return;
+
+    // doldecomp runningRippleEffect() — position emit, never ModelWaterManager.
+    JGeometry::TVec3<f32> pos;
+    pos.x = body->mTranslation.x;
+    pos.y = body->mFloorBelow;
+    pos.z = body->mTranslation.z;
+    gpMarioParticleManager->emit(particles::kTurboWaterRipple, &pos, 0, nullptr);
+}
+
+static void emitRemoteSprayVfx(TWaterGun *fludd, u16 vfxFlags, TMario *body, RemoteActorSlot *slot) {
     if (!fludd || !gpMarioParticleManager)
         return;
 
     const u8 nozzleType = fludd->mCurrentNozzle;
-    if (nozzleType == TWaterGun::Turbo) {
-        if ((vfxFlags & VFX_TURBO) != 0 && body)
-            emitRemoteTurboDashVfx(body);
+    if (nozzleType == TWaterGun::Turbo)
         return;
-    }
 
     TNozzleBase *nozzle = fludd->mNozzleList[fludd->mCurrentNozzle];
     if (!nozzle)
@@ -1820,19 +1998,60 @@ static void emitRemoteSprayStartVfx(TWaterGun *fludd) {
     gpMarioParticleManager->emitAndBindToMtxPtr(particles::kSpraySplashB, *emitMtx, 1, nozzle);
 }
 
+static void emitRemoteTurboWaterVfx(TMario *body, TWaterGun *fludd, RemoteActorSlot *slot, bool emitThisFrame) {
+    if (!fludd || !body)
+        return;
+
+    if (emitThisFrame) {
+        emitRemoteTurboNozzleSpray(fludd);
+        emitRemoteTurboDashBoostVfx(fludd);
+    }
+
+    if (emitThisFrame && body->mForwardSpeed > 30.0f)
+        emitRemoteTurboRunningRipple(body);
+
+    if (slot) {
+        const u16 prev = slot->lastSoundVfx;
+        if (!(prev & VFX_WATER_SPRAY))
+            emitRemoteSprayStartVfx(fludd);
+    }
+}
+
 static void emitRemoteFluddVfx(TMario *body, TWaterGun *fludd, RemoteActorSlot *slot, u16 vfxFlags) {
     if (!fludd || !(vfxFlags & VFX_WATER_SPRAY) || (vfxFlags & VFX_FLUDD_EMPTY) != 0)
         return;
     if (fludd->mCurrentWater <= 0)
         return;
 
-    emitRemoteSprayVfx(fludd, vfxFlags, body);
+    bool emitThisFrame = false;
     if (slot)
-        emitRemoteWaterDroplets(fludd, *slot);
+        emitThisFrame = shouldEmitRemoteSprayThisFrame(*slot);
+
+    if (fludd->mCurrentNozzle == TWaterGun::Turbo) {
+        if (body && remoteMarioInWater(body)) {
+            emitRemoteTurboWaterVfx(body, fludd, slot, emitThisFrame);
+            return;
+        }
+
+        if (emitThisFrame) {
+            emitRemoteTurboNozzleSpray(fludd);
+            emitRemoteTurboDashBoostVfx(fludd);
+        }
+        if (slot) {
+            const u16 prev = slot->lastSoundVfx;
+            if (!(prev & VFX_WATER_SPRAY))
+                emitRemoteSprayStartVfx(fludd);
+        }
+        return;
+    }
+
+    emitRemoteSprayVfx(fludd, vfxFlags, body, slot);
+    if (slot)
+        emitRemoteWaterDroplets(fludd, *slot, emitThisFrame);
 
     if (slot) {
         const u16 prev = slot->lastSoundVfx;
-        if (!(prev & VFX_WATER_SPRAY) && fludd->mCurrentNozzle != TWaterGun::Turbo)
+        if (!(prev & VFX_WATER_SPRAY))
             emitRemoteSprayStartVfx(fludd);
     }
 }
@@ -1882,7 +2101,18 @@ static void bindRemoteFludd(TMario *mario, RemoteActorSlot *slot, u16 vfxFlags,
     if (slot)
         maintainRemoteFluddSwitchSpeed(fludd, *slot);
     syncRemoteShadowGround(mario);
-    fludd->movement();
+
+    const bool remoteTurboSpray =
+        fludd->mCurrentNozzle == TWaterGun::Turbo && (vfxFlags & VFX_WATER_SPRAY) != 0;
+    if (remoteTurboSpray) {
+        mario->mAttributes.mIsFluddEmitting = false;
+        fludd->mIsEmitWater = false;
+        // Safe with mIsEmitWater=false: drives turbo BCK only, particles are manual.
+        fludd->mNozzleList[fludd->mCurrentNozzle]->animation(fludd->mCurrentNozzle);
+    } else {
+        fludd->movement();
+    }
+
     if (slot)
         syncRemoteSprayPressure(fludd, *slot, vfxFlags);
     if (slot) {
@@ -1932,6 +2162,7 @@ static void resetRemoteRuntimeState(RemoteActorSlot &slot, bool stageAppear) {
     slot.lastMovementState = 0xFF;
     slot.fluddSecondNozzle = 0;
     slot.vfxFlags = 0;
+    slot.surfGessoType = 0;
     slot.lastHealth = 0xFF;
     slot.lastVfxFlags = 0xFFFF;
     slot.lastState = kInvalidTrackState;
@@ -1955,6 +2186,7 @@ static void resetRemoteRuntimeState(RemoteActorSlot &slot, bool stageAppear) {
     slot.remoteSprayPressure = 0.0f;
     slot.rosterSlot = 0xFF;
     slot.hideSeekSeekerLook = false;
+    slot.hideSeekSeekerLookWas = false;
     slot.inWarpTransition = false;
 }
 
@@ -2437,6 +2669,8 @@ static TMario *spawnRemoteBody() {
     body->mHeldObject = nullptr;
     body->mGrabTarget = nullptr;
     body->mHolder = nullptr;
+    body->mSurfGesso = nullptr;
+    body->mSurfGessoID = 0;
     disableRemotePickupInteraction(body);
     body->mAttributes.mIsInvisible = false;
     body->mAttributes.mIsGameOver = false;
@@ -2465,6 +2699,8 @@ static void parkRemoteBody(TMario *body) {
     body->mSpeed.x = 0.0f;
     body->mSpeed.y = 0.0f;
     body->mSpeed.z = 0.0f;
+    body->mSurfGesso = nullptr;
+    body->mSurfGessoID = 0;
 }
 
 static bool isPoolBodyAssigned(const TMario *body) {
@@ -2585,7 +2821,13 @@ static void applySnapshotToBody(RemoteActorSlot &slot, const PlayerSnapshot &sna
 
     slot.yaw = resolveSnapshotYaw(snap);
     slot.rosterSlot = snap.slot;
-    slot.hideSeekSeekerLook = isHideSeekActive() && isHideSeekSeekerSlot(snap.slot);
+    const bool seekerLook = isHideSeekActive() && isHideSeekSeekerSlot(snap.slot);
+    if (seekerLook != slot.hideSeekSeekerLook) {
+        applyHideSeekPlayerCosmetics(body, seekerLook, true);
+        playHideSeekSeekerCosmeticVfx(body);
+    }
+    slot.hideSeekSeekerLook = seekerLook;
+    slot.hideSeekSeekerLookWas = seekerLook;
     slot.vfxFlags = snap.vfxFlags;
     slot.nozzleId = snap.nozzleId;
 
@@ -2627,6 +2869,14 @@ static void applySnapshotToBody(RemoteActorSlot &slot, const PlayerSnapshot &sna
     const bool showFluddOnBack = (snap.vfxFlags & VFX_NO_FLUDD) == 0;
     syncRemoteAnimAux(body, body->mFludd, snap.health, showFluddOnBack);
     applyRemoteFacing(body, slot.yaw, snap.animId, body->mState, &slot);
+
+    if (isBlooperSurfState(rawState)) {
+        slot.surfGessoType = static_cast<u8>(snap.water & 0x03u);
+        bindRemoteSurfGesso(body, slot.surfGessoType, true);
+    } else if (slot.surfGessoType != 0 || body->mSurfGesso) {
+        slot.surfGessoType = 0;
+        bindRemoteSurfGesso(body, 0, false);
+    }
 
     applyRemoteCosmetics(body, snap.slot);
     if (!isHideSeekActive())
@@ -2692,6 +2942,23 @@ static void applySnapshotToBody(RemoteActorSlot &slot, const PlayerSnapshot &sna
 
 // Replaces BSE's checkExecWaterGun patch with a remote-safe version. Remote
 // puppets never call emit(); spray is visual-only via emitRemoteSprayVfx().
+static void smso_emitLocalTurboWaterSprayCone(TWaterGun *fludd) {
+    if (!fludd || !gpMarioParticleManager)
+        return;
+
+    TNozzleTrigger *trigger =
+        static_cast<TNozzleTrigger *>(fludd->mNozzleList[TWaterGun::Turbo]);
+    if (!trigger || trigger->mSprayState != TNozzleTrigger::ACTIVE)
+        return;
+
+    Mtx *emitMtx = fludd->getEmitMtx(0);
+    if (!emitMtx || !emitMtxTranslationValid(*emitMtx))
+        return;
+
+    // doldecomp TNozzleTrigger::animation when mIsEmitWater — skip ModelWaterManager path.
+    gpMarioParticleManager->emitAndBindToMtxPtr(particles::kWaterSpray, *emitMtx, 1, trigger);
+}
+
 static void smso_checkExecWaterGun(TWaterGun *fludd) {
     if (!fludd || !fludd->mMario)
         return;
@@ -2699,12 +2966,24 @@ static void smso_checkExecWaterGun(TWaterGun *fludd) {
     if (isRemoteBody(fludd->mMario))
         return;
 
+    const bool turboInWater =
+        fludd->mCurrentNozzle == TWaterGun::Turbo && remoteMarioInWater(fludd->mMario);
+
     if (!BetterSMS::areExploitsPatched()) {
+        if (turboInWater) {
+            smso_emitLocalTurboWaterSprayCone(fludd);
+            return;
+        }
         fludd->emit();
         return;
     }
 
     if (fludd->mCurrentNozzle != TWaterGun::Hover && fludd->mCurrentNozzle != TWaterGun::Rocket) {
+        // doldecomp TWaterGun::emit skips model-water below surface; manual 0x10D matches retail.
+        if (turboInWater) {
+            smso_emitLocalTurboWaterSprayCone(fludd);
+            return;
+        }
         fludd->emit();
         return;
     }
@@ -2790,6 +3069,14 @@ static int TMario_perform_remote(TMario *mario, u32 flags, JDrama::TGraphics *gr
 
     const bool drawBody = isRemoteBodyDrawVisible(slot);
 
+    u32 savedSurfState = 0;
+    bool strippedSurfDraw = false;
+    if (isBlooperSurfState(mario->mState) && !mario->mSurfGesso) {
+        savedSurfState = mario->mState;
+        mario->mState = stripSurfDrawFlag(savedSurfState);
+        strippedSurfDraw = true;
+    }
+
     if (flags & 0x4) {
         mario->calcView(graphics);
         if (drawBody && showFluddOnBack && mario->mFludd) {
@@ -2810,6 +3097,9 @@ static int TMario_perform_remote(TMario *mario, u32 flags, JDrama::TGraphics *gr
             drawRemoteMarioShadow(mario, vfx);
         }
     }
+
+    if (strippedSurfDraw)
+        mario->mState = savedSurfState;
 
     return 0;
 }

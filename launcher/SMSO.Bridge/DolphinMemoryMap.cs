@@ -225,7 +225,7 @@ internal static class DolphinMemoryMap
             return false;
         if (!anchor[..4].SequenceEqual(MagicBytes))
             return false;
-        if (BinaryPrimitives.ReadUInt16BigEndian(anchor.Slice(4, 2)) != ProtocolConstants.CommVersion)
+        if (BinaryPrimitives.ReadUInt16BigEndian(anchor.Slice(4, 2)) == 0)
             return false;
         if (BinaryPrimitives.ReadUInt16BigEndian(anchor.Slice(6, 2)) != 0)
             return false;
@@ -248,7 +248,7 @@ internal static class DolphinMemoryMap
             return false;
 
         var version = BinaryPrimitives.ReadUInt16BigEndian(header.AsSpan(4, 2));
-        if (version != ProtocolConstants.CommVersion)
+        if (version == 0)
             return false;
 
         if (TryParseAnchor(header.AsSpan(0, CommMailboxAnchorSize), out _))
@@ -279,7 +279,8 @@ internal static class DolphinMemoryMap
                 (DateTime.UtcNow - _regionCacheUtc).TotalMilliseconds < 1000 &&
                 _cachedRegions.Count > 0)
             {
-                return _cachedRegions;
+                // Return a snapshot — callers may enumerate while another thread invalidates the cache.
+                return new List<(UIntPtr Base, ulong Size)>(_cachedRegions);
             }
         }
 
@@ -291,7 +292,7 @@ internal static class DolphinMemoryMap
             _regionCacheUtc = DateTime.UtcNow;
         }
 
-        return regions;
+        return new List<(UIntPtr Base, ulong Size)>(regions);
     }
 
     private static List<(UIntPtr Base, ulong Size)> EnumerateReadableRegions(IntPtr processHandle)

@@ -28,6 +28,9 @@ public sealed class SessionCoordinator : IDisposable
     private PlayerRosterEntry[] _roster = Array.Empty<PlayerRosterEntry>();
     private bool _sessionHasSeenRoster;
     private volatile bool _shuttingDown;
+    private int _networkCleanupGate;
+    private int _dolphinStopHandling;
+    private DisconnectReason? _pendingDisconnectReason;
     private PlayerSnapshot _lastLocalSnapshot;
     private bool _hasLastLocalSnapshot;
 
@@ -43,6 +46,7 @@ public sealed class SessionCoordinator : IDisposable
     public bool IsHosting => _server?.IsRunning == true;
     public bool IsConnected => _client?.IsConnected == true;
     public bool AllowClientTeleport { get; private set; }
+    public bool ClientTeleportPolicyKnown { get; private set; }
     public bool CanUseClientTeleport => IsHosting || AllowClientTeleport;
     public GameModeStatePacket GameModeState => _bridgeWorker.CurrentGameModeState;
     public byte LocalSlot => _client?.AssignedSlot ?? 0;
@@ -100,7 +104,8 @@ public sealed class SessionCoordinator : IDisposable
                 _server = new GameServer(levels) { MaxPlayers = maxPlayers };
                 _server.Log += m => Log?.Invoke(m);
                 _server.Start(port);
-                _server.SetAllowClientTeleport(_config.Config.AllowClientTeleporting);
+                _config.Config.AllowClientTeleporting = false;
+                _server.SetAllowClientTeleport(false);
             }).ConfigureAwait(true);
 
             await ConnectClientAsync("127.0.0.1", port, isHost: true).ConfigureAwait(true);
@@ -136,6 +141,8 @@ public sealed class SessionCoordinator : IDisposable
     private async Task ConnectClientAsync(string host, int port, bool isHost)
     {
         StopClientOnly();
+        AllowClientTeleport = false;
+        ClientTeleportPolicyKnown = false;
 
         var client = new NetClient();
         client.Log += m => Log?.Invoke(m);
@@ -171,11 +178,21 @@ public sealed class SessionCoordinator : IDisposable
         client.ClientTeleportSettingsReceived += allowed =>
         {
             AllowClientTeleport = allowed;
+            ClientTeleportPolicyKnown = true;
             ClientTeleportPolicyChanged?.Invoke();
         };
         client.GameModeStateReceived += state => ApplyGameModeState(state);
         client.Disconnected += reason =>
         {
+            if (_shuttingDown)
+                return;
+
+            if (_networkCleanupGate != 0)
+            {
+                _pendingDisconnectReason = reason;
+                return;
+            }
+
             Log?.Invoke($"Disconnected: {reason}");
             CleanupNetworkSession(stopServer: isHost && !_shuttingDown, updateStatus: true);
         };
@@ -198,29 +215,46 @@ public sealed class SessionCoordinator : IDisposable
         }
     }
 
-    public async Task DisconnectAsync()
+    public async Task DisconnectAsync(DisconnectReason reason = DisconnectReason.UserRequest)
     {
-        if (_client != null)
-        {
-            try
-            {
-                await _client.DisconnectAsync().WaitAsync(TimeSpan.FromSeconds(1)).ConfigureAwait(true);
-            }
-            catch (TimeoutException)
-            {
-                Log?.Invoke("Disconnect timed out — forcing local cleanup");
-            }
-        }
+        if (!TryEnterNetworkCleanup())
+            return;
 
-        StopClientOnly();
-        StopServer();
-        _bridgeWorker.SetConnected(false, 0, "", false);
-        _remoteSnapshots.Clear();
-        _activeRosterSlots.Clear();
-        _rosterMissStrikes.Clear();
-        _sessionHasSeenRoster = false;
-        _roster = Array.Empty<PlayerRosterEntry>();
-        StatusChanged?.Invoke("Disconnected");
+        try
+        {
+            ResetHideSeekIfActiveOnServer();
+
+            if (_client != null)
+            {
+                try
+                {
+                    await _client.DisconnectAsync(reason).WaitAsync(TimeSpan.FromSeconds(1)).ConfigureAwait(true);
+                }
+                catch (TimeoutException)
+                {
+                    Log?.Invoke("Disconnect timed out — forcing local cleanup");
+                }
+                catch (Exception ex)
+                {
+                    Log?.Invoke($"Client disconnect error: {ex.Message}");
+                }
+            }
+
+            StopClientOnly();
+            StopServer();
+            _bridgeWorker.SetConnected(false, 0, "", false);
+            ForceGameModeToNormalLocally();
+            _remoteSnapshots.Clear();
+            _activeRosterSlots.Clear();
+            _rosterMissStrikes.Clear();
+            _sessionHasSeenRoster = false;
+            _roster = Array.Empty<PlayerRosterEntry>();
+            StatusChanged?.Invoke("Disconnected");
+        }
+        finally
+        {
+            ExitNetworkCleanup();
+        }
     }
 
     private void StopServer()
@@ -243,8 +277,23 @@ public sealed class SessionCoordinator : IDisposable
 
     private void StopClientOnly()
     {
-        _client?.Dispose();
+        var client = _client;
         _client = null;
+        if (client != null)
+        {
+            try
+            {
+                client.DisconnectAsync(DisconnectReason.UserRequest)
+                    .WaitAsync(TimeSpan.FromMilliseconds(500))
+                    .GetAwaiter()
+                    .GetResult();
+            }
+            catch
+            {
+                // socket may already be closed
+            }
+        }
+
         _remoteSnapshots.Clear();
         _activeRosterSlots.Clear();
         _rosterMissStrikes.Clear();
@@ -262,19 +311,48 @@ public sealed class SessionCoordinator : IDisposable
 
     private void CleanupNetworkSession(bool stopServer, bool updateStatus)
     {
-        StopClientOnly();
-        if (stopServer)
-            StopServer();
-        _bridgeWorker.SetConnected(false, 0, "", false);
-        AllowClientTeleport = false;
-        _remoteSnapshots.Clear();
-        _activeRosterSlots.Clear();
-        _rosterMissStrikes.Clear();
-        _sessionHasSeenRoster = false;
-        _roster = Array.Empty<PlayerRosterEntry>();
-        ClientTeleportPolicyChanged?.Invoke();
-        if (updateStatus)
-            StatusChanged?.Invoke("Disconnected");
+        if (!TryEnterNetworkCleanup())
+            return;
+
+        try
+        {
+            ResetHideSeekIfActiveOnServer();
+            StopClientOnly();
+            if (stopServer)
+                StopServer();
+            _bridgeWorker.SetConnected(false, 0, "", false);
+            ForceGameModeToNormalLocally();
+            AllowClientTeleport = false;
+            ClientTeleportPolicyKnown = false;
+            _remoteSnapshots.Clear();
+            _activeRosterSlots.Clear();
+            _rosterMissStrikes.Clear();
+            _sessionHasSeenRoster = false;
+            _roster = Array.Empty<PlayerRosterEntry>();
+            ClientTeleportPolicyChanged?.Invoke();
+            if (updateStatus)
+                StatusChanged?.Invoke("Disconnected");
+        }
+        finally
+        {
+            ExitNetworkCleanup();
+        }
+    }
+
+    private bool TryEnterNetworkCleanup() =>
+        Interlocked.CompareExchange(ref _networkCleanupGate, 1, 0) == 0;
+
+    private void ExitNetworkCleanup()
+    {
+        Interlocked.Exchange(ref _networkCleanupGate, 0);
+
+        var pending = _pendingDisconnectReason;
+        if (!pending.HasValue || _shuttingDown)
+            return;
+
+        _pendingDisconnectReason = null;
+        Log?.Invoke($"Disconnected: {pending.Value}");
+        CleanupNetworkSession(stopServer: IsHosting && !_shuttingDown, updateStatus: true);
     }
 
     private void ApplyConfiguredSyncSettings()
@@ -364,7 +442,7 @@ public sealed class SessionCoordinator : IDisposable
             await _client.SendWarpRequestAsync(selfSlot, courseId, episodeId);
 
         if (!_bridgeWorker.ApplyWarp(selfSlot, courseId, episodeId, IsHosting))
-            Log?.Invoke("Warp queued — waiting for Dolphin link (launch game with _SMSO.kxe loaded)");
+            Log?.Invoke($"Warp queued — waiting for BSMSO link (launch game with {ModuleVersionMessages.ModuleFileName} loaded)");
     }
 
     public async Task WarpToPlayerAsync(byte targetSlot)
@@ -421,7 +499,7 @@ public sealed class SessionCoordinator : IDisposable
                     posZ: targetSnap.Position.Z,
                     facingY: targetSnap.RotationY))
             {
-                Log?.Invoke("Teleport queued — waiting for Dolphin link (launch game with _SMSO.kxe loaded)");
+                Log?.Invoke($"Teleport queued — waiting for BSMSO link (launch game with {ModuleVersionMessages.ModuleFileName} loaded)");
                 return;
             }
 
@@ -446,7 +524,7 @@ public sealed class SessionCoordinator : IDisposable
                 posZ: hasPosition ? targetSnap.Position.Z : 0f,
                 facingY: hasPosition ? targetSnap.RotationY : 0f))
         {
-            Log?.Invoke("Warp queued — waiting for Dolphin link (launch game with _SMSO.kxe loaded)");
+            Log?.Invoke($"Warp queued — waiting for BSMSO link (launch game with {ModuleVersionMessages.ModuleFileName} loaded)");
             return;
         }
 
@@ -479,8 +557,10 @@ public sealed class SessionCoordinator : IDisposable
         if (IsHosting)
         {
             AllowClientTeleport = allowClientTeleport;
-            ClientTeleportPolicyChanged?.Invoke();
+            ClientTeleportPolicyKnown = true;
         }
+
+        ClientTeleportPolicyChanged?.Invoke();
     }
 
     public void SetServerSync(bool syncFlags, bool syncObjects, bool syncProgress)
@@ -554,6 +634,24 @@ public sealed class SessionCoordinator : IDisposable
         GameModeStateChanged?.Invoke(state);
     }
 
+    private void ResetHideSeekIfActiveOnServer()
+    {
+        if (_server == null || _server.GetGameModeState().GameMode != GameMode.HideSeek)
+            return;
+
+        _server.SetGameMode(GameMode.Normal);
+        if (IsConnected)
+            ApplyGameModeState(_server.GetGameModeState());
+    }
+
+    private void ForceGameModeToNormalLocally()
+    {
+        if (_bridgeWorker.CurrentGameModeState.GameMode == GameMode.HideSeek)
+            _bridgeWorker.ForceResetGameModeToNormal(LocalSlot);
+
+        GameModeStateChanged?.Invoke(_bridgeWorker.CurrentGameModeState);
+    }
+
     private void OnRosterUpdated(PlayerRosterEntry[] entries)
     {
         PlayerRosterEntry[] rosterCopy;
@@ -581,9 +679,11 @@ public sealed class SessionCoordinator : IDisposable
                     }
 
                     var strikes = _rosterMissStrikes.TryGetValue(slot, out var count) ? count + 1 : 1;
-                    _rosterMissStrikes[slot] = strikes;
-                    if (strikes < 2)
+                    if (strikes < ProtocolConstants.RosterMissEvictThreshold)
+                    {
+                        _rosterMissStrikes[slot] = strikes;
                         continue;
+                    }
 
                     _rosterMissStrikes.Remove(slot);
                     EvictRemotePlayer(slot);
@@ -750,6 +850,9 @@ public sealed class SessionCoordinator : IDisposable
         if (_shuttingDown)
             return;
 
+        if (Interlocked.CompareExchange(ref _dolphinStopHandling, 1, 0) != 0)
+            return;
+
         var hadSession = IsConnected || IsHosting;
 
         try
@@ -761,7 +864,7 @@ public sealed class SessionCoordinator : IDisposable
         }
         catch (Exception ex)
         {
-            Log?.Invoke($"Dolphin closed (cleanup note: {ex.Message})");
+            Log?.Invoke($"Dolphin closed (cleanup note: {ex.Message}");
         }
 
         _ = Task.Run(async () =>
@@ -771,7 +874,7 @@ public sealed class SessionCoordinator : IDisposable
                 if (hadSession && !_shuttingDown)
                 {
                     Log?.Invoke("Dolphin closed — disconnecting from server.");
-                    await DisconnectAsync().ConfigureAwait(false);
+                    await DisconnectAsync(DisconnectReason.DolphinClosed).ConfigureAwait(false);
                 }
                 else
                 {
@@ -784,6 +887,7 @@ public sealed class SessionCoordinator : IDisposable
             }
             finally
             {
+                Interlocked.Exchange(ref _dolphinStopHandling, 0);
                 SafeRaise(DolphinClosed);
             }
         });

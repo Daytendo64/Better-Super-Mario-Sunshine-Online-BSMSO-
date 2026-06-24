@@ -93,7 +93,7 @@ public sealed class HideSeekServiceTests
     }
 
     [Fact]
-    public void TagDetection_RespectsStartGracePeriod()
+    public void TagDetection_TagsImmediatelyOnStart()
     {
         var levels = new LevelCatalog();
         var server = new GameServer(levels);
@@ -106,6 +106,7 @@ public sealed class HideSeekServiceTests
             {
                 [0] = HideSeekRole.Seeker,
                 [1] = HideSeekRole.Hider,
+                [2] = HideSeekRole.Hider,
             });
             Assert.True(service.TryStartTag(out _));
 
@@ -121,11 +122,12 @@ public sealed class HideSeekServiceTests
                 Connected = 1,
                 StageId = 2,
                 EpisodeId = 0,
-                Position = new Vec3 { X = 0f, Y = 0f, Z = 0f },
+                Position = new Vec3 { X = 20f, Y = 0f, Z = 0f },
             };
 
             service.ProcessSnapshot(0, seeker, 1, hider);
-            Assert.Equal(HideSeekRole.Hider, service.CurrentState.Roles[1]);
+            Assert.Equal(HideSeekRole.Seeker, service.CurrentState.Roles[1]);
+            Assert.Equal(HideSeekRole.Hider, service.CurrentState.Roles[2]);
             Assert.True(service.CurrentState.TagActive);
         }
         finally
@@ -151,7 +153,6 @@ public sealed class HideSeekServiceTests
             };
             service.SetRoles(roles);
             Assert.True(service.TryStartTag(out _));
-            service.EndTagGraceForTesting();
 
             var seeker = new PlayerSnapshot
             {
@@ -200,7 +201,6 @@ public sealed class HideSeekServiceTests
                 [2] = HideSeekRole.Hider,
             });
             Assert.True(service.TryStartTag(out _));
-            service.EndTagGraceForTesting();
 
             var seeker = new PlayerSnapshot
             {
@@ -243,6 +243,74 @@ public sealed class HideSeekServiceTests
     }
 
     [Fact]
+    public void TagDetection_TagsAtVisualBodyContact()
+    {
+        var seeker = new PlayerSnapshot
+        {
+            Connected = 1,
+            Position = new Vec3 { X = 0f, Y = 0f, Z = 0f },
+        };
+        var hider = new PlayerSnapshot
+        {
+            Connected = 1,
+            Position = new Vec3 { X = 105f, Y = 0f, Z = 0f },
+        };
+
+        Assert.True(HideSeekService.IsWithinTagRange(seeker, hider));
+    }
+
+    [Fact]
+    public void TagDetection_MissesJustBeyondBodyContact()
+    {
+        var seeker = new PlayerSnapshot
+        {
+            Connected = 1,
+            Position = new Vec3 { X = 0f, Y = 0f, Z = 0f },
+        };
+        var hider = new PlayerSnapshot
+        {
+            Connected = 1,
+            Position = new Vec3 { X = HideSeekTagConstants.MaxHorizontalReach + 10f, Y = 0f, Z = 0f },
+        };
+
+        Assert.False(HideSeekService.IsWithinTagRange(seeker, hider));
+    }
+
+    [Fact]
+    public void TagDetection_TagsJumpingSeekerWithinHorizontalRange()
+    {
+        var seeker = new PlayerSnapshot
+        {
+            Connected = 1,
+            Position = new Vec3 { X = 0f, Y = 50f, Z = 0f },
+        };
+        var hider = new PlayerSnapshot
+        {
+            Connected = 1,
+            Position = new Vec3 { X = 45f, Y = 0f, Z = 0f },
+        };
+
+        Assert.True(HideSeekService.IsWithinTagRange(seeker, hider));
+    }
+
+    [Fact]
+    public void TagDetection_IgnoresDifferentFloors()
+    {
+        var seeker = new PlayerSnapshot
+        {
+            Connected = 1,
+            Position = new Vec3 { X = 0f, Y = 0f, Z = 0f },
+        };
+        var hider = new PlayerSnapshot
+        {
+            Connected = 1,
+            Position = new Vec3 { X = 10f, Y = 700f, Z = 0f },
+        };
+
+        Assert.False(HideSeekService.IsWithinTagRange(seeker, hider));
+    }
+
+    [Fact]
     public void TagDetection_TagsWithinObservedTouchRange()
     {
         var levels = new LevelCatalog();
@@ -259,7 +327,6 @@ public sealed class HideSeekServiceTests
                 [2] = HideSeekRole.Hider,
             });
             Assert.True(service.TryStartTag(out _));
-            service.EndTagGraceForTesting();
 
             var seeker = new PlayerSnapshot
             {
@@ -273,7 +340,7 @@ public sealed class HideSeekServiceTests
                 Connected = 1,
                 StageId = 2,
                 EpisodeId = 0,
-                Position = new Vec3 { X = 55f, Y = 300f, Z = 0f },
+                Position = new Vec3 { X = 58f, Y = 300f, Z = 0f },
             };
             var otherHider = new PlayerSnapshot
             {
@@ -311,7 +378,6 @@ public sealed class HideSeekServiceTests
                 [1] = HideSeekRole.Hider,
             });
             Assert.True(service.TryStartTag(out _));
-            service.EndTagGraceForTesting();
 
             var seeker = new PlayerSnapshot
             {

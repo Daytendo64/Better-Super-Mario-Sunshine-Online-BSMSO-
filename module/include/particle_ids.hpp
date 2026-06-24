@@ -40,10 +40,12 @@ constexpr s32 kWalkDustC = 0x17;   // PARTICLE_MS_MARIWALK1_C
 constexpr s32 kSpraySplashA = 0x1D4;
 constexpr s32 kSpraySplashB = 0x1D5;
 constexpr s32 kSprayRipple = 0x34;   // PARTICLE_MS_M_WATRUN_A
-constexpr s32 kWaterSpray = 0x10D;
+constexpr s32 kWaterSpray = 0x10D;     // doldecomp TNozzleTrigger::animation — nozzle-bound spray cone
 constexpr s32 kBodyBubbleA = 0x10C;  // PARTICLE_MS_M_AWA — swimming/body bubbles, not hover
 constexpr s32 kBodyBubbleB = 0x111;  // PARTICLE_MS_M_AWA_S
 constexpr s32 kRocketExhaustA = 0x11E; // PARTICLE_MS_M_SEASMOKE
-constexpr s32 kTurboTrail = 0x103;    // PARTICLE_MS_M_SLIPSMOKE (water skid mist)
+constexpr s32 kTurboWaterRipple = 0x34;  // PARTICLE_MS_M_WATRUN_A — doldecomp runningRippleEffect()
+constexpr s32 kTurboDashBoostA = 0xFE;   // doldecomp TMarioEffect::perform — waterboost trail A
+constexpr s32 kTurboDashBoostB = 0xFF;   // doldecomp TMarioEffect::perform — waterboost trail B
 
 } // namespace smso::particles

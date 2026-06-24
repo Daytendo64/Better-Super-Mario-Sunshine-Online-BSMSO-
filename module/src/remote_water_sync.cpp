@@ -17,6 +17,7 @@ namespace {
 constexpr u32 kModelWaterCullRadiusOffset = 0x5E08;
 constexpr f32 kVanillaWaterCullRadius = 5000.0f;
 constexpr f32 kRemoteSprayReachMargin = 2000.0f;
+constexpr s32 kRemoteWaterDropletMaxPerRequest = 6;
 
 static f32 *getWaterCullRadius() {
     if (!gpModelWaterManager)
@@ -81,6 +82,12 @@ void updateRemoteWaterSync() {
 void emitRemoteWaterRequest(TWaterEmitInfo *emitInfo) {
     if (!emitInfo || !gpModelWaterManager)
         return;
+
+    const s32 requested = emitInfo->mNum.get();
+    if (requested > kRemoteWaterDropletMaxPerRequest)
+        emitInfo->mNum.set(kRemoteWaterDropletMaxPerRequest);
+    else if (requested < 0)
+        emitInfo->mNum.set(0);
 
     applyWaterCullRadius();
     gpModelWaterManager->emitRequest(*emitInfo);

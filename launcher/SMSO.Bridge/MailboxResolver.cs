@@ -5,7 +5,7 @@ using SMSO.Net;
 namespace SMSO.Bridge;
 
 /// <summary>
-/// Resolves the SMSO CommBuffer host address in Dolphin. Fast path uses known fastmem layout;
+/// Resolves the BSMSO CommBuffer host address in Dolphin. Fast path uses known fastmem layout;
 /// a bounded background scan handles unusual builds without blocking the 60 Hz bridge loop.
 /// </summary>
 internal sealed class MailboxResolver
@@ -134,8 +134,8 @@ internal sealed class MailboxResolver
             _lastError = regionCount == 0
                 ? "Could not read Dolphin memory — run launcher as administrator"
                 : SearchDuration.TotalSeconds < 8
-                    ? "Waiting for _SMSO.kxe — boot the game and enter a stage"
-                    : "SMSO mailbox not found — confirm _SMSO.kxe is enabled in Kuribo Mods";
+                    ? $"Waiting for {ModuleVersionMessages.ModuleFileName} — boot the game and enter a stage"
+                    : $"BSMSO mailbox not found — confirm {ModuleVersionMessages.ModuleFileName} is enabled in Kuribo Mods";
             return false;
         }
     }
@@ -171,6 +171,11 @@ internal sealed class MailboxResolver
 
                 if (DolphinMemoryMap.TryResolveMailboxScan(handle, guest, out var host))
                     OnBackgroundScanSucceeded(host);
+            }
+            catch (Exception ex)
+            {
+                lock (_lock)
+                    _lastError = $"Mailbox scan failed: {ex.Message}";
             }
             finally
             {

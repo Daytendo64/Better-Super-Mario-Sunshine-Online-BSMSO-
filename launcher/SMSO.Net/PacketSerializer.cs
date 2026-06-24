@@ -190,12 +190,20 @@ public static class PacketSerializer
     public static byte[] BuildUdpSnapshot(byte slot, uint seq, in PlayerSnapshot snap)
     {
         var bytes = new byte[ProtocolConstants.UdpSnapshotPayloadOffset + ProtocolConstants.PlayerSnapshotSize];
-        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(0, 4), ProtocolConstants.Magic);
-        bytes[4] = (byte)UdpPacketId.PlayerSnapshot;
-        bytes[5] = slot;
-        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(6, 4), seq);
-        SnapshotToBytes(snap, bytes.AsSpan(ProtocolConstants.UdpSnapshotPayloadOffset, ProtocolConstants.PlayerSnapshotSize));
+        WriteUdpSnapshot(bytes, slot, seq, snap);
         return bytes;
+    }
+
+    public static void WriteUdpSnapshot(Span<byte> dest, byte slot, uint seq, in PlayerSnapshot snap)
+    {
+        if (dest.Length < ProtocolConstants.UdpSnapshotPayloadOffset + ProtocolConstants.PlayerSnapshotSize)
+            throw new ArgumentException("UDP snapshot buffer is too small.", nameof(dest));
+
+        BinaryPrimitives.WriteUInt32LittleEndian(dest.Slice(0, 4), ProtocolConstants.Magic);
+        dest[4] = (byte)UdpPacketId.PlayerSnapshot;
+        dest[5] = slot;
+        BinaryPrimitives.WriteUInt32LittleEndian(dest.Slice(6, 4), seq);
+        SnapshotToBytes(snap, dest.Slice(ProtocolConstants.UdpSnapshotPayloadOffset, ProtocolConstants.PlayerSnapshotSize));
     }
 
     public static byte[] SnapshotToBytes(PlayerSnapshot snap)

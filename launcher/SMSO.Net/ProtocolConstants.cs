@@ -34,6 +34,8 @@ public static class ProtocolConstants
     public const int ConnectTimeoutMs = 10000;
     public const int RosterBroadcastIntervalMs = 200;
     public const int ReconnectWindowMs = 30000;
+    /// <summary>Consecutive roster misses before evicting a remote player snapshot.</summary>
+    public const int RosterMissEvictThreshold = 3;
     public const byte WarpNoTarget = 0xFC;
     public const byte WarpAllSlots = 0xFF;
 }

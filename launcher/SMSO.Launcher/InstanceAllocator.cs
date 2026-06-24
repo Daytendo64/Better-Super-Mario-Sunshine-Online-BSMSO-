@@ -12,7 +12,7 @@ internal static class InstanceAllocator
         Process[] launchers;
         try
         {
-            launchers = Process.GetProcessesByName("SMSO.Launcher");
+            launchers = Process.GetProcessesByName("BSMSO.Launcher");
         }
         catch
         {

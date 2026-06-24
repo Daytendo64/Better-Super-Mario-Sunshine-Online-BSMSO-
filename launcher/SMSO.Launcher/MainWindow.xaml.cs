@@ -1,12 +1,14 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
+using System.Windows.Navigation;
 using System.Windows.Threading;
 using Microsoft.Win32;
 using SMSO.Bridge;
@@ -37,7 +39,6 @@ public partial class MainWindow : Window
         InitializeComponent();
         ClientRosterList.ItemsSource = _rosterItems;
         ServerRosterList.ItemsSource = _rosterItems;
-        MultiSelectPlayers.ItemsSource = _rosterItems;
         WarpTargetCombo.ItemsSource = _warpTargets;
         ClientWarpTargetCombo.ItemsSource = _clientWarpTargets;
         _config.Load();
@@ -46,9 +47,9 @@ public partial class MainWindow : Window
         LoadConfigToUi();
         LoadLevels();
         Title = _config.InstanceIndex == 0
-            ? "Better Super Mario Sunshine Online"
-            : $"Better Super Mario Sunshine Online — {_config.InstanceLabel}";
-        VersionText.Text = $"BSMSO v1.0 | {_config.InstanceLabel} | .NET {Environment.Version}";
+            ? "BSMSO — Better Super Mario Sunshine Online"
+            : $"BSMSO — Better Super Mario Sunshine Online ({_config.InstanceLabel})";
+        VersionText.Text = $"BSMSO v1.0 | comm v{ProtocolConstants.CommVersion} | {_config.InstanceLabel} | .NET {Environment.Version}";
         UpdateConnectionUi();
         UpdateDolphinUi();
         UpdateSessionStatusColor();
@@ -146,7 +147,12 @@ public partial class MainWindow : Window
             UpdateSessionStatusColor();
         });
         _session.RosterUpdated += entries => RunOnUiThread(() => UpdateRosterCore(entries));
-        _session.HostingStateChanged += () => RunOnUiThread(UpdateConnectionUi);
+        _session.HostingStateChanged += () => RunOnUiThread(() =>
+        {
+            if (_session.IsHosting)
+                AllowClientTeleportToggle.IsChecked = false;
+            UpdateConnectionUi();
+        });
         _session.ClientTeleportPolicyChanged += () => RunOnUiThread(() =>
         {
             UpdateClientActionsUi();
@@ -155,6 +161,7 @@ public partial class MainWindow : Window
         _session.DolphinClosed += () => SafeRunOnUiThread(() =>
         {
             RefreshDolphinStateUi();
+            ResetGameModeUiToNormal();
             if (!_session.IsConnected && !_session.IsHosting)
                 ClearRoster();
         });
@@ -296,8 +303,7 @@ public partial class MainWindow : Window
 
     private void UpdateRosterCore(PlayerRosterEntry[] entries)
     {
-        var selectedSlots = MultiSelectPlayers.SelectedItems.Cast<RosterViewModel>().Select(v => v.Slot).ToHashSet();
-        var selectedWarpSlot = WarpTargetCombo.SelectedItem is WarpTargetItem warp ? warp.Slot : ProtocolConstants.WarpAllSlots;
+        var selectedWarpSlot = WarpTargetCombo.SelectedItem is WarpTargetItem warp ? warp.Slot : (byte)0;
         var selectedClientWarpSlot = ClientWarpTargetCombo.SelectedItem is WarpTargetItem clientWarp
             ? clientWarp.Slot
             : (byte)0;
@@ -334,7 +340,6 @@ public partial class MainWindow : Window
         {
             _lastRosterSlots = slotSet;
             _warpTargets.Clear();
-            _warpTargets.Add(new WarpTargetItem { Username = "All Players", Slot = ProtocolConstants.WarpAllSlots });
             foreach (var entry in ordered)
                 _warpTargets.Add(new WarpTargetItem { Username = entry.Username, Slot = entry.Slot });
 
@@ -350,13 +355,6 @@ public partial class MainWindow : Window
 
             if (GameModeCombo.SelectedIndex == 1)
                 SyncHideSeekRoleListsFromRoster();
-        }
-
-        if (selectedSlots.Count > 0)
-        {
-            MultiSelectPlayers.SelectedItems.Clear();
-            foreach (var row in _rosterItems.Where(r => selectedSlots.Contains(r.Slot)))
-                MultiSelectPlayers.SelectedItems.Add(row);
         }
     }
 
@@ -386,7 +384,7 @@ public partial class MainWindow : Window
         _config.Save();
         if (_session.DolphinLinkState != DolphinLinkState.ModuleReady)
         {
-            MessageBox.Show("Launch Dolphin with _SMSO.kxe loaded and wait until the launcher is linked to the game before hosting.", "BSMSO", MessageBoxButton.OK, MessageBoxImage.Information);
+            MessageBox.Show($"Launch Dolphin with {ModuleVersionMessages.ModuleFileName} loaded and wait until BSMSO is linked to the game before hosting.", "BSMSO", MessageBoxButton.OK, MessageBoxImage.Information);
             UpdateConnectionUi();
             return;
         }
@@ -413,7 +411,7 @@ public partial class MainWindow : Window
         SaveConfigFromUi();
         if (_session.DolphinLinkState != DolphinLinkState.ModuleReady)
         {
-            MessageBox.Show("Launch Dolphin with _SMSO.kxe loaded and wait until the launcher is linked to the game before connecting.", "BSMSO", MessageBoxButton.OK, MessageBoxImage.Information);
+            MessageBox.Show($"Launch Dolphin with {ModuleVersionMessages.ModuleFileName} loaded and wait until BSMSO is linked to the game before connecting.", "BSMSO", MessageBoxButton.OK, MessageBoxImage.Information);
             UpdateConnectionUi();
             return;
         }
@@ -519,27 +517,34 @@ public partial class MainWindow : Window
         DolphinProcessBadge.Text = processText;
         DolphinProcessBadge.Foreground = running ? ok : bad;
         DolphinLinkBadge.Text = linkText;
-        DolphinLinkBadge.Foreground = link == DolphinLinkState.ModuleReady ? ok :
-            link == DolphinLinkState.Attached ? warn : bad;
+        DolphinLinkBadge.Foreground = link switch
+        {
+            DolphinLinkState.ModuleReady => ok,
+            DolphinLinkState.Attached => warn,
+            _ => bad,
+        };
 
+        var moduleInstallWarning = ModuleInstallValidator.ValidateInstalledModule(IsoPathBox.Text);
         var linkError = _session.DolphinLinkError;
         var searchSeconds = _session.DolphinMailboxSearchDuration.TotalSeconds;
         DolphinDetailText.Text = link switch
         {
+            DolphinLinkState.ModuleReady when !string.IsNullOrWhiteSpace(moduleInstallWarning) => moduleInstallWarning,
             DolphinLinkState.ModuleReady =>
-                "Mailbox link active — warps and player sync enabled.",
+                "BSMSO link active — warps and player sync enabled.",
             DolphinLinkState.Attached when !string.IsNullOrWhiteSpace(linkError) && searchSeconds >= 3 =>
                 linkError,
             DolphinLinkState.Attached when searchSeconds < 3 =>
-                "Attached to Dolphin — waiting for game to boot and load _SMSO.kxe.",
+                $"Attached to Dolphin — waiting for game to boot and load {ModuleVersionMessages.ModuleFileName}.",
             DolphinLinkState.Attached =>
                 "Searching for BSMSO mailbox — enter a stage in-game if you have not yet.",
             DolphinLinkState.Running when !string.IsNullOrWhiteSpace(linkError) =>
                 linkError,
             DolphinLinkState.Running when running =>
                 "Dolphin is running — linking automatically.",
+            _ when !string.IsNullOrWhiteSpace(moduleInstallWarning) => moduleInstallWarning,
             _ => running
-                ? "Dolphin is open — link will restore when the game loads _SMSO.kxe."
+                ? $"Dolphin is open — link will restore when the game loads {ModuleVersionMessages.ModuleFileName}."
                 : "Launch Dolphin here before hosting or connecting (button enables when paths are set).",
         };
         UpdateConnectionUi();
@@ -601,15 +606,17 @@ public partial class MainWindow : Window
         bool teleportActive;
         bool showOverlay;
 
-        if (hosting && connected)
+        if (connected && hosting)
         {
-            teleportActive = true;
-            showOverlay = false;
+            var allowed = AllowClientTeleportToggle.IsChecked == true;
+            teleportActive = allowed;
+            showOverlay = !allowed;
         }
         else if (connected)
         {
-            teleportActive = _session.AllowClientTeleport;
-            showOverlay = !_session.AllowClientTeleport;
+            var policyKnown = _session.ClientTeleportPolicyKnown;
+            teleportActive = policyKnown && _session.AllowClientTeleport;
+            showOverlay = !policyKnown || !_session.AllowClientTeleport;
         }
         else
         {
@@ -648,10 +655,9 @@ public partial class MainWindow : Window
 
     private async void ServerTeleportToPlayer_Click(object sender, RoutedEventArgs e)
     {
-        if (WarpTargetCombo.SelectedItem is not WarpTargetItem target ||
-            target.Slot == ProtocolConstants.WarpAllSlots)
+        if (WarpTargetCombo.SelectedItem is not WarpTargetItem target)
         {
-            MessageBox.Show("Select a specific player in Warp target (not All Players).", "BSMSO", MessageBoxButton.OK, MessageBoxImage.Information);
+            MessageBox.Show("Select a player in Warp target first.", "BSMSO", MessageBoxButton.OK, MessageBoxImage.Information);
             return;
         }
 
@@ -670,14 +676,10 @@ public partial class MainWindow : Window
         if (ServerLevelCombo.SelectedItem is not CourseEntry course ||
             ServerEpisodeCombo.SelectedItem is not EpisodeEntry episode) return;
 
-        var selected = MultiSelectPlayers.SelectedItems.Cast<RosterViewModel>().ToList();
-        if (selected.Count == 0 && WarpTargetCombo.SelectedItem is WarpTargetItem target)
-        {
-            _session.HostWarp(target.Slot, course.CourseId, episode.EpisodeId);
+        if (WarpTargetCombo.SelectedItem is not WarpTargetItem target)
             return;
-        }
-        foreach (var player in selected)
-            _session.HostWarp(player.Slot, course.CourseId, episode.EpisodeId);
+
+        _session.HostWarp(target.Slot, course.CourseId, episode.EpisodeId);
     }
 
     private void AllowClientTeleport_Changed(object sender, RoutedEventArgs e)
@@ -685,6 +687,13 @@ public partial class MainWindow : Window
         if (!IsLoaded || !_session.IsHosting) return;
         _session.SetAllowClientTeleport(AllowClientTeleportToggle.IsChecked == true);
         UpdateServerClientTeleportStatus();
+        UpdateClientActionsUi();
+    }
+
+    private void HelpLink_RequestNavigate(object sender, RequestNavigateEventArgs e)
+    {
+        Process.Start(new ProcessStartInfo(e.Uri.AbsoluteUri) { UseShellExecute = true });
+        e.Handled = true;
     }
 
     private void OpenLogs_Click(object sender, RoutedEventArgs e)
@@ -1040,20 +1049,35 @@ public partial class MainWindow : Window
                 HideSeekHidersList.ItemsSource = hiders;
                 HideSeekSeekersList.ItemsSource = seekers;
             }
+            else
+            {
+                HideSeekHidersList.ItemsSource = null;
+                HideSeekSeekersList.ItemsSource = null;
+                _tagRunning = false;
+                StartStopTagButton.Content = "Start Tag";
+                HideSeekStatusText.Text = string.Empty;
+            }
 
             _tagRunning = state.TagActive;
             StartStopTagButton.Content = state.TagActive ? "Stop Tag" : "Start Tag";
-            HideSeekStatusText.Text = state.RoundComplete
-                ? "All hiders found!"
-                : state.TagActive
-                    ? "Tag is running."
-                    : "Assign seekers, then start tag.";
+            HideSeekStatusText.Text = state.GameMode == GameMode.HideSeek
+                ? state.RoundComplete
+                    ? "All hiders found!"
+                    : state.TagActive
+                        ? "Tag is running."
+                        : "Assign seekers, then start tag."
+                : string.Empty;
             UpdateStartStopTagButtonState();
         }
         finally
         {
             _suppressHideSeekUiSync = false;
         }
+    }
+
+    private void ResetGameModeUiToNormal()
+    {
+        ApplyGameModeStateToUi(GameModeStatePacket.CreateDefault());
     }
 
     private void SyncHideSeekRoleListsFromRoster(bool forceAllHiders = false)

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <Dolphin/types.h>
+
 class TMarDirector;
 class TMario;
 
@@ -14,6 +16,7 @@ void applyPendingWarpPoint(TMarDirector *director);
 void skipEntryDemoIfPending(TMarDirector *director);
 void skipCutscenesIfConnected(TMarDirector *director);
 void respawnLocalMarioAtStageSpawn(TMarDirector *director, TMario *mario);
+void reloadLocalStage(TMarDirector *director, u8 areaId, u8 episodeId);
 void updatePuppets(TMarDirector *director);
 void clearPuppets();
 

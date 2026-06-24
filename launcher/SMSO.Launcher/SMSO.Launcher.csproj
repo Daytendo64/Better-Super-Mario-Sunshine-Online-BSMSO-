@@ -11,6 +11,9 @@
     <TargetFramework>net7.0-windows</TargetFramework>
     <Nullable>enable</Nullable>
     <UseWPF>true</UseWPF>
+    <AssemblyName>BSMSO.Launcher</AssemblyName>
+    <Product>BSMSO</Product>
+    <AssemblyTitle>BSMSO Launcher</AssemblyTitle>
   </PropertyGroup>
 
   <ItemGroup>

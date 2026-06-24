@@ -101,6 +101,16 @@ static f32 readFluddDeploy(TWaterGun *fludd) {
     return *reinterpret_cast<f32 *>(reinterpret_cast<u8 *>(fludd) + kFluddDeployOffset);
 }
 
+static bool isLocalBlooperSurf(const TMario *mario) {
+    if (!mario)
+        return false;
+    const u32 state = mario->mState;
+    if ((state & 0x10000u) == 0)
+        return false;
+    const u32 id = state & 0x1FFu;
+    return id == 0x046u || id == 0x09Au;
+}
+
 static u8 exportHandIndex(TMario *mario) {
     if ((mario->mState & 0x1C0) == 0x040 &&
         (mario->mAnimationID == 0x48 || mario->mAnimationID == 0x72)) {
@@ -188,7 +198,8 @@ static u16 buildVfxFlags(TMario *mario) {
             vfx |= VFX_ROCKET;
             break;
         case TWaterGun::Turbo:
-            vfx |= VFX_TURBO;
+            if (sprayAttempt)
+                vfx |= VFX_TURBO;
             break;
         default:
             break;
@@ -378,8 +389,9 @@ void exportLocalPlayer(TMario *mario, TMarDirector *director) {
             }
         }
     }
+    const bool blooperSurf = isLocalBlooperSurf(mario);
     const bool waistPack = !yCam && (mario->mAnimationID == 0x48 || mario->mAnimationID == 0x72 ||
-                                     mario->mAnimationID == 0x6D);
+                                     mario->mAnimationID == 0x6D || blooperSurf);
     const bool running = waistPack && (mario->mAnimationID == 0x48 || mario->mAnimationID == 0x72);
     u8 highEnc = upperEnc;
     if (yCam) {
@@ -391,13 +403,16 @@ void exportLocalPlayer(TMario *mario, TMarDirector *director) {
 
     // water: tank level by default; Y-cam and hold-pump reuse it for upper BCK frame;
     // while spraying water it carries synced nozzle pressure (0..1 -> 0..255);
-    // dry spray reuses the byte as an explicit empty-tank marker (0).
+    // dry spray reuses the byte as an explicit empty-tank marker (0);
+    // blooper surf reuses it for mSurfGessoID (purple/yellow/green).
     if (yCam || (pumpHold && !sprayingWater && !drySpray))
         snap.water = upperEnc;
     else if (sprayingWater)
         snap.water = encodeSprayPressure(sprayPressure);
     else if (drySpray)
         snap.water = 0;
+    else if (isLocalBlooperSurf(mario))
+        snap.water = mario->mSurfGessoID & 0x03u;
     else
         snap.water = tankEnc;
 
@@ -556,6 +571,25 @@ void respawnLocalMarioAtStageSpawn(TMarDirector *director, TMario *mario) {
     forceInstantMarioSpawn(director, mario);
 }
 
+void reloadLocalStage(TMarDirector *director, u8 areaId, u8 episodeId) {
+    if (!director)
+        return;
+
+    const u16 stageId = static_cast<u16>(((static_cast<u32>(areaId) + 1) << 8) | episodeId);
+
+    gpApplication.mNextScene.mAreaID = areaId;
+    gpApplication.mNextScene.mEpisodeID = episodeId;
+
+    TFlagManager::smInstance->setFlag(0x40002, 0);
+    TFlagManager::smInstance->setFlag(0x40003, episodeId);
+
+    BetterSMS::Loading::setLoading(false);
+    setHideSeekAllowStageTransition(true);
+    director->setNextStage(stageId, nullptr);
+
+    getCommBuffer()->bridgeFlags |= BF_SKIP_ENTRY_DEMO;
+}
+
 static void smso_entrySkipPlayerUpdate(TMario *player, bool isLocalMario) {
     if (!isLocalMario || !gpMarDirector)
         return;
@@ -622,6 +656,10 @@ static bool smso_returnStart(TMario *self, const TVec3f *pos, f32 rot, bool flag
 
 SMS_PATCH_B(SMS_PORT_REGION(0x80240954, 0x8023888C, 0, 0), smso_rollingStart);
 SMS_PATCH_B(SMS_PORT_REGION(0x802407BC, 0x802386F4, 0, 0), smso_returnStart);
+
+// Force THP/cutscene skip checks to succeed (li r3, 1) — BSE generic.cpp debug patch.
+SMS_WRITE_32(SMS_PORT_REGION(0x802B5E8C, 0x802ade20, 0, 0), 0x38600001);
+SMS_WRITE_32(SMS_PORT_REGION(0x802B5EF4, 0x802ade88, 0, 0), 0x38600001);
 
 void skipEntryDemoIfPending(TMarDirector *director) {
     if (isHideSeekTaggedDeathActive())
@@ -734,6 +772,7 @@ void consumeWarpIntent() {
 
     BetterSMS::Loading::setLoading(false);
 
+    setHideSeekAllowStageTransition(true);
     gpMarDirector->setNextStage(stageId, nullptr);
 
     buf->bridgeFlags |= BF_SKIP_ENTRY_DEMO;

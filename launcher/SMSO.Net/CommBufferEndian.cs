@@ -47,11 +47,19 @@ public static class CommBufferEndian
     public static byte[] ToRemoteSnapshotsDolphinBytes(PlayerSnapshot[] remotes)
     {
         var data = new byte[ProtocolConstants.CommRemoteSnapshotsSize];
+        WriteRemoteSnapshotsInto(data, remotes);
+        return data;
+    }
+
+    public static void WriteRemoteSnapshotsInto(Span<byte> dest, PlayerSnapshot[] remotes)
+    {
+        if (dest.Length < ProtocolConstants.CommRemoteSnapshotsSize)
+            throw new ArgumentException("Remote snapshot buffer is too small.", nameof(dest));
+
         int o = 0;
         var slots = remotes ?? CommBuffer.CreateRemoteArray();
         for (int i = 0; i < ProtocolConstants.MaxRemoteSlots; i++)
-            WriteSnapshot(data, ref o, i < slots.Length ? slots[i] : new PlayerSnapshot { Name = new byte[16] });
-        return data;
+            WriteSnapshot(dest, ref o, i < slots.Length ? slots[i] : new PlayerSnapshot { Name = new byte[16] });
     }
 
     public static void ApplyWarpIntentToControlSpan(
@@ -131,30 +139,54 @@ public static class CommBufferEndian
     public static byte[] ToGameModeStateDolphinBytes(in CommGameModeState state)
     {
         var data = new byte[ProtocolConstants.CommGameModeStateSize];
-        int o = 0;
-        WriteGameModeState(data, ref o, state);
+        WriteGameModeStateInto(data, state);
         return data;
+    }
+
+    public static void WriteGameModeStateInto(Span<byte> dest, in CommGameModeState state)
+    {
+        if (dest.Length < ProtocolConstants.CommGameModeStateSize)
+            throw new ArgumentException("Game mode buffer is too small.", nameof(dest));
+
+        int o = 0;
+        WriteGameModeState(dest, ref o, state);
     }
 
     public static byte[] ToNameTagAppearancesDolphinBytes(NameTagAppearance local, NameTagAppearance[] remotes)
     {
         var data = new byte[ProtocolConstants.CommNameTagAppearancesSize];
+        WriteNameTagAppearancesInto(data, local, remotes);
+        return data;
+    }
+
+    public static void WriteNameTagAppearancesInto(Span<byte> dest, NameTagAppearance local, NameTagAppearance[] remotes)
+    {
+        if (dest.Length < ProtocolConstants.CommNameTagAppearancesSize)
+            throw new ArgumentException("Name tag buffer is too small.", nameof(dest));
+
         int o = 0;
-        WriteAppearance(data, ref o, local);
+        WriteAppearance(dest, ref o, local);
         var slots = remotes ?? CommBuffer.CreateRemoteAppearanceArray();
         for (int i = 0; i < ProtocolConstants.MaxRemoteSlots; i++)
-            WriteAppearance(data, ref o, i < slots.Length ? slots[i] : NameTagAppearance.CreateDefault());
-        return data;
+            WriteAppearance(dest, ref o, i < slots.Length ? slots[i] : NameTagAppearance.CreateDefault());
     }
 
     public static byte[] ToRemoteMarioVoiceEventsDolphinBytes(MarioVoiceEvent[] remotes)
     {
         var data = new byte[ProtocolConstants.MarioVoiceEventSize * ProtocolConstants.MaxRemoteSlots];
+        WriteRemoteMarioVoiceEventsInto(data, remotes);
+        return data;
+    }
+
+    public static void WriteRemoteMarioVoiceEventsInto(Span<byte> dest, MarioVoiceEvent[] remotes)
+    {
+        if (dest.Length < ProtocolConstants.MarioVoiceEventSize * ProtocolConstants.MaxRemoteSlots)
+            throw new ArgumentException("Remote voice buffer is too small.", nameof(dest));
+
         int o = 0;
         var slots = remotes ?? CommBuffer.CreateRemoteMarioVoiceEventArray();
         for (int i = 0; i < ProtocolConstants.MaxRemoteSlots; i++)
-            WriteMarioVoiceEvent(data, ref o, i < slots.Length ? slots[i] : default);
-        return data;
+            WriteMarioVoiceEvent(dest, ref o, i < slots.Length ? slots[i] : default);
     }
 
     private static NameTagAppearance ReadAppearance(byte[] data, ref int o)
@@ -174,7 +206,7 @@ public static class CommBufferEndian
         };
     }
 
-    private static void WriteAppearance(byte[] data, ref int o, NameTagAppearance appearance)
+    private static void WriteAppearance(Span<byte> data, ref int o, NameTagAppearance appearance)
     {
         data[o++] = appearance.TextTopR;
         data[o++] = appearance.TextTopG;
@@ -187,6 +219,9 @@ public static class CommBufferEndian
         data[o++] = appearance.OutlineB;
         data[o++] = appearance.Flags;
     }
+
+    private static void WriteAppearance(byte[] data, ref int o, NameTagAppearance appearance) =>
+        WriteAppearance(data.AsSpan(), ref o, appearance);
 
     private static MarioVoiceEvent ReadMarioVoiceEvent(byte[] data, ref int o)
     {
@@ -205,10 +240,10 @@ public static class CommBufferEndian
         return voiceEvent;
     }
 
-    private static void WriteMarioVoiceEvent(byte[] data, ref int o, MarioVoiceEvent voiceEvent)
+    private static void WriteMarioVoiceEvent(Span<byte> data, ref int o, MarioVoiceEvent voiceEvent)
     {
-        BinaryPrimitives.WriteUInt32BigEndian(data.AsSpan(o, 4), voiceEvent.SoundId);
-        BinaryPrimitives.WriteUInt16BigEndian(data.AsSpan(o + 4, 2), voiceEvent.Sequence);
+        BinaryPrimitives.WriteUInt32BigEndian(data.Slice(o, 4), voiceEvent.SoundId);
+        BinaryPrimitives.WriteUInt16BigEndian(data.Slice(o + 4, 2), voiceEvent.Sequence);
         data[o + 6] = voiceEvent.Flags;
         data[o + 7] = voiceEvent.Health;
         data[o + 8] = voiceEvent.StageId;
@@ -217,6 +252,9 @@ public static class CommBufferEndian
         data[o + 11] = voiceEvent.Reserved1;
         o += ProtocolConstants.MarioVoiceEventSize;
     }
+
+    private static void WriteMarioVoiceEvent(byte[] data, ref int o, MarioVoiceEvent voiceEvent) =>
+        WriteMarioVoiceEvent(data.AsSpan(), ref o, voiceEvent);
 
     private static CommGameModeState ReadGameModeState(byte[] data, ref int o)
     {
@@ -235,19 +273,22 @@ public static class CommBufferEndian
         return state;
     }
 
-    private static void WriteGameModeState(byte[] data, ref int o, in CommGameModeState state)
+    private static void WriteGameModeState(Span<byte> data, ref int o, in CommGameModeState state)
     {
         data[o++] = state.Mode;
         data[o++] = state.Flags;
         data[o++] = state.LocalRole;
         data[o++] = state.LastTaggedSlot;
         data[o++] = state.TagEventId;
-        BinaryPrimitives.WriteUInt32BigEndian(data.AsSpan(o, 4), state.RoundStartMs);
+        BinaryPrimitives.WriteUInt32BigEndian(data.Slice(o, 4), state.RoundStartMs);
         o += 4;
         var roles = state.RoleBySlot ?? new byte[ProtocolConstants.StableMaxPlayers];
         for (int i = 0; i < ProtocolConstants.StableMaxPlayers; i++)
             data[o++] = i < roles.Length ? roles[i] : (byte)HideSeekRole.Hider;
     }
+
+    private static void WriteGameModeState(byte[] data, ref int o, in CommGameModeState state) =>
+        WriteGameModeState(data.AsSpan(), ref o, state);
 
     private static PlayerSnapshot ReadSnapshot(byte[] data, ref int o)
     {
@@ -273,27 +314,32 @@ public static class CommBufferEndian
         return snap;
     }
 
-    private static void WriteSnapshot(byte[] data, ref int o, PlayerSnapshot snap)
+    private static void WriteSnapshot(Span<byte> data, ref int o, PlayerSnapshot snap)
     {
         WriteVec3(data, ref o, snap.Position);
         WriteVec3(data, ref o, snap.Velocity);
         WriteF32(data, ref o, snap.RotationY);
-        BinaryPrimitives.WriteUInt16BigEndian(data.AsSpan(o, 2), snap.AnimId); o += 2;
+        BinaryPrimitives.WriteUInt16BigEndian(data.Slice(o, 2), snap.AnimId); o += 2;
         data[o++] = snap.NozzleId;
         data[o++] = snap.Water;
         data[o++] = snap.Health;
         data[o++] = snap.StageId;
         data[o++] = snap.EpisodeId;
         data[o++] = snap.MovementState;
-        BinaryPrimitives.WriteUInt16BigEndian(data.AsSpan(o, 2), snap.ActionId); o += 2;
-        BinaryPrimitives.WriteUInt16BigEndian(data.AsSpan(o, 2), snap.VfxFlags); o += 2;
+        BinaryPrimitives.WriteUInt16BigEndian(data.Slice(o, 2), snap.ActionId); o += 2;
+        BinaryPrimitives.WriteUInt16BigEndian(data.Slice(o, 2), snap.VfxFlags); o += 2;
         data[o++] = snap.Connected;
         data[o++] = snap.Slot;
-        BinaryPrimitives.WriteUInt16BigEndian(data.AsSpan(o, 2), snap.PingMs); o += 2;
-        Array.Copy(snap.Name ?? new byte[16], 0, data, o, 16); o += 16;
-        BinaryPrimitives.WriteUInt16BigEndian(data.AsSpan(o, 2), snap.AnimFrame); o += 2;
-        BinaryPrimitives.WriteUInt16BigEndian(data.AsSpan(o, 2), snap.ActionIdHi); o += 2;
+        BinaryPrimitives.WriteUInt16BigEndian(data.Slice(o, 2), snap.PingMs); o += 2;
+        var name = snap.Name ?? new byte[16];
+        name.AsSpan(0, Math.Min(16, name.Length)).CopyTo(data.Slice(o, 16));
+        o += 16;
+        BinaryPrimitives.WriteUInt16BigEndian(data.Slice(o, 2), snap.AnimFrame); o += 2;
+        BinaryPrimitives.WriteUInt16BigEndian(data.Slice(o, 2), snap.ActionIdHi); o += 2;
     }
+
+    private static void WriteSnapshot(byte[] data, ref int o, PlayerSnapshot snap) =>
+        WriteSnapshot(data.AsSpan(), ref o, snap);
 
     private static Vec3 ReadVec3(byte[] data, ref int o)
     {
@@ -305,12 +351,15 @@ public static class CommBufferEndian
         };
     }
 
-    private static void WriteVec3(byte[] data, ref int o, Vec3 v)
+    private static void WriteVec3(Span<byte> data, ref int o, Vec3 v)
     {
         WriteF32(data, ref o, v.X);
         WriteF32(data, ref o, v.Y);
         WriteF32(data, ref o, v.Z);
     }
+
+    private static void WriteVec3(byte[] data, ref int o, Vec3 v) =>
+        WriteVec3(data.AsSpan(), ref o, v);
 
     private static float ReadF32(byte[] data, ref int o)
     {
@@ -319,9 +368,12 @@ public static class CommBufferEndian
         return BitConverter.UInt32BitsToSingle(bits);
     }
 
-    private static void WriteF32(byte[] data, ref int o, float value)
+    private static void WriteF32(Span<byte> data, ref int o, float value)
     {
-        BinaryPrimitives.WriteUInt32BigEndian(data.AsSpan(o, 4), BitConverter.SingleToUInt32Bits(value));
+        BinaryPrimitives.WriteUInt32BigEndian(data.Slice(o, 4), BitConverter.SingleToUInt32Bits(value));
         o += 4;
     }
+
+    private static void WriteF32(byte[] data, ref int o, float value) =>
+        WriteF32(data.AsSpan(), ref o, value);
 }

@@ -23,6 +23,9 @@ public sealed class NetClient : IDisposable
     private readonly HashSet<byte> _knownRosterSlots = new();
     private PlayerSnapshot _pendingSnapshot;
     private bool _hasPendingSnapshot;
+    private readonly byte[] _udpSendScratch =
+        new byte[ProtocolConstants.UdpSnapshotPayloadOffset + ProtocolConstants.PlayerSnapshotSize];
+    private readonly byte[] _heartbeatScratch = new byte[10];
 
     public event Action<PlayerRosterEntry[]>? RosterUpdated;
     public event Action<byte, byte, byte, byte>? WarpCommandReceived;
@@ -159,10 +162,10 @@ public sealed class NetClient : IDisposable
             if (!hasSnap || _udp == null || _udpServerEndpoint == null)
                 continue;
 
-            var bytes = PacketSerializer.BuildUdpSnapshot(_assignedSlot, ++_snapshotSeq, snap);
+            PacketSerializer.WriteUdpSnapshot(_udpSendScratch, _assignedSlot, ++_snapshotSeq, snap);
             try
             {
-                _udp.Send(bytes, bytes.Length, _udpServerEndpoint);
+                _udp.Send(_udpSendScratch, _udpSendScratch.Length, _udpServerEndpoint);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
@@ -471,11 +474,10 @@ public sealed class NetClient : IDisposable
 
             try
             {
-                var payload = new byte[10];
                 var sentMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-                BinaryPrimitives.WriteInt64LittleEndian(payload.AsSpan(0, 8), sentMs);
-                BinaryPrimitives.WriteUInt16LittleEndian(payload.AsSpan(8, 2), MeasuredPingMs);
-                await SendTcpAsync(PacketSerializer.BuildHeartbeat(payload), ct).ConfigureAwait(false);
+                BinaryPrimitives.WriteInt64LittleEndian(_heartbeatScratch.AsSpan(0, 8), sentMs);
+                BinaryPrimitives.WriteUInt16LittleEndian(_heartbeatScratch.AsSpan(8, 2), MeasuredPingMs);
+                await SendTcpAsync(PacketSerializer.BuildHeartbeat(_heartbeatScratch), ct).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
@@ -561,6 +563,16 @@ public sealed class NetClient : IDisposable
             return;
         }
 
-        _ = DisconnectInternalAsync(DisconnectReason.UserRequest, sendPacket: false);
+        try
+        {
+            DisconnectInternalAsync(DisconnectReason.UserRequest, sendPacket: false)
+                .WaitAsync(TimeSpan.FromMilliseconds(750))
+                .GetAwaiter()
+                .GetResult();
+        }
+        catch
+        {
+            DisposeResources();
+        }
     }
 }

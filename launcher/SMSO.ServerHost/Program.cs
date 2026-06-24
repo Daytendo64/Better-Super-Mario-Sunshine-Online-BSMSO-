@@ -19,7 +19,7 @@ var levels = File.Exists(levelsPath) ? LevelCatalog.Load(levelsPath) : new Level
 var server = new GameServer(levels) { MaxPlayers = maxPlayers };
 server.Log += msg => Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] {msg}");
 
-Console.WriteLine($"SMSO Dedicated Server — port {port}, max players {maxPlayers}");
+Console.WriteLine($"BSMSO Dedicated Server — port {port}, max players {maxPlayers}");
 Console.WriteLine("Press Ctrl+C to stop.");
 server.Start(port);
 

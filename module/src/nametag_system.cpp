@@ -41,6 +41,7 @@ static constexpr f32 kPerspectiveMeasureFill = 0.92f;
 static constexpr f32 kNominalFontSize = 22.0f;
 static constexpr f32 kMinFontSize = 5.0f;
 static constexpr f32 kMaxFontSize = 22.0f;
+static constexpr f32 kHideSeekFontSizeReduce = 2.0f;
 
 static constexpr f32 kScaleSmoothRate = 16.0f;
 static constexpr f32 kAlphaSmoothRate = 14.0f;
@@ -205,8 +206,8 @@ static f32 evaluateTargetFontSize(f32 cameraDistance, f32 anchorX, f32 anchorY, 
 static f32 evaluateHideSeekFontSize(f32 cameraDistance, f32 anchorX, f32 anchorY, f32 anchorZ) {
     f32 size = evaluateTargetFontSize(cameraDistance, anchorX, anchorY, anchorZ);
     if (size <= 0.0f)
-        size = kMinFontSize;
-    return size;
+        return kMinFontSize;
+    return clampf(size - kHideSeekFontSizeReduce, kMinFontSize, kMaxFontSize);
 }
 
 static f32 evaluateTargetAlpha(f32 cameraDistance) {
