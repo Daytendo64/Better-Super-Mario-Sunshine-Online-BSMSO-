@@ -18,9 +18,11 @@ New-Item -ItemType Directory -Force -Path $DistServer | Out-Null
 
 Push-Location $LauncherDir
 dotnet publish SMSO.Launcher\SMSO.Launcher.csproj -c Release -r win-x64 --self-contained true `
-    -p:PublishSingleFile=true -o $DistLauncher
+    -p:PublishSingleFile=true -p:EnableCompressionInSingleFile=false `
+    -p:IncludeNativeLibrariesForSelfExtract=true -o $DistLauncher
 dotnet publish SMSO.ServerHost\SMSO.ServerHost.csproj -c Release -r win-x64 --self-contained true `
-    -p:PublishSingleFile=true -o $DistServer
+    -p:PublishSingleFile=true -p:EnableCompressionInSingleFile=false `
+    -p:IncludeNativeLibrariesForSelfExtract=true -o $DistServer
 Pop-Location
 
 # Bundle level data
@@ -32,5 +34,46 @@ $serverAssetsDest = Join-Path $DistServer "assets"
 New-Item -ItemType Directory -Force -Path $serverAssetsDest | Out-Null
 Copy-Item (Join-Path $AssetsSrc "levels.ntsc-u.json") $serverAssetsDest -Force
 Copy-Item (Join-Path $AssetsSrc "episode-names.ntsc-u.json") $serverAssetsDest -Force
+
+# Optional Authenticode signing (set CODESIGN_PFX + CODESIGN_PASSWORD env vars)
+$pfxPath = $env:CODESIGN_PFX
+$pfxPassword = $env:CODESIGN_PASSWORD
+if ($pfxPath -and (Test-Path $pfxPath)) {
+    $signtool = Get-Command signtool.exe -ErrorAction SilentlyContinue
+    if ($signtool) {
+        $timestamp = "http://timestamp.digicert.com"
+        $exes = @(
+            (Join-Path $DistLauncher "BSMSO.Launcher.exe"),
+            (Join-Path $DistServer "SMSO.ServerHost.exe")
+        )
+        foreach ($exe in $exes) {
+            if (Test-Path $exe) {
+                if ($pfxPassword) {
+                    & signtool sign /fd SHA256 /tr $timestamp /td SHA256 /f $pfxPath /p $pfxPassword $exe
+                } else {
+                    & signtool sign /fd SHA256 /tr $timestamp /td SHA256 /f $pfxPath $exe
+                }
+            }
+        }
+        Write-Host "Signed published executables."
+    } else {
+        Write-Warning "signtool.exe not found - skipping code signing."
+    }
+}
+
+# Release checksums for SmartScreen / AV verification
+$checksumsPath = Join-Path $Root "dist\CHECKSUMS.txt"
+$hashLines = @()
+foreach ($dir in @($DistLauncher, $DistServer)) {
+    Get-ChildItem $dir -Filter *.exe | ForEach-Object {
+        $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash
+        $relative = $_.FullName.Substring($Root.Length + 1)
+        $hashLines += "$hash  $relative"
+    }
+}
+if ($hashLines.Count -gt 0) {
+    $hashLines | Set-Content $checksumsPath -Encoding UTF8
+    Write-Host "Wrote dist/CHECKSUMS.txt"
+}
 
 Write-Host "Published to dist/launcher and dist/server"

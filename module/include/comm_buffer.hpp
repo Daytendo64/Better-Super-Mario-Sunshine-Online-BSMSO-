@@ -6,7 +6,7 @@
 namespace smso {
 
 constexpr u32 COMM_MAGIC = 0x534D534F; // "SMSO"
-constexpr u16 COMM_VERSION = 4;
+constexpr u16 COMM_VERSION = 6;
 // Legacy scan hint for the launcher; the live buffer lives in module BSS.
 constexpr u32 COMM_GUEST_ADDRESS = 0x817FC000;
 constexpr u32 MAX_REMOTE_SLOTS = 9;
@@ -32,7 +32,14 @@ enum GameModeFlags : u8 {
 
 constexpr u32 COMM_GAME_MODE_STATE_SIZE = 13;
 constexpr u32 COMM_GAME_MODE_STATE_OFFSET = COMM_MARIO_VOICE_EVENTS_OFFSET + COMM_MARIO_VOICE_EVENTS_SIZE;
-constexpr u32 COMM_BUFFER_SIZE = COMM_GAME_MODE_STATE_OFFSET + COMM_GAME_MODE_STATE_SIZE;
+constexpr u32 COMM_WORLD_EVENT_SIZE = 15;
+constexpr u32 COMM_WORLD_SYNC_SIZE = COMM_WORLD_EVENT_SIZE * 2 + 4;
+constexpr u32 COMM_WORLD_SYNC_OFFSET = COMM_GAME_MODE_STATE_OFFSET + COMM_GAME_MODE_STATE_SIZE;
+constexpr u32 COMM_ROSTER_HUD_EVENT_SIZE = 20;
+constexpr u32 COMM_ROSTER_HUD_RING_SLOTS = 8;
+constexpr u32 COMM_ROSTER_HUD_SYNC_SIZE = 2 + COMM_ROSTER_HUD_RING_SLOTS * COMM_ROSTER_HUD_EVENT_SIZE;
+constexpr u32 COMM_ROSTER_HUD_OFFSET = COMM_WORLD_SYNC_OFFSET + COMM_WORLD_SYNC_SIZE;
+constexpr u32 COMM_BUFFER_SIZE = COMM_ROSTER_HUD_OFFSET + COMM_ROSTER_HUD_SYNC_SIZE;
 constexpr u32 COMM_NAME_TAG_APPEARANCES_OFFSET = 688;
 constexpr u32 COMM_NAME_TAG_APPEARANCES_SIZE = 100;
 constexpr u32 PLAYER_SNAPSHOT_SIZE = 64;
@@ -51,7 +58,6 @@ enum BridgeFlags : u32 {
     BF_SYNC_SECRET = 1 << 9,
     BF_SYNC_OBJECTS = 1 << 10,
     BF_SYNC_PROGRESS = 1 << 11,
-    BF_SKIP_ENTRY_DEMO = 1 << 12, // set by consumeWarpIntent; skip startcamera on next stage
     BF_WARP_TO_POINT = 1 << 13,   // apply warpPos* after stage load (or immediately if same stage)
     BF_WARP_ALL = 1 << 14,        // warp command explicitly targets every connected slot
 };
@@ -463,6 +469,59 @@ struct GameModeState {
 
 static_assert(sizeof(GameModeState) == COMM_GAME_MODE_STATE_SIZE, "GameModeState size mismatch");
 
+enum WorldEventType : u8 {
+    WE_SHINE_COLLECTED = 1,
+    WE_BLUE_COIN_COLLECTED = 2,
+    WE_EPISODE_COMPLETE = 3,
+    WE_STORY_FLAG = 4,
+    WE_TRIGGER_FLAG = 5,
+    WE_SECRET_COMPLETE = 6,
+    WE_GOLD_COIN_COLLECTED = 7,
+    WE_RED_COIN_COLLECTED = 9,
+};
+
+struct CommWorldEvent {
+    u32 eventId;
+    u16 sequence;
+    u8 type;
+    u8 courseId;
+    u8 episodeId;
+    u8 payload0;
+    u8 reserved;
+    u32 payload1;
+};
+
+static_assert(sizeof(CommWorldEvent) == COMM_WORLD_EVENT_SIZE, "CommWorldEvent size mismatch");
+
+struct WorldSyncState {
+    CommWorldEvent localPending;
+    CommWorldEvent incoming;
+    u32 lastAppliedEventId;
+};
+
+static_assert(sizeof(WorldSyncState) == COMM_WORLD_SYNC_SIZE, "WorldSyncState size mismatch");
+
+enum RosterHudEventKind : u8 {
+    RHE_NONE = 0,
+    RHE_CONNECTED = 1,
+    RHE_DISCONNECTED = 2,
+};
+
+struct RosterHudEvent {
+    u16 sequence;
+    u8 kind;
+    u8 slot;
+    char name[MAX_PLAYER_NAME];
+};
+
+struct RosterHudSync {
+    u16 latestSequence;
+    RosterHudEvent events[COMM_ROSTER_HUD_RING_SLOTS];
+};
+
+static_assert(sizeof(RosterHudEvent) == COMM_ROSTER_HUD_EVENT_SIZE, "RosterHudEvent size mismatch");
+static_assert(sizeof(RosterHudSync) == COMM_ROSTER_HUD_SYNC_SIZE, "RosterHudSync size mismatch");
+
 struct CommBuffer {
     u32 magic;
     u16 version;
@@ -485,6 +544,8 @@ struct CommBuffer {
     MarioVoiceEvent localMarioVoiceEvent;
     MarioVoiceEvent remoteMarioVoiceEvents[MAX_REMOTE_SLOTS];
     GameModeState gameModeState;
+    WorldSyncState worldSync;
+    RosterHudSync rosterHud;
 };
 
 #pragma pack(pop)

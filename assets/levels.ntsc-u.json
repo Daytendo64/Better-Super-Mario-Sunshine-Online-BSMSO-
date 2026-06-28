@@ -161,7 +161,16 @@
       "courseId": 7,
       "displayName": "Sirena Beach \u2014 Hotel Interior",
       "warpable": true,
-      "episodes": [{ "episodeId": 0, "displayName": "Episode 1 \u2014 Mysterious Hotel Delfino" }]
+      "episodes": [
+        { "episodeId": 2, "displayName": "Episode 3 \u2014 Mysterious Hotel Delfino" },
+        { "episodeId": 7, "displayName": "Episode 8 \u2014 Red Coins in the Hotel" }
+      ]
+    },
+    {
+      "courseId": 56,
+      "displayName": "Sirena Beach \u2014 King Boo Down Below",
+      "warpable": true,
+      "episodes": [{ "episodeId": 0, "displayName": "Episode 1 \u2014 King Boo Down Below" }]
     },
     {
       "courseId": 14,

@@ -25,6 +25,7 @@ public sealed class DolphinBridge : IDisposable
     private readonly byte[] _remoteVoiceScratch =
         new byte[ProtocolConstants.MarioVoiceEventSize * ProtocolConstants.MaxRemoteSlots];
     private readonly byte[] _gameModeScratch = new byte[ProtocolConstants.CommGameModeStateSize];
+    private readonly byte[] _incomingWorldEventScratch = new byte[ProtocolConstants.CommWorldEventSize];
 
     private const int AttachFailureBackoffMs = 500;
     private const int AttachStatusLogCooldownMs = 6000;
@@ -570,6 +571,22 @@ public sealed class DolphinBridge : IDisposable
             var bytes = CommBufferEndian.ToGameModeStateDolphinBytes(state);
             var address = new UIntPtr(MailboxHost.ToUInt64() + ProtocolConstants.CommGameModeStateOffset);
             return TryWriteProcessMemoryLocked(address, bytes);
+        }
+    }
+
+    public bool TryWriteIncomingWorldEventOnly(in CommWorldEvent incoming)
+    {
+        lock (_processLock)
+        {
+            if (_processHandle == IntPtr.Zero)
+                return false;
+
+            if (!_mailbox.IsResolved && !TryResolveMailboxAddressLocked())
+                return false;
+
+            CommBufferEndian.WriteIncomingWorldEventInto(_incomingWorldEventScratch, incoming);
+            var address = new UIntPtr(MailboxHost.ToUInt64() + ProtocolConstants.CommIncomingWorldEventOffset);
+            return TryWriteProcessMemoryLocked(address, _incomingWorldEventScratch);
         }
     }
 

@@ -29,20 +29,26 @@ public sealed class BridgeWorker : IDisposable
     private bool _dolphinRunning;
     private bool _pendingConnectionWrite;
     private bool _loggedConnectionPending;
+    private bool _remoteClearPending;
     private PlayerSnapshot[]? _cachedRemoteSnapshots;
     private byte _lastRestoredStageId;
     private byte _lastRestoredEpisodeId;
     private ushort _lastLocalMarioVoiceSequence;
+    private ushort _lastLocalWorldEventSequence;
     private GameModeStatePacket _gameModeState = GameModeStatePacket.CreateDefault();
     private ushort _lastGameModeSeq;
     private NameTagAppearance _savedLocalAppearance = NameTagAppearance.CreateDefault();
     private readonly Dictionary<byte, NameTagAppearance> _savedRemoteAppearances = new();
+    private int _remoteSyncWriteFailStreak;
+    private DateTime _lastRemoteSyncFailLogUtc = DateTime.MinValue;
+    private ushort _rosterHudNextSequence;
 
     public GameModeStatePacket CurrentGameModeState => _gameModeState.Clone();
 
     public event Action<CommBuffer>? BufferUpdated;
     public event Action<PlayerSnapshot>? LocalSnapshotReady;
     public event Action<MarioVoiceEvent>? LocalMarioVoiceReady;
+    public event Action<WorldEventRequest>? LocalWorldEventReady;
     public event Action<string>? Log;
     public event Action<DolphinLinkState>? LinkStateChanged;
 
@@ -148,9 +154,19 @@ public sealed class BridgeWorker : IDisposable
             }
 
             if (connected)
+            {
                 _workingBuffer.BridgeFlags |= BridgeFlags.Connected;
+                _workingBuffer.WorldSync.LastAppliedEventId = 0;
+                _workingBuffer.WorldSync.Incoming = default;
+                _workingBuffer.WorldSync.LocalPending = default;
+                _lastLocalWorldEventSequence = 0;
+            }
             else
+            {
                 _workingBuffer.BridgeFlags &= ~BridgeFlags.Connected;
+                _rosterHudNextSequence = 0;
+                _workingBuffer.RosterHud = CommRosterHudSync.CreateDefault();
+            }
 
             if (isHost)
                 _workingBuffer.BridgeFlags |= BridgeFlags.Host;
@@ -202,7 +218,37 @@ public sealed class BridgeWorker : IDisposable
         }
 
         _interpolation.Remove(slot);
+        _remoteClearPending = true;
         FlushInterpolatedRemotes(force: true);
+    }
+
+    /// <summary>Push roster join/leave to the in-game HUD as soon as TCP roster updates arrive.</summary>
+    public void EnqueueRosterHudEvent(RosterHudEventKind kind, byte slot, string username)
+    {
+        if (kind == RosterHudEventKind.None)
+            return;
+
+        lock (_bufferLock)
+        {
+            if (!EnsureWorkingBuffer())
+                return;
+
+            _rosterHudNextSequence++;
+            var idx = (ushort)((_rosterHudNextSequence - 1) % ProtocolConstants.CommRosterHudRingSlots);
+            var ev = new CommRosterHudEvent
+            {
+                Sequence = _rosterHudNextSequence,
+                Kind = kind,
+                Slot = slot,
+                Name = new byte[16],
+            };
+            ev.SetPlayerName(username);
+            _workingBuffer.RosterHud.Events ??= CommRosterHudSync.CreateDefault().Events;
+            _workingBuffer.RosterHud.Events[idx] = ev;
+            _workingBuffer.RosterHud.LatestSequence = _rosterHudNextSequence;
+        }
+
+        TryWriteWorkingBuffer();
     }
 
     public void PushRemoteMarioVoiceEvent(byte slot, in MarioVoiceEvent voiceEvent)
@@ -347,6 +393,7 @@ public sealed class BridgeWorker : IDisposable
         }
 
         _interpolation.Clear();
+        _remoteClearPending = true;
         FlushInterpolatedRemotes(force: true);
     }
 
@@ -378,7 +425,8 @@ public sealed class BridgeWorker : IDisposable
         CommGameModeState commGameMode;
         lock (_bufferLock)
         {
-            if (!force && _remoteRaw.Count == 0 && _gameModeState.GameMode != GameMode.HideSeek)
+            if (!force && _remoteRaw.Count == 0 && _gameModeState.GameMode != GameMode.HideSeek &&
+                !_remoteClearPending)
                 return;
 
             if (liveBuffer.HasValue)
@@ -441,6 +489,11 @@ public sealed class BridgeWorker : IDisposable
             remoteVoiceEvents = _remoteMarioVoiceEvents;
         }
 
+        // Only skip during boot — Loading/Warping skips left remotes starved when blocked
+        // loading zones wedged mGameState in WARPING during otherwise normal play.
+        if (liveBuffer.HasValue && liveBuffer.Value.DolphinState is DolphinState.Booting)
+            return;
+
         if (!_bridge.TryWriteRemoteSyncPayload(
                 remoteCopy,
                 localAppearance,
@@ -448,8 +501,23 @@ public sealed class BridgeWorker : IDisposable
                 remoteVoiceEvents,
                 commGameMode))
         {
-            Log?.Invoke("Failed to write remote sync payload to Dolphin");
+            _remoteSyncWriteFailStreak++;
+            var now = DateTime.UtcNow;
+            if (now - _lastRemoteSyncFailLogUtc >= TimeSpan.FromSeconds(2))
+            {
+                var suffix = _remoteSyncWriteFailStreak > 1
+                    ? $" ({_remoteSyncWriteFailStreak} consecutive failures)"
+                    : string.Empty;
+                Log?.Invoke($"Failed to write remote sync payload to Dolphin{suffix}");
+                _lastRemoteSyncFailLogUtc = now;
+                _remoteSyncWriteFailStreak = 0;
+            }
+
+            return;
         }
+
+        _remoteSyncWriteFailStreak = 0;
+        _remoteClearPending = false;
     }
 
     private void MaybeRestoreRemoteSnapshotsAfterStageChange(CommBuffer buffer)
@@ -488,7 +556,8 @@ public sealed class BridgeWorker : IDisposable
             else _workingBuffer.BridgeFlags &= ~BridgeFlags.SyncProgress;
         }
 
-        TryWriteWorkingBuffer();
+        if (TryWriteWorkingBuffer())
+            Log?.Invoke($"Bridge sync flags applied: flags={syncFlags} objects={syncObjects} progress={syncProgress}");
     }
 
     private async Task PollLoop(CancellationToken ct)
@@ -518,6 +587,7 @@ public sealed class BridgeWorker : IDisposable
                             if (buffer.LocalSnapshot.Connected != 0 || (buffer.BridgeFlags & BridgeFlags.Connected) != 0)
                                 LocalSnapshotReady?.Invoke(buffer.LocalSnapshot);
                             MaybePublishLocalMarioVoice(buffer.LocalMarioVoiceEvent);
+                            MaybePublishLocalWorldEvent(buffer.WorldSync.LocalPending);
 
                             MaybeRestoreRemoteSnapshotsAfterStageChange(buffer);
                         }
@@ -570,7 +640,8 @@ public sealed class BridgeWorker : IDisposable
             }
         }
 
-        if (liveBuffer.HasValue && liveBuffer.Value.Magic == ProtocolConstants.Magic)
+        if (liveBuffer.HasValue && liveBuffer.Value.Magic == ProtocolConstants.Magic &&
+            liveBuffer.Value.Version == ProtocolConstants.CommVersion)
             SetLinkState(DolphinLinkState.ModuleReady);
         else
             SetLinkState(DolphinLinkState.Attached);
@@ -664,6 +735,50 @@ public sealed class BridgeWorker : IDisposable
 
         _lastLocalMarioVoiceSequence = voiceEvent.Sequence;
         LocalMarioVoiceReady?.Invoke(voiceEvent);
+    }
+
+    private void MaybePublishLocalWorldEvent(CommWorldEvent worldEvent)
+    {
+        if (worldEvent.IsEmpty || worldEvent.Sequence == _lastLocalWorldEventSequence)
+            return;
+
+        _lastLocalWorldEventSequence = worldEvent.Sequence;
+        LocalWorldEventReady?.Invoke(new WorldEventRequest(
+            worldEvent.Sequence,
+            worldEvent.Type,
+            worldEvent.CourseId,
+            worldEvent.EpisodeId,
+            worldEvent.Payload0,
+            worldEvent.Reserved,
+            worldEvent.Payload1));
+    }
+
+    public void PushIncomingWorldEvent(in WorldEventPacket packet)
+    {
+        lock (_bufferLock)
+        {
+            if (!EnsureWorkingBuffer())
+                return;
+
+            _workingBuffer.WorldSync.Incoming = packet.ToIncomingEvent();
+            if (_hasWorkingBuffer)
+                _bridge.TryWriteIncomingWorldEventOnly(_workingBuffer.WorldSync.Incoming);
+        }
+    }
+
+    public bool TryGetLastAppliedEventId(out uint lastAppliedEventId)
+    {
+        lock (_bufferLock)
+        {
+            if (_bridge.IsAttached && _bridge.TryReadBuffer(out var buffer) && buffer.Magic == ProtocolConstants.Magic)
+            {
+                _workingBuffer = buffer;
+                _hasWorkingBuffer = true;
+            }
+
+            lastAppliedEventId = _workingBuffer.WorldSync.LastAppliedEventId;
+            return _hasWorkingBuffer;
+        }
     }
 
     private bool TryWriteWorkingBuffer()

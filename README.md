@@ -1,4 +1,5 @@
-# Better Super Mario Sunshine Online (BSMSO)
+# BSMSO (Better Super Mario Sunshine Online)
+
 Online multiplayer mod for Super Mario Sunshine via Dolphin Emulator and [Better Sunshine Engine (BSE)](https://github.com/DotKuribo/BetterSunshineEngine).
 
 Each player runs their own Dolphin instance. A dedicated server relays player state; the BSMSO launcher bridges Dolphin memory to the network via a RAM mailbox.

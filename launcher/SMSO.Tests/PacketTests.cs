@@ -97,6 +97,89 @@ public class PacketTests
     }
 
     [Fact]
+    public void WorldEventRequest_RoundTrip_PreservesFields()
+    {
+        var request = new WorldEventRequest(42, WorldEventType.ShineCollected, 5, 2, 17, 3, 0);
+
+        var frame = PacketSerializer.BuildWorldEventRequest(request);
+
+        Assert.True(PacketSerializer.TryUnwrapTcp(frame, out var id, out var payload));
+        Assert.Equal(TcpPacketId.WorldEvent, id);
+        Assert.True(PacketSerializer.TryReadWorldEventRequest(payload, out var restored));
+        Assert.Equal(42, restored.Sequence);
+        Assert.Equal(WorldEventType.ShineCollected, restored.Type);
+        Assert.Equal((byte)5, restored.CourseId);
+        Assert.Equal((byte)17, restored.Payload0);
+        Assert.Equal((byte)3, restored.Reserved);
+    }
+
+    [Fact]
+    public void WorldEventBroadcast_RoundTrip_PreservesFields()
+    {
+        var packet = new WorldEventPacket(99, WorldEventType.GoldCoinCollected, 3, 1, 0, 0, 42);
+
+        var frame = PacketSerializer.BuildWorldEventBroadcast(packet);
+
+        Assert.True(PacketSerializer.TryUnwrapTcp(frame, out var id, out var payload));
+        Assert.Equal(TcpPacketId.WorldEvent, id);
+        Assert.True(PacketSerializer.TryReadWorldEventBroadcast(payload, out var restored));
+        Assert.Equal(99u, restored.EventId);
+        Assert.Equal(WorldEventType.GoldCoinCollected, restored.Type);
+        Assert.Equal(42u, restored.Payload1);
+    }
+
+    [Fact]
+    public void WorldEventBroadcast_RedCoinEvents_RoundTrip()
+    {
+        var coinEvent = new WorldEventPacket(101, WorldEventType.RedCoinCollected, 2, 3, 0x24, 2, 0x205);
+        var coinFrame = PacketSerializer.BuildWorldEventBroadcast(coinEvent);
+        Assert.True(PacketSerializer.TryUnwrapTcp(coinFrame, out _, out var coinPayload));
+        Assert.True(PacketSerializer.TryReadWorldEventBroadcast(coinPayload, out var restoredCoin));
+        Assert.Equal(WorldEventType.RedCoinCollected, restoredCoin.Type);
+        Assert.Equal((byte)0x24, restoredCoin.Payload0);
+        Assert.Equal((byte)2, restoredCoin.Reserved);
+        Assert.Equal(0x205u, restoredCoin.Payload1);
+
+        var shineEvent = new WorldEventPacket(102, WorldEventType.ShineCollected, 1, 2, 117, 0, 0xABCDEF);
+        var shineFrame = PacketSerializer.BuildWorldEventBroadcast(shineEvent);
+        Assert.True(PacketSerializer.TryUnwrapTcp(shineFrame, out _, out var shinePayload));
+        Assert.True(PacketSerializer.TryReadWorldEventBroadcast(shinePayload, out var restoredShine));
+        Assert.Equal((byte)117, restoredShine.Payload0);
+        Assert.Equal((byte)0, restoredShine.Reserved);
+        Assert.Equal(0xABCDEFu, restoredShine.Payload1);
+    }
+
+    [Fact]
+    public void WorldStateReplay_RoundTrip_PreservesEvents()
+    {
+        var events = new[]
+        {
+            new WorldEventPacket(1, WorldEventType.RedCoinCollected, 2, 3, 0x14, 2, 0x205),
+            new WorldEventPacket(2, WorldEventType.ShineCollected, 2, 3, 17, 0, 0xABCDEF),
+            new WorldEventPacket(3, WorldEventType.BlueCoinCollected, 2, 3, 5, 0, 0),
+        };
+
+        var payload = new byte[2 + events.Length * ProtocolConstants.WorldEventBroadcastPayloadSize];
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(payload.AsSpan(0, 2), (ushort)events.Length);
+        var offset = 2;
+        foreach (var packet in events)
+        {
+            var frame = PacketSerializer.BuildWorldEventBroadcast(packet);
+            Assert.True(PacketSerializer.TryUnwrapTcp(frame, out _, out var eventPayload));
+            eventPayload.AsSpan().CopyTo(payload.AsSpan(offset));
+            offset += ProtocolConstants.WorldEventBroadcastPayloadSize;
+        }
+
+        Assert.True(PacketSerializer.TryReadWorldStateReplay(payload, out var restored));
+        Assert.Equal(events.Length, restored.Length);
+        Assert.Equal(WorldEventType.RedCoinCollected, restored[0].Type);
+        Assert.Equal((byte)17, restored[1].Payload0);
+        Assert.Equal((byte)0, restored[1].Reserved);
+        Assert.Equal(0xABCDEFu, restored[1].Payload1);
+        Assert.Equal((byte)5, restored[2].Payload0);
+    }
+
+    [Fact]
     public void ClientTeleportSettings_RoundTrip()
     {
         var frame = PacketSerializer.BuildClientTeleportSettings(true);

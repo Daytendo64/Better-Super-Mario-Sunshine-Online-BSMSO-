@@ -102,6 +102,60 @@ public class CommBufferTests
     }
 
     [Fact]
+    public void DolphinEndian_RoundTrip_PreservesWorldSyncState()
+    {
+        var buf = CommBuffer.CreateDefault();
+        buf.WorldSync.LocalPending = new CommWorldEvent
+        {
+            Sequence = 9,
+            Type = WorldEventType.BlueCoinCollected,
+            CourseId = 2,
+            EpisodeId = 1,
+            Payload0 = 7,
+            Payload1 = 0,
+        };
+        buf.WorldSync.Incoming = new CommWorldEvent
+        {
+            EventId = 55,
+            Type = WorldEventType.ShineCollected,
+            CourseId = 2,
+            EpisodeId = 1,
+            Payload0 = 3,
+            Payload1 = 0,
+        };
+        buf.WorldSync.LastAppliedEventId = 54;
+
+        var restored = CommBufferEndian.FromDolphinBytes(CommBufferEndian.ToDolphinBytes(buf));
+
+        Assert.Equal(9, restored.WorldSync.LocalPending.Sequence);
+        Assert.Equal(WorldEventType.BlueCoinCollected, restored.WorldSync.LocalPending.Type);
+        Assert.Equal(55u, restored.WorldSync.Incoming.EventId);
+        Assert.Equal(54u, restored.WorldSync.LastAppliedEventId);
+    }
+
+    [Fact]
+    public void DolphinEndian_RoundTrip_PreservesRosterHudSync()
+    {
+        var buf = CommBuffer.CreateDefault();
+        buf.RosterHud.LatestSequence = 2;
+        buf.RosterHud.Events[1] = new CommRosterHudEvent
+        {
+            Sequence = 2,
+            Kind = RosterHudEventKind.Disconnected,
+            Slot = 3,
+            Name = new byte[16],
+        };
+        buf.RosterHud.Events[1].SetPlayerName("Luigi");
+
+        var restored = CommBufferEndian.FromDolphinBytes(CommBufferEndian.ToDolphinBytes(buf));
+
+        Assert.Equal(2, restored.RosterHud.LatestSequence);
+        Assert.Equal(RosterHudEventKind.Disconnected, restored.RosterHud.Events[1].Kind);
+        Assert.Equal(3, restored.RosterHud.Events[1].Slot);
+        Assert.Equal("Luigi", restored.RosterHud.Events[1].GetPlayerName());
+    }
+
+    [Fact]
     public void DolphinEndian_RoundTrip_PreservesFourPlayerRemoteSlots()
     {
         var buf = CommBuffer.CreateDefault();

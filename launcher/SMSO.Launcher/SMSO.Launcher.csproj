@@ -14,7 +14,13 @@
     <AssemblyName>BSMSO.Launcher</AssemblyName>
     <Product>BSMSO</Product>
     <AssemblyTitle>BSMSO Launcher</AssemblyTitle>
+    <ApplicationIcon>Assets\bsmso.ico</ApplicationIcon>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
   </PropertyGroup>
+
+  <ItemGroup>
+    <Resource Include="Assets\bsmso.ico" />
+  </ItemGroup>
 
   <ItemGroup>
     <Content Include="..\..\assets\levels.ntsc-u.json">

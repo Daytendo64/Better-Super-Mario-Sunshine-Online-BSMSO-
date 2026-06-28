@@ -4,7 +4,7 @@ public static class ProtocolConstants
 {
     public const uint Magic = 0x534D534F;
     public const ushort ProtocolVersion = 1;
-    public const ushort CommVersion = 4;
+    public const ushort CommVersion = 6;
     public const int DefaultPort = 27015;
     public const int StableMaxPlayers = 4;
     public const int MaxPlayers = 10;
@@ -14,7 +14,17 @@ public static class ProtocolConstants
     public const int CommMarioVoiceEventsSize = MarioVoiceEventSize * MaxPlayers;
     public const int CommGameModeStateSize = 13;
     public const int CommGameModeStateOffset = CommMarioVoiceEventsOffset + CommMarioVoiceEventsSize;
-    public const int CommBufferSize = CommGameModeStateOffset + CommGameModeStateSize;
+    public const int CommWorldEventSize = 15;
+    public const int CommWorldSyncSize = CommWorldEventSize * 2 + 4;
+    public const int CommWorldSyncOffset = CommGameModeStateOffset + CommGameModeStateSize;
+    public const int CommIncomingWorldEventOffset = CommWorldSyncOffset + CommWorldEventSize;
+    public const int CommRosterHudEventSize = 20;
+    public const int CommRosterHudRingSlots = 8;
+    public const int CommRosterHudSyncSize = 2 + CommRosterHudEventSize * CommRosterHudRingSlots;
+    public const int CommRosterHudOffset = CommWorldSyncOffset + CommWorldSyncSize;
+    public const int CommBufferSize = CommRosterHudOffset + CommRosterHudSyncSize;
+    public const int WorldEventClientPayloadSize = 11;
+    public const int WorldEventBroadcastPayloadSize = 13;
     public const int CommNameTagAppearancesOffset = 688;
     public const int CommNameTagAppearancesSize = 100;
     public const int CommBridgeControlOffset = 6;
@@ -34,8 +44,6 @@ public static class ProtocolConstants
     public const int ConnectTimeoutMs = 10000;
     public const int RosterBroadcastIntervalMs = 200;
     public const int ReconnectWindowMs = 30000;
-    /// <summary>Consecutive roster misses before evicting a remote player snapshot.</summary>
-    public const int RosterMissEvictThreshold = 3;
     public const byte WarpNoTarget = 0xFC;
     public const byte WarpAllSlots = 0xFF;
 }
@@ -59,6 +67,7 @@ public enum TcpPacketId : byte
     MarioVoiceEvent = 15,
     ClientTeleportSettings = 16,
     GameModeState = 17,
+    WorldStateReplay = 18,
 }
 
 public enum UdpPacketId : byte
@@ -102,7 +111,6 @@ public enum BridgeFlags : uint
     SyncSecret = 1 << 9,
     SyncObjects = 1 << 10,
     SyncProgress = 1 << 11,
-    SkipEntryDemo = 1 << 12,
     WarpToPoint = 1 << 13,
     WarpAll = 1 << 14,
 }
@@ -131,6 +139,13 @@ public enum VfxFlags : ushort
     NoFludd = 1 << 9, // FLUDD pack hidden on Mario's back (stolen / on Yoshi)
 }
 
+public enum RosterHudEventKind : byte
+{
+    None = 0,
+    Connected = 1,
+    Disconnected = 2,
+}
+
 public enum WorldEventType : byte
 {
     ShineCollected = 1,
@@ -139,4 +154,6 @@ public enum WorldEventType : byte
     StoryFlag = 4,
     TriggerFlag = 5,
     SecretComplete = 6,
+    GoldCoinCollected = 7,
+    RedCoinCollected = 9,
 }

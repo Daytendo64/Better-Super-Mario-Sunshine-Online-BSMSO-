@@ -1,8 +1,32 @@
 <UserControl x:Class="SMSO.Launcher.Controls.FastSelector"
              xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:net="clr-namespace:SMSO.Net;assembly=SMSO.Net"
              MinHeight="32"
              Focusable="True">
+    <UserControl.Resources>
+        <DataTemplate x:Key="WarpCourseItemTemplate" DataType="{x:Type net:WarpCourseListItem}">
+            <StackPanel>
+                <TextBlock Text="{Binding Group}"
+                           Margin="0,6,0,2"
+                           FontWeight="SemiBold"
+                           FontSize="12"
+                           Foreground="{StaticResource SmsAccent}">
+                    <TextBlock.Style>
+                        <Style TargetType="TextBlock">
+                            <Setter Property="Visibility" Value="Collapsed"/>
+                            <Style.Triggers>
+                                <DataTrigger Binding="{Binding ShowGroupHeader}" Value="True">
+                                    <Setter Property="Visibility" Value="Visible"/>
+                                </DataTrigger>
+                            </Style.Triggers>
+                        </Style>
+                    </TextBlock.Style>
+                </TextBlock>
+                <TextBlock Text="{Binding DisplayName}"/>
+            </StackPanel>
+        </DataTemplate>
+    </UserControl.Resources>
     <Grid>
         <Border x:Name="MainBorder"
                 Background="{StaticResource SmsSurfaceAlt}"
@@ -52,7 +76,7 @@
                     BorderThickness="1"
                     MinWidth="{Binding ActualWidth, ElementName=MainBorder}">
                 <ListBox x:Name="ItemsList"
-                         MaxHeight="280"
+                         MaxHeight="320"
                          Background="{StaticResource SmsPopup}"
                          BorderThickness="0"
                          ScrollViewer.HorizontalScrollBarVisibility="Disabled"

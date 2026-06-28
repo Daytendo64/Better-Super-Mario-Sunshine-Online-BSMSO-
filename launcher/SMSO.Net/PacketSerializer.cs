@@ -180,6 +180,111 @@ public static class PacketSerializer
         return true;
     }
 
+    public static byte[] BuildWorldEventRequest(in WorldEventRequest request)
+    {
+        var payload = new byte[ProtocolConstants.WorldEventClientPayloadSize];
+        BinaryPrimitives.WriteUInt16LittleEndian(payload.AsSpan(0, 2), request.Sequence);
+        payload[2] = (byte)request.Type;
+        payload[3] = request.CourseId;
+        payload[4] = request.EpisodeId;
+        payload[5] = request.Payload0;
+        payload[6] = request.Reserved;
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(7, 4), request.Payload1);
+        return WrapTcp(TcpPacketId.WorldEvent, payload);
+    }
+
+    public static bool TryReadWorldEventRequest(ReadOnlySpan<byte> payload, out WorldEventRequest request)
+    {
+        request = default;
+        if (payload.Length < ProtocolConstants.WorldEventClientPayloadSize)
+            return false;
+
+        var sequence = BinaryPrimitives.ReadUInt16LittleEndian(payload.Slice(0, 2));
+        var type = (WorldEventType)payload[2];
+        if (sequence == 0 || type == 0)
+            return false;
+
+        request = new WorldEventRequest(
+            sequence,
+            type,
+            payload[3],
+            payload[4],
+            payload[5],
+            payload[6],
+            BinaryPrimitives.ReadUInt32LittleEndian(payload.Slice(7, 4)));
+        return true;
+    }
+
+    public static byte[] BuildWorldEventBroadcast(in WorldEventPacket packet)
+    {
+        var payload = new byte[ProtocolConstants.WorldEventBroadcastPayloadSize];
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(0, 4), packet.EventId);
+        payload[4] = (byte)packet.Type;
+        payload[5] = packet.CourseId;
+        payload[6] = packet.EpisodeId;
+        payload[7] = packet.Payload0;
+        payload[8] = packet.Reserved;
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(9, 4), packet.Payload1);
+        return WrapTcp(TcpPacketId.WorldEvent, payload);
+    }
+
+    public static bool TryReadWorldEventBroadcast(ReadOnlySpan<byte> payload, out WorldEventPacket packet)
+    {
+        packet = default;
+        if (payload.Length < ProtocolConstants.WorldEventBroadcastPayloadSize)
+            return false;
+
+        var eventId = BinaryPrimitives.ReadUInt32LittleEndian(payload.Slice(0, 4));
+        var type = (WorldEventType)payload[4];
+        if (eventId == 0 || type == 0)
+            return false;
+
+        var payload1 = BinaryPrimitives.ReadUInt32LittleEndian(payload.Slice(9, 4));
+        packet = new WorldEventPacket(
+            eventId,
+            type,
+            payload[5],
+            payload[6],
+            payload[7],
+            payload[8],
+            payload1);
+        return true;
+    }
+
+    public static bool TryReadWorldStateReplay(ReadOnlySpan<byte> payload, out WorldEventPacket[] events)
+    {
+        events = Array.Empty<WorldEventPacket>();
+        if (payload.Length < 2)
+            return false;
+
+        var count = BinaryPrimitives.ReadUInt16LittleEndian(payload.Slice(0, 2));
+        var expected = 2 + count * ProtocolConstants.WorldEventBroadcastPayloadSize;
+        if (payload.Length != expected)
+            return false;
+
+        if (count == 0)
+        {
+            events = Array.Empty<WorldEventPacket>();
+            return true;
+        }
+
+        var parsed = new WorldEventPacket[count];
+        var offset = 2;
+        for (var i = 0; i < count; ++i)
+        {
+            if (!TryReadWorldEventBroadcast(payload.Slice(offset, ProtocolConstants.WorldEventBroadcastPayloadSize),
+                    out parsed[i]))
+            {
+                return false;
+            }
+
+            offset += ProtocolConstants.WorldEventBroadcastPayloadSize;
+        }
+
+        events = parsed;
+        return true;
+    }
+
     public static byte[] BuildUdpRegister(ushort udpPort)
     {
         var buf = new byte[2];
@@ -190,20 +295,12 @@ public static class PacketSerializer
     public static byte[] BuildUdpSnapshot(byte slot, uint seq, in PlayerSnapshot snap)
     {
         var bytes = new byte[ProtocolConstants.UdpSnapshotPayloadOffset + ProtocolConstants.PlayerSnapshotSize];
-        WriteUdpSnapshot(bytes, slot, seq, snap);
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(0, 4), ProtocolConstants.Magic);
+        bytes[4] = (byte)UdpPacketId.PlayerSnapshot;
+        bytes[5] = slot;
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(6, 4), seq);
+        SnapshotToBytes(snap, bytes.AsSpan(ProtocolConstants.UdpSnapshotPayloadOffset, ProtocolConstants.PlayerSnapshotSize));
         return bytes;
-    }
-
-    public static void WriteUdpSnapshot(Span<byte> dest, byte slot, uint seq, in PlayerSnapshot snap)
-    {
-        if (dest.Length < ProtocolConstants.UdpSnapshotPayloadOffset + ProtocolConstants.PlayerSnapshotSize)
-            throw new ArgumentException("UDP snapshot buffer is too small.", nameof(dest));
-
-        BinaryPrimitives.WriteUInt32LittleEndian(dest.Slice(0, 4), ProtocolConstants.Magic);
-        dest[4] = (byte)UdpPacketId.PlayerSnapshot;
-        dest[5] = slot;
-        BinaryPrimitives.WriteUInt32LittleEndian(dest.Slice(6, 4), seq);
-        SnapshotToBytes(snap, dest.Slice(ProtocolConstants.UdpSnapshotPayloadOffset, ProtocolConstants.PlayerSnapshotSize));
     }
 
     public static byte[] SnapshotToBytes(PlayerSnapshot snap)

@@ -27,6 +27,16 @@
 - Do not load SMSCoop with SMSO
 - Ensure `_SMSO.kxe` is built for your BSE version
 
+## Windows SmartScreen / antivirus warnings
+
+BSMSO reads and writes Dolphin's memory to sync multiplayer state. That pattern is common in game trainers and can trigger **false positives** from Defender or SmartScreen on unsigned builds.
+
+- Prefer the published build from `dist/launcher` after running `tools/publish.ps1`
+- Verify SHA-256 hashes in `dist/CHECKSUMS.txt` match your download
+- SmartScreen **"Unknown publisher"** is expected until the project is code-signed; set `CODESIGN_PFX` when publishing to sign releases
+- If attach fails, try **Run as administrator** — the launcher does not require admin by default
+- You may add a Defender exclusion for the BSMSO install folder; do not disable antivirus globally
+
 ## Logs
 
 Open **Help** tab → **Open Logs Folder**, or `%AppData%\SMSO\logs\`

@@ -225,7 +225,7 @@ internal static class DolphinMemoryMap
             return false;
         if (!anchor[..4].SequenceEqual(MagicBytes))
             return false;
-        if (BinaryPrimitives.ReadUInt16BigEndian(anchor.Slice(4, 2)) == 0)
+        if (BinaryPrimitives.ReadUInt16BigEndian(anchor.Slice(4, 2)) != ProtocolConstants.CommVersion)
             return false;
         if (BinaryPrimitives.ReadUInt16BigEndian(anchor.Slice(6, 2)) != 0)
             return false;
@@ -248,7 +248,7 @@ internal static class DolphinMemoryMap
             return false;
 
         var version = BinaryPrimitives.ReadUInt16BigEndian(header.AsSpan(4, 2));
-        if (version == 0)
+        if (version != ProtocolConstants.CommVersion)
             return false;
 
         if (TryParseAnchor(header.AsSpan(0, CommMailboxAnchorSize), out _))

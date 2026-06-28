@@ -41,6 +41,8 @@ public static class CommBufferEndian
         for (int i = 0; i < buf.RemoteMarioVoiceEvents.Length; i++)
             buf.RemoteMarioVoiceEvents[i] = ReadMarioVoiceEvent(data, ref o);
         buf.GameModeState = ReadGameModeState(data, ref o);
+        buf.WorldSync = ReadWorldSyncState(data, ref o);
+        buf.RosterHud = ReadRosterHudSync(data, ref o);
         return buf;
     }
 
@@ -133,6 +135,8 @@ public static class CommBufferEndian
         foreach (var voiceEvent in buffer.RemoteMarioVoiceEvents ?? CommBuffer.CreateRemoteMarioVoiceEventArray())
             WriteMarioVoiceEvent(data, ref o, voiceEvent);
         WriteGameModeState(data, ref o, buffer.GameModeState);
+        WriteWorldSyncState(data, ref o, buffer.WorldSync);
+        WriteRosterHudSync(data, ref o, buffer.RosterHud);
         return data;
     }
 
@@ -255,6 +259,114 @@ public static class CommBufferEndian
 
     private static void WriteMarioVoiceEvent(byte[] data, ref int o, MarioVoiceEvent voiceEvent) =>
         WriteMarioVoiceEvent(data.AsSpan(), ref o, voiceEvent);
+
+    public static byte[] ToIncomingWorldEventDolphinBytes(in CommWorldEvent incoming)
+    {
+        var data = new byte[ProtocolConstants.CommWorldEventSize];
+        WriteIncomingWorldEventInto(data, incoming);
+        return data;
+    }
+
+    public static void WriteIncomingWorldEventInto(Span<byte> dest, in CommWorldEvent incoming)
+    {
+        if (dest.Length < ProtocolConstants.CommWorldEventSize)
+            throw new ArgumentException("Incoming world event buffer is too small.", nameof(dest));
+
+        int o = 0;
+        WriteWorldEvent(dest, ref o, incoming);
+    }
+
+    private static CommWorldSyncState ReadWorldSyncState(byte[] data, ref int o)
+    {
+        var state = new CommWorldSyncState
+        {
+            LocalPending = ReadWorldEvent(data, ref o),
+            Incoming = ReadWorldEvent(data, ref o),
+            LastAppliedEventId = BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(o, 4)),
+        };
+        o += 4;
+        return state;
+    }
+
+    private static void WriteWorldSyncState(Span<byte> data, ref int o, in CommWorldSyncState state)
+    {
+        WriteWorldEvent(data, ref o, state.LocalPending);
+        WriteWorldEvent(data, ref o, state.Incoming);
+        BinaryPrimitives.WriteUInt32BigEndian(data.Slice(o, 4), state.LastAppliedEventId);
+        o += 4;
+    }
+
+    private static CommRosterHudSync ReadRosterHudSync(byte[] data, ref int o)
+    {
+        var sync = CommRosterHudSync.CreateDefault();
+        sync.LatestSequence = BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(o, 2));
+        o += 2;
+        for (int i = 0; i < sync.Events.Length; i++)
+            sync.Events[i] = ReadRosterHudEvent(data, ref o);
+        return sync;
+    }
+
+    private static void WriteRosterHudSync(Span<byte> data, ref int o, in CommRosterHudSync sync)
+    {
+        BinaryPrimitives.WriteUInt16BigEndian(data.Slice(o, 2), sync.LatestSequence);
+        o += 2;
+        var events = sync.Events ?? CommRosterHudSync.CreateDefault().Events;
+        for (int i = 0; i < ProtocolConstants.CommRosterHudRingSlots; i++)
+            WriteRosterHudEvent(data, ref o, i < events.Length ? events[i] : default);
+    }
+
+    private static CommRosterHudEvent ReadRosterHudEvent(byte[] data, ref int o)
+    {
+        var ev = new CommRosterHudEvent { Name = new byte[16] };
+        ev.Sequence = BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(o, 2));
+        o += 2;
+        ev.Kind = (RosterHudEventKind)data[o++];
+        ev.Slot = data[o++];
+        Array.Copy(data, o, ev.Name, 0, 16);
+        o += 16;
+        return ev;
+    }
+
+    private static void WriteRosterHudEvent(Span<byte> data, ref int o, in CommRosterHudEvent ev)
+    {
+        BinaryPrimitives.WriteUInt16BigEndian(data.Slice(o, 2), ev.Sequence);
+        o += 2;
+        data[o++] = (byte)ev.Kind;
+        data[o++] = ev.Slot;
+        var name = ev.Name ?? new byte[16];
+        name.AsSpan(0, 16).CopyTo(data.Slice(o, 16));
+        o += 16;
+    }
+
+    private static CommWorldEvent ReadWorldEvent(byte[] data, ref int o)
+    {
+        var worldEvent = new CommWorldEvent
+        {
+            EventId = BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(o, 4)),
+            Sequence = BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(o + 4, 2)),
+            Type = (WorldEventType)data[o + 6],
+            CourseId = data[o + 7],
+            EpisodeId = data[o + 8],
+            Payload0 = data[o + 9],
+            Reserved = data[o + 10],
+            Payload1 = BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(o + 11, 4)),
+        };
+        o += ProtocolConstants.CommWorldEventSize;
+        return worldEvent;
+    }
+
+    private static void WriteWorldEvent(Span<byte> data, ref int o, in CommWorldEvent worldEvent)
+    {
+        BinaryPrimitives.WriteUInt32BigEndian(data.Slice(o, 4), worldEvent.EventId);
+        BinaryPrimitives.WriteUInt16BigEndian(data.Slice(o + 4, 2), worldEvent.Sequence);
+        data[o + 6] = (byte)worldEvent.Type;
+        data[o + 7] = worldEvent.CourseId;
+        data[o + 8] = worldEvent.EpisodeId;
+        data[o + 9] = worldEvent.Payload0;
+        data[o + 10] = worldEvent.Reserved;
+        BinaryPrimitives.WriteUInt32BigEndian(data.Slice(o + 11, 4), worldEvent.Payload1);
+        o += ProtocolConstants.CommWorldEventSize;
+    }
 
     private static CommGameModeState ReadGameModeState(byte[] data, ref int o)
     {

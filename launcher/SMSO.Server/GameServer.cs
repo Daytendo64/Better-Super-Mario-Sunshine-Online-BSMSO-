@@ -11,6 +11,7 @@ public sealed class GameServer : IDisposable
     private readonly LevelCatalog _levels;
     private readonly ConcurrentDictionary<byte, ClientSession> _sessions = new();
     private readonly Dictionary<string, byte> _usernames = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, (byte Slot, DateTime ReleasedUtc)> _recentReleases = new(StringComparer.OrdinalIgnoreCase);
     private readonly object _lock = new();
 
     private TcpListener? _tcpListener;
@@ -23,6 +24,10 @@ public sealed class GameServer : IDisposable
     private int _maxPlayers = ProtocolConstants.StableMaxPlayers;
     private DateTime _lastRosterBroadcastUtc = DateTime.MinValue;
     private readonly HideSeekService _hideSeek;
+    private readonly WorldEventRelay _worldEvents = new();
+    private readonly RedCoinAuthority _redCoinAuthority = new();
+    private readonly ShineAuthority _shineAuthority = new();
+    private readonly BlueCoinAuthority _blueCoinAuthority = new();
 
     public event Action<string>? Log;
     public event Action<PlayerRosterEntry[]>? RosterChanged;
@@ -52,8 +57,7 @@ public sealed class GameServer : IDisposable
 
         _udp = new UdpClient(AddressFamily.InterNetwork);
         _udp.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-        _udp.Client.ReceiveBufferSize = 65536;
-        _udp.Client.SendBufferSize = 65536;
+        ConfigureUdpSocketForServer(_udp.Client);
         _udp.Client.Bind(new IPEndPoint(IPAddress.Any, port));
 
         IsRunning = true;
@@ -78,6 +82,7 @@ public sealed class GameServer : IDisposable
         {
             _sessions.Clear();
             _usernames.Clear();
+            _recentReleases.Clear();
         }
         _hideSeek.Reset();
         Log?.Invoke("Server stopped");
@@ -256,8 +261,15 @@ public sealed class GameServer : IDisposable
                             accepted[0] = session.Slot;
                             roster.CopyTo(accepted, 1);
                             await stream.WriteAsync(PacketSerializer.WrapTcp(TcpPacketId.JoinAccepted, accepted), ct);
+                            await stream.WriteAsync(PacketSerializer.BuildSyncSettings(_syncFlags, _syncObjects, _syncProgress), ct);
                             await stream.WriteAsync(PacketSerializer.BuildClientTeleportSettings(_allowClientTeleport), ct);
                             await stream.WriteAsync(PacketSerializer.BuildGameModeState(_hideSeek.CurrentState), ct);
+                            if (_syncFlags && _worldEvents.History.Count > 0)
+                            {
+                                await stream.WriteAsync(_worldEvents.BuildWorldStateReplay(), ct);
+                                Log?.Invoke(
+                                    $"World sync: replayed {_worldEvents.History.Count} events to slot {session.Slot}");
+                            }
                             MaybeBroadcastRoster(force: true);
                             break;
 
@@ -301,8 +313,14 @@ public sealed class GameServer : IDisposable
                             {
                                 var port = BinaryPrimitives.ReadUInt16LittleEndian(payload.AsSpan(0, 2));
                                 var tcpEp = (IPEndPoint)session.Tcp.Client.RemoteEndPoint!;
-                                session.UdpEndPoint = new IPEndPoint(tcpEp.Address, port);
-                                Log?.Invoke($"UDP registered for slot {session.Slot} at {session.UdpEndPoint}");
+                                var endpoint = new IPEndPoint(tcpEp.Address, port);
+                                if (session.UdpEndPoint == null ||
+                                    !session.UdpEndPoint.Equals(endpoint))
+                                {
+                                    session.UdpEndPoint = endpoint;
+                                    session.LastSnapshotSeq = 0;
+                                    Log?.Invoke($"UDP registered for slot {session.Slot} at {session.UdpEndPoint}");
+                                }
                             }
                             break;
 
@@ -315,6 +333,97 @@ public sealed class GameServer : IDisposable
                                 break;
                             }
                             BroadcastTcp(PacketSerializer.BuildMarioVoiceEvent(session.Slot, voiceEvent));
+                            break;
+
+                        case TcpPacketId.WorldEvent:
+                            if (session == null || !_syncFlags)
+                                break;
+
+                            if (!PacketSerializer.TryReadWorldEventRequest(payload, out var worldRequest))
+                                break;
+
+                            byte[]? broadcast = null;
+                            switch (worldRequest.Type)
+                            {
+                                case WorldEventType.RedCoinCollected:
+                                    if (!_redCoinAuthority.TryAcceptCollected(worldRequest, out var coinPayload0,
+                                            out var coinReserved, out var coinPayload1))
+                                    {
+                                        Log?.Invoke(
+                                            $"World sync: rejected duplicate red coin index course={worldRequest.CourseId}/{worldRequest.EpisodeId} slot={session.Slot} reserved={worldRequest.Reserved} payload1={worldRequest.Payload1}");
+                                        break;
+                                    }
+
+                                    broadcast = _worldEvents.CreateWorldEvent(
+                                        worldRequest.Type,
+                                        worldRequest.CourseId,
+                                        worldRequest.EpisodeId,
+                                        coinPayload0,
+                                        coinReserved,
+                                        coinPayload1);
+                                    break;
+
+                                default:
+                                {
+                                    switch (worldRequest.Type)
+                                    {
+                                        case WorldEventType.ShineCollected:
+                                            if (!_shineAuthority.TryAccept(worldRequest.Payload0))
+                                            {
+                                                Log?.Invoke(
+                                                    $"World sync: rejected duplicate shine id={worldRequest.Payload0} slot={session.Slot}");
+                                                break;
+                                            }
+
+                                            broadcast = _worldEvents.CreateWorldEvent(
+                                                worldRequest.Type,
+                                                worldRequest.CourseId,
+                                                worldRequest.EpisodeId,
+                                                worldRequest.Payload0,
+                                                worldRequest.Reserved,
+                                                worldRequest.Payload1);
+                                            break;
+
+                                        case WorldEventType.BlueCoinCollected:
+                                            if (!_blueCoinAuthority.TryAccept(worldRequest.CourseId, worldRequest.Payload0))
+                                            {
+                                                Log?.Invoke(
+                                                    $"World sync: rejected duplicate blue coin course={worldRequest.CourseId} index={worldRequest.Payload0} slot={session.Slot}");
+                                                break;
+                                            }
+
+                                            broadcast = _worldEvents.CreateWorldEvent(
+                                                worldRequest.Type,
+                                                worldRequest.CourseId,
+                                                worldRequest.EpisodeId,
+                                                worldRequest.Payload0,
+                                                worldRequest.Reserved,
+                                                worldRequest.Payload1);
+                                            break;
+
+                                        default:
+                                        {
+                                            broadcast = _worldEvents.CreateWorldEvent(
+                                                worldRequest.Type,
+                                                worldRequest.CourseId,
+                                                worldRequest.EpisodeId,
+                                                worldRequest.Payload0,
+                                                worldRequest.Reserved,
+                                                worldRequest.Payload1);
+                                            break;
+                                        }
+                                    }
+
+                                    break;
+                                }
+                            }
+
+                            if (broadcast == null)
+                                break;
+
+                            BroadcastTcp(broadcast);
+                            Log?.Invoke(
+                                $"World sync: slot {session.Slot} type={worldRequest.Type} course={worldRequest.CourseId}/{worldRequest.EpisodeId} payload0={worldRequest.Payload0} reserved={worldRequest.Reserved} payload1={worldRequest.Payload1}");
                             break;
                     }
                 }
@@ -332,31 +441,24 @@ public sealed class GameServer : IDisposable
         if (!_hideSeek.CurrentState.TagActive)
             return;
 
-        var updatedRole = _hideSeek.CurrentState.GetRole(updatedSlot);
-        if (updatedRole != (byte)HideSeekRole.Seeker && updatedRole != (byte)HideSeekRole.Hider)
-            return;
-
         ClientSession[] peers;
         lock (_lock)
             peers = _sessions.Values.ToArray();
 
         var nowMs = Environment.TickCount64;
-        var updatedIsSeeker = updatedRole == (byte)HideSeekRole.Seeker;
-
         foreach (var other in peers)
         {
-            if (other.Slot == updatedSlot || other.LastSnapshot.Connected == 0)
+            if (other.Slot == updatedSlot)
+                continue;
+            if (other.LastSnapshot.Connected == 0)
                 continue;
 
-            var otherRole = _hideSeek.CurrentState.GetRole(other.Slot);
             var otherLagSeconds = other.LastSnapshotReceivedMs == 0
                 ? 0f
                 : MathF.Min((nowMs - other.LastSnapshotReceivedMs) / 1000f, HideSeekService.TagLagCompensationMaxSeconds);
 
-            if (updatedIsSeeker && otherRole == (byte)HideSeekRole.Hider)
-                _hideSeek.ProcessSnapshot(updatedSlot, snap, other.Slot, other.LastSnapshot, 0f, otherLagSeconds);
-            else if (!updatedIsSeeker && otherRole == (byte)HideSeekRole.Seeker)
-                _hideSeek.ProcessSnapshot(other.Slot, other.LastSnapshot, updatedSlot, snap, otherLagSeconds, 0f);
+            _hideSeek.ProcessSnapshot(updatedSlot, snap, other.Slot, other.LastSnapshot, 0f, otherLagSeconds);
+            _hideSeek.ProcessSnapshot(other.Slot, other.LastSnapshot, updatedSlot, snap, otherLagSeconds, 0f);
         }
     }
 
@@ -366,6 +468,9 @@ public sealed class GameServer : IDisposable
         lock (_lock)
         {
             if (_sessions.Count >= _maxPlayers) return null;
+
+            PruneExpiredReleases();
+
             for (byte i = 0; i < _maxPlayers; i++)
             {
                 if (!_sessions.ContainsKey(i))
@@ -386,45 +491,122 @@ public sealed class GameServer : IDisposable
         return null;
     }
 
+    private void PruneExpiredReleases()
+    {
+        var now = DateTime.UtcNow;
+        foreach (var name in _recentReleases.Keys.ToArray())
+        {
+            if ((now - _recentReleases[name].ReleasedUtc).TotalMilliseconds > ProtocolConstants.ReconnectWindowMs)
+                _recentReleases.Remove(name);
+        }
+    }
+
     private bool TryRegisterName(ClientSession session, string name, out JoinRejectReason reason)
     {
         reason = JoinRejectReason.None;
-        if (string.IsNullOrWhiteSpace(name) || name.Length < 3 || name.Length > 16)
-        {
-            reason = JoinRejectReason.InvalidName;
-            return false;
-        }
-        if (!name.All(c => char.IsLetterOrDigit(c) || c == '_'))
+        if (!PlayerNameValidator.TryValidate(name, out _))
         {
             reason = JoinRejectReason.InvalidName;
             return false;
         }
         lock (_lock)
         {
-            if (_usernames.TryGetValue(name, out var existing) && existing != session.Slot)
+            PruneExpiredReleases();
+
+            if (_usernames.TryGetValue(name, out var existingSlot) && existingSlot != session.Slot)
             {
-                reason = JoinRejectReason.NameTaken;
-                return false;
+                if (_sessions.TryGetValue(existingSlot, out var existingSession))
+                {
+                    if (IsSessionTcpAlive(existingSession))
+                    {
+                        reason = JoinRejectReason.NameTaken;
+                        return false;
+                    }
+
+                    EvictSessionLocked(existingSession);
+                    BroadcastRoster();
+                }
+                else
+                {
+                    _usernames.Remove(name);
+                }
             }
+
             _usernames[name] = session.Slot;
             session.Username = name;
             session.State = DolphinState.Booting;
             session.StageId = 0;
             session.EpisodeId = 0;
             session.LastSnapshotSeq = 0;
+            session.LastSnapshot = default;
+            session.LastSnapshotReceivedMs = 0;
+            session.UdpEndPoint = null;
+            _recentReleases.Remove(name);
         }
         return true;
+    }
+
+    private static bool IsSessionTcpAlive(ClientSession session)
+    {
+        try
+        {
+            return session.Tcp.Connected;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private void EvictSessionLocked(ClientSession session)
+    {
+        _sessions.TryRemove(session.Slot, out _);
+        if (!string.IsNullOrEmpty(session.Username))
+        {
+            _recentReleases[session.Username] = (session.Slot, DateTime.UtcNow);
+            _usernames.Remove(session.Username);
+        }
+
+        try
+        {
+            if (session.Tcp.Connected)
+                session.Tcp.GetStream().Write(PacketSerializer.BuildDisconnect(DisconnectReason.Timeout));
+        }
+        catch
+        {
+            // socket already closed
+        }
+
+        try { session.Tcp.Close(); } catch { }
+
+        session.LastSnapshot = default;
+        session.LastSnapshotSeq = 0;
+        session.LastSnapshotReceivedMs = 0;
+        session.UdpEndPoint = null;
+
+        Log?.Invoke($"Evicted stale session for slot {session.Slot}");
     }
 
     private void RemoveSession(ClientSession? session, DisconnectReason reason = DisconnectReason.Timeout)
     {
         if (session == null) return;
+
+        var removed = false;
         lock (_lock)
         {
-            _sessions.TryRemove(session.Slot, out _);
-            if (!string.IsNullOrEmpty(session.Username))
-                _usernames.Remove(session.Username);
+            if (_sessions.TryRemove(session.Slot, out _))
+            {
+                removed = true;
+                if (!string.IsNullOrEmpty(session.Username))
+                {
+                    _recentReleases[session.Username] = (session.Slot, DateTime.UtcNow);
+                    _usernames.Remove(session.Username);
+                }
+            }
         }
+
+        if (!removed)
+            return;
 
         try
         {
@@ -438,11 +620,33 @@ public sealed class GameServer : IDisposable
 
         try { session.Tcp.Close(); } catch { }
 
+        session.LastSnapshot = default;
+        session.LastSnapshotSeq = 0;
+        session.LastSnapshotReceivedMs = 0;
+        session.UdpEndPoint = null;
+
         if (_hideSeek.CurrentState.GameMode == GameMode.HideSeek)
-            _hideSeek.SetGameMode(GameMode.Normal);
+        {
+            if (session.IsHost)
+            {
+                _hideSeek.SetGameMode(GameMode.Normal);
+                Log?.Invoke("Hide & Seek stopped — host disconnected.");
+            }
+            else
+            {
+                _hideSeek.OnPlayerDisconnected(session.Slot);
+            }
+        }
 
         BroadcastRoster();
         Log?.Invoke($"Player left slot {session.Slot}");
+        // #region agent log
+        AgentDebugLog.Write("B", "GameServer.RemoveSession", "session removed", new
+        {
+            slot = session.Slot,
+            reason = reason.ToString(),
+        });
+        // #endregion
     }
 
     private byte[] BuildRoster()
@@ -516,7 +720,8 @@ public sealed class GameServer : IDisposable
                 if (BinaryPrimitives.ReadUInt32LittleEndian(result.Buffer.AsSpan(0, 4)) != ProtocolConstants.Magic)
                     continue;
 
-                if (!TryApplySnapshotFromUdp(result.Buffer, result.RemoteEndPoint))
+                var applied = TryApplySnapshotFromUdp(result.Buffer, result.RemoteEndPoint);
+                if (!applied)
                     continue;
 
                 ClientSession[] peers;
@@ -534,13 +739,69 @@ public sealed class GameServer : IDisposable
                     {
                         _udp.Send(buffer, length, s.UdpEndPoint);
                     }
-                    catch
+                    catch (Exception ex)
                     {
-                        // client gone
+                        // #region agent log
+                        AgentDebugLog.Write("B", "GameServer.UdpRelayLoop", "relay send failed", new
+                        {
+                            targetSlot = s.Slot,
+                            target = s.UdpEndPoint.ToString(),
+                            error = ex.Message,
+                        });
+                        // #endregion
                     }
                 }
             }
-            catch when (ct.IsCancellationRequested) { break; }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (SocketException ex) when (ex.SocketErrorCode is SocketError.ConnectionReset
+                                                 or SocketError.NetworkReset
+                                                 or SocketError.Interrupted)
+            {
+                // Windows ICMP port-unreachable after relaying to a dead client poisons UDP recv.
+                // #region agent log
+                AgentDebugLog.Write("A", "GameServer.UdpRelayLoop", "recv reset recovered", new
+                {
+                    error = ex.SocketErrorCode.ToString(),
+                });
+                // #endregion
+                Log?.Invoke($"UDP recv reset ({ex.SocketErrorCode}) — continuing relay");
+            }
+            catch (Exception ex) when (!ct.IsCancellationRequested)
+            {
+                // #region agent log
+                AgentDebugLog.Write("A", "GameServer.UdpRelayLoop", "recv error recovered", new
+                {
+                    error = ex.Message,
+                });
+                // #endregion
+                Log?.Invoke($"UDP relay error: {ex.Message}");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Windows sends ICMP port-unreachable when relaying to a disconnected client's UDP port.
+    /// Without SIO_UDP_CONNRESET disabled, the next ReceiveAsync throws and kills the relay loop.
+    /// </summary>
+    private static void ConfigureUdpSocketForServer(Socket socket)
+    {
+        socket.ReceiveBufferSize = 65536;
+        socket.SendBufferSize = 65536;
+
+        if (!OperatingSystem.IsWindows())
+            return;
+
+        try
+        {
+            const int SioUdpConnReset = -1744830452; // SIO_UDP_CONNRESET
+            socket.IOControl((IOControlCode)SioUdpConnReset, new byte[] { 0, 0, 0, 0 }, null);
+        }
+        catch
+        {
+            // Non-fatal — relay loop also catches ConnectionReset above.
         }
     }
 
@@ -550,8 +811,27 @@ public sealed class GameServer : IDisposable
         if ((UdpPacketId)buffer[4] != UdpPacketId.PlayerSnapshot) return false;
 
         var slot = buffer[5];
-        if (!_sessions.TryGetValue(slot, out var session)) return false;
-        if (session.UdpEndPoint == null || !session.UdpEndPoint.Equals(sender)) return false;
+        if (!_sessions.TryGetValue(slot, out var session))
+            return false;
+
+        if (session.UdpEndPoint == null)
+        {
+            session.UdpEndPoint = sender;
+            session.LastSnapshotSeq = 0;
+            Log?.Invoke($"UDP auto-bound for slot {slot} at {sender}");
+        }
+        else if (!session.UdpEndPoint.Equals(sender))
+        {
+            // #region agent log
+            AgentDebugLog.Write("C", "GameServer.TryApplySnapshotFromUdp", "endpoint mismatch", new
+            {
+                slot,
+                sender = sender.ToString(),
+                expected = session.UdpEndPoint.ToString(),
+            });
+            // #endregion
+            return false;
+        }
 
         var seq = BinaryPrimitives.ReadUInt32LittleEndian(buffer.AsSpan(6, 4));
         if (session.LastSnapshotSeq != 0 && (int)(seq - session.LastSnapshotSeq) <= 0)
@@ -573,6 +853,7 @@ public sealed class GameServer : IDisposable
         session.LastSnapshot = snap;
         session.LastSnapshotReceivedMs = Environment.TickCount64;
         ProcessHideSeekTagsForSnapshot(slot, snap);
+        _hideSeek.ProcessHiderDeath(slot, snap);
         MaybeBroadcastRoster(force: locationChanged);
         return true;
     }
@@ -585,8 +866,11 @@ public sealed class GameServer : IDisposable
             var now = DateTime.UtcNow;
             foreach (var s in _sessions.Values.ToArray())
             {
-                if ((now - s.LastSeen).TotalMilliseconds > ProtocolConstants.DisconnectTimeoutMs)
+                if (!IsSessionTcpAlive(s) ||
+                    (now - s.LastSeen).TotalMilliseconds > ProtocolConstants.DisconnectTimeoutMs)
+                {
                     RemoveSession(s);
+                }
             }
         }
     }

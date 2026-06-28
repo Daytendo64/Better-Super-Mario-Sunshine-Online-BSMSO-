@@ -1,19 +1,18 @@
 #include "puppets.hpp"
 #include "comm_buffer.hpp"
 #include "hide_seek.hpp"
+#include "stage_guard.hpp"
+#include "yoshi_sync.hpp"
 
 #include <BetterSMS/loading.hxx>
-#include <BetterSMS/player.hxx>
 #include <Dolphin/mem.h>
 #include <Dolphin/string.h>
 #include <Dolphin/types.h>
 #include <SMS/Camera/PolarSubCamera.hxx>
-#include <SMS/GC2D/GCConsole2.hxx>
 #include <SMS/Manager/FlagManager.hxx>
 #include <SMS/Map/BGCheck.hxx>
 #include <SMS/Player/Mario.hxx>
 #include <SMS/Player/Watergun.hxx>
-#include <SMS/Player/MarioGamePad.hxx>
 #include <SMS/System/Application.hxx>
 #include <SMS/System/MarDirector.hxx>
 #include <SMS/macros.h>
@@ -25,9 +24,6 @@ extern TApplication gpApplication;
 extern CPolarSubCamera *gpCamera;
 
 namespace smso {
-
-static void smso_entrySkipPlayerUpdate(TMario *player, bool isLocalMario);
-static void smso_onMarioLoadAfter(TMario *player);
 
 // Retail FLUDD pack visibility on Mario's back (Super Mario Wiki / GameFAQs):
 // - Hidden when riding Yoshi (pack is on Yoshi, not Mario).
@@ -63,24 +59,71 @@ static constexpr DelfinoPlazaEpisode kDelfinoPlazaEpisodes[] = {
     {7, 2}, // dolpic10 — post-flood (scenario 2, not 10)
 };
 
-static u8 resolveWarpScenario(u8 areaId, u8 catalogEpisodeId) {
-    if (areaId != kDelfinoPlazaAreaId)
-        return catalogEpisodeId;
-    for (const auto &ep : kDelfinoPlazaEpisodes) {
+// Sirena hotel interior (area 7): only delfino0/2/4 stage files load; 6 and 7 crash to title.
+// timenoe/RAScripts: Sirena ep 8 red coins use logical episode 5 → scenario 4.
+struct SirenaHotelEpisode {
+    u8 catalogId;
+    u8 loadScenario;
+    u8 missionEpisode;
+};
+
+struct WarpTarget {
+    u8 loadScenario;
+    u8 missionEpisode;
+};
+
+static constexpr u8 kSirenaBeachAreaId = 6;
+static constexpr u8 kSirenaHotelAreaId = 7;
+static constexpr u8 kInvalidHotelMission = 0xFF;
+// Survives stageExit/clearPuppets — set in consumeWarpIntent, consumed in applyHotelWarpMissionOverride.
+// doldecomp/BSE Stage::getStageName indexes mStageArchiveAry by episode; delfino6 is missing on disc.
+static u8 s_hotelMissionEpisodeSync = kInvalidHotelMission;
+static u8 s_hotelWarpDemoSkipFrames = 0;
+
+struct ResolvedWarp {
+    u8 areaId;
+    WarpTarget target;
+};
+
+static constexpr SirenaHotelEpisode kSirenaHotelEpisodes[] = {
+    {0, 0, 0}, // delfino0 lobby
+    {2, 2, 2}, // Sirena ep 3 — Mysterious Hotel Delfino
+    {6, 0, 6}, // Sirena ep 7 — Shadow Mario (delfino0 map, ep7 mission scripts)
+    {7, 4, 4}, // Sirena ep 8 — Red Coins (logical ep 5 → scenario 4)
+};
+
+static WarpTarget resolveHotelWarpTarget(u8 catalogEpisodeId) {
+    for (const auto &ep : kSirenaHotelEpisodes) {
         if (ep.catalogId == catalogEpisodeId)
-            return ep.scenarioId;
+            return {ep.loadScenario, ep.missionEpisode};
     }
-    return catalogEpisodeId;
+    return {catalogEpisodeId, catalogEpisodeId};
 }
 
-static u8 normalizeEpisodeForNetwork(u8 areaId, u8 scenarioId) {
-    if (areaId != kDelfinoPlazaAreaId)
-        return scenarioId;
-    for (const auto &ep : kDelfinoPlazaEpisodes) {
-        if (ep.scenarioId == scenarioId)
-            return ep.catalogId;
+static WarpTarget resolveWarpTarget(u8 areaId, u8 catalogEpisodeId) {
+    if (areaId == kSirenaHotelAreaId)
+        return resolveHotelWarpTarget(catalogEpisodeId);
+
+    if (areaId == kDelfinoPlazaAreaId) {
+        for (const auto &ep : kDelfinoPlazaEpisodes) {
+            if (ep.catalogId == catalogEpisodeId)
+                return {ep.scenarioId, ep.scenarioId};
+        }
     }
-    return scenarioId;
+
+    return {catalogEpisodeId, catalogEpisodeId};
+}
+
+// Shadow Mario / hotel red coins play inside area 7 even when launched from Sirena Beach (area 6).
+static ResolvedWarp resolveFullWarp(u8 areaId, u8 catalogEpisodeId) {
+    if (areaId == kSirenaBeachAreaId && (catalogEpisodeId == 6 || catalogEpisodeId == 7))
+        return {kSirenaHotelAreaId, resolveHotelWarpTarget(catalogEpisodeId)};
+
+    return {areaId, resolveWarpTarget(areaId, catalogEpisodeId)};
+}
+
+static u8 resolveWarpScenario(u8 areaId, u8 catalogEpisodeId) {
+    return resolveWarpTarget(areaId, catalogEpisodeId).missionEpisode;
 }
 
 // doldecomp CPolarSubCamera::mCurrentTarget.mPitch @ 0xA4 (BSE names the field _02).
@@ -209,6 +252,10 @@ static u16 buildVfxFlags(TMario *mario) {
     if (mario->mState == TMario::STATE_DEATH || mario->mAttributes.mIsGameOver)
         vfx |= VFX_DEAD;
 
+    // Hide & seek: death recovery can clamp game-over before UDP snapshots reach the server.
+    if ((vfx & VFX_DEAD) == 0 && shouldForceHideSeekDeadSnapshot())
+        vfx |= VFX_DEAD;
+
     if (hostUsesWetSlideParticles(mario))
         vfx |= VFX_WET_SLIDE;
 
@@ -229,6 +276,11 @@ static u16 buildVfxFlags(TMario *mario) {
 }
 
 static u8 mapGameStateToDolphin(u8 gameState) {
+    // During normal stage play, publish Active even if a blocked loading zone left
+    // mGameState stuck in WARPING — keeps bridge remote sync alive (SMSO visibility).
+    if (gpMarDirector && gpMarDirector->mCurState == TMarDirector::STATE_NORMAL)
+        return DS_ACTIVE;
+
     switch (gameState) {
     case 0x00:
         return DS_LOADING;
@@ -244,8 +296,6 @@ static u8 mapGameStateToDolphin(u8 gameState) {
 
 void initPuppets() {
     publishMailboxAnchor();
-    BetterSMS::Player::addUpdateCallback(smso_entrySkipPlayerUpdate);
-    BetterSMS::Player::addLoadAfterCallback(smso_onMarioLoadAfter);
 }
 
 // doldecomp: ANIM_TURN keeps mModelFaceAngle at pre-turn root; ANIM_TRNED / turnEnd()
@@ -310,9 +360,22 @@ static s16 exportSnapshotYaw(TMario *mario) {
     return yaw;
 }
 
+static void detachLocalSurfGessoIfDying(TMario *mario) {
+    if (!mario)
+        return;
+
+    if (mario->mState == TMario::STATE_DEATH || mario->mAttributes.mIsGameOver ||
+        mario->mHealth <= 0) {
+        mario->mSurfGesso = nullptr;
+        mario->mSurfGessoID = 0;
+    }
+}
+
 void exportLocalPlayer(TMario *mario, TMarDirector *director) {
     if (!mario || !director)
         return;
+
+    detachLocalSurfGessoIfDying(mario);
 
     publishMailboxAnchor();
     CommBuffer *buf = getCommBuffer();
@@ -353,7 +416,8 @@ void exportLocalPlayer(TMario *mario, TMarDirector *director) {
     snap.health = packAnimAux(exportHandIndex(mario),
                               mario->mFludd ? readFluddDeploy(mario->mFludd) : 0.0f);
     snap.stageId = director->mAreaID;
-    snap.episodeId = normalizeEpisodeForNetwork(director->mAreaID, director->mEpisodeID);
+    // Raw in-game scenario index; launcher server normalizes Delfino Plaza for roster display.
+    snap.episodeId = director->mEpisodeID;
     // Offset 0x380 is named mFluddUsageState in the BSE header, but doldecomp
     // identifies it as Mario's upper-body state. Sync it so remote FLUDD
     // holding/pumping posture matches the local player.
@@ -368,6 +432,8 @@ void exportLocalPlayer(TMario *mario, TMarDirector *director) {
     snap.actionId = static_cast<u16>(marioState);
     snap.actionIdHi = static_cast<u16>(marioState >> 16);
     snap.vfxFlags = buildVfxFlags(mario);
+
+    exportYoshiSnapshotFields(mario, snap);
 
     const bool yCam = (snap.vfxFlags & VFX_Y_CAM) != 0;
     const bool pumpHold = mario->mFluddUsageState <= 1;
@@ -401,11 +467,18 @@ void exportLocalPlayer(TMario *mario, TMarDirector *director) {
     }
     snap.pingMs = static_cast<u16>(rateEnc) | (static_cast<u16>(highEnc) << 8);
 
+    if (snapshotHostOnYoshi(snap.nozzleId, snap.vfxFlags) && sprayingWater)
+        snap.pingMs = static_cast<u16>(rateEnc) |
+                      (static_cast<u16>(encodeSprayPressure(sprayPressure)) << 8);
+
     // water: tank level by default; Y-cam and hold-pump reuse it for upper BCK frame;
     // while spraying water it carries synced nozzle pressure (0..1 -> 0..255);
     // dry spray reuses the byte as an explicit empty-tank marker (0);
-    // blooper surf reuses it for mSurfGessoID (purple/yellow/green).
-    if (yCam || (pumpHold && !sprayingWater && !drySpray))
+    // blooper surf reuses it for mSurfGessoID (purple/yellow/green);
+    // host on Yoshi reuses it for TYoshi BCK index (set in exportYoshiSnapshotFields).
+    if (snapshotHostOnYoshi(snap.nozzleId, snap.vfxFlags)) {
+        // snap.water already carries host Yoshi BCK.
+    } else if (yCam || (pumpHold && !sprayingWater && !drySpray))
         snap.water = upperEnc;
     else if (sprayingWater)
         snap.water = encodeSprayPressure(sprayPressure);
@@ -438,13 +511,8 @@ void exportLocalPlayer(TMario *mario, TMarDirector *director) {
 // doldecomp TMarDirector::setMario unkD1: 1=rollingStart, 2=returnStart, 3=waitingStart, 4=torocco.
 constexpr u32 kDirectorMarioEntryKindOffset = 0xD1u;
 constexpr u32 kDirectorEntryFlagsOffset = 0x50u;
-constexpr u32 kDirectorSceneFlagsOffset = 0x4Eu;
 constexpr u8 kMarioEntryWaitingStart = 3u;
 constexpr u16 kDirectorMarioReadyFlag = 1u;
-constexpr u16 kDirectorSkipIntroCameraFlag = 2u;
-constexpr u16 kDirectorWipeCloseFlag = 4u;
-constexpr u32 kMarioGamePadFlagsOffset = 0xE2u;
-constexpr u16 kMarioGamePadControlEnabledFlag = 0x2u;
 constexpr u32 kMarioStatusTypeMask = 0x1C0u;
 constexpr u32 kMarioStatusTypeDemo = 0x100u;
 constexpr u32 kMarioStatusWait = 0xC400201u;
@@ -457,92 +525,6 @@ static void overrideDirectorEntryKind(TMarDirector *director) {
 
 static bool isMarioInDemoState(const TMario *mario) {
     return mario && (mario->mState & kMarioStatusTypeMask) == kMarioStatusTypeDemo;
-}
-
-static bool isMarioPlayableAfterSkip(const TMario *mario) {
-    return mario && !isMarioInDemoState(mario);
-}
-
-// Tracks whether local Mario has finished the current stage's entry sequence (gate fly-in,
-// pipe roll, etc.). doldecomp TMarDirector::unk4E/unk50 + mCurState gate the intro camera.
-static u8 sStageAreaId = 0xFFu;
-static u8 sStageEpisodeId = 0xFFu;
-static bool sMarioWasPlayableThisStage = false;
-
-static void markStageIntroComplete() {
-    sMarioWasPlayableThisStage = true;
-}
-
-static void updateStageIntroTracking(const TMarDirector *director, const TMario *mario) {
-    if (!director)
-        return;
-
-    if (director->mCurState < TMarDirector::STATE_NORMAL) {
-        sStageAreaId = director->mAreaID;
-        sStageEpisodeId = director->mEpisodeID;
-        sMarioWasPlayableThisStage = false;
-        return;
-    }
-
-    if (director->mAreaID != sStageAreaId || director->mEpisodeID != sStageEpisodeId) {
-        sStageAreaId = director->mAreaID;
-        sStageEpisodeId = director->mEpisodeID;
-        sMarioWasPlayableThisStage = false;
-    }
-
-    if (!mario || !isMarioPlayableAfterSkip(mario))
-        return;
-
-    const u8 *raw = reinterpret_cast<const u8 *>(director);
-    const u16 entryFlags = *reinterpret_cast<const u16 *>(raw + kDirectorEntryFlagsOffset);
-    if (entryFlags & kDirectorMarioReadyFlag)
-        sMarioWasPlayableThisStage = true;
-}
-
-// Stage intro = episode title / gate camera / spawn roll before Mario is controllable.
-static bool isInStageIntroCutscene(const TMarDirector *director, const TMario *mario) {
-    if (!director)
-        return true;
-
-    updateStageIntroTracking(director, mario);
-
-    if (director->mCurState < TMarDirector::STATE_NORMAL)
-        return true;
-
-    const u8 *raw = reinterpret_cast<const u8 *>(director);
-    const u16 sceneFlags = *reinterpret_cast<const u16 *>(raw + kDirectorSceneFlagsOffset);
-    if (sceneFlags & kDirectorSkipIntroCameraFlag)
-        return true;
-
-    return !sMarioWasPlayableThisStage;
-}
-
-static void openConsoleWipeForSkip(TMarDirector *director) {
-    if (!director->mGCConsole || !director->mGCConsole->mConsoleStr)
-        return;
-    director->mGCConsole->mConsoleStr->startOpenWipe();
-}
-
-static void skipDirectorIntroState(TMarDirector *director) {
-    if (!director || director->mCurState >= TMarDirector::STATE_NORMAL)
-        return;
-
-    u8 *raw = reinterpret_cast<u8 *>(director);
-    u16 &sceneFlags = *reinterpret_cast<u16 *>(raw + kDirectorSceneFlagsOffset);
-    sceneFlags &= ~(kDirectorSkipIntroCameraFlag | kDirectorWipeCloseFlag);
-
-    if (gpCamera)
-        gpCamera->endDemoCamera();
-
-    openConsoleWipeForSkip(director);
-    endStageEntranceDemo__10MSMainProcFUcUc(director->mAreaID, director->mEpisodeID);
-
-    director->mCurState = TMarDirector::STATE_NORMAL;
-
-    if (director->mGamePads && director->mGamePads[0]) {
-        u8 *padRaw = reinterpret_cast<u8 *>(director->mGamePads[0]);
-        *reinterpret_cast<u16 *>(padRaw + kMarioGamePadFlagsOffset) |= kMarioGamePadControlEnabledFlag;
-    }
 }
 
 static void forceInstantMarioSpawn(TMarDirector *director, TMario *mario) {
@@ -584,160 +566,8 @@ void reloadLocalStage(TMarDirector *director, u8 areaId, u8 episodeId) {
     TFlagManager::smInstance->setFlag(0x40003, episodeId);
 
     BetterSMS::Loading::setLoading(false);
-    setHideSeekAllowStageTransition(true);
+    setHideSeekAllowDeathStageReload(true);
     director->setNextStage(stageId, nullptr);
-
-    getCommBuffer()->bridgeFlags |= BF_SKIP_ENTRY_DEMO;
-}
-
-static void smso_entrySkipPlayerUpdate(TMario *player, bool isLocalMario) {
-    if (!isLocalMario || !gpMarDirector)
-        return;
-
-    if (isHideSeekTaggedDeathActive())
-        return;
-
-    CommBuffer *buf = getCommBuffer();
-    if (!(buf->bridgeFlags & BF_SKIP_ENTRY_DEMO))
-        return;
-
-    overrideDirectorEntryKind(gpMarDirector);
-
-    if (isMarioInDemoState(player))
-        forceInstantMarioSpawn(gpMarDirector, player);
-}
-
-static void smso_onMarioLoadAfter(TMario *player) {
-    if (!gpMarDirector || !player)
-        return;
-
-    CommBuffer *buf = getCommBuffer();
-    if (!(buf->bridgeFlags & BF_SKIP_ENTRY_DEMO))
-        return;
-
-    overrideDirectorEntryKind(gpMarDirector);
-    forceInstantMarioSpawn(gpMarDirector, player);
-}
-
-// Intercept pipe/cannon/rolling entry demos at the source (setMario -> rollingStart/returnStart).
-static bool smso_rollingStart(TMario *self, const TVec3f *pos, f32 rot) {
-    if (getCommBuffer()->bridgeFlags & BF_SKIP_ENTRY_DEMO)
-        return self->waitingStart(pos, rot);
-
-    if (self->isUnUsualStageStart())
-        return true;
-
-    constexpr u32 kMarioStatusDisappear = 0x133Fu;
-    if (self->mState != kMarioStatusDisappear)
-        return false;
-
-    if (pos)
-        self->warpRequest(*pos, rot);
-
-    return self->changePlayerStatus(0x1337u, 0x200u, true);
-}
-
-static bool smso_returnStart(TMario *self, const TVec3f *pos, f32 rot, bool flag, int playerStatus) {
-    if (getCommBuffer()->bridgeFlags & BF_SKIP_ENTRY_DEMO)
-        return self->waitingStart(pos, rot);
-
-    constexpr u32 kMarioStatusDisappear = 0x133Fu;
-    if (self->mState != kMarioStatusDisappear)
-        return false;
-
-    const u32 offsetPlayerStatus = static_cast<u32>(playerStatus) << 8;
-    const f32 facing = flag ? rot : rot + 180.0f;
-    if (pos)
-        self->warpRequest(*pos, facing);
-
-    const u32 warpArg = offsetPlayerStatus | (flag ? 2u : 1u);
-    return self->changePlayerStatus(0x1337u, warpArg, true);
-}
-
-SMS_PATCH_B(SMS_PORT_REGION(0x80240954, 0x8023888C, 0, 0), smso_rollingStart);
-SMS_PATCH_B(SMS_PORT_REGION(0x802407BC, 0x802386F4, 0, 0), smso_returnStart);
-
-// Force THP/cutscene skip checks to succeed (li r3, 1) — BSE generic.cpp debug patch.
-SMS_WRITE_32(SMS_PORT_REGION(0x802B5E8C, 0x802ade20, 0, 0), 0x38600001);
-SMS_WRITE_32(SMS_PORT_REGION(0x802B5EF4, 0x802ade88, 0, 0), 0x38600001);
-
-void skipEntryDemoIfPending(TMarDirector *director) {
-    if (isHideSeekTaggedDeathActive())
-        return;
-
-    CommBuffer *buf = getCommBuffer();
-    if (!(buf->bridgeFlags & BF_SKIP_ENTRY_DEMO))
-        return;
-
-    if (!director)
-        return;
-
-    overrideDirectorEntryKind(director);
-    skipDirectorIntroState(director);
-
-    if (gpMarioAddress)
-        forceInstantMarioSpawn(director, gpMarioAddress);
-
-    if (isMarioPlayableAfterSkip(gpMarioAddress)) {
-        buf->bridgeFlags &= ~static_cast<u32>(BF_SKIP_ENTRY_DEMO);
-        markStageIntroComplete();
-        OSReport("[SMSO] Skipped stage entry demo -> area=%u episode=%u\n", director->mAreaID,
-                 director->mEpisodeID);
-    }
-}
-
-void skipCutscenesIfConnected(TMarDirector *director) {
-    CommBuffer *buf = getCommBuffer();
-    if (!(buf->bridgeFlags & BF_CONNECTED))
-        return;
-
-    if (!director || !gpMarioAddress)
-        return;
-
-    if (isHideSeekTaggedDeathActive())
-        return;
-
-    if (buf->bridgeFlags & BF_SKIP_ENTRY_DEMO)
-        return;
-
-    if (!director->mGamePads || !director->mGamePads[0])
-        return;
-
-    constexpr u32 kSkipCutsceneButtonMask =
-        JUTGamePad::A | JUTGamePad::B | JUTGamePad::X | JUTGamePad::Y | JUTGamePad::START |
-        JUTGamePad::L | JUTGamePad::R | JUTGamePad::Z | JUTGamePad::DPAD_UP |
-        JUTGamePad::DPAD_DOWN | JUTGamePad::DPAD_LEFT | JUTGamePad::DPAD_RIGHT;
-
-    const u32 pressed = director->mGamePads[0]->mButtons.mFrameInput & kSkipCutsceneButtonMask;
-    if (pressed == 0)
-        return;
-
-    if (isInStageIntroCutscene(director, gpMarioAddress))
-        return;
-
-    const u32 directorState = director->mCurState;
-    const bool inDemoCamera = gpCamera && gpCamera->isSimpleDemoCamera();
-    const bool inMarioDemo = isMarioInDemoState(gpMarioAddress);
-    const bool inShineCollect =
-        gpMarioAddress->mState == static_cast<u32>(TMario::STATE_SHINE_C);
-    const bool inDirectorCutscene =
-        directorState == TMarDirector::STATE_SAVE_CARD ||
-        directorState == TMarDirector::STATE_FREEZE;
-    const bool inThpMovie = THPPlayerGetState() != 0;
-
-    if (!inDemoCamera && !inMarioDemo && !inShineCollect && !inDirectorCutscene && !inThpMovie)
-        return;
-
-    if (inDemoCamera)
-        gpCamera->endDemoCamera();
-
-    director->fireEndDemoCamera();
-
-    if (inMarioDemo)
-        gpMarioAddress->changePlayerStatus(kMarioStatusWait, 0, true);
-
-    if (inThpMovie)
-        THPPlayerStop();
 }
 
 void consumeWarpIntent() {
@@ -757,27 +587,70 @@ void consumeWarpIntent() {
         return;
     }
 
-    const u8 areaId = buf->warpCourseId;
-    const u8 scenario = resolveWarpScenario(areaId, buf->warpEpisodeId);
-    const u16 stageId = static_cast<u16>(((static_cast<u32>(areaId) + 1) << 8) | scenario);
+    const ResolvedWarp resolved = resolveFullWarp(buf->warpCourseId, buf->warpEpisodeId);
+    const u8 areaId = resolved.areaId;
+    const WarpTarget warpTarget = resolved.target;
+    const u16 stageId =
+        static_cast<u16>(((static_cast<u32>(areaId) + 1) << 8) | warpTarget.loadScenario);
 
-    OSReport("[SMSO] Warp -> area=%u scenario=%u stage=0x%04X slot=%u\n", areaId, scenario,
-             stageId, buf->localSlot);
+    OSReport("[SMSO] Warp -> area=%u load=%u mission=%u stage=0x%04X slot=%u\n", areaId,
+             warpTarget.loadScenario, warpTarget.missionEpisode, stageId, buf->localSlot);
 
     gpApplication.mNextScene.mAreaID = areaId;
-    gpApplication.mNextScene.mEpisodeID = scenario;
+    gpApplication.mNextScene.mEpisodeID = warpTarget.loadScenario;
 
     TFlagManager::smInstance->setFlag(0x40002, 0);
-    TFlagManager::smInstance->setFlag(0x40003, scenario);
+    TFlagManager::smInstance->setFlag(0x40003, warpTarget.missionEpisode);
+
+    if (areaId == kSirenaHotelAreaId && warpTarget.loadScenario != warpTarget.missionEpisode)
+        s_hotelMissionEpisodeSync = warpTarget.missionEpisode;
+    else
+        s_hotelMissionEpisodeSync = kInvalidHotelMission;
 
     BetterSMS::Loading::setLoading(false);
 
     setHideSeekAllowStageTransition(true);
+    authorizeLauncherStageMove();
     gpMarDirector->setNextStage(stageId, nullptr);
 
-    buf->bridgeFlags |= BF_SKIP_ENTRY_DEMO;
     buf->bridgeFlags &= ~static_cast<u32>(BF_WARP_PENDING | BF_WARP_ALL);
     buf->warpTargetSlot = WARP_NO_TARGET;
+}
+
+void applyHotelWarpMissionOverride(TMarDirector *director) {
+    if (!director || s_hotelMissionEpisodeSync == kInvalidHotelMission)
+        return;
+    if (director->mAreaID != kSirenaHotelAreaId)
+        return;
+
+    const u8 missionEpisode = s_hotelMissionEpisodeSync;
+
+    // After TFlagManager::resetStage(). Mission scripts read mEpisodeID during setupObjects;
+    // mCurrentScene.mEpisodeID stays on the load scenario so getStageName loads delfino0/2/4.
+    director->mEpisodeID = missionEpisode;
+    TFlagManager::smInstance->setFlag(0x40003, missionEpisode);
+    s_hotelWarpDemoSkipFrames = 120;
+    s_hotelMissionEpisodeSync = kInvalidHotelMission;
+
+    OSReport("[SMSO] Hotel mission override load=%u mission=%u\n",
+             gpApplication.mCurrentScene.mEpisodeID, missionEpisode);
+}
+
+void syncHotelWarpMissionEpisode(TMarDirector *director) {
+    if (!director || s_hotelWarpDemoSkipFrames == 0)
+        return;
+    if (director->mAreaID != kSirenaHotelAreaId)
+        return;
+    if (!gpMarioAddress)
+        return;
+
+    if (isMarioInDemoState(gpMarioAddress))
+        forceInstantMarioSpawn(director, gpMarioAddress);
+
+    if (!isMarioInDemoState(gpMarioAddress) || s_hotelWarpDemoSkipFrames == 1)
+        s_hotelWarpDemoSkipFrames = 0;
+    else
+        --s_hotelWarpDemoSkipFrames;
 }
 
 void applyPendingWarpPoint(TMarDirector *director) {
@@ -787,17 +660,19 @@ void applyPendingWarpPoint(TMarDirector *director) {
     if (!gpMarioAddress || !director)
         return;
 
-    if ((buf->bridgeFlags & BF_SKIP_ENTRY_DEMO) && !isMarioPlayableAfterSkip(gpMarioAddress))
-        return;
     if (director->mCurState < TMarDirector::STATE_NORMAL)
         return;
 
-    const u8 expectArea = buf->warpCourseId;
-    const u8 expectScenario = resolveWarpScenario(expectArea, buf->warpEpisodeId);
-    if (director->mAreaID != expectArea || director->mEpisodeID != expectScenario)
+    const ResolvedWarp resolved = resolveFullWarp(buf->warpCourseId, buf->warpEpisodeId);
+    const u8 expectArea = resolved.areaId;
+    const u8 expectMission = resolved.target.missionEpisode;
+    u8 actualMission = director->mEpisodeID;
+    if (expectArea == kSirenaHotelAreaId)
+        actualMission = static_cast<u8>(TFlagManager::smInstance->getFlag(0x40003));
+    if (director->mAreaID != expectArea || actualMission != expectMission)
         return;
 
-    if (!isMarioPlayableAfterSkip(gpMarioAddress))
+    if (isMarioInDemoState(gpMarioAddress))
         return;
 
     TVec3f pos;

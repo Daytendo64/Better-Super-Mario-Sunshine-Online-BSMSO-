@@ -3,6 +3,7 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:controls="clr-namespace:SMSO.Launcher.Controls"
         Title="BSMSO — Better Super Mario Sunshine Online"
+        Icon="/Assets/bsmso.ico"
         Height="820" Width="1080"
         MinHeight="680" MinWidth="920"
         UseLayoutRounding="True"
@@ -127,8 +128,8 @@
             </Border>
         </Border>
 
-        <TabControl Grid.Row="1" BorderThickness="0" Margin="0,0,0,0">
-            <TabItem Header="Settings">
+        <TabControl x:Name="MainTabControl" Grid.Row="1" BorderThickness="0" Margin="0,0,0,0">
+            <TabItem x:Name="SettingsTab" Header="Settings">
                 <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="20,12,20,20">
                     <StackPanel MaxWidth="980" HorizontalAlignment="Stretch">
 
@@ -382,7 +383,7 @@
                 </ScrollViewer>
             </TabItem>
 
-            <TabItem Header="Client Actions">
+            <TabItem x:Name="ClientTab" Header="Client Actions">
                 <Grid Margin="20,12,20,20">
                     <Grid.RowDefinitions>
                         <RowDefinition Height="Auto"/>
@@ -391,17 +392,29 @@
                     <Grid Grid.Row="0" ClipToBounds="True">
                         <GroupBox x:Name="ClientTeleportPanel" Header="Teleport" Padding="14,8,14,10" Margin="0">
                             <StackPanel>
-                                <WrapPanel VerticalAlignment="Center">
-                                    <TextBlock Text="Destination" Style="{StaticResource SmsSectionLabel}" VerticalAlignment="Center" Margin="0,0,8,0"/>
-                                    <controls:FastSelector x:Name="ClientLevelCombo" Width="220" DisplayMemberPath="DisplayName" Margin="0,0,8,0"/>
-                                    <controls:FastSelector x:Name="ClientEpisodeCombo" Width="240" DisplayMemberPath="DisplayName" Margin="0,0,8,0"/>
-                                    <Button x:Name="ClientWarpButton" Content="Warp" Style="{StaticResource SmsPrimaryButton}" Click="ClientWarp_Click" VerticalAlignment="Center"/>
-                                </WrapPanel>
+                                <Grid VerticalAlignment="Center" Margin="0,0,0,0">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="*" MinWidth="140"/>
+                                        <ColumnDefinition Width="8"/>
+                                        <ColumnDefinition Width="*" MinWidth="160"/>
+                                        <ColumnDefinition Width="8"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Grid.Column="0" Text="Destination" Style="{StaticResource SmsSectionLabel}" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                    <controls:FastSelector Grid.Column="1" x:Name="ClientLevelCombo" DisplayMemberPath="DisplayName" EnableGroupHeaders="True"/>
+                                    <controls:FastSelector Grid.Column="3" x:Name="ClientEpisodeCombo" DisplayMemberPath="DisplayName"/>
+                                    <Button Grid.Column="5" x:Name="ClientWarpButton" Content="Warp" Style="{StaticResource SmsPrimaryButton}" Click="ClientWarp_Click" VerticalAlignment="Center"/>
+                                </Grid>
                                 <WrapPanel Margin="0,8,0,0">
                                     <TextBlock Text="Warp target" Style="{StaticResource SmsSectionLabel}" VerticalAlignment="Center" Margin="0,0,8,0"/>
                                     <controls:FastSelector x:Name="ClientWarpTargetCombo" Width="200" DisplayMemberPath="Username" Margin="0,0,8,0"/>
                                     <Button x:Name="ClientTeleportToPlayerButton" Content="Teleport to Player" ToolTip="Teleport to the selected player's exact position" Click="ClientTeleportToPlayer_Click"/>
                                 </WrapPanel>
+                                <TextBlock x:Name="ClientWorldSyncStatusText"
+                                           Style="{StaticResource SmsHintText}"
+                                           TextWrapping="Wrap"
+                                           Margin="0,10,0,0"/>
                             </StackPanel>
                         </GroupBox>
                         <Border x:Name="ClientTeleportOverlay"
@@ -471,17 +484,22 @@
                             </Grid.ColumnDefinitions>
                         <GroupBox Header="Host Teleport">
                             <StackPanel>
-                                <TextBlock Text="Destination" Style="{StaticResource SmsSectionLabel}"/>
-                                <WrapPanel Margin="0,0,0,8">
-                                    <controls:FastSelector x:Name="ServerLevelCombo" Width="240" DisplayMemberPath="DisplayName" Margin="0,0,8,8"/>
-                                    <controls:FastSelector x:Name="ServerEpisodeCombo" Width="280" DisplayMemberPath="DisplayName" Margin="0,0,8,8"/>
-                                </WrapPanel>
+                                <Grid Margin="0,0,0,8" VerticalAlignment="Center">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="*" MinWidth="100"/>
+                                        <ColumnDefinition Width="8"/>
+                                        <ColumnDefinition Width="*" MinWidth="120"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Grid.Column="0" Text="Destination" Style="{StaticResource SmsSectionLabel}" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                    <controls:FastSelector Grid.Column="1" x:Name="ServerLevelCombo" DisplayMemberPath="DisplayName" EnableGroupHeaders="True"/>
+                                    <controls:FastSelector Grid.Column="3" x:Name="ServerEpisodeCombo" DisplayMemberPath="DisplayName"/>
+                                </Grid>
+                                <Button Content="Warp Everyone" Style="{StaticResource SmsDangerButton}" Click="ServerWarpAll_Click" HorizontalAlignment="Left" Margin="0,0,0,8"/>
                                 <TextBlock Text="Warp target" Style="{StaticResource SmsSectionLabel}"/>
                                 <WrapPanel Margin="0,0,0,8">
                                     <controls:FastSelector x:Name="WarpTargetCombo" Width="200" DisplayMemberPath="Username" Margin="0,0,8,8"/>
                                     <Button Content="Warp Selected" Style="{StaticResource SmsPrimaryButton}" Click="ServerWarpSelected_Click" Margin="0,0,8,8"/>
-                                    <Button Content="Warp Everyone" Click="ServerWarpAll_Click" Margin="0,0,8,8"/>
-                                    <Button x:Name="ServerTeleportToPlayerButton" Content="Teleport to Player" ToolTip="Teleport yourself to the warp target player's exact position" Click="ServerTeleportToPlayer_Click" Margin="0,0,0,8"/>
                                 </WrapPanel>
                                 <TextBlock x:Name="ClientTeleportStatusText"
                                            Style="{StaticResource SmsHintText}"
@@ -492,6 +510,15 @@
                                               HorizontalAlignment="Left"
                                               Checked="AllowClientTeleport_Changed"
                                               Unchecked="AllowClientTeleport_Changed"/>
+                                <ToggleButton x:Name="WorldSyncToggle"
+                                              Content="Sync collectibles"
+                                              Style="{StaticResource SmsRedToggleButton}"
+                                              HorizontalAlignment="Left"
+                                              Margin="0,8,0,0"
+                                              IsChecked="True"
+                                              Checked="WorldSync_Changed"
+                                              Unchecked="WorldSync_Changed"
+                                              ToolTip="Shines and blue coins sync everywhere. Yellow and red coins only sync when players share the same course and episode."/>
                             </StackPanel>
                         </GroupBox>
                         <GroupBox Grid.Column="2" Header="Game Modes">
@@ -632,7 +659,7 @@
                             <StackPanel>
                                 <TextBlock Text="Troubleshooting" FontWeight="SemiBold" FontSize="14" Foreground="{StaticResource SmsAccent}" Margin="0,0,0,8"/>
                                 <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap">
-                                    Launch Dolphin from BSMSO before hosting or connecting. Duplicate usernames are rejected.
+                                    Launch Dolphin from BSMSO before hosting or connecting. Usernames may include punctuation. Duplicate usernames are rejected.
                                     Warps are blocked while a player is loading. Do not use SMSCoop alongside BSMSO.
                                 </TextBlock>
                             </StackPanel>

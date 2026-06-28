@@ -363,6 +363,126 @@ public sealed class HideSeekServiceTests
     }
 
     [Fact]
+    public void HiderDeath_PromotesToSeekerOnFirstDeadSnapshot()
+    {
+        var levels = new LevelCatalog();
+        var server = new GameServer(levels);
+        server.Start(27106);
+        try
+        {
+            var service = server.HideSeek;
+            service.SetGameMode(GameMode.HideSeek);
+            service.SetRoles(new Dictionary<byte, HideSeekRole>
+            {
+                [0] = HideSeekRole.Seeker,
+                [1] = HideSeekRole.Hider,
+                [2] = HideSeekRole.Hider,
+            });
+            Assert.True(service.TryStartTag(out _));
+
+            var alive = new PlayerSnapshot
+            {
+                Connected = 1,
+                StageId = 2,
+                EpisodeId = 0,
+                VfxFlags = 0,
+            };
+            service.ProcessHiderDeath(1, alive);
+            Assert.Equal(HideSeekRole.Hider, service.CurrentState.Roles[1]);
+            Assert.Equal((byte)0, service.CurrentState.TagEventId);
+
+            var dead = alive with { VfxFlags = (ushort)VfxFlags.Dead };
+            service.ProcessHiderDeath(1, dead);
+            var state = service.CurrentState;
+            Assert.Equal(HideSeekRole.Seeker, state.Roles[1]);
+            Assert.Equal(HideSeekRole.Hider, state.Roles[2]);
+            Assert.Equal((byte)1, state.LastTaggedSlot);
+            Assert.Equal((byte)1, state.TagEventId);
+            Assert.True(state.TagActive);
+        }
+        finally
+        {
+            server.Stop();
+        }
+    }
+
+    [Fact]
+    public void HiderDeath_DoesNotPromoteTwiceWhileDead()
+    {
+        var levels = new LevelCatalog();
+        var server = new GameServer(levels);
+        server.Start(27107);
+        try
+        {
+            var service = server.HideSeek;
+            service.SetGameMode(GameMode.HideSeek);
+            service.SetRoles(new Dictionary<byte, HideSeekRole>
+            {
+                [0] = HideSeekRole.Seeker,
+                [1] = HideSeekRole.Hider,
+                [2] = HideSeekRole.Hider,
+            });
+            Assert.True(service.TryStartTag(out _));
+
+            var dead = new PlayerSnapshot
+            {
+                Connected = 1,
+                StageId = 2,
+                EpisodeId = 0,
+                VfxFlags = (ushort)VfxFlags.Dead,
+            };
+
+            service.ProcessHiderDeath(1, dead);
+            Assert.Equal((byte)1, service.CurrentState.TagEventId);
+
+            service.ProcessHiderDeath(1, dead);
+            Assert.Equal((byte)1, service.CurrentState.TagEventId);
+            Assert.True(service.CurrentState.TagActive);
+        }
+        finally
+        {
+            server.Stop();
+        }
+    }
+
+    [Fact]
+    public void HiderDeath_EndsRoundWhenLastHiderDies()
+    {
+        var levels = new LevelCatalog();
+        var server = new GameServer(levels);
+        server.Start(27108);
+        try
+        {
+            var service = server.HideSeek;
+            service.SetGameMode(GameMode.HideSeek);
+            service.SetRoles(new Dictionary<byte, HideSeekRole>
+            {
+                [0] = HideSeekRole.Seeker,
+                [1] = HideSeekRole.Hider,
+            });
+            Assert.True(service.TryStartTag(out _));
+
+            var dead = new PlayerSnapshot
+            {
+                Connected = 1,
+                StageId = 2,
+                EpisodeId = 0,
+                VfxFlags = (ushort)VfxFlags.Dead,
+            };
+
+            service.ProcessHiderDeath(1, dead);
+            var state = service.CurrentState;
+            Assert.False(state.TagActive);
+            Assert.Equal(HideSeekRole.Hider, state.Roles[0]);
+            Assert.Equal(HideSeekRole.Hider, state.Roles[1]);
+        }
+        finally
+        {
+            server.Stop();
+        }
+    }
+
+    [Fact]
     public void TagDetection_IgnoresOutOfRange()
     {
         var levels = new LevelCatalog();
@@ -396,6 +516,205 @@ public sealed class HideSeekServiceTests
 
             service.ProcessSnapshot(0, seeker, 1, hider);
             Assert.Equal(HideSeekRole.Hider, service.CurrentState.Roles[1]);
+        }
+        finally
+        {
+            server.Stop();
+        }
+    }
+
+    [Fact]
+    public void OnPlayerDisconnected_KeepsTagActiveWhenHidersRemain()
+    {
+        var levels = new LevelCatalog();
+        var server = new GameServer(levels);
+        server.Start(27109);
+        try
+        {
+            var service = server.HideSeek;
+            service.SetGameMode(GameMode.HideSeek);
+            service.SetRoles(new Dictionary<byte, HideSeekRole>
+            {
+                [0] = HideSeekRole.Seeker,
+                [1] = HideSeekRole.Hider,
+                [2] = HideSeekRole.Hider,
+            });
+            Assert.True(service.TryStartTag(out _));
+
+            service.OnPlayerDisconnected(2);
+
+            var state = service.CurrentState;
+            Assert.Equal(GameMode.HideSeek, state.GameMode);
+            Assert.True(state.TagActive);
+            Assert.Equal(HideSeekRole.Hider, state.Roles[1]);
+        }
+        finally
+        {
+            server.Stop();
+        }
+    }
+
+    [Fact]
+    public void OnPlayerDisconnected_EndsRoundWhenLastHiderLeaves()
+    {
+        var levels = new LevelCatalog();
+        var server = new GameServer(levels);
+        server.Start(27110);
+        try
+        {
+            var service = server.HideSeek;
+            service.SetGameMode(GameMode.HideSeek);
+            service.SetRoles(new Dictionary<byte, HideSeekRole>
+            {
+                [0] = HideSeekRole.Seeker,
+                [1] = HideSeekRole.Hider,
+            });
+            Assert.True(service.TryStartTag(out _));
+
+            service.OnPlayerDisconnected(1);
+
+            var state = service.CurrentState;
+            Assert.Equal(GameMode.HideSeek, state.GameMode);
+            Assert.False(state.TagActive);
+            Assert.Equal(HideSeekRole.Hider, state.Roles[0]);
+            Assert.Equal(HideSeekRole.Hider, state.Roles[1]);
+        }
+        finally
+        {
+            server.Stop();
+        }
+    }
+
+    [Fact]
+    public void SetRoles_DoesNotStopTagWhenDisconnectedSlotOmitted()
+    {
+        var levels = new LevelCatalog();
+        var server = new GameServer(levels);
+        server.Start(27111);
+        try
+        {
+            var service = server.HideSeek;
+            service.SetGameMode(GameMode.HideSeek);
+            service.SetRoles(new Dictionary<byte, HideSeekRole>
+            {
+                [0] = HideSeekRole.Seeker,
+                [1] = HideSeekRole.Hider,
+                [2] = HideSeekRole.Hider,
+            });
+            Assert.True(service.TryStartTag(out _));
+
+            service.SetRoles(new Dictionary<byte, HideSeekRole>
+            {
+                [0] = HideSeekRole.Seeker,
+                [1] = HideSeekRole.Hider,
+            });
+
+            Assert.True(service.CurrentState.TagActive);
+            Assert.Equal(GameMode.HideSeek, service.CurrentState.GameMode);
+        }
+        finally
+        {
+            server.Stop();
+        }
+    }
+
+    [Fact]
+    public void SetRoles_StopsTagWhenConnectedRoleChanges()
+    {
+        var levels = new LevelCatalog();
+        var server = new GameServer(levels);
+        server.Start(27112);
+        try
+        {
+            var service = server.HideSeek;
+            service.SetGameMode(GameMode.HideSeek);
+            service.SetRoles(new Dictionary<byte, HideSeekRole>
+            {
+                [0] = HideSeekRole.Seeker,
+                [1] = HideSeekRole.Hider,
+            });
+            Assert.True(service.TryStartTag(out _));
+
+            service.SetRoles(new Dictionary<byte, HideSeekRole>
+            {
+                [0] = HideSeekRole.Seeker,
+                [1] = HideSeekRole.Seeker,
+            });
+
+            Assert.False(service.CurrentState.TagActive);
+            Assert.Equal(GameMode.HideSeek, service.CurrentState.GameMode);
+        }
+        finally
+        {
+            server.Stop();
+        }
+    }
+
+    [Fact]
+    public void StopTag_PreservesElapsedTimeForResume()
+    {
+        var levels = new LevelCatalog();
+        var server = new GameServer(levels);
+        server.Start(27113);
+        try
+        {
+            var service = server.HideSeek;
+            service.SetGameMode(GameMode.HideSeek);
+            service.SetRoles(new Dictionary<byte, HideSeekRole>
+            {
+                [0] = HideSeekRole.Seeker,
+                [1] = HideSeekRole.Hider,
+            });
+            Assert.True(service.TryStartTag(out _));
+            Thread.Sleep(100);
+
+            service.StopTag();
+            var paused = service.CurrentState;
+            Assert.False(paused.TagActive);
+            Assert.True(paused.RoundStartMs > 0);
+
+            Assert.True(service.TryStartTag(out _));
+            var resumed = service.CurrentState;
+            Assert.True(resumed.TagActive);
+            Assert.Equal(paused.RoundStartMs, resumed.RoundStartMs);
+        }
+        finally
+        {
+            server.Stop();
+        }
+    }
+
+    [Fact]
+    public void ResetTag_ClearsElapsedTime()
+    {
+        var levels = new LevelCatalog();
+        var server = new GameServer(levels);
+        server.Start(27114);
+        try
+        {
+            var service = server.HideSeek;
+            service.SetGameMode(GameMode.HideSeek);
+            service.SetRoles(new Dictionary<byte, HideSeekRole>
+            {
+                [0] = HideSeekRole.Seeker,
+                [1] = HideSeekRole.Hider,
+            });
+            Assert.True(service.TryStartTag(out _));
+            Thread.Sleep(100);
+            service.StopTag();
+            Assert.True(service.CurrentState.RoundStartMs > 0);
+
+            service.ResetTag();
+            Assert.Equal(0u, service.CurrentState.RoundStartMs);
+            Assert.False(service.CurrentState.TagActive);
+
+            service.SetRoles(new Dictionary<byte, HideSeekRole>
+            {
+                [0] = HideSeekRole.Seeker,
+                [1] = HideSeekRole.Hider,
+            });
+            Assert.True(service.TryStartTag(out _));
+            Assert.Equal(0u, service.CurrentState.RoundStartMs);
         }
         finally
         {

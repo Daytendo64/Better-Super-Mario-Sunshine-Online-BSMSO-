@@ -1,15 +1,1085 @@
 #include "world_sync.hpp"
+
+#include "collectible_scan.hpp"
 #include "comm_buffer.hpp"
+#include "red_coin_sync.hpp"
+#include "remote_actor.hpp"
+
+#include <SMS/GC2D/GCConsole2.hxx>
+#include <SMS/Manager/FlagManager.hxx>
+#include <SMS/Manager/ItemManager.hxx>
+#include <SMS/Manager/ObjManager.hxx>
+#include <SMS/MapObj/MapObjBase.hxx>
+#include <SMS/MoveBG/Coin.hxx>
+#include <SMS/MoveBG/Shine.hxx>
+#include <SMS/Player/Mario.hxx>
+#include <SMS/Strategic/LiveActor.hxx>
+#include <SMS/System/MarDirector.hxx>
+#include <SMS/macros.h>
+
+extern TMarDirector *gpMarDirector;
+extern TItemManager *gpItemManager;
+
+struct TMapObjManager;
+extern TMapObjManager *gpMapObjManager;
+
+namespace {
+
+constexpr u32 kStageSettleFrames = 180;
+constexpr u32 kCoinTakenFlagOffset = 0x152;
+constexpr u8 kMaxStageBlueCoins = 30;
+constexpr u8 kMaxStageShines = 48;
+constexpr f32 kPosMatchEpsilon = 4.0f;
+constexpr f32 kShinePosMatchEpsilon = 64.0f;
+// 10-bit axis @ scale 16 → roughly ±4096..+12288 world units (SMS stage extents).
+constexpr f32 kWorldPosPackScale = 16.0f;
+constexpr f32 kWorldPosPackBias = 256.0f;
+constexpr u16 kRemoteShineCollectMaxFrames = 300;
+
+struct RemoteShineCollectState {
+    u8 collectorSlot;
+    TShine *shine;
+    u16 frames;
+    bool shrinking;
+};
+
+static RemoteShineCollectState sRemoteShineCollect = {};
+
+struct PendingShineCapture {
+    u8 shineId;
+    u8 hasPos;
+    u8 hasId;
+    TVec3f pos;
+};
+
+static PendingShineCapture sPendingShineCapture = {};
+
+struct StageShineEntry {
+    u8 shineId;
+    TVec3f initialPos;
+    TVec3f livePos;
+};
+
+static StageShineEntry sStageShines[kMaxStageShines] = {};
+static u8 sStageShineCount = 0;
+static bool sStageShineSnapshotReady = false;
+static u8 sKnownShinePosValid[128] = {};
+static TVec3f sKnownShinePos[128] = {};
+
+static bool sApplyingRemoteEvent = false;
+static u16 sLocalWorldEventSequence = 0;
+
+static u32 sLastGoldCoinCount = 0;
+static u8 sLastCourseId = 0xFF;
+static u8 sLastEpisodeId = 0xFF;
+static u8 sShineBits[16] = {};
+static u32 sBlueCoinBits = 0;
+static u16 sStageSettleFrames = 0;
+
+static u32 gShineVtable = 0;
+static u32 gCoinBlueVtable = 0;
+static u32 gCoinEmptyVtable = 0;
+
+using GetShineIdFn = s32 (*)(u32 shineStage, u32 index, bool);
+using GetShineStageFn = u32 (*)(u8 areaId);
+
+static GetShineIdFn gGetShineId = nullptr;
+static GetShineStageFn gGetShineStage = nullptr;
+
+using IncGoldCoinFlagFn = void (*)(TFlagManager *, u8, s32);
+using CountShineFn = void (*)(TGCConsole2 *);
+using CountBlueCoinFn = void (*)(TGCConsole2 *);
+
+static IncGoldCoinFlagFn gIncGoldCoinFlag = nullptr;
+static CountShineFn gCountShine = nullptr;
+static CountBlueCoinFn gCountBlueCoin = nullptr;
+
+static bool worldSyncEnabled(const smso::CommBuffer *buf) {
+    return buf && (buf->bridgeFlags & smso::BF_CONNECTED) != 0 &&
+           (buf->bridgeFlags & (smso::BF_SYNC_SHINE | smso::BF_SYNC_BLUE_COIN | smso::BF_SYNC_EVENT |
+                                smso::BF_SYNC_STORY | smso::BF_SYNC_MISSION | smso::BF_SYNC_SECRET)) != 0;
+}
+
+static bool episodeCollectibleSyncEnabled(const smso::CommBuffer *buf) {
+    return buf && (buf->bridgeFlags & (smso::BF_SYNC_EVENT | smso::BF_SYNC_SHINE)) != 0;
+}
+
+static u8 currentCourseId() {
+    if (!gpMarDirector)
+        return 0;
+    return gpMarDirector->mAreaID;
+}
+
+static u8 currentEpisodeId() {
+    if (!gpMarDirector)
+        return 0;
+    return gpMarDirector->mEpisodeID;
+}
+
+static bool sameStage(u8 courseId, u8 episodeId) {
+    return courseId == currentCourseId() && episodeId == currentEpisodeId();
+}
+
+static bool positionsMatch(const TVec3f &a, const TVec3f &b) {
+    return (a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y) + (a.z - b.z) * (a.z - b.z) <=
+           kPosMatchEpsilon * kPosMatchEpsilon;
+}
+
+static bool shinePositionsMatch(const TVec3f &a, const TVec3f &b) {
+    return (a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y) + (a.z - b.z) * (a.z - b.z) <=
+           kShinePosMatchEpsilon * kShinePosMatchEpsilon;
+}
+
+static void rememberShinePosition(u8 shineId, const TVec3f &pos) {
+    if (shineId >= 128)
+        return;
+    sKnownShinePos[shineId] = pos;
+    sKnownShinePosValid[shineId] = 1;
+}
+
+static void clearKnownShinePositions() {
+    for (u32 i = 0; i < sizeof(sKnownShinePosValid); ++i)
+        sKnownShinePosValid[i] = 0;
+}
+
+static u32 packWorldPos(const TVec3f &pos) {
+    return smso::packCollectibleWorldPos(pos.x, pos.y, pos.z);
+}
+
+static TVec3f unpackWorldPos(u32 packed) {
+    f32 x = 0.0f;
+    f32 y = 0.0f;
+    f32 z = 0.0f;
+    smso::unpackCollectibleWorldPos(packed, x, y, z);
+    return TVec3f(x, y, z);
+}
+
+static void clearRemoteShineCollect() {
+    sRemoteShineCollect.collectorSlot = 0xFF;
+    sRemoteShineCollect.shine = nullptr;
+    sRemoteShineCollect.frames = 0;
+    sRemoteShineCollect.shrinking = false;
+}
+
+static bool isPendingRemoteCollectShine(const TShine *shine) {
+    return shine != nullptr && sRemoteShineCollect.shine == shine;
+}
+
+static bool shouldHideShineActor(TShine *shine) {
+    return shine && !isPendingRemoteCollectShine(shine);
+}
+
+static bool shineWasSet(u8 shineId) {
+    return (sShineBits[shineId >> 3] & (1u << (shineId & 7))) != 0;
+}
+
+static void markShineSet(u8 shineId) {
+    sShineBits[shineId >> 3] |= static_cast<u8>(1u << (shineId & 7));
+}
+
+static bool blueCoinWasSet(u8 coinIndex) {
+    return (sBlueCoinBits & (1u << coinIndex)) != 0;
+}
+
+static void markBlueCoinSet(u8 coinIndex) {
+    sBlueCoinBits |= 1u << coinIndex;
+}
+
+static bool isLiveCollectible(const TMapObjBase *obj) {
+    if (!obj || !smso::isValidMapObjPtr(obj))
+        return false;
+    const auto *live = reinterpret_cast<const TLiveActor *>(obj);
+    return !live->mStateFlags.asFlags.mIsObjDead;
+}
+
+static bool isCollectibleBlueCoin(const TMapObjBase *obj) {
+    if (!isLiveCollectible(obj))
+        return false;
+    if (*reinterpret_cast<const u32 *>(obj) != gCoinBlueVtable)
+        return false;
+    const auto *bytes = reinterpret_cast<const u8 *>(obj);
+    return bytes[kCoinTakenFlagOffset] == 0;
+}
+
+static void hideBlueCoinActor(TMapObjBase *obj) {
+    if (!obj || !isCollectibleBlueCoin(obj))
+        return;
+
+    obj->makeObjDead();
+
+    auto *mutableBytes = reinterpret_cast<u8 *>(obj);
+    mutableBytes[kCoinTakenFlagOffset] = 1;
+
+    auto *live = reinterpret_cast<TLiveActor *>(obj);
+    live->mStateFlags.asFlags.mClipFromScene = true;
+    live->mStateFlags.asFlags.mIsObjDead = true;
+}
+
+struct HideBlueCtx {
+    u8 flagIndex;
+    bool hidden;
+};
+
+static bool visitHideBlueCoinByFlagIndex(TMapObjBase *obj, void *rawCtx) {
+    auto *hideCtx = reinterpret_cast<HideBlueCtx *>(rawCtx);
+    if (!isCollectibleBlueCoin(obj))
+        return false;
+
+    auto *coin = reinterpret_cast<TCoin *>(obj);
+    const u8 coinIndex = static_cast<u8>(coin->_154);
+    const u8 mapObjId = static_cast<u8>(obj->mMapObjID);
+    if (coinIndex != hideCtx->flagIndex && mapObjId != hideCtx->flagIndex)
+        return false;
+
+    hideBlueCoinActor(obj);
+    hideCtx->hidden = true;
+    return true;
+}
+
+static void hideBlueCoinAtIndex(u8 flagIndex) {
+    if (flagIndex >= kMaxStageBlueCoins)
+        return;
+
+    HideBlueCtx ctx = {flagIndex, false};
+    smso::forEachManagedMapObj(visitHideBlueCoinByFlagIndex, &ctx);
+}
+
+static s32 shineGlobalIdForActor(const TShine *shine) {
+    if (!gGetShineId || !gGetShineStage || !shine)
+        return -1;
+
+    const u32 shineStage = gGetShineStage(currentCourseId());
+    const bool isEx = (shine->mType & 0x10) != 0;
+    const u32 scenario = shine->mType & 0xFu;
+    return gGetShineId(shineStage, scenario, isEx);
+}
+
+static void hideShineActor(TShine *shine) {
+    if (!shine || shine->mIsAlreadyObtained || !shouldHideShineActor(shine))
+        return;
+
+    auto *live = reinterpret_cast<TLiveActor *>(shine);
+    if (live->mStateFlags.asFlags.mIsObjDead)
+        return;
+
+    shine->mIsAlreadyObtained = true;
+    reinterpret_cast<TMapObjBase *>(shine)->makeObjDead();
+    live->mStateFlags.asFlags.mClipFromScene = true;
+    live->mStateFlags.asFlags.mIsObjDead = true;
+}
+
+struct LiveShineCtx {
+    u8 count;
+    TShine *only;
+};
+
+static bool visitCountLiveShine(TMapObjBase *obj, void *ctx) {
+    auto *liveCtx = reinterpret_cast<LiveShineCtx *>(ctx);
+    if (*reinterpret_cast<const u32 *>(obj) != gShineVtable)
+        return false;
+
+    auto *shine = reinterpret_cast<TShine *>(obj);
+    if (!isLiveCollectible(obj) || shine->mIsAlreadyObtained)
+        return false;
+
+    if (liveCtx->count == 0)
+        liveCtx->only = shine;
+    else
+        liveCtx->only = nullptr;
+    ++liveCtx->count;
+    return false;
+}
+
+static bool visitHideShineIfFlagged(TMapObjBase *obj, void *ctx) {
+    auto *fm = reinterpret_cast<TFlagManager *>(ctx);
+    if (*reinterpret_cast<const u32 *>(obj) != gShineVtable)
+        return false;
+
+    auto *shine = reinterpret_cast<TShine *>(obj);
+    if (!isLiveCollectible(obj) || shine->mIsAlreadyObtained)
+        return false;
+
+    const s32 globalId = shineGlobalIdForActor(shine);
+    if (globalId >= 0 && fm->getShineFlag(static_cast<u8>(globalId)) && shouldHideShineActor(shine))
+        hideShineActor(shine);
+    return false;
+}
+
+static void hideAllShinesWithSetFlags(TFlagManager *fm) {
+    if (!fm || gShineVtable == 0)
+        return;
+
+    smso::forEachManagedMapObj(visitHideShineIfFlagged, fm);
+}
+
+struct HideShineCtx {
+    u8 targetShineId;
+    bool found;
+};
+
+static bool visitHideShineById(TMapObjBase *obj, void *ctx) {
+    auto *hideCtx = reinterpret_cast<HideShineCtx *>(ctx);
+    if (*reinterpret_cast<const u32 *>(obj) != gShineVtable)
+        return false;
+
+    auto *shine = reinterpret_cast<TShine *>(obj);
+    if (!isLiveCollectible(obj) || shine->mIsAlreadyObtained)
+        return false;
+
+    const s32 globalId = shineGlobalIdForActor(shine);
+    if (globalId < 0 || static_cast<u8>(globalId) != hideCtx->targetShineId)
+        return false;
+
+    hideShineActor(shine);
+    hideCtx->found = true;
+    return false;
+}
+
+struct BruteShineCtx {
+    u8 targetShineId;
+    u32 scenario;
+    bool isEx;
+    bool found;
+};
+
+static bool visitHideShineByScenario(TMapObjBase *obj, void *rawCtx) {
+    auto *match = reinterpret_cast<BruteShineCtx *>(rawCtx);
+    if (*reinterpret_cast<const u32 *>(obj) != gShineVtable)
+        return false;
+
+    auto *shine = reinterpret_cast<TShine *>(obj);
+    if (!isLiveCollectible(obj) || shine->mIsAlreadyObtained)
+        return false;
+
+    const bool isEx = (shine->mType & 0x10) != 0;
+    const u32 scenario = shine->mType & 0xFu;
+    if (scenario != match->scenario || isEx != match->isEx)
+        return false;
+
+    hideShineActor(shine);
+    match->found = true;
+    return true;
+}
+
+static void hideShineByGlobalId(u8 shineId) {
+    HideShineCtx ctx = {shineId, false};
+    smso::forEachManagedMapObj(visitHideShineById, &ctx);
+    if (ctx.found)
+        return;
+
+    if (!gGetShineId || !gGetShineStage)
+        return;
+
+    const u32 shineStage = gGetShineStage(currentCourseId());
+    BruteShineCtx brute = {shineId, 0, false, false};
+
+    for (u32 scenario = 0; scenario < 12; ++scenario) {
+        for (u32 ex = 0; ex < 2; ++ex) {
+            const s32 candidate = gGetShineId(shineStage, scenario, ex != 0);
+            if (candidate < 0 || static_cast<u8>(candidate) != shineId)
+                continue;
+
+            brute.scenario = scenario;
+            brute.isEx = ex != 0;
+            brute.found = false;
+            smso::forEachManagedMapObj(visitHideShineByScenario, &brute);
+            if (brute.found)
+                return;
+        }
+    }
+
+    LiveShineCtx live = {0, nullptr};
+    smso::forEachManagedMapObj(visitCountLiveShine, &live);
+    (void)live;
+}
+
+struct FindShinePosCtx {
+    TVec3f pos;
+    TShine *found;
+};
+
+static bool visitFindShineAtPos(TMapObjBase *obj, void *ctx) {
+    auto *find = reinterpret_cast<FindShinePosCtx *>(ctx);
+    if (*reinterpret_cast<const u32 *>(obj) != gShineVtable)
+        return false;
+
+    auto *shine = reinterpret_cast<TShine *>(obj);
+    if (!isLiveCollectible(obj) || shine->mIsAlreadyObtained)
+        return false;
+
+    TVec3f actorPos;
+    shine->JSGGetTranslation(reinterpret_cast<Vec *>(&actorPos));
+    if (!shinePositionsMatch(actorPos, find->pos) &&
+        !shinePositionsMatch(obj->mInitialPosition, find->pos))
+        return false;
+
+    find->found = shine;
+    return true;
+}
+
+struct FindShineIdCtx {
+    u8 targetShineId;
+    TShine *found;
+};
+
+static bool visitFindShineById(TMapObjBase *obj, void *ctx) {
+    auto *find = reinterpret_cast<FindShineIdCtx *>(ctx);
+    if (*reinterpret_cast<const u32 *>(obj) != gShineVtable)
+        return false;
+
+    auto *shine = reinterpret_cast<TShine *>(obj);
+    if (!isLiveCollectible(obj) || shine->mIsAlreadyObtained)
+        return false;
+
+    const s32 globalId = shineGlobalIdForActor(shine);
+    if (globalId < 0 || static_cast<u8>(globalId) != find->targetShineId)
+        return false;
+
+    find->found = shine;
+    return true;
+}
+
+static TShine *findShineAtPosition(const TVec3f &pos) {
+    FindShinePosCtx ctx = {pos, nullptr};
+    smso::forEachManagedMapObj(visitFindShineAtPos, &ctx);
+    return ctx.found;
+}
+
+struct FindShineScenarioCtx {
+    u32 scenario;
+    bool isEx;
+    TShine *found;
+};
+
+static bool visitFindShineByScenario(TMapObjBase *obj, void *rawCtx) {
+    auto *match = reinterpret_cast<FindShineScenarioCtx *>(rawCtx);
+    if (*reinterpret_cast<const u32 *>(obj) != gShineVtable)
+        return false;
+
+    auto *shine = reinterpret_cast<TShine *>(obj);
+    if (!isLiveCollectible(obj) || shine->mIsAlreadyObtained)
+        return false;
+
+    const bool isEx = (shine->mType & 0x10) != 0;
+    const u32 scenario = shine->mType & 0xFu;
+    if (scenario != match->scenario || isEx != match->isEx)
+        return false;
+
+    match->found = shine;
+    return true;
+}
+
+static TShine *findShineByGlobalId(u8 shineId) {
+    FindShineIdCtx ctx = {shineId, nullptr};
+    smso::forEachManagedMapObj(visitFindShineById, &ctx);
+    if (ctx.found)
+        return ctx.found;
+
+    if (!gGetShineId || !gGetShineStage)
+        return nullptr;
+
+    const u32 shineStage = gGetShineStage(currentCourseId());
+    for (u32 scenario = 0; scenario < 12; ++scenario) {
+        for (u32 ex = 0; ex < 2; ++ex) {
+            const s32 candidate = gGetShineId(shineStage, scenario, ex != 0);
+            if (candidate < 0 || static_cast<u8>(candidate) != shineId)
+                continue;
+
+            FindShineScenarioCtx scenarioCtx = {scenario, ex != 0, nullptr};
+            smso::forEachManagedMapObj(visitFindShineByScenario, &scenarioCtx);
+            if (scenarioCtx.found)
+                return scenarioCtx.found;
+        }
+    }
+
+    return nullptr;
+}
+
+struct GatherStageShineCtx {
+    StageShineEntry entries[kMaxStageShines];
+    u8 count;
+};
+
+static bool visitGatherStageShine(TMapObjBase *obj, void *ctx) {
+    auto *gather = reinterpret_cast<GatherStageShineCtx *>(ctx);
+    if (gather->count >= kMaxStageShines)
+        return false;
+    if (*reinterpret_cast<const u32 *>(obj) != gShineVtable)
+        return false;
+
+    auto *shine = reinterpret_cast<TShine *>(obj);
+    if (!isLiveCollectible(obj) || shine->mIsAlreadyObtained)
+        return false;
+
+    StageShineEntry &entry = gather->entries[gather->count++];
+    entry.initialPos = obj->mInitialPosition;
+    shine->JSGGetTranslation(reinterpret_cast<Vec *>(&entry.livePos));
+
+    const s32 globalId = shineGlobalIdForActor(shine);
+    entry.shineId = globalId >= 0 ? static_cast<u8>(globalId) : 0xFF;
+    if (globalId >= 0)
+        rememberShinePosition(static_cast<u8>(globalId), entry.livePos);
+    return false;
+}
+
+static void captureStageShineSnapshot() {
+    GatherStageShineCtx gather = {};
+    smso::forEachManagedMapObj(visitGatherStageShine, &gather);
+
+    sStageShineCount = gather.count;
+    for (u8 i = 0; i < gather.count; ++i)
+        sStageShines[i] = gather.entries[i];
+    sStageShineSnapshotReady = true;
+}
+
+static bool lookupStageShinePosition(u8 shineId, TVec3f *outPos) {
+    if (!outPos)
+        return false;
+
+    for (u8 i = 0; i < sStageShineCount; ++i) {
+        if (sStageShines[i].shineId != shineId)
+            continue;
+        *outPos = sStageShines[i].livePos;
+        return true;
+    }
+    return false;
+}
+
+static bool lookupKnownShinePosition(u8 shineId, TVec3f *outPos) {
+    if (!outPos || shineId >= 128 || sKnownShinePosValid[shineId] == 0)
+        return false;
+    *outPos = sKnownShinePos[shineId];
+    return true;
+}
+
+static void trackLocalShineCollection() {
+    if (sApplyingRemoteEvent || !gpMarDirector || !gpMarDirector->mCollectedShine)
+        return;
+
+    TShine *shine = gpMarDirector->mCollectedShine;
+    shine->JSGGetTranslation(reinterpret_cast<Vec *>(&sPendingShineCapture.pos));
+    sPendingShineCapture.hasPos = 1;
+
+    const s32 globalId = shineGlobalIdForActor(shine);
+    if (globalId >= 0 && globalId < 128) {
+        sPendingShineCapture.shineId = static_cast<u8>(globalId);
+        sPendingShineCapture.hasId = 1;
+        rememberShinePosition(sPendingShineCapture.shineId, sPendingShineCapture.pos);
+    }
+}
+
+static TShine *resolveShineForCollect(u8 shineId, u32 packedPos) {
+    if (packedPos != 0) {
+        TShine *shine = findShineAtPosition(unpackWorldPos(packedPos));
+        if (shine)
+            return shine;
+    }
+
+    TShine *shine = findShineByGlobalId(shineId);
+    if (shine)
+        return shine;
+
+    TVec3f pos{};
+    if (lookupKnownShinePosition(shineId, &pos)) {
+        shine = findShineAtPosition(pos);
+        if (shine)
+            return shine;
+    }
+
+    for (u8 i = 0; i < sStageShineCount; ++i) {
+        if (sStageShines[i].shineId != shineId)
+            continue;
+        shine = findShineAtPosition(sStageShines[i].livePos);
+        if (shine)
+            return shine;
+        shine = findShineAtPosition(sStageShines[i].initialPos);
+        if (shine)
+            return shine;
+    }
+
+    LiveShineCtx live = {0, nullptr};
+    smso::forEachManagedMapObj(visitCountLiveShine, &live);
+    (void)live;
+    return nullptr;
+}
+
+static void hideCollectedShineActor(u8 shineId, u32 packedPos) {
+    TShine *shine = resolveShineForCollect(shineId, packedPos);
+    if (shine) {
+        hideShineActor(shine);
+        return;
+    }
+    hideShineByGlobalId(shineId);
+}
+
+static bool captureShinePublishPosition(u8 shineId, TVec3f *outPos) {
+    if (!outPos)
+        return false;
+
+    if (sPendingShineCapture.hasPos &&
+        (!sPendingShineCapture.hasId || sPendingShineCapture.shineId == shineId)) {
+        *outPos = sPendingShineCapture.pos;
+        return true;
+    }
+
+    if (gpMarDirector && gpMarDirector->mCollectedShine) {
+        gpMarDirector->mCollectedShine->JSGGetTranslation(reinterpret_cast<Vec *>(outPos));
+        return true;
+    }
+
+    if (lookupKnownShinePosition(shineId, outPos))
+        return true;
+
+    if (lookupStageShinePosition(shineId, outPos))
+        return true;
+
+    TShine *shine = findShineByGlobalId(shineId);
+    if (shine) {
+        shine->JSGGetTranslation(reinterpret_cast<Vec *>(outPos));
+        return true;
+    }
+
+    return false;
+}
+
+static u32 packShinePublishPayload(u8 shineId) {
+    TVec3f shinePos{};
+    if (!captureShinePublishPosition(shineId, &shinePos))
+        return 0;
+    rememberShinePosition(shineId, shinePos);
+    return packWorldPos(shinePos);
+}
+
+static void tickRemoteShineCollect() {
+    if (!sRemoteShineCollect.shine)
+        return;
+
+    TShine *shine = sRemoteShineCollect.shine;
+    if (shine->mIsAlreadyObtained) {
+        clearRemoteShineCollect();
+        return;
+    }
+
+    TMario *remote = smso::getRemoteBodyForSlot(sRemoteShineCollect.collectorSlot);
+    if (!remote || !smso::hasRemoteBodyForSlot(sRemoteShineCollect.collectorSlot)) {
+        hideShineActor(shine);
+        clearRemoteShineCollect();
+        return;
+    }
+
+    f32 hx = remote->mTranslation.x;
+    f32 hy = remote->mTranslation.y + 200.0f;
+    f32 hz = remote->mTranslation.z;
+    smso::getRemoteHeadAnchorPosition(sRemoteShineCollect.collectorSlot, hx, hy, hz);
+
+    const TVec3f target(hx, hy, hz);
+    TVec3f position;
+    TVec3f size;
+    TVec3f rotation;
+    shine->JSGGetTranslation(reinterpret_cast<Vec *>(&position));
+    shine->JSGGetScaling(reinterpret_cast<Vec *>(&size));
+    shine->JSGGetRotation(reinterpret_cast<Vec *>(&rotation));
+
+    const TVec3f step(0.007f, 0.007f, 0.007f);
+
+    if (sRemoteShineCollect.shrinking) {
+        if (size.x - 0.011f <= 0.0f) {
+            hideShineActor(shine);
+            remote->mGrabTarget = nullptr;
+            remote->mState = 0x337u; // STATE_WARPOUT
+            clearRemoteShineCollect();
+            return;
+        }
+
+        rotation.y += 3.0f;
+        position.y += 4.0f;
+        size.sub(step);
+        shine->JSGSetScaling(reinterpret_cast<Vec &>(size));
+        shine->JSGSetRotation(reinterpret_cast<Vec &>(rotation));
+        shine->JSGSetTranslation(reinterpret_cast<Vec &>(position));
+        shine->mGlowSize.sub(step);
+    } else {
+        position.x += (target.x - position.x) * 0.15f;
+        position.y += (target.y - position.y) * 0.15f + 2.0f;
+        position.z += (target.z - position.z) * 0.15f;
+        shine->JSGSetTranslation(reinterpret_cast<Vec &>(position));
+        shine->mGlowSize.set(1.0f, 1.0f, 1.0f);
+
+        const f32 dx = target.x - position.x;
+        const f32 dy = target.y - position.y;
+        const f32 dz = target.z - position.z;
+        if (dx * dx + dy * dy + dz * dz < 400.0f)
+            sRemoteShineCollect.shrinking = true;
+    }
+
+    ++sRemoteShineCollect.frames;
+    if (sRemoteShineCollect.frames >= kRemoteShineCollectMaxFrames) {
+        hideShineActor(shine);
+        remote->mGrabTarget = nullptr;
+        remote->mState = 0x337u; // STATE_WARPOUT
+        clearRemoteShineCollect();
+    }
+}
+
+static void beginRemoteShineCollect(u8 collectorSlot, u8 shineId, u32 packedPos) {
+    smso::CommBuffer *buf = smso::getCommBuffer();
+    const u8 localSlot = buf ? buf->localSlot : 0;
+
+    if (packedPos != 0)
+        rememberShinePosition(shineId, unpackWorldPos(packedPos));
+
+    TShine *shine = resolveShineForCollect(shineId, packedPos);
+    if (!shine) {
+        hideShineByGlobalId(shineId);
+        return;
+    }
+
+    if (collectorSlot == localSlot) {
+        hideShineActor(shine);
+        return;
+    }
+
+    TMario *remote = smso::getRemoteBodyForSlot(collectorSlot);
+    if (!remote || !smso::hasRemoteBodyForSlot(collectorSlot)) {
+        hideShineActor(shine);
+        return;
+    }
+
+    clearRemoteShineCollect();
+    sRemoteShineCollect.collectorSlot = collectorSlot;
+    sRemoteShineCollect.shine = shine;
+    sRemoteShineCollect.frames = 0;
+    sRemoteShineCollect.shrinking = false;
+
+    remote->mGrabTarget = reinterpret_cast<TTakeActor *>(shine);
+    remote->mState = static_cast<u32>(TMario::STATE_SHINE_C);
+    remote->setAnimation(TMario::ANIMATION_SHINEGET, 1.0f);
+    shine->mType = (shine->mType & 0x10) | 1;
+}
+
+static void reconcileCollectibleActors(TFlagManager *fm, u8 courseId) {
+    if (!fm || gShineVtable == 0 || gCoinBlueVtable == 0)
+        return;
+
+    if (sStageSettleFrames < kStageSettleFrames)
+        return;
+
+    hideAllShinesWithSetFlags(fm);
+
+    for (u8 shineId = 0; shineId < 128; ++shineId) {
+        if (!fm->getShineFlag(shineId))
+            continue;
+
+        u32 packed = 0;
+        TVec3f pos{};
+        if (lookupKnownShinePosition(shineId, &pos))
+            packed = packWorldPos(pos);
+        hideCollectedShineActor(shineId, packed);
+    }
+
+    for (u8 coinIndex = 0; coinIndex < kMaxStageBlueCoins; ++coinIndex) {
+        if (fm->getBlueCoinFlag(courseId, coinIndex))
+            hideBlueCoinAtIndex(coinIndex);
+    }
+}
+
+static void resetLocalTrackersForStage(u8 courseId, u8 episodeId) {
+    sLastCourseId = courseId;
+    sLastEpisodeId = episodeId;
+    sLastGoldCoinCount = 0;
+    sBlueCoinBits = 0;
+    sStageSettleFrames = 0;
+    sStageShineSnapshotReady = false;
+    sStageShineCount = 0;
+    sPendingShineCapture = {};
+    clearRemoteShineCollect();
+    clearKnownShinePositions();
+    for (u32 i = 0; i < sizeof(sShineBits); ++i)
+        sShineBits[i] = 0;
+
+    TFlagManager *fm = TFlagManager::smInstance;
+    if (!fm)
+        return;
+
+    sLastGoldCoinCount = static_cast<u32>(fm->getFlag(0x40002u));
+    for (u8 shineId = 0; shineId < 128; ++shineId) {
+        if (fm->getShineFlag(shineId))
+            markShineSet(shineId);
+    }
+    for (u8 coinIndex = 0; coinIndex < 30; ++coinIndex) {
+        if (fm->getBlueCoinFlag(courseId, coinIndex))
+            markBlueCoinSet(coinIndex);
+    }
+}
+
+static void publishLocalWorldEvent(smso::WorldEventType type, u8 courseId, u8 episodeId, u8 payload0,
+                                   u8 reserved, u32 payload1) {
+    if (sApplyingRemoteEvent)
+        return;
+
+    smso::CommBuffer *buf = smso::getCommBuffer();
+    if (!worldSyncEnabled(buf))
+        return;
+
+    switch (type) {
+    case smso::WE_SHINE_COLLECTED:
+        if ((buf->bridgeFlags & smso::BF_SYNC_SHINE) == 0)
+            return;
+        break;
+    case smso::WE_BLUE_COIN_COLLECTED:
+        if ((buf->bridgeFlags & smso::BF_SYNC_BLUE_COIN) == 0)
+            return;
+        break;
+    case smso::WE_GOLD_COIN_COLLECTED:
+        if (!episodeCollectibleSyncEnabled(buf))
+            return;
+        break;
+    case smso::WE_RED_COIN_COLLECTED:
+        if ((buf->bridgeFlags & (smso::BF_SYNC_EVENT | smso::BF_SYNC_MISSION)) == 0)
+            return;
+        break;
+    default:
+        return;
+    }
+
+    smso::CommWorldEvent &event = buf->worldSync.localPending;
+    event.eventId = 0;
+    event.sequence = ++sLocalWorldEventSequence;
+    event.type = static_cast<u8>(type);
+    event.courseId = courseId;
+    event.episodeId = episodeId;
+    event.payload0 = payload0;
+    event.reserved = reserved;
+    event.payload1 = payload1;
+}
+
+static void refreshHudCounters() {
+    if (!gpMarDirector || !gpMarDirector->mGCConsole)
+        return;
+
+    TGCConsole2 *console = gpMarDirector->mGCConsole;
+    if (gCountBlueCoin)
+        gCountBlueCoin(console);
+    if (gCountShine)
+        gCountShine(console);
+}
+
+static void applyGoldCoinCount(TFlagManager *fm, u8 courseId, u32 targetCount) {
+    if (!gIncGoldCoinFlag || !fm)
+        return;
+
+    u32 current = static_cast<u32>(fm->getFlag(0x40002u));
+    if (targetCount <= current)
+        return;
+
+    const u32 delta = targetCount - current;
+    for (u32 i = 0; i < delta && current < 100u; ++i) {
+        gIncGoldCoinFlag(fm, courseId, 1);
+        current = static_cast<u32>(fm->getFlag(0x40002u));
+    }
+}
+
+static bool applyWorldEvent(const smso::CommWorldEvent &event) {
+    TFlagManager *fm = TFlagManager::smInstance;
+    if (!fm || event.eventId == 0 || event.type == 0)
+        return false;
+
+    sApplyingRemoteEvent = true;
+
+    bool applied = true;
+    switch (static_cast<smso::WorldEventType>(event.type)) {
+    case smso::WE_SHINE_COLLECTED:
+        if (!fm->getShineFlag(event.payload0)) {
+            fm->setShineFlag(event.payload0);
+            markShineSet(event.payload0);
+        }
+        if (event.payload1 != 0)
+            rememberShinePosition(event.payload0, unpackWorldPos(event.payload1));
+        beginRemoteShineCollect(event.reserved, event.payload0, event.payload1);
+        break;
+
+    case smso::WE_BLUE_COIN_COLLECTED: {
+        const u8 flagIndex = event.payload0;
+        const bool alreadySet = fm->getBlueCoinFlag(event.courseId, flagIndex);
+        const bool locallyTracked = blueCoinWasSet(flagIndex);
+
+        if (!alreadySet) {
+            fm->setBlueCoinFlag(event.courseId, flagIndex);
+            markBlueCoinSet(flagIndex);
+        } else if (!locallyTracked && event.courseId == sLastCourseId) {
+            markBlueCoinSet(flagIndex);
+        }
+
+        // Skip hide on host echo after a local pickup — vanilla is still driving the coin actor.
+        if (event.courseId == currentCourseId() && (!alreadySet || !locallyTracked))
+            hideBlueCoinAtIndex(flagIndex);
+        break;
+    }
+
+    case smso::WE_GOLD_COIN_COLLECTED:
+        if (!sameStage(event.courseId, event.episodeId)) {
+            applied = false;
+            break;
+        }
+        applyGoldCoinCount(fm, event.courseId, event.payload1);
+        sLastGoldCoinCount = static_cast<u32>(fm->getFlag(0x40002u));
+        break;
+
+    case smso::WE_RED_COIN_COLLECTED:
+        applied = applyRedCoinWorldEvent(event);
+        break;
+
+    default:
+        applied = false;
+        break;
+    }
+
+    refreshHudCounters();
+    sApplyingRemoteEvent = false;
+    return applied;
+}
+
+static void captureLocalWorldProgress() {
+    if (sApplyingRemoteEvent)
+        return;
+
+    smso::CommBuffer *buf = smso::getCommBuffer();
+    if (!worldSyncEnabled(buf))
+        return;
+
+    TFlagManager *fm = TFlagManager::smInstance;
+    if (!fm)
+        return;
+
+    const u8 courseId = currentCourseId();
+    const u8 episodeId = currentEpisodeId();
+    if (courseId != sLastCourseId || episodeId != sLastEpisodeId)
+        resetLocalTrackersForStage(courseId, episodeId);
+
+    if (sStageSettleFrames < kStageSettleFrames)
+        ++sStageSettleFrames;
+
+    if (sStageSettleFrames >= kStageSettleFrames && !sStageShineSnapshotReady)
+        captureStageShineSnapshot();
+
+    trackLocalShineCollection();
+    smso::flushDeferredRedCoinEvents();
+
+    const u32 goldCoins = static_cast<u32>(fm->getFlag(0x40002u));
+    if (goldCoins > sLastGoldCoinCount) {
+        publishLocalWorldEvent(smso::WE_GOLD_COIN_COLLECTED, courseId, episodeId, 0, 0, goldCoins);
+        sLastGoldCoinCount = goldCoins;
+    }
+
+    if ((buf->bridgeFlags & smso::BF_SYNC_SHINE) != 0) {
+        for (u8 shineId = 0; shineId < 128; ++shineId) {
+            if (!fm->getShineFlag(shineId) || shineWasSet(shineId))
+                continue;
+            markShineSet(shineId);
+
+            const u32 packedPos = packShinePublishPayload(shineId);
+            publishLocalWorldEvent(smso::WE_SHINE_COLLECTED, courseId, episodeId, shineId, buf->localSlot,
+                                   packedPos);
+
+            if (sPendingShineCapture.hasId && sPendingShineCapture.shineId == shineId)
+                sPendingShineCapture = {};
+            else if (sPendingShineCapture.hasPos && !sPendingShineCapture.hasId)
+                sPendingShineCapture = {};
+        }
+    }
+
+    if ((buf->bridgeFlags & smso::BF_SYNC_BLUE_COIN) != 0) {
+        for (u8 coinIndex = 0; coinIndex < 30; ++coinIndex) {
+            if (!fm->getBlueCoinFlag(courseId, coinIndex) || blueCoinWasSet(coinIndex))
+                continue;
+            markBlueCoinSet(coinIndex);
+            publishLocalWorldEvent(smso::WE_BLUE_COIN_COLLECTED, courseId, episodeId, coinIndex, 0, 0);
+        }
+    }
+
+    tickRemoteShineCollect();
+
+    smso::captureLocalRedCoinProgress();
+    reconcileCollectibleActors(fm, courseId);
+}
+
+} // namespace
 
 namespace smso {
 
-void initWorldSync() {}
+bool isRemoteShineCollectActive(u8 slot) {
+    return sRemoteShineCollect.shine != nullptr && sRemoteShineCollect.collectorSlot == slot;
+}
+
+u32 packCollectibleWorldPos(f32 x, f32 y, f32 z) {
+    auto enc = [](f32 v) -> s32 {
+        return static_cast<s32>(v / kWorldPosPackScale + kWorldPosPackBias);
+    };
+    const s32 ex = enc(x);
+    const s32 ey = enc(y);
+    const s32 ez = enc(z);
+    if (ex < 0 || ex > 1023 || ey < 0 || ey > 1023 || ez < 0 || ez > 1023)
+        return 0;
+
+    return static_cast<u32>(ex) | (static_cast<u32>(ey) << 10) | (static_cast<u32>(ez) << 20);
+}
+
+void unpackCollectibleWorldPos(u32 packed, f32 &x, f32 &y, f32 &z) {
+    auto dec = [](u32 bits) -> f32 {
+        return (static_cast<f32>(bits & 0x3FFu) - kWorldPosPackBias) * kWorldPosPackScale;
+    };
+    x = dec(packed);
+    y = dec(packed >> 10);
+    z = dec(packed >> 20);
+}
+
+bool isValidPackedWorldPos(u32 packed) {
+    return packed != 0 && packed != 0x3FFFFFFFu;
+}
+
+bool looksLikePackedCollectibleWorldPos(u32 packed) {
+    if (!isValidPackedWorldPos(packed))
+        return false;
+    // Pre-position wire format: (stableIndex << 8) | count, always fits in 16 bits with Z term zero.
+    if (packed <= 0xFFFFu && (packed >> 20) == 0)
+        return false;
+    return true;
+}
+
+void initWorldSync() {
+    initRedCoinSync();
+    clearRemoteShineCollect();
+    sPendingShineCapture = {};
+    clearKnownShinePositions();
+    gIncGoldCoinFlag =
+        reinterpret_cast<IncGoldCoinFlagFn>(SMS_PORT_REGION(0x80294610, 0x8028C428, 0, 0));
+    gCountShine = reinterpret_cast<CountShineFn>(SMS_PORT_REGION(0x80147A0C, 0x8013C690, 0, 0));
+    gCountBlueCoin =
+        reinterpret_cast<CountBlueCoinFn>(SMS_PORT_REGION(0x8014757C, 0x8013C200, 0, 0));
+    gGetShineId = reinterpret_cast<GetShineIdFn>(SMS_PORT_REGION(0x8016FAC0, 0x80165834, 0, 0));
+    gGetShineStage =
+        reinterpret_cast<GetShineStageFn>(SMS_PORT_REGION(0x802A8AC8, 0x802A0B70, 0, 0));
+    gShineVtable = SMS_PORT_REGION(0x803C97EC, 0x803C0FDC, 0, 0);
+    gCoinBlueVtable = SMS_PORT_REGION(0x803C99D0, 0x803C11C0, 0, 0);
+    gCoinEmptyVtable = SMS_PORT_REGION(0x803C9D98, 0x803C1588, 0, 0);
+    sLastCourseId = 0xFF;
+    sLastEpisodeId = 0xFF;
+}
 
 void processWorldEvents() {
     CommBuffer *buf = getCommBuffer();
-    if (!(buf->bridgeFlags & (BF_SYNC_SHINE | BF_SYNC_BLUE_COIN | BF_SYNC_EVENT | BF_SYNC_STORY |
-                              BF_SYNC_MISSION | BF_SYNC_SECRET)))
+    if (!worldSyncEnabled(buf))
         return;
+
+    captureLocalWorldProgress();
+
+    CommWorldEvent &incoming = buf->worldSync.incoming;
+    if (incoming.eventId != 0 && incoming.type != 0 &&
+        incoming.eventId > buf->worldSync.lastAppliedEventId) {
+        if (applyWorldEvent(incoming))
+            buf->worldSync.lastAppliedEventId = incoming.eventId;
+        incoming = {};
+    }
 }
 
 } // namespace smso

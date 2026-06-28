@@ -142,9 +142,21 @@ public partial class MainWindow : Window
         {
             StatusBadge.Text = status;
             if (status == "Disconnected")
+            {
                 ClearRoster();
+                MainTabControl.SelectedItem = SettingsTab;
+            }
+            else if (status == "Hosting")
+                MainTabControl.SelectedItem = ServerTab;
+            else if (status == "Connected")
+                MainTabControl.SelectedItem = ClientTab;
             UpdateConnectionUi();
             UpdateSessionStatusColor();
+        });
+        _session.DisconnectNotice += message => RunOnUiThread(() =>
+        {
+            LogLine.Text = message;
+            MessageBox.Show(message, "BSMSO — Disconnected", MessageBoxButton.OK, MessageBoxImage.Information);
         });
         _session.RosterUpdated += entries => RunOnUiThread(() => UpdateRosterCore(entries));
         _session.HostingStateChanged += () => RunOnUiThread(() =>
@@ -158,6 +170,7 @@ public partial class MainWindow : Window
             UpdateClientActionsUi();
             UpdateServerClientTeleportStatus();
         });
+        _session.SyncSettingsChanged += () => RunOnUiThread(UpdateClientWorldSyncStatus);
         _session.DolphinClosed += () => SafeRunOnUiThread(() =>
         {
             RefreshDolphinStateUi();
@@ -228,6 +241,11 @@ public partial class MainWindow : Window
             _config.Config.NameTagGradientEnabled,
             persist: false);
         AllowClientTeleportToggle.IsChecked = _config.Config.AllowClientTeleporting;
+        WorldSyncToggle.IsChecked = IsWorldSyncEnabled(
+            _config.Config.SyncFlags,
+            _config.Config.SyncObjects,
+            _config.Config.SyncProgress);
+        UpdateClientWorldSyncStatus();
     }
 
     private void SaveConfigFromUi()
@@ -253,9 +271,12 @@ public partial class MainWindow : Window
         _session.Initialize(levelsPath);
         if (!File.Exists(levelsPath)) return;
         _levels = LevelCatalog.Load(levelsPath);
-        ClientLevelCombo.ItemsSource = _levels.Courses;
-        ServerLevelCombo.ItemsSource = _levels.Courses;
-        if (_levels.Courses.Count > 0)
+        var warpCourses = _levels.GetOrganizedWarpCourses();
+        ClientLevelCombo.EnableGroupHeaders = true;
+        ServerLevelCombo.EnableGroupHeaders = true;
+        ClientLevelCombo.ItemsSource = warpCourses;
+        ServerLevelCombo.ItemsSource = warpCourses;
+        if (warpCourses.Count > 0)
         {
             ClientLevelCombo.SelectedIndex = 0;
             ServerLevelCombo.SelectedIndex = 0;
@@ -277,9 +298,18 @@ public partial class MainWindow : Window
         return candidates.FirstOrDefault(File.Exists) ?? candidates[0];
     }
 
+    private static CourseEntry? ResolveSelectedCourse(FastSelector levelCombo) =>
+        levelCombo.SelectedItem switch
+        {
+            WarpCourseListItem item => item.Course,
+            CourseEntry course => course,
+            _ => null,
+        };
+
     private static void UpdateEpisodeCombo(FastSelector levelCombo, FastSelector episodeCombo)
     {
-        if (levelCombo.SelectedItem is CourseEntry course)
+        var course = ResolveSelectedCourse(levelCombo);
+        if (course != null)
         {
             episodeCombo.SelectedItem = null;
             episodeCombo.SelectedIndex = -1;
@@ -329,15 +359,25 @@ public partial class MainWindow : Window
             row.Username = entry.Username;
             row.StageId = entry.StageId;
             row.EpisodeId = entry.EpisodeId;
-            row.LevelName = _levels?.GetCourseName(entry.StageId) ?? entry.StageId.ToString();
-            row.EpisodeName = _levels?.GetEpisodeDisplayName(entry.StageId, entry.EpisodeId)
-                              ?? $"Episode {entry.EpisodeId + 1}";
+            if (entry.State is DolphinState.Booting or DolphinState.Loading or DolphinState.Warping)
+            {
+                row.LevelName = "Loading...";
+                row.EpisodeName = "";
+            }
+            else
+            {
+                row.LevelName = _levels?.GetCourseName(entry.StageId) ?? entry.StageId.ToString();
+                row.EpisodeName = _levels?.GetEpisodeDisplayName(entry.StageId, entry.EpisodeId)
+                                  ?? $"Episode {entry.EpisodeId + 1}";
+            }
             row.Status = entry.State.ToString();
             row.PingMs = entry.PingMs.ToString();
         }
 
         if (!_lastRosterSlots.SequenceEqual(slotSet))
         {
+            var rosterShrunk = slotSet.Length < _lastRosterSlots.Length &&
+                               slotSet.All(_lastRosterSlots.Contains);
             _lastRosterSlots = slotSet;
             _warpTargets.Clear();
             foreach (var entry in ordered)
@@ -354,7 +394,10 @@ public partial class MainWindow : Window
             ClientWarpTargetCombo.SelectedItem = clientWarpMatch ?? _clientWarpTargets.FirstOrDefault();
 
             if (GameModeCombo.SelectedIndex == 1)
-                SyncHideSeekRoleListsFromRoster();
+                SyncHideSeekRoleListsFromRoster(rosterShrunk: rosterShrunk);
+
+            if (rosterShrunk && (_session.IsConnected || _session.IsHosting))
+                MainTabControl.SelectedItem = SettingsTab;
         }
     }
 
@@ -434,7 +477,17 @@ public partial class MainWindow : Window
 
     private async void Disconnect_Click(object sender, RoutedEventArgs e)
     {
-        await _session.DisconnectAsync();
+        HostButton.IsEnabled = false;
+        ConnectButton.IsEnabled = false;
+        DisconnectButton.IsEnabled = false;
+        try
+        {
+            await _session.DisconnectAsync();
+        }
+        finally
+        {
+            UpdateConnectionUi();
+        }
     }
 
     private void LaunchDolphin_Click(object sender, RoutedEventArgs e)
@@ -581,8 +634,38 @@ public partial class MainWindow : Window
         ServerActionsOverlay.Visibility = serverActionsActive ? Visibility.Collapsed : Visibility.Visible;
         UpdateClientActionsUi();
         UpdateServerClientTeleportStatus();
+        UpdateClientWorldSyncStatus();
         UpdateSessionStatusColor();
     }
+
+    private void UpdateClientWorldSyncStatus()
+    {
+        if (!_session.IsConnected)
+        {
+            ClientWorldSyncStatusText.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        ClientWorldSyncStatusText.Visibility = Visibility.Visible;
+        if (_session.IsHosting)
+        {
+            ClientWorldSyncStatusText.Text = WorldSyncToggle.IsChecked == true
+                ? "World sync is enabled for this session (host control in Server Actions)."
+                : "World sync is off — enable Sync collectibles under Server Actions.";
+            return;
+        }
+
+        if (!IsWorldSyncEnabled(_session.SyncFlagsEnabled, _session.SyncObjectsEnabled, _session.SyncProgressEnabled))
+        {
+            ClientWorldSyncStatusText.Text = "World sync is off on the host — collectibles will not update for other players.";
+            return;
+        }
+
+        ClientWorldSyncStatusText.Text = "World sync is on — shines and blue coins update everywhere; yellow and red coins only when you share a course and episode.";
+    }
+
+    private static bool IsWorldSyncEnabled(bool syncFlags, bool syncObjects, bool syncProgress) =>
+        syncFlags && syncObjects && syncProgress;
 
     private void UpdateServerClientTeleportStatus()
     {
@@ -637,8 +720,9 @@ public partial class MainWindow : Window
 
     private async void ClientWarp_Click(object sender, RoutedEventArgs e)
     {
-        if (ClientLevelCombo.SelectedItem is not CourseEntry course ||
-            ClientEpisodeCombo.SelectedItem is not EpisodeEntry episode) return;
+        var course = ResolveSelectedCourse(ClientLevelCombo);
+        if (course == null || ClientEpisodeCombo.SelectedItem is not EpisodeEntry episode)
+            return;
         await _session.WarpSelfAsync(course.CourseId, episode.EpisodeId);
     }
 
@@ -653,31 +737,25 @@ public partial class MainWindow : Window
         await _session.WarpToPlayerAsync(target.Slot);
     }
 
-    private async void ServerTeleportToPlayer_Click(object sender, RoutedEventArgs e)
-    {
-        if (WarpTargetCombo.SelectedItem is not WarpTargetItem target)
-        {
-            MessageBox.Show("Select a player in Warp target first.", "BSMSO", MessageBoxButton.OK, MessageBoxImage.Information);
-            return;
-        }
-
-        await _session.WarpToPlayerAsync(target.Slot);
-    }
-
     private void ServerWarpAll_Click(object sender, RoutedEventArgs e)
     {
-        if (ServerLevelCombo.SelectedItem is not CourseEntry course ||
-            ServerEpisodeCombo.SelectedItem is not EpisodeEntry episode) return;
+        var course = ResolveSelectedCourse(ServerLevelCombo);
+        if (course == null || ServerEpisodeCombo.SelectedItem is not EpisodeEntry episode)
+            return;
         _session.HostWarp(ProtocolConstants.WarpAllSlots, course.CourseId, episode.EpisodeId);
     }
 
     private void ServerWarpSelected_Click(object sender, RoutedEventArgs e)
     {
-        if (ServerLevelCombo.SelectedItem is not CourseEntry course ||
-            ServerEpisodeCombo.SelectedItem is not EpisodeEntry episode) return;
+        var course = ResolveSelectedCourse(ServerLevelCombo);
+        if (course == null || ServerEpisodeCombo.SelectedItem is not EpisodeEntry episode)
+            return;
 
         if (WarpTargetCombo.SelectedItem is not WarpTargetItem target)
+        {
+            MessageBox.Show("Select a player in Warp target first.", "BSMSO", MessageBoxButton.OK, MessageBoxImage.Information);
             return;
+        }
 
         _session.HostWarp(target.Slot, course.CourseId, episode.EpisodeId);
     }
@@ -688,6 +766,16 @@ public partial class MainWindow : Window
         _session.SetAllowClientTeleport(AllowClientTeleportToggle.IsChecked == true);
         UpdateServerClientTeleportStatus();
         UpdateClientActionsUi();
+    }
+
+    private void WorldSync_Changed(object sender, RoutedEventArgs e)
+    {
+        if (!IsLoaded || !_session.IsHosting)
+            return;
+
+        var enabled = WorldSyncToggle.IsChecked == true;
+        _session.SetServerSync(enabled, enabled, enabled);
+        UpdateClientWorldSyncStatus();
     }
 
     private void HelpLink_RequestNavigate(object sender, RequestNavigateEventArgs e)
@@ -1080,7 +1168,7 @@ public partial class MainWindow : Window
         ApplyGameModeStateToUi(GameModeStatePacket.CreateDefault());
     }
 
-    private void SyncHideSeekRoleListsFromRoster(bool forceAllHiders = false)
+    private void SyncHideSeekRoleListsFromRoster(bool forceAllHiders = false, bool rosterShrunk = false)
     {
         if (_suppressHideSeekUiSync || GameModeCombo.SelectedIndex != 1)
             return;
@@ -1127,6 +1215,11 @@ public partial class MainWindow : Window
                     hiders.Add(row);
             }
         }
+
+        // During an active tag round, roster shrink only removes departed players from the UI.
+        // Do not push role updates to the server — that would stop tag for everyone.
+        if (_tagRunning && rosterShrunk)
+            return;
 
         PushHideSeekRolesToServer();
     }

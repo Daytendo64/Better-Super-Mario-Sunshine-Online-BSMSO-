@@ -12,6 +12,30 @@ public class LevelCatalogTests
     }
 
     [Fact]
+    public void NormalizeEpisodeFromGame_DelfinoPlaza_MainHub()
+    {
+        var normalized = LevelCatalog.NormalizeEpisodeFromGame(DelfinoPlazaMapping.AreaId, 8);
+        Assert.Equal(0, normalized);
+        Assert.Contains("Main Hub",
+            LevelCatalog.Load(FindLevelsPath()).GetEpisodeDisplayName(DelfinoPlazaMapping.AreaId, normalized),
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void GetOrganizedWarpCourses_InsertsGroupHeaderFlags()
+    {
+        var levelsPath = FindLevelsPath();
+        if (!File.Exists(levelsPath))
+            return;
+
+        var catalog = LevelCatalog.Load(levelsPath);
+        var courses = catalog.GetOrganizedWarpCourses();
+        Assert.NotEmpty(courses);
+        Assert.Contains(courses, c => c.ShowGroupHeader && c.Group == "Main Story");
+        Assert.Contains(courses, c => !c.ShowGroupHeader && c.Group == "Main Story");
+    }
+
+    [Fact]
     public void GetEpisodeDisplayName_UsesCatalogEpisodeId()
     {
         var levelsPath = FindLevelsPath();
@@ -55,6 +79,9 @@ public class LevelCatalogTests
     [InlineData(3, 1, "Blooper Surfing Safari")]
     [InlineData(5, 0, "Mecha-Bowser Appears!")]
     [InlineData(5, 7, "Roller Coaster Balloons")]
+    [InlineData(7, 2, "Mysterious Hotel Delfino")]
+    [InlineData(7, 7, "Red Coins in the Hotel")]
+    [InlineData(56, 0, "King Boo Down Below")]
     [InlineData(8, 2, "The Goopy Inferno")]
     [InlineData(9, 7, "The Red Coin Fish")]
     public void EpisodeReference_SpotCheckTitles(byte courseId, byte episodeId, string titleFragment)

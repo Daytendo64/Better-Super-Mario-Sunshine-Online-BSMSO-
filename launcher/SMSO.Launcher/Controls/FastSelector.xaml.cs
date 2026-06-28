@@ -1,5 +1,7 @@
 using System;
 using System.Collections;
+using System.Collections.Generic;
+using System.Linq;
 using System.Reflection;
 using System.Windows;
 using System.Windows.Controls;
@@ -7,6 +9,7 @@ using System.Windows.Controls.Primitives;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Threading;
+using SMSO.Net;
 
 namespace SMSO.Launcher.Controls;
 
@@ -26,7 +29,11 @@ public partial class FastSelector : UserControl
 
     public static readonly DependencyProperty DisplayMemberPathProperty =
         DependencyProperty.Register(nameof(DisplayMemberPath), typeof(string), typeof(FastSelector),
-            new PropertyMetadata(string.Empty, (d, _) => ((FastSelector)d).RefreshDisplay()));
+            new PropertyMetadata(string.Empty, (d, _) => ((FastSelector)d).ApplyDisplayMemberPath()));
+
+    public static readonly DependencyProperty EnableGroupHeadersProperty =
+        DependencyProperty.Register(nameof(EnableGroupHeaders), typeof(bool), typeof(FastSelector),
+            new PropertyMetadata(false, (d, _) => ((FastSelector)d).ApplyGroupHeaderTemplate()));
 
     public static readonly DependencyProperty ItemTemplateProperty =
         DependencyProperty.Register(nameof(ItemTemplate), typeof(DataTemplate), typeof(FastSelector),
@@ -73,6 +80,12 @@ public partial class FastSelector : UserControl
         set => SetValue(DisplayMemberPathProperty, value);
     }
 
+    public bool EnableGroupHeaders
+    {
+        get => (bool)GetValue(EnableGroupHeadersProperty);
+        set => SetValue(EnableGroupHeadersProperty, value);
+    }
+
     public DataTemplate? ItemTemplate
     {
         get => (DataTemplate?)GetValue(ItemTemplateProperty);
@@ -85,6 +98,7 @@ public partial class FastSelector : UserControl
     {
         var control = (FastSelector)d;
         control.ItemsList.ItemsSource = e.NewValue as IEnumerable;
+        control.ApplyGroupHeaderTemplate();
         if (control.SelectedIndex < 0 && control.GetItemCount() > 0)
             control.SelectedIndex = 0;
         control.RefreshDisplay();
@@ -141,12 +155,38 @@ public partial class FastSelector : UserControl
         if (ItemTemplate != null)
             ItemsList.ItemTemplate = ItemTemplate;
 
+        ApplyDisplayMemberPath();
+        ApplyGroupHeaderTemplate();
         RefreshDisplay();
+    }
+
+    private void ApplyDisplayMemberPath()
+    {
+        if (EnableGroupHeaders)
+            return;
+
+        ItemsList.DisplayMemberPath = string.IsNullOrWhiteSpace(DisplayMemberPath)
+            ? string.Empty
+            : DisplayMemberPath;
+        RefreshDisplay();
+    }
+
+    private void ApplyGroupHeaderTemplate()
+    {
+        if (!EnableGroupHeaders)
+        {
+            ItemsList.ItemTemplate = ItemTemplate;
+            ApplyDisplayMemberPath();
+            return;
+        }
+
+        ItemsList.DisplayMemberPath = string.Empty;
+        ItemsList.ItemTemplate = (DataTemplate)FindResource("WarpCourseItemTemplate");
     }
 
     private void RefreshDisplay()
     {
-        var useText = !string.IsNullOrWhiteSpace(DisplayMemberPath);
+        var useText = !string.IsNullOrWhiteSpace(DisplayMemberPath) || EnableGroupHeaders;
         SelectionDisplay.Visibility = useText ? Visibility.Collapsed : Visibility.Visible;
         SelectionText.Visibility = useText ? Visibility.Visible : Visibility.Collapsed;
 
@@ -159,33 +199,65 @@ public partial class FastSelector : UserControl
             return;
         }
 
+        if (SelectedItem is IWarpListEntry entry)
+        {
+            SelectionText.Text = entry.DisplayName;
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(DisplayMemberPath))
+        {
+            SelectionText.Text = SelectedItem.ToString() ?? string.Empty;
+            return;
+        }
+
         var prop = SelectedItem.GetType().GetProperty(DisplayMemberPath, BindingFlags.Public | BindingFlags.Instance);
         SelectionText.Text = prop?.GetValue(SelectedItem)?.ToString() ?? SelectedItem.ToString() ?? string.Empty;
     }
 
+    private IEnumerable<object> EnumerateItems()
+    {
+        if (ItemsSource is IEnumerable enumerable)
+        {
+            foreach (var item in enumerable)
+                yield return item!;
+        }
+    }
+
     private int GetItemCount()
     {
-        if (ItemsSource is not IList list)
-            return 0;
-        return list.Count;
+        if (ItemsSource is IList list)
+            return list.Count;
+        return ItemsSource?.Cast<object>().Count() ?? 0;
     }
 
     private object? GetItemAt(int index)
     {
-        if (ItemsSource is not IList list || index < 0 || index >= list.Count)
+        if (index < 0)
             return null;
-        return list[index];
+
+        var i = 0;
+        foreach (var item in EnumerateItems())
+        {
+            if (i == index)
+                return item;
+            i++;
+        }
+
+        return null;
     }
 
     private int IndexOfItem(object? item)
     {
-        if (ItemsSource is not IList list || item == null)
+        if (item == null)
             return -1;
 
-        for (var i = 0; i < list.Count; i++)
+        var i = 0;
+        foreach (var candidate in EnumerateItems())
         {
-            if (Equals(list[i], item))
+            if (Equals(candidate, item))
                 return i;
+            i++;
         }
 
         return -1;

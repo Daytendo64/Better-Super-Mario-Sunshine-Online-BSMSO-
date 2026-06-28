@@ -23,14 +23,13 @@ public sealed class NetClient : IDisposable
     private readonly HashSet<byte> _knownRosterSlots = new();
     private PlayerSnapshot _pendingSnapshot;
     private bool _hasPendingSnapshot;
-    private readonly byte[] _udpSendScratch =
-        new byte[ProtocolConstants.UdpSnapshotPayloadOffset + ProtocolConstants.PlayerSnapshotSize];
-    private readonly byte[] _heartbeatScratch = new byte[10];
 
     public event Action<PlayerRosterEntry[]>? RosterUpdated;
     public event Action<byte, byte, byte, byte>? WarpCommandReceived;
     public event Action<byte, PlayerSnapshot>? SnapshotReceived;
     public event Action<byte, MarioVoiceEvent>? MarioVoiceEventReceived;
+    public event Action<WorldEventPacket>? WorldEventReceived;
+    public event Action<WorldEventPacket[]>? WorldStateReplayReceived;
     public event Action<JoinRejectReason>? JoinRejected;
     public event Action? JoinAccepted;
     public event Action<DisconnectReason>? Disconnected;
@@ -45,12 +44,13 @@ public sealed class NetClient : IDisposable
 
     public async Task ConnectAsync(string host, int port, string username, CancellationToken ct = default)
     {
-        if (_tcp?.Connected == true)
-            throw new InvalidOperationException("Already connected.");
+        EnsureFullyDisposed();
 
         _isDisconnecting = false;
         _assignedSlot = 0;
         _snapshotSeq = 0;
+        _hasPendingSnapshot = false;
+        MeasuredPingMs = 0;
         _lastReceivedSnapshotSeq.Clear();
         _knownRosterSlots.Clear();
 
@@ -93,6 +93,8 @@ public sealed class NetClient : IDisposable
             _udpReadTask = Task.Run(() => UdpReadLoop(_cts.Token), _cts.Token);
             _udpSendTask = Task.Run(() => UdpSnapshotSendLoop(_cts.Token), _cts.Token);
             _heartbeatTask = Task.Run(() => HeartbeatLoop(_cts.Token), _cts.Token);
+
+            TrySendPendingSnapshot();
         }
         catch
         {
@@ -116,6 +118,59 @@ public sealed class NetClient : IDisposable
         }
     }
 
+    /// <summary>Send the latest queued local snapshot immediately (e.g. right after join).</summary>
+    public void SendSnapshotNow()
+    {
+        if (_udp == null || _udpServerEndpoint == null)
+            return;
+
+        PlayerSnapshot snap;
+        lock (_snapshotLock)
+        {
+            if (!_hasPendingSnapshot)
+                return;
+            snap = _pendingSnapshot;
+        }
+
+        SendSnapshotPacket(snap);
+        // #region agent log
+        AgentDebugLog.Write("D", "NetClient.SendSnapshotNow", "immediate udp sent", new
+        {
+            slot = _assignedSlot,
+            seq = _snapshotSeq,
+            connected = snap.Connected,
+            port = ((IPEndPoint)_udp!.Client.LocalEndPoint!).Port,
+        });
+        // #endregion
+    }
+
+    public void ForceDispose()
+    {
+        if (_isDisconnecting && _tcp == null && _udp == null)
+            return;
+
+        _isDisconnecting = true;
+        try
+        {
+            _cts?.Cancel();
+        }
+        catch
+        {
+            // ignore
+        }
+
+        try
+        {
+            WaitForBackgroundTasksAsync().Wait(TimeSpan.FromSeconds(1));
+        }
+        catch
+        {
+            // expected during forced shutdown
+        }
+
+        DisposeResources();
+    }
+
     public async Task SendWarpRequestAsync(byte targetSlot, byte courseId, byte episodeId)
     {
         await SendTcpAsync(PacketSerializer.BuildWarpRequest(targetSlot, courseId, episodeId),
@@ -125,6 +180,12 @@ public sealed class NetClient : IDisposable
     public async Task SendMarioVoiceEventAsync(MarioVoiceEvent voiceEvent)
     {
         await SendTcpAsync(PacketSerializer.BuildMarioVoiceEvent(_assignedSlot, voiceEvent),
+            _cts?.Token ?? default);
+    }
+
+    public async Task SendWorldEventAsync(WorldEventRequest request)
+    {
+        await SendTcpAsync(PacketSerializer.BuildWorldEventRequest(request),
             _cts?.Token ?? default);
     }
 
@@ -139,6 +200,8 @@ public sealed class NetClient : IDisposable
         using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(ProtocolConstants.UdpSnapshotIntervalMs));
         while (!ct.IsCancellationRequested)
         {
+            TrySendPendingSnapshot();
+
             try
             {
                 await timer.WaitForNextTickAsync(ct).ConfigureAwait(false);
@@ -147,34 +210,38 @@ public sealed class NetClient : IDisposable
             {
                 break;
             }
+        }
+    }
 
-            PlayerSnapshot snap = default;
-            var hasSnap = false;
-            lock (_snapshotLock)
-            {
-                if (_hasPendingSnapshot)
-                {
-                    snap = _pendingSnapshot;
-                    hasSnap = true;
-                }
-            }
+    private void TrySendPendingSnapshot()
+    {
+        if (_udp == null || _udpServerEndpoint == null || _isDisconnecting)
+            return;
 
-            if (!hasSnap || _udp == null || _udpServerEndpoint == null)
-                continue;
+        PlayerSnapshot snap;
+        lock (_snapshotLock)
+        {
+            if (!_hasPendingSnapshot)
+                return;
+            snap = _pendingSnapshot;
+        }
 
-            PacketSerializer.WriteUdpSnapshot(_udpSendScratch, _assignedSlot, ++_snapshotSeq, snap);
-            try
-            {
-                _udp.Send(_udpSendScratch, _udpSendScratch.Length, _udpServerEndpoint);
-            }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested)
-            {
-                break;
-            }
-            catch (Exception ex) when (!_isDisconnecting)
-            {
-                Log?.Invoke($"UDP snapshot send error: {ex.Message}");
-            }
+        SendSnapshotPacket(snap);
+    }
+
+    private void SendSnapshotPacket(in PlayerSnapshot snap)
+    {
+        if (_udp == null || _udpServerEndpoint == null || _isDisconnecting)
+            return;
+
+        var bytes = PacketSerializer.BuildUdpSnapshot(_assignedSlot, ++_snapshotSeq, snap);
+        try
+        {
+            _udp.Send(bytes, bytes.Length, _udpServerEndpoint);
+        }
+        catch (Exception ex) when (!_isDisconnecting)
+        {
+            Log?.Invoke($"UDP snapshot send error: {ex.Message}");
         }
     }
 
@@ -202,8 +269,12 @@ public sealed class NetClient : IDisposable
 
     private async Task DisconnectInternalAsync(DisconnectReason reason, bool sendPacket)
     {
-        if (_isDisconnecting && sendPacket)
+        if (_isDisconnecting)
+        {
+            await WaitForBackgroundTasksAsync().ConfigureAwait(false);
+            DisposeResources();
             return;
+        }
 
         _isDisconnecting = true;
         if (sendPacket)
@@ -244,7 +315,7 @@ public sealed class NetClient : IDisposable
 
         try
         {
-            await Task.WhenAll(tasks).WaitAsync(TimeSpan.FromMilliseconds(750)).ConfigureAwait(false);
+            await Task.WhenAll(tasks).WaitAsync(TimeSpan.FromSeconds(1)).ConfigureAwait(false);
         }
         catch
         {
@@ -252,8 +323,30 @@ public sealed class NetClient : IDisposable
         }
     }
 
+    private void EnsureFullyDisposed()
+    {
+        if (_tcp == null && _udp == null && _cts == null)
+            return;
+
+        ForceDispose();
+    }
+
     private void DisposeResources()
     {
+        lock (_snapshotLock)
+        {
+            _hasPendingSnapshot = false;
+        }
+
+        try
+        {
+            _udp?.Client?.Close();
+        }
+        catch
+        {
+            // ignore
+        }
+
         _tcpStream?.Dispose();
         _tcp?.Dispose();
         _udp?.Dispose();
@@ -362,8 +455,17 @@ public sealed class NetClient : IDisposable
                 if (PacketSerializer.TryReadMarioVoiceEvent(payload, out var voiceSlot, out var voiceEvent))
                     MarioVoiceEventReceived?.Invoke(voiceSlot, voiceEvent);
                 break;
+            case TcpPacketId.WorldEvent:
+                if (PacketSerializer.TryReadWorldEventBroadcast(payload, out var worldEvent))
+                    WorldEventReceived?.Invoke(worldEvent);
+                break;
+            case TcpPacketId.WorldStateReplay:
+                if (PacketSerializer.TryReadWorldStateReplay(payload, out var replayEvents))
+                    WorldStateReplayReceived?.Invoke(replayEvents);
+                break;
             case TcpPacketId.Disconnect:
-                Disconnected?.Invoke(payload.Length > 0 ? (DisconnectReason)payload[0] : DisconnectReason.ServerShutdown);
+                if (!_isDisconnecting)
+                    Disconnected?.Invoke(payload.Length > 0 ? (DisconnectReason)payload[0] : DisconnectReason.ServerShutdown);
                 _isDisconnecting = true;
                 _cts?.Cancel();
                 break;
@@ -474,10 +576,11 @@ public sealed class NetClient : IDisposable
 
             try
             {
+                var payload = new byte[10];
                 var sentMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-                BinaryPrimitives.WriteInt64LittleEndian(_heartbeatScratch.AsSpan(0, 8), sentMs);
-                BinaryPrimitives.WriteUInt16LittleEndian(_heartbeatScratch.AsSpan(8, 2), MeasuredPingMs);
-                await SendTcpAsync(PacketSerializer.BuildHeartbeat(_heartbeatScratch), ct).ConfigureAwait(false);
+                BinaryPrimitives.WriteInt64LittleEndian(payload.AsSpan(0, 8), sentMs);
+                BinaryPrimitives.WriteUInt16LittleEndian(payload.AsSpan(8, 2), MeasuredPingMs);
+                await SendTcpAsync(PacketSerializer.BuildHeartbeat(payload), ct).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
@@ -557,22 +660,6 @@ public sealed class NetClient : IDisposable
 
     public void Dispose()
     {
-        if (_isDisconnecting)
-        {
-            DisposeResources();
-            return;
-        }
-
-        try
-        {
-            DisconnectInternalAsync(DisconnectReason.UserRequest, sendPacket: false)
-                .WaitAsync(TimeSpan.FromMilliseconds(750))
-                .GetAwaiter()
-                .GetResult();
-        }
-        catch
-        {
-            DisposeResources();
-        }
+        ForceDispose();
     }
 }

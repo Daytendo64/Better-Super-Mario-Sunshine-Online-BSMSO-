@@ -47,6 +47,25 @@ public class IntegrationTests
     }
 
     [Fact]
+    public async Task PunctuationUsername_IsAccepted()
+    {
+        var server = new GameServer(new LevelCatalog());
+        var port = GetFreePort();
+        server.Start(port);
+        try
+        {
+            var client = new NetClient();
+            await client.ConnectAsync("127.0.0.1", port, "Mr.Smith!");
+            Assert.True(client.IsConnected);
+            await client.DisconnectAsync();
+        }
+        finally
+        {
+            server.Stop();
+        }
+    }
+
+    [Fact]
     public async Task DuplicateUsername_IsRejected()
     {
         var server = new GameServer(new LevelCatalog());
@@ -216,6 +235,222 @@ public class IntegrationTests
         {
             foreach (var client in clients)
                 client.Dispose();
+            server.Stop();
+        }
+    }
+
+    [Fact]
+    public async Task SameUsername_CanReconnectImmediately_AfterDisconnect()
+    {
+        var port = GetFreePort();
+        var server = new GameServer(new LevelCatalog()) { MaxPlayers = ProtocolConstants.StableMaxPlayers };
+        server.Start(port);
+
+        try
+        {
+            var first = new NetClient();
+            await first.ConnectAsync("127.0.0.1", port, "ReconnectMe");
+            var firstSlot = first.AssignedSlot;
+            Assert.True(first.IsConnected);
+
+            await first.DisconnectAsync();
+            first.Dispose();
+
+            var second = new NetClient();
+            await second.ConnectAsync("127.0.0.1", port, "ReconnectMe");
+            Assert.True(second.IsConnected);
+            Assert.Equal(firstSlot, second.AssignedSlot);
+
+            await second.DisconnectAsync();
+            second.Dispose();
+
+            var third = new NetClient();
+            await third.ConnectAsync("127.0.0.1", port, "ReconnectMe");
+            Assert.True(third.IsConnected);
+            Assert.Equal(firstSlot, third.AssignedSlot);
+
+            await third.DisconnectAsync();
+        }
+        finally
+        {
+            server.Stop();
+        }
+    }
+
+    [Fact]
+    public async Task RapidReconnectCycle_ThreeTimesWithoutNameTaken()
+    {
+        var port = GetFreePort();
+        var server = new GameServer(new LevelCatalog()) { MaxPlayers = ProtocolConstants.StableMaxPlayers };
+        server.Start(port);
+
+        try
+        {
+            for (var attempt = 0; attempt < 3; attempt++)
+            {
+                var client = new NetClient();
+                await client.ConnectAsync("127.0.0.1", port, "RapidUser");
+                Assert.True(client.IsConnected);
+                client.PublishSnapshot(new PlayerSnapshot
+                {
+                    Connected = 1,
+                    Slot = client.AssignedSlot,
+                    StageId = 1,
+                    EpisodeId = 0,
+                    Name = new byte[16],
+                });
+                client.SendSnapshotNow();
+                await client.DisconnectAsync();
+                client.Dispose();
+            }
+        }
+        finally
+        {
+            server.Stop();
+        }
+    }
+
+    [Fact]
+    public async Task UdpRelay_SurvivesAbruptClientDisconnect_AndRelaysAfterReconnect()
+    {
+        var port = GetFreePort();
+        var server = new GameServer(new LevelCatalog()) { MaxPlayers = ProtocolConstants.StableMaxPlayers };
+        server.Start(port);
+
+        NetClient? replacement = null;
+        try
+        {
+            var first = new NetClient();
+            var observer = new NetClient();
+            await first.ConnectAsync("127.0.0.1", port, "Dropper");
+            await observer.ConnectAsync("127.0.0.1", port, "Observer");
+
+            var sawDropperSnapshot = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            observer.SnapshotReceived += (slot, _) =>
+            {
+                if (slot == first.AssignedSlot)
+                    sawDropperSnapshot.TrySetResult(true);
+            };
+
+            first.PublishSnapshot(new PlayerSnapshot
+            {
+                Connected = 1,
+                Slot = first.AssignedSlot,
+                StageId = 1,
+                Name = new byte[16],
+            });
+            first.SendSnapshotNow();
+            await sawDropperSnapshot.Task.WaitAsync(TimeSpan.FromSeconds(3));
+
+            first.ForceDispose();
+
+            replacement = new NetClient();
+            var sawReplacement = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            observer.SnapshotReceived += (slot, _) =>
+            {
+                if (slot == replacement.AssignedSlot)
+                    sawReplacement.TrySetResult(true);
+            };
+
+            await replacement.ConnectAsync("127.0.0.1", port, "Replacement");
+            replacement.PublishSnapshot(new PlayerSnapshot
+            {
+                Connected = 1,
+                Slot = replacement.AssignedSlot,
+                StageId = 2,
+                Name = new byte[16],
+            });
+            replacement.SendSnapshotNow();
+
+            await sawReplacement.Task.WaitAsync(TimeSpan.FromSeconds(3));
+            await observer.DisconnectAsync();
+            await replacement.DisconnectAsync();
+        }
+        finally
+        {
+            replacement?.Dispose();
+            server.Stop();
+        }
+    }
+
+    [Fact]
+    public async Task NonHostDisconnect_KeepsHideSeekTagActive()
+    {
+        var port = GetFreePort();
+        var server = new GameServer(new LevelCatalog()) { MaxPlayers = ProtocolConstants.StableMaxPlayers };
+        server.Start(port);
+
+        try
+        {
+            var host = new NetClient();
+            var guest = new NetClient();
+            var observer = new NetClient();
+
+            await host.ConnectAsync("127.0.0.1", port, "Host");
+            await guest.ConnectAsync("127.0.0.1", port, "Guest");
+            await observer.ConnectAsync("127.0.0.1", port, "Observer");
+            await WaitForRosterCountAsync(observer, 3);
+
+            server.SetGameMode(GameMode.HideSeek);
+            server.SetHideSeekRoles(new Dictionary<byte, HideSeekRole>
+            {
+                [host.AssignedSlot] = HideSeekRole.Seeker,
+                [guest.AssignedSlot] = HideSeekRole.Hider,
+                [observer.AssignedSlot] = HideSeekRole.Hider,
+            });
+            Assert.True(server.TryStartHideSeekTag(out _));
+
+            await guest.DisconnectAsync();
+            await WaitForRosterCountAsync(host, 2);
+
+            var state = server.GetGameModeState();
+            Assert.Equal(GameMode.HideSeek, state.GameMode);
+            Assert.True(state.TagActive);
+
+            await host.DisconnectAsync();
+            await observer.DisconnectAsync();
+        }
+        finally
+        {
+            server.Stop();
+        }
+    }
+
+    [Fact]
+    public async Task HostDisconnect_StopsHideSeek()
+    {
+        var port = GetFreePort();
+        var server = new GameServer(new LevelCatalog()) { MaxPlayers = ProtocolConstants.StableMaxPlayers };
+        server.Start(port);
+
+        try
+        {
+            var host = new NetClient();
+            var guest = new NetClient();
+
+            await host.ConnectAsync("127.0.0.1", port, "Host");
+            await guest.ConnectAsync("127.0.0.1", port, "Guest");
+            await WaitForRosterCountAsync(guest, 2);
+
+            server.SetGameMode(GameMode.HideSeek);
+            server.SetHideSeekRoles(new Dictionary<byte, HideSeekRole>
+            {
+                [host.AssignedSlot] = HideSeekRole.Seeker,
+                [guest.AssignedSlot] = HideSeekRole.Hider,
+            });
+            Assert.True(server.TryStartHideSeekTag(out _));
+
+            await host.DisconnectAsync();
+            await WaitForRosterCountAsync(guest, 1);
+
+            var state = server.GetGameModeState();
+            Assert.Equal(GameMode.Normal, state.GameMode);
+            Assert.False(state.TagActive);
+
+            await guest.DisconnectAsync();
+        }
+        finally
+        {
             server.Stop();
         }
     }

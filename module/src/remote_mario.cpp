@@ -57,7 +57,7 @@ static nametag::Appearance readNameTagAppearance(const CommBuffer *buf, const Pl
     appearance.textTopColor = toTagColor(255, 255, 255);
     appearance.textBottomColor = appearance.textTopColor;
     appearance.outlineColor = toTagColor(0, 0, 0);
-    appearance.hasOutlineColor = false;
+    appearance.hasOutlineColor = true;
     appearance.gradientEnabled = false;
 
     const NameTagAppearance *sidecar = snap.slot < MAX_REMOTE_SLOTS
@@ -68,17 +68,15 @@ static nametag::Appearance readNameTagAppearance(const CommBuffer *buf, const Pl
     u8 textBottomR = 255, textBottomG = 255, textBottomB = 255;
     u8 outlineR = 0, outlineG = 0, outlineB = 0;
     bool gradientEnabled = false;
-    if (!readNameTagAppearanceFromSidecar(*sidecar, textTopR, textTopG, textTopB, textBottomR,
-                                          textBottomG, textBottomB, outlineR, outlineG, outlineB,
-                                          gradientEnabled)) {
-        return appearance;
+    if (readNameTagAppearanceFromSidecar(*sidecar, textTopR, textTopG, textTopB, textBottomR,
+                                         textBottomG, textBottomB, outlineR, outlineG, outlineB,
+                                         gradientEnabled)) {
+        appearance.textTopColor = toTagColor(textTopR, textTopG, textTopB);
+        appearance.textBottomColor = toTagColor(textBottomR, textBottomG, textBottomB);
+        appearance.outlineColor = toTagColor(outlineR, outlineG, outlineB);
+        appearance.gradientEnabled = gradientEnabled;
     }
 
-    appearance.textTopColor = toTagColor(textTopR, textTopG, textTopB);
-    appearance.textBottomColor = toTagColor(textBottomR, textBottomG, textBottomB);
-    appearance.outlineColor = toTagColor(outlineR, outlineG, outlineB);
-    appearance.hasOutlineColor = true;
-    appearance.gradientEnabled = gradientEnabled;
     return appearance;
 }
 

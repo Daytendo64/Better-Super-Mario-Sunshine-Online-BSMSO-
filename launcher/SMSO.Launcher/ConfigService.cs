@@ -69,6 +69,8 @@ public sealed class ConfigService
             {
                 var json = File.ReadAllText(_configPath);
                 _config = JsonSerializer.Deserialize<AppConfig>(json) ?? CreateDefaults();
+                if (MigrateLegacySyncDefaults(_config))
+                    Save();
                 NormalizeConfig(_config);
                 return;
             }
@@ -86,6 +88,9 @@ public sealed class ConfigService
         var cfg = new AppConfig
         {
             AllowClientTeleporting = false,
+            SyncFlags = true,
+            SyncObjects = true,
+            SyncProgress = true,
         };
         if (InstanceIndex > 0)
             cfg.Username = $"Player{InstanceIndex + 1}";
@@ -125,6 +130,21 @@ public sealed class ConfigService
     private static void NormalizeConfig(AppConfig config)
     {
         config.MaxPlayers = ClampMaxPlayers(config.MaxPlayers);
+    }
+
+    /// <summary>
+    /// Older configs saved all sync toggles as false before world-sync defaults existed.
+    /// Treat that as unset and opt into multiplayer progress sync.
+    /// </summary>
+    private static bool MigrateLegacySyncDefaults(AppConfig config)
+    {
+        if (config.SyncFlags || config.SyncObjects || config.SyncProgress)
+            return false;
+
+        config.SyncFlags = true;
+        config.SyncObjects = true;
+        config.SyncProgress = true;
+        return true;
     }
 
     public void SaveDebounced()

@@ -23,30 +23,42 @@ public sealed class SessionCoordinator : IDisposable
     private LevelCatalog? _levels;
     private readonly Dictionary<byte, PlayerSnapshot> _remoteSnapshots = new();
     private readonly HashSet<byte> _activeRosterSlots = new();
+    private readonly HashSet<byte> _previousRosterSlots = new();
     private readonly Dictionary<byte, int> _rosterMissStrikes = new();
     private readonly object _sessionLock = new();
+    private readonly SemaphoreSlim _networkOpLock = new(1, 1);
     private PlayerRosterEntry[] _roster = Array.Empty<PlayerRosterEntry>();
     private bool _sessionHasSeenRoster;
     private volatile bool _shuttingDown;
-    private int _networkCleanupGate;
-    private int _dolphinStopHandling;
-    private DisconnectReason? _pendingDisconnectReason;
+    private int _clientGeneration;
+    private int _sessionEndHandling;
+    private int _gameCloseCheckGeneration;
+    private CancellationTokenSource? _gameCloseCts;
+    private DolphinLinkState _previousLinkState = DolphinLinkState.NotRunning;
+    private const int GameCloseGraceMs = 1500;
     private PlayerSnapshot _lastLocalSnapshot;
     private bool _hasLastLocalSnapshot;
+    private CancellationTokenSource? _worldReplayCts;
+    private readonly List<WorldEventPacket> _pendingEpisodeWorldEvents = new();
 
     public event Action<string>? StatusChanged;
     public event Action<string>? Log;
     public event Action<PlayerRosterEntry[]>? RosterUpdated;
     public event Action? HostingStateChanged;
     public event Action? ClientTeleportPolicyChanged;
+    public event Action? SyncSettingsChanged;
     public event Action? DolphinClosed;
     public event Action<GameModeStatePacket>? GameModeStateChanged;
     public event Action<DolphinLinkState>? DolphinLinkStateChanged;
+    public event Action<string>? DisconnectNotice;
 
     public bool IsHosting => _server?.IsRunning == true;
     public bool IsConnected => _client?.IsConnected == true;
     public bool AllowClientTeleport { get; private set; }
     public bool ClientTeleportPolicyKnown { get; private set; }
+    public bool SyncFlagsEnabled { get; private set; }
+    public bool SyncObjectsEnabled { get; private set; }
+    public bool SyncProgressEnabled { get; private set; }
     public bool CanUseClientTeleport => IsHosting || AllowClientTeleport;
     public GameModeStatePacket GameModeState => _bridgeWorker.CurrentGameModeState;
     public byte LocalSlot => _client?.AssignedSlot ?? 0;
@@ -61,13 +73,15 @@ public sealed class SessionCoordinator : IDisposable
         _bridgeWorker = new BridgeWorker(_bridge);
         _bridge.Log += m => Log?.Invoke(m);
         _bridgeWorker.Log += m => Log?.Invoke(m);
-        _bridgeWorker.LinkStateChanged += state => DolphinLinkStateChanged?.Invoke(state);
+        _bridgeWorker.LinkStateChanged += OnBridgeLinkStateChanged;
         _monitor.Log += m => Log?.Invoke(m);
         _monitor.DolphinStopped += OnDolphinStopped;
         _monitor.DolphinStarted += OnDolphinStarted;
 
         _bridgeWorker.LocalSnapshotReady += OnLocalSnapshot;
         _bridgeWorker.LocalMarioVoiceReady += OnLocalMarioVoice;
+        _bridgeWorker.LocalWorldEventReady += OnLocalWorldEvent;
+        UpdateSyncSettingsState(_config.Config.SyncFlags, _config.Config.SyncObjects, _config.Config.SyncProgress);
     }
 
     public void Initialize(string levelsPath)
@@ -88,7 +102,7 @@ public sealed class SessionCoordinator : IDisposable
         if (_levels == null)
             throw new InvalidOperationException("Level data is not loaded.");
 
-        ValidateUsername(_config.Config.Username);
+        PlayerNameValidator.ValidateOrThrow(_config.Config.Username);
 
         StatusChanged?.Invoke("Starting server...");
         await DisconnectAsync().ConfigureAwait(true);
@@ -106,6 +120,7 @@ public sealed class SessionCoordinator : IDisposable
                 _server.Start(port);
                 _config.Config.AllowClientTeleporting = false;
                 _server.SetAllowClientTeleport(false);
+                ApplyConfiguredSyncSettings();
             }).ConfigureAwait(true);
 
             await ConnectClientAsync("127.0.0.1", port, isHost: true).ConfigureAwait(true);
@@ -134,126 +149,248 @@ public sealed class SessionCoordinator : IDisposable
             return;
         }
 
-        ValidateUsername(_config.Config.Username);
+        PlayerNameValidator.ValidateOrThrow(_config.Config.Username);
         await ConnectClientAsync(_config.Config.ServerIp, _config.Config.ServerPort, isHost: false);
     }
 
+    /// <summary>
+    /// Connect to a server using the same lifecycle as a first-time join:
+    /// fully tear down any prior client, reset bridge/roster state, then create a fresh NetClient.
+    /// </summary>
     private async Task ConnectClientAsync(string host, int port, bool isHost)
     {
-        StopClientOnly();
-        AllowClientTeleport = false;
-        ClientTeleportPolicyKnown = false;
-
-        var client = new NetClient();
-        client.Log += m => Log?.Invoke(m);
-        client.JoinRejected += reason =>
-        {
-            if (reason == JoinRejectReason.NameTaken)
-                Log?.Invoke($"Join rejected: username '{_config.Config.Username}' is already in use — set a unique name in Settings (e.g. Player{InstanceIndex + 1})");
-            else
-                Log?.Invoke($"Join rejected: {reason}");
-        };
-        client.JoinAccepted += () =>
-        {
-            try
-            {
-                _bridgeWorker.SetConnected(true, client.AssignedSlot, _config.Config.Username, isHost);
-                ApplyConfiguredSyncSettings();
-                RefreshPlayerAppearance();
-                StatusChanged?.Invoke(isHost ? "Hosting" : "Connected");
-                Log?.Invoke(isHost
-                    ? $"Joined own server as slot {client.AssignedSlot}"
-                    : $"Connected as slot {client.AssignedSlot}");
-            }
-            catch (Exception ex)
-            {
-                Log?.Invoke($"Join setup error: {ex.Message}");
-            }
-        };
-        client.RosterUpdated += OnRosterUpdated;
-        client.WarpCommandReceived += OnWarpCommand;
-        client.SnapshotReceived += OnSnapshotReceived;
-        client.MarioVoiceEventReceived += OnMarioVoiceEventReceived;
-        client.SyncSettingsReceived += (f, o, p) => _bridgeWorker.ApplySyncSettings(f, o, p);
-        client.ClientTeleportSettingsReceived += allowed =>
-        {
-            AllowClientTeleport = allowed;
-            ClientTeleportPolicyKnown = true;
-            ClientTeleportPolicyChanged?.Invoke();
-        };
-        client.GameModeStateReceived += state => ApplyGameModeState(state);
-        client.Disconnected += reason =>
-        {
-            if (_shuttingDown)
-                return;
-
-            if (_networkCleanupGate != 0)
-            {
-                _pendingDisconnectReason = reason;
-                return;
-            }
-
-            Log?.Invoke($"Disconnected: {reason}");
-            CleanupNetworkSession(stopServer: isHost && !_shuttingDown, updateStatus: true);
-        };
-
-        _client = client;
-        StatusChanged?.Invoke("Connecting");
+        await _networkOpLock.WaitAsync().ConfigureAwait(true);
         try
         {
-            await client.ConnectAsync(host, port, _config.Config.Username).ConfigureAwait(true);
+            await TearDownClientAsync(DisconnectReason.UserRequest, sendGoodbye: true).ConfigureAwait(true);
+
+            var generation = Interlocked.Increment(ref _clientGeneration);
+            var client = new NetClient();
+            client.Log += m => Log?.Invoke(m);
+            client.JoinRejected += reason =>
+            {
+                if (reason == JoinRejectReason.NameTaken)
+                    Log?.Invoke($"Join rejected: username '{_config.Config.Username}' is already in use — set a unique name in Settings (e.g. Player{InstanceIndex + 1})");
+                else if (reason == JoinRejectReason.InvalidName)
+                    Log?.Invoke($"Join rejected: {PlayerNameValidator.InvalidNameHint}");
+                else
+                    Log?.Invoke($"Join rejected: {reason}");
+            };
+            client.JoinAccepted += () =>
+            {
+                if (generation != Volatile.Read(ref _clientGeneration))
+                    return;
+
+                try
+                {
+                    _bridgeWorker.SetConnected(true, client.AssignedSlot, _config.Config.Username, isHost);
+                    if (isHost)
+                        ApplyConfiguredSyncSettings();
+                    RefreshPlayerAppearance();
+                    StatusChanged?.Invoke(isHost ? "Hosting" : "Connected");
+                    Log?.Invoke(isHost
+                        ? $"Joined own server as slot {client.AssignedSlot}"
+                        : $"Connected as slot {client.AssignedSlot}");
+                }
+                catch (Exception ex)
+                {
+                    Log?.Invoke($"Join setup error: {ex.Message}");
+                }
+            };
+            client.RosterUpdated += OnRosterUpdated;
+            client.WarpCommandReceived += OnWarpCommand;
+            client.SnapshotReceived += OnSnapshotReceived;
+            client.MarioVoiceEventReceived += OnMarioVoiceEventReceived;
+            client.WorldEventReceived += OnWorldEventReceived;
+            client.WorldStateReplayReceived += OnWorldStateReplayReceived;
+            client.SyncSettingsReceived += (f, o, p) =>
+            {
+                UpdateSyncSettingsState(f, o, p);
+                _bridgeWorker.ApplySyncSettings(f, o, p);
+                Log?.Invoke($"Sync settings from host: flags={f} objects={o} progress={p}");
+            };
+            client.ClientTeleportSettingsReceived += allowed =>
+            {
+                AllowClientTeleport = allowed;
+                ClientTeleportPolicyKnown = true;
+                ClientTeleportPolicyChanged?.Invoke();
+            };
+            client.GameModeStateReceived += state => ApplyGameModeState(state);
+            client.Disconnected += reason =>
+            {
+                if (generation != Volatile.Read(ref _clientGeneration) || _shuttingDown)
+                    return;
+
+                var message = DisconnectMessages.GetUserMessage(reason);
+                Log?.Invoke(message);
+                DisconnectNotice?.Invoke(message);
+                _ = HandleUnexpectedDisconnectAsync(isHost, reason);
+            };
+
+            _client = client;
+            StatusChanged?.Invoke("Connecting");
+            try
+            {
+                await client.ConnectAsync(host, port, _config.Config.Username).ConfigureAwait(true);
+                FlushSnapshotsAfterConnect();
+            }
+            catch (NetJoinRejectedException ex)
+            {
+                await TearDownClientAsync(DisconnectReason.UserRequest, sendGoodbye: false).ConfigureAwait(true);
+                if (isHost)
+                    StopServer();
+                StatusChanged?.Invoke("Disconnected");
+                throw new InvalidOperationException(ex.Message, ex);
+            }
+            catch
+            {
+                await TearDownClientAsync(DisconnectReason.UserRequest, sendGoodbye: false).ConfigureAwait(true);
+                if (isHost)
+                    StopServer();
+                StatusChanged?.Invoke("Disconnected");
+                throw;
+            }
         }
-        catch (NetJoinRejectedException ex)
+        finally
         {
-            CleanupNetworkSession(stopServer: isHost, updateStatus: true);
-            throw new InvalidOperationException(ex.Message, ex);
+            _networkOpLock.Release();
         }
-        catch
+    }
+
+    /// <summary>Push local + remote sync to Dolphin and UDP immediately after TCP/UDP join completes.</summary>
+    private void FlushSnapshotsAfterConnect()
+    {
+        try
         {
-            CleanupNetworkSession(stopServer: isHost, updateStatus: true);
-            throw;
+            var client = _client;
+            if (client == null)
+                return;
+
+            _bridgeWorker.SetConnected(true, client.AssignedSlot, _config.Config.Username, IsHosting);
+
+            if (_hasLastLocalSnapshot)
+            {
+                var snap = _lastLocalSnapshot;
+                snap.Connected = 1;
+                SendLocalSnapshot(snap);
+            }
+
+            client.SendSnapshotNow();
+            _bridgeWorker.FlushRemoteSnapshotsToDolphin();
+            // #region agent log
+            AgentDebugLog.Write("D", "SessionCoordinator.FlushSnapshotsAfterConnect", "post-connect flush", new
+            {
+                slot = client.AssignedSlot,
+                hasLastLocalSnapshot = _hasLastLocalSnapshot,
+                linkState = _bridgeWorker.LinkState.ToString(),
+            });
+            // #endregion
+        }
+        catch (Exception ex) when (!_shuttingDown)
+        {
+            Log?.Invoke($"Post-connect snapshot flush error: {ex.Message}");
         }
     }
 
     public async Task DisconnectAsync(DisconnectReason reason = DisconnectReason.UserRequest)
     {
-        if (!TryEnterNetworkCleanup())
-            return;
-
+        await _networkOpLock.WaitAsync().ConfigureAwait(true);
         try
         {
             ResetHideSeekIfActiveOnServer();
-
-            if (_client != null)
-            {
-                try
-                {
-                    await _client.DisconnectAsync(reason).WaitAsync(TimeSpan.FromSeconds(1)).ConfigureAwait(true);
-                }
-                catch (TimeoutException)
-                {
-                    Log?.Invoke("Disconnect timed out — forcing local cleanup");
-                }
-                catch (Exception ex)
-                {
-                    Log?.Invoke($"Client disconnect error: {ex.Message}");
-                }
-            }
-
-            StopClientOnly();
-            StopServer();
-            _bridgeWorker.SetConnected(false, 0, "", false);
+            await TearDownClientAsync(reason, sendGoodbye: true).ConfigureAwait(true);
             ForceGameModeToNormalLocally();
-            _remoteSnapshots.Clear();
-            _activeRosterSlots.Clear();
-            _rosterMissStrikes.Clear();
-            _sessionHasSeenRoster = false;
-            _roster = Array.Empty<PlayerRosterEntry>();
             StatusChanged?.Invoke("Disconnected");
         }
         finally
         {
-            ExitNetworkCleanup();
+            StopServer();
+            _networkOpLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Fully destroy the current NetClient and reset all client-side session state so the next
+    /// connect starts from a clean slate identical to a first-time join.
+    /// </summary>
+    private async Task TearDownClientAsync(DisconnectReason reason, bool sendGoodbye)
+    {
+        Interlocked.Increment(ref _clientGeneration);
+
+        var client = Interlocked.Exchange(ref _client, null);
+        if (client != null)
+        {
+            if (sendGoodbye)
+            {
+                try
+                {
+                    await client.DisconnectAsync(reason).WaitAsync(TimeSpan.FromSeconds(1)).ConfigureAwait(false);
+                }
+                catch (TimeoutException)
+                {
+                    Log?.Invoke("Client disconnect timed out — forcing cleanup");
+                    client.ForceDispose();
+                }
+                catch (Exception ex)
+                {
+                    Log?.Invoke($"Client disconnect error: {ex.Message}");
+                    client.ForceDispose();
+                }
+            }
+            else
+            {
+                client.ForceDispose();
+            }
+        }
+
+        ResetClientSessionState();
+    }
+
+    private void ResetClientSessionState()
+    {
+        _bridgeWorker.SetConnected(false, 0, "", false);
+        AllowClientTeleport = false;
+        ClientTeleportPolicyKnown = false;
+        _remoteSnapshots.Clear();
+        _activeRosterSlots.Clear();
+        _previousRosterSlots.Clear();
+        _rosterMissStrikes.Clear();
+        _sessionHasSeenRoster = false;
+        _roster = Array.Empty<PlayerRosterEntry>();
+        _pendingEpisodeWorldEvents.Clear();
+        _worldReplayCts?.Cancel();
+        _worldReplayCts = null;
+        _bridgeWorker.ClearRemoteSnapshots();
+        try
+        {
+            _bridgeWorker.FlushRemoteSnapshotsToDolphin();
+        }
+        catch (Exception ex)
+        {
+            Log?.Invoke($"Remote snapshot flush skipped: {ex.Message}");
+        }
+
+        ClientTeleportPolicyChanged?.Invoke();
+    }
+
+    private async Task HandleUnexpectedDisconnectAsync(bool stopServer, DisconnectReason reason)
+    {
+        await _networkOpLock.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            if (_shuttingDown)
+                return;
+
+            ResetHideSeekIfActiveOnServer();
+            await TearDownClientAsync(reason, sendGoodbye: false).ConfigureAwait(false);
+            if (stopServer)
+                StopServer();
+            ForceGameModeToNormalLocally();
+            StatusChanged?.Invoke("Disconnected");
+        }
+        finally
+        {
+            _networkOpLock.Release();
         }
     }
 
@@ -275,86 +412,6 @@ public sealed class SessionCoordinator : IDisposable
         HostingStateChanged?.Invoke();
     }
 
-    private void StopClientOnly()
-    {
-        var client = _client;
-        _client = null;
-        if (client != null)
-        {
-            try
-            {
-                client.DisconnectAsync(DisconnectReason.UserRequest)
-                    .WaitAsync(TimeSpan.FromMilliseconds(500))
-                    .GetAwaiter()
-                    .GetResult();
-            }
-            catch
-            {
-                // socket may already be closed
-            }
-        }
-
-        _remoteSnapshots.Clear();
-        _activeRosterSlots.Clear();
-        _rosterMissStrikes.Clear();
-        _sessionHasSeenRoster = false;
-        _bridgeWorker.ClearRemoteSnapshots();
-        try
-        {
-            _bridgeWorker.FlushRemoteSnapshotsToDolphin();
-        }
-        catch (Exception ex)
-        {
-            Log?.Invoke($"Remote snapshot flush skipped: {ex.Message}");
-        }
-    }
-
-    private void CleanupNetworkSession(bool stopServer, bool updateStatus)
-    {
-        if (!TryEnterNetworkCleanup())
-            return;
-
-        try
-        {
-            ResetHideSeekIfActiveOnServer();
-            StopClientOnly();
-            if (stopServer)
-                StopServer();
-            _bridgeWorker.SetConnected(false, 0, "", false);
-            ForceGameModeToNormalLocally();
-            AllowClientTeleport = false;
-            ClientTeleportPolicyKnown = false;
-            _remoteSnapshots.Clear();
-            _activeRosterSlots.Clear();
-            _rosterMissStrikes.Clear();
-            _sessionHasSeenRoster = false;
-            _roster = Array.Empty<PlayerRosterEntry>();
-            ClientTeleportPolicyChanged?.Invoke();
-            if (updateStatus)
-                StatusChanged?.Invoke("Disconnected");
-        }
-        finally
-        {
-            ExitNetworkCleanup();
-        }
-    }
-
-    private bool TryEnterNetworkCleanup() =>
-        Interlocked.CompareExchange(ref _networkCleanupGate, 1, 0) == 0;
-
-    private void ExitNetworkCleanup()
-    {
-        Interlocked.Exchange(ref _networkCleanupGate, 0);
-
-        var pending = _pendingDisconnectReason;
-        if (!pending.HasValue || _shuttingDown)
-            return;
-
-        _pendingDisconnectReason = null;
-        Log?.Invoke($"Disconnected: {pending.Value}");
-        CleanupNetworkSession(stopServer: IsHosting && !_shuttingDown, updateStatus: true);
-    }
-
     private void ApplyConfiguredSyncSettings()
     {
         var syncFlags = _config.Config.SyncFlags;
@@ -362,6 +419,15 @@ public sealed class SessionCoordinator : IDisposable
         var syncProgress = _config.Config.SyncProgress;
         _server?.SetSyncSettings(syncFlags, syncObjects, syncProgress);
         _bridgeWorker.ApplySyncSettings(syncFlags, syncObjects, syncProgress);
+        UpdateSyncSettingsState(syncFlags, syncObjects, syncProgress);
+    }
+
+    private void UpdateSyncSettingsState(bool syncFlags, bool syncObjects, bool syncProgress)
+    {
+        SyncFlagsEnabled = syncFlags;
+        SyncObjectsEnabled = syncObjects;
+        SyncProgressEnabled = syncProgress;
+        SyncSettingsChanged?.Invoke();
     }
 
     public bool TryReconnectDolphin()
@@ -541,12 +607,8 @@ public sealed class SessionCoordinator : IDisposable
             return;
         }
 
+        // WarpCommand broadcast (including back to host) applies the bridge intent once.
         _server?.RequestWarp(LocalSlot, targetSlot, courseId, episodeId);
-        if (targetSlot == ProtocolConstants.WarpAllSlots || targetSlot == LocalSlot)
-        {
-            if (!_bridgeWorker.ApplyWarp(targetSlot, courseId, episodeId, true))
-                Log?.Invoke("Warp queued — waiting for Dolphin link");
-        }
     }
 
     public void SetAllowClientTeleport(bool allowClientTeleport)
@@ -571,6 +633,7 @@ public sealed class SessionCoordinator : IDisposable
         _config.SaveDebounced();
         _server?.SetSyncSettings(syncFlags, syncObjects, syncProgress);
         _bridgeWorker.ApplySyncSettings(syncFlags, syncObjects, syncProgress);
+        UpdateSyncSettingsState(syncFlags, syncObjects, syncProgress);
     }
 
     public void SetGameMode(GameMode mode)
@@ -655,13 +718,48 @@ public sealed class SessionCoordinator : IDisposable
     private void OnRosterUpdated(PlayerRosterEntry[] entries)
     {
         PlayerRosterEntry[] rosterCopy;
+        List<(byte Slot, string Name)>? departedPlayers = null;
+        List<(byte Slot, string Name)>? joinedPlayers = null;
         lock (_sessionLock)
         {
+            var incomingSlots = new HashSet<byte>(entries.Select(e => e.Slot));
+
+            if (IsConnected && _sessionHasSeenRoster)
+            {
+                foreach (var previous in _roster)
+                {
+                    if (previous.Slot == LocalSlot || incomingSlots.Contains(previous.Slot))
+                        continue;
+
+                    departedPlayers ??= new List<(byte, string)>();
+                    var name = string.IsNullOrWhiteSpace(previous.Username)
+                        ? $"Player {previous.Slot + 1}"
+                        : previous.Username;
+                    departedPlayers.Add((previous.Slot, name));
+                }
+            }
+
             _roster = entries;
             rosterCopy = entries;
 
             if (!IsConnected)
                 return;
+
+            if (_sessionHasSeenRoster)
+            {
+                foreach (var entry in entries)
+                {
+                    if (entry.Slot == LocalSlot || _previousRosterSlots.Contains(entry.Slot))
+                        continue;
+
+                    joinedPlayers ??= new List<(byte, string)>();
+                    var name = string.IsNullOrWhiteSpace(entry.Username)
+                        ? $"Player {entry.Slot + 1}"
+                        : entry.Username;
+                    joinedPlayers.Add((entry.Slot, name));
+                    ResetRemotePlayerForSlot(entry.Slot);
+                }
+            }
 
             _activeRosterSlots.Clear();
             foreach (var entry in entries)
@@ -678,13 +776,6 @@ public sealed class SessionCoordinator : IDisposable
                         continue;
                     }
 
-                    var strikes = _rosterMissStrikes.TryGetValue(slot, out var count) ? count + 1 : 1;
-                    if (strikes < ProtocolConstants.RosterMissEvictThreshold)
-                    {
-                        _rosterMissStrikes[slot] = strikes;
-                        continue;
-                    }
-
                     _rosterMissStrikes.Remove(slot);
                     EvictRemotePlayer(slot);
                 }
@@ -694,10 +785,36 @@ public sealed class SessionCoordinator : IDisposable
                 _rosterMissStrikes.Clear();
             }
 
+            _previousRosterSlots.Clear();
+            foreach (var slot in incomingSlots)
+                _previousRosterSlots.Add(slot);
+
             _sessionHasSeenRoster = true;
         }
 
+        if (departedPlayers != null)
+        {
+            foreach (var (slot, name) in departedPlayers)
+            {
+                _bridgeWorker.EnqueueRosterHudEvent(RosterHudEventKind.Disconnected, slot, name);
+                Log?.Invoke($"{name} disconnected.");
+            }
+        }
+
+        if (joinedPlayers != null)
+        {
+            foreach (var (slot, name) in joinedPlayers)
+                _bridgeWorker.EnqueueRosterHudEvent(RosterHudEventKind.Connected, slot, name);
+        }
+
         RosterUpdated?.Invoke(rosterCopy);
+    }
+
+    private void ResetRemotePlayerForSlot(byte slot)
+    {
+        _remoteSnapshots.Remove(slot);
+        _bridgeWorker.RemoveRemoteSnapshot(slot);
+        Log?.Invoke($"Player rejoined slot {slot} — reset remote sync state");
     }
 
     private void EvictRemotePlayer(byte slot)
@@ -711,7 +828,12 @@ public sealed class SessionCoordinator : IDisposable
         _ = requesterSlot;
         if (targetSlot != ProtocolConstants.WarpAllSlots && targetSlot != LocalSlot) return;
         if (!_bridgeWorker.ApplyWarp(targetSlot, courseId, episodeId, IsHosting))
+        {
             Log?.Invoke("Warp queued — waiting for Dolphin link");
+            return;
+        }
+
+        FlushPendingEpisodeWorldEvents(courseId, episodeId);
     }
 
     private void OnSnapshotReceived(byte slot, PlayerSnapshot snap)
@@ -773,8 +895,13 @@ public sealed class SessionCoordinator : IDisposable
 
     private void OnLocalSnapshot(PlayerSnapshot snap)
     {
+        var stageChanged = _hasLastLocalSnapshot &&
+                           (snap.StageId != _lastLocalSnapshot.StageId ||
+                            snap.EpisodeId != _lastLocalSnapshot.EpisodeId);
         _lastLocalSnapshot = snap;
         _hasLastLocalSnapshot = true;
+        if (stageChanged)
+            FlushPendingEpisodeWorldEvents(snap.StageId, snap.EpisodeId);
         SendLocalSnapshot(snap);
     }
 
@@ -784,6 +911,106 @@ public sealed class SessionCoordinator : IDisposable
             return;
 
         _ = _client.SendMarioVoiceEventAsync(voiceEvent);
+    }
+
+    private void OnLocalWorldEvent(WorldEventRequest worldEvent)
+    {
+        if (_client?.IsConnected != true || worldEvent.IsEmpty)
+            return;
+
+        Log?.Invoke(
+            $"World sync: sending type={worldEvent.Type} course={worldEvent.CourseId}/{worldEvent.EpisodeId} payload0={worldEvent.Payload0} reserved={worldEvent.Reserved} payload1={worldEvent.Payload1}");
+        _ = _client.SendWorldEventAsync(worldEvent);
+    }
+
+    private static bool IsEpisodeScopedWorldEvent(WorldEventType type) =>
+        type is WorldEventType.GoldCoinCollected
+            or WorldEventType.RedCoinCollected;
+
+    private void OnWorldEventReceived(WorldEventPacket worldEvent)
+    {
+        ApplyWorldEventToBridge(worldEvent);
+    }
+
+    private void OnWorldStateReplayReceived(WorldEventPacket[] events)
+    {
+        Log?.Invoke($"World sync: received {events.Length} replayed events from server");
+        if (events.Length == 0)
+            return;
+
+        _worldReplayCts?.Cancel();
+        _worldReplayCts = new CancellationTokenSource();
+        var ct = _worldReplayCts.Token;
+        _ = DrainWorldEventReplayAsync(events, ct);
+    }
+
+    private async Task DrainWorldEventReplayAsync(WorldEventPacket[] events, CancellationToken ct)
+    {
+        foreach (var worldEvent in events)
+        {
+            if (ct.IsCancellationRequested)
+                return;
+
+            ApplyWorldEventToBridge(worldEvent, forceApply: true);
+
+            var deadline = DateTime.UtcNow.AddSeconds(5);
+            while (!ct.IsCancellationRequested && DateTime.UtcNow < deadline)
+            {
+                if (_bridgeWorker.TryGetLastAppliedEventId(out var lastApplied) &&
+                    lastApplied >= worldEvent.EventId)
+                {
+                    break;
+                }
+
+                await Task.Delay(16, ct).ConfigureAwait(false);
+            }
+        }
+
+        Log?.Invoke($"World sync: replay drain finished ({events.Length} events)");
+    }
+
+    private void ApplyWorldEventToBridge(WorldEventPacket worldEvent, bool forceApply = false)
+    {
+        if (worldEvent.EventId == 0)
+            return;
+
+        if (!forceApply &&
+            IsEpisodeScopedWorldEvent(worldEvent.Type) &&
+            _hasLastLocalSnapshot &&
+            (worldEvent.CourseId != _lastLocalSnapshot.StageId ||
+             worldEvent.EpisodeId != _lastLocalSnapshot.EpisodeId))
+        {
+            if (_pendingEpisodeWorldEvents.All(pending => pending.EventId != worldEvent.EventId))
+                _pendingEpisodeWorldEvents.Add(worldEvent);
+            Log?.Invoke(
+                $"World sync: queued episode-local eventId={worldEvent.EventId} type={worldEvent.Type} — local stage {_lastLocalSnapshot.StageId}/{_lastLocalSnapshot.EpisodeId}, event {worldEvent.CourseId}/{worldEvent.EpisodeId}");
+            return;
+        }
+
+        Log?.Invoke(
+            $"World sync: applying eventId={worldEvent.EventId} type={worldEvent.Type} course={worldEvent.CourseId}/{worldEvent.EpisodeId} payload0={worldEvent.Payload0} reserved={worldEvent.Reserved} payload1={worldEvent.Payload1}{(forceApply ? " (forced)" : "")}");
+        _bridgeWorker.PushIncomingWorldEvent(worldEvent);
+    }
+
+    private void FlushPendingEpisodeWorldEvents(byte stageId, byte episodeId)
+    {
+        if (_pendingEpisodeWorldEvents.Count == 0)
+            return;
+
+        var ready = _pendingEpisodeWorldEvents
+            .Where(worldEvent => worldEvent.CourseId == stageId && worldEvent.EpisodeId == episodeId)
+            .OrderBy(worldEvent => worldEvent.EventId)
+            .ToArray();
+
+        if (ready.Length == 0)
+            return;
+
+        foreach (var worldEvent in ready)
+            _pendingEpisodeWorldEvents.Remove(worldEvent);
+
+        Log?.Invoke(
+            $"World sync: flushing {ready.Length} queued episode events for stage {stageId}/{episodeId}");
+        _ = DrainWorldEventReplayAsync(ready, CancellationToken.None);
     }
 
     private void SendLocalSnapshot(PlayerSnapshot snap)
@@ -834,8 +1061,110 @@ public sealed class SessionCoordinator : IDisposable
         }
     }
 
+    private void OnBridgeLinkStateChanged(DolphinLinkState state)
+    {
+        var previous = _previousLinkState;
+        _previousLinkState = state;
+        DolphinLinkStateChanged?.Invoke(state);
+
+        if (state == DolphinLinkState.ModuleReady)
+        {
+            CancelPendingGameCloseCheck();
+            return;
+        }
+
+        if (previous != DolphinLinkState.ModuleReady || !_monitor.IsDolphinRunning)
+            return;
+
+        if (!IsHosting && !IsConnected)
+            return;
+
+        ScheduleGameCloseCheck();
+    }
+
+    private void CancelPendingGameCloseCheck()
+    {
+        Interlocked.Increment(ref _gameCloseCheckGeneration);
+        _gameCloseCts?.Cancel();
+        _gameCloseCts?.Dispose();
+        _gameCloseCts = null;
+    }
+
+    private void ScheduleGameCloseCheck()
+    {
+        if (_shuttingDown)
+            return;
+
+        CancelPendingGameCloseCheck();
+        var generation = Volatile.Read(ref _gameCloseCheckGeneration);
+        _gameCloseCts = new CancellationTokenSource();
+        var token = _gameCloseCts.Token;
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await Task.Delay(GameCloseGraceMs, token).ConfigureAwait(false);
+                if (generation != Volatile.Read(ref _gameCloseCheckGeneration) || _shuttingDown)
+                    return;
+                if (!_monitor.IsDolphinRunning)
+                    return;
+                if (_bridgeWorker.LinkState == DolphinLinkState.ModuleReady)
+                    return;
+                if (!IsHosting && !IsConnected)
+                    return;
+
+                await EndSessionFromGameOrDolphinClosedAsync(
+                    dolphinProcessEnded: false,
+                    logMessage: IsHosting
+                        ? "Game closed — stopping server and disconnecting."
+                        : "Game closed — disconnecting from server.").ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                // superseded by a newer link-state change or shutdown
+            }
+        }, token);
+    }
+
+    private async Task EndSessionFromGameOrDolphinClosedAsync(bool dolphinProcessEnded, string logMessage)
+    {
+        if (_shuttingDown)
+            return;
+
+        if (Interlocked.CompareExchange(ref _sessionEndHandling, 1, 0) != 0)
+            return;
+
+        CancelPendingGameCloseCheck();
+
+        try
+        {
+            var hadSession = IsConnected || IsHosting;
+            if (!hadSession)
+            {
+                Log?.Invoke(dolphinProcessEnded ? "Dolphin closed." : "Game closed.");
+                return;
+            }
+
+            Log?.Invoke(logMessage);
+            await DisconnectAsync(DisconnectReason.DolphinClosed).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            Log?.Invoke($"Session teardown after {(dolphinProcessEnded ? "Dolphin" : "game")} close: {ex.Message}");
+            StopServer();
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _sessionEndHandling, 0);
+            SafeRaise(DolphinClosed);
+        }
+    }
+
     private void OnDolphinStarted()
     {
+        CancelPendingGameCloseCheck();
+        _previousLinkState = DolphinLinkState.NotRunning;
         _bridgeWorker.NotifyDolphinRunning(true);
         _bridge.PrepareForRelink();
         _bridge.TryAttach();
@@ -850,10 +1179,8 @@ public sealed class SessionCoordinator : IDisposable
         if (_shuttingDown)
             return;
 
-        if (Interlocked.CompareExchange(ref _dolphinStopHandling, 1, 0) != 0)
-            return;
-
-        var hadSession = IsConnected || IsHosting;
+        CancelPendingGameCloseCheck();
+        _previousLinkState = DolphinLinkState.NotRunning;
 
         try
         {
@@ -867,30 +1194,11 @@ public sealed class SessionCoordinator : IDisposable
             Log?.Invoke($"Dolphin closed (cleanup note: {ex.Message}");
         }
 
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                if (hadSession && !_shuttingDown)
-                {
-                    Log?.Invoke("Dolphin closed — disconnecting from server.");
-                    await DisconnectAsync(DisconnectReason.DolphinClosed).ConfigureAwait(false);
-                }
-                else
-                {
-                    Log?.Invoke("Dolphin closed.");
-                }
-            }
-            catch (Exception ex)
-            {
-                Log?.Invoke($"Disconnect after Dolphin close: {ex.Message}");
-            }
-            finally
-            {
-                Interlocked.Exchange(ref _dolphinStopHandling, 0);
-                SafeRaise(DolphinClosed);
-            }
-        });
+        _ = EndSessionFromGameOrDolphinClosedAsync(
+            dolphinProcessEnded: true,
+            logMessage: IsHosting
+                ? "Dolphin closed — stopping server and disconnecting."
+                : "Dolphin closed — disconnecting from server.");
     }
 
     private static void SafeRaise(Action? handler)
@@ -913,14 +1221,6 @@ public sealed class SessionCoordinator : IDisposable
         _bridge.SetPreferredExecutablePath(dolphinPath);
         _bridge.SetGuestMailboxAddress(_config.Config.MailboxAddress);
         _monitor.SetExpectedDolphinPath(dolphinPath);
-    }
-
-    private static void ValidateUsername(string name)
-    {
-        if (string.IsNullOrWhiteSpace(name) || name.Length < 3 || name.Length > 16)
-            throw new InvalidOperationException("Username must be 3-16 characters.");
-        if (!name.All(c => char.IsLetterOrDigit(c) || c == '_'))
-            throw new InvalidOperationException("Username may only use letters, digits, and underscores.");
     }
 
     private static bool TryParseNameTagColor(string? value, out byte r, out byte g, out byte b)
@@ -950,6 +1250,7 @@ public sealed class SessionCoordinator : IDisposable
     {
         if (_shuttingDown) return;
         _shuttingDown = true;
+        CancelPendingGameCloseCheck();
 
         try
         {
@@ -957,8 +1258,11 @@ public sealed class SessionCoordinator : IDisposable
         }
         catch
         {
-            StopClientOnly();
+            Interlocked.Increment(ref _clientGeneration);
+            var client = Interlocked.Exchange(ref _client, null);
+            client?.ForceDispose();
             StopServer();
+            ResetClientSessionState();
         }
 
         _bridgeWorker.SetConnected(false, 0, "", false);
@@ -973,5 +1277,6 @@ public sealed class SessionCoordinator : IDisposable
         _bridgeWorker.Dispose();
         _bridge.Dispose();
         _monitor.Dispose();
+        _networkOpLock.Dispose();
     }
 }

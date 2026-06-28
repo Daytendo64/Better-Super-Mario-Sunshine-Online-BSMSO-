@@ -15,8 +15,11 @@ public sealed class HideSeekService
     private readonly GameServer _server;
     private GameModeStatePacket _state = GameModeStatePacket.CreateDefault();
     private readonly Dictionary<(byte seeker, byte hider), long> _tagCooldowns = new();
+    private readonly Dictionary<byte, bool> _hiderDeathWasActive = new();
     private readonly HashSet<byte> _assignedRoleSlots = new();
     private byte _tagEventId;
+    private uint _tagElapsedMs;
+    private long _tagSegmentStartTick;
 
     public HideSeekService(GameServer server) => _server = server;
 
@@ -26,8 +29,25 @@ public sealed class HideSeekService
     {
         _state = GameModeStatePacket.CreateDefault();
         _tagCooldowns.Clear();
+        _hiderDeathWasActive.Clear();
         _assignedRoleSlots.Clear();
         _tagEventId = 0;
+        _tagElapsedMs = 0;
+        _tagSegmentStartTick = 0;
+    }
+
+    private void AccumulateTagElapsed()
+    {
+        if (!_state.TagActive || _tagSegmentStartTick == 0)
+            return;
+
+        _tagElapsedMs += (uint)(Environment.TickCount64 - _tagSegmentStartTick);
+        _tagSegmentStartTick = 0;
+    }
+
+    private void BeginTagSegment()
+    {
+        _tagSegmentStartTick = Environment.TickCount64;
     }
 
     public void SetGameMode(GameMode mode)
@@ -41,8 +61,11 @@ public sealed class HideSeekService
             for (int i = 0; i < _state.Roles.Length; i++)
                 _state.Roles[i] = HideSeekRole.Hider;
             _tagCooldowns.Clear();
+            _hiderDeathWasActive.Clear();
             _assignedRoleSlots.Clear();
             _tagEventId = 0;
+            _tagElapsedMs = 0;
+            _tagSegmentStartTick = 0;
         }
 
         BumpAndBroadcast();
@@ -53,7 +76,12 @@ public sealed class HideSeekService
         if (_state.GameMode != GameMode.HideSeek)
             return;
 
+        var connected = _server.GetConnectedSlots();
+        var activeSlots = connected.Count > 0
+            ? connected.ToHashSet()
+            : roles.Keys.ToHashSet();
         var changed = false;
+        var connectedRoleChanged = false;
         foreach (var (slot, role) in roles)
         {
             _assignedRoleSlots.Add(slot);
@@ -62,15 +90,19 @@ public sealed class HideSeekService
 
             _state.SetRole(slot, role);
             changed = true;
+            if (activeSlots.Contains(slot))
+                connectedRoleChanged = true;
         }
 
         if (!changed)
             return;
 
-        if (_state.TagActive)
+        if (_state.TagActive && connectedRoleChanged)
         {
+            AccumulateTagElapsed();
             _state.Flags &= ~GameModeFlags.TagActive;
-            _state.RoundStartMs = 0;
+            _state.RoundStartMs = _tagElapsedMs;
+            _server.LogMessage("Hide & Seek tag stopped — roles changed.");
         }
 
         _state.Flags &= ~GameModeFlags.RoundComplete;
@@ -98,13 +130,17 @@ public sealed class HideSeekService
 
         _state.Flags = GameModeFlags.TagActive;
         _state.Flags &= ~(GameModeFlags.RoundComplete | GameModeFlags.RoundFanfare);
-        _state.RoundStartMs = (uint)Environment.TickCount64;
+        _state.RoundStartMs = _tagElapsedMs;
         _state.LastTaggedSlot = 0xFF;
         _state.TagEventId = 0;
         _tagEventId = 0;
         _tagCooldowns.Clear();
+        _hiderDeathWasActive.Clear();
+        BeginTagSegment();
         BumpAndBroadcast();
-        _server.LogMessage("Hide & Seek tag started.");
+        _server.LogMessage(_tagElapsedMs > 0
+            ? "Hide & Seek tag resumed."
+            : "Hide & Seek tag started.");
         return true;
     }
 
@@ -113,11 +149,13 @@ public sealed class HideSeekService
         if (_state.GameMode != GameMode.HideSeek)
             return;
 
+        AccumulateTagElapsed();
         _state.Flags &= ~(GameModeFlags.TagActive | GameModeFlags.RoundComplete | GameModeFlags.RoundFanfare);
-        _state.RoundStartMs = 0;
+        _state.RoundStartMs = _tagElapsedMs;
         _state.LastTaggedSlot = 0xFF;
         _state.TagEventId = 0;
         _tagCooldowns.Clear();
+        _hiderDeathWasActive.Clear();
         BumpAndBroadcast();
         _server.LogMessage("Hide & Seek tag stopped.");
     }
@@ -130,12 +168,16 @@ public sealed class HideSeekService
         foreach (var slot in GetActiveRoleSlots())
             _state.SetRole(slot, HideSeekRole.Hider);
 
+        AccumulateTagElapsed();
+        _tagElapsedMs = 0;
+        _tagSegmentStartTick = 0;
         _state.Flags &= ~(GameModeFlags.TagActive | GameModeFlags.RoundComplete | GameModeFlags.RoundFanfare);
         _state.RoundStartMs = 0;
         _state.LastTaggedSlot = 0xFF;
         _state.TagEventId = 0;
         _tagEventId = 0;
         _tagCooldowns.Clear();
+        _hiderDeathWasActive.Clear();
         if (playRoundFanfare)
             _state.Flags |= GameModeFlags.RoundFanfare;
         _state.Flags |= GameModeFlags.TimerReset;
@@ -188,8 +230,38 @@ public sealed class HideSeekService
             return;
 
         _tagCooldowns[key] = now;
-        ApplyTag(hiderSlot, seekerSlot);
+        PromoteHiderToSeeker(hiderSlot, seekerSlot);
     }
+
+    public void ProcessHiderDeath(byte hiderSlot, in PlayerSnapshot snap)
+    {
+        if (!_state.TagActive || _state.GameMode != GameMode.HideSeek)
+            return;
+
+        if (_state.GetRole(hiderSlot) != (byte)HideSeekRole.Hider)
+        {
+            _hiderDeathWasActive.Remove(hiderSlot);
+            return;
+        }
+
+        if (snap.Connected == 0)
+        {
+            _hiderDeathWasActive.Remove(hiderSlot);
+            return;
+        }
+
+        var isDead = IsSnapshotDead(snap);
+        var wasDead = _hiderDeathWasActive.TryGetValue(hiderSlot, out var previous) && previous;
+        _hiderDeathWasActive[hiderSlot] = isDead;
+
+        if (!isDead || wasDead)
+            return;
+
+        PromoteHiderToSeeker(hiderSlot, taggedBySeekerSlot: null);
+    }
+
+    internal static bool IsSnapshotDead(in PlayerSnapshot snap)
+        => (snap.VfxFlags & (ushort)VfxFlags.Dead) != 0;
 
     internal static bool IsWithinTagRange(
         in PlayerSnapshot seekerSnap,
@@ -221,14 +293,18 @@ public sealed class HideSeekService
         };
     }
 
-    private void ApplyTag(byte hiderSlot, byte seekerSlot)
+    private void PromoteHiderToSeeker(byte hiderSlot, byte? taggedBySeekerSlot)
     {
+        if (_state.GetRole(hiderSlot) != (byte)HideSeekRole.Hider)
+            return;
+
         _state.SetRole(hiderSlot, HideSeekRole.Seeker);
         _state.LastTaggedSlot = hiderSlot;
         _tagEventId++;
         if (_tagEventId == 0)
             _tagEventId = 1;
         _state.TagEventId = _tagEventId;
+        _hiderDeathWasActive[hiderSlot] = true;
 
         var roundComplete = CountConnectedRole(HideSeekRole.Hider, GetActiveRoleSlots()) == 0;
         if (roundComplete)
@@ -238,7 +314,10 @@ public sealed class HideSeekService
         }
 
         BumpAndBroadcast();
-        _server.LogMessage($"Tagged slot {hiderSlot} (by seeker {seekerSlot}).");
+        if (taggedBySeekerSlot.HasValue)
+            _server.LogMessage($"Tagged slot {hiderSlot} (by seeker {taggedBySeekerSlot.Value}).");
+        else
+            _server.LogMessage($"Hider slot {hiderSlot} died — now a seeker.");
 
         if (roundComplete)
         {
@@ -250,6 +329,37 @@ public sealed class HideSeekService
     public void ConsumeTagPulse()
     {
         ClearTagPulse();
+    }
+
+    public void OnPlayerDisconnected(byte slot)
+    {
+        _assignedRoleSlots.Remove(slot);
+        _hiderDeathWasActive.Remove(slot);
+
+        var staleCooldowns = new List<(byte seeker, byte hider)>();
+        foreach (var key in _tagCooldowns.Keys)
+        {
+            if (key.seeker == slot || key.hider == slot)
+                staleCooldowns.Add(key);
+        }
+
+        foreach (var key in staleCooldowns)
+            _tagCooldowns.Remove(key);
+
+        if (_state.GameMode != GameMode.HideSeek)
+            return;
+
+        if (!_state.TagActive)
+            return;
+
+        if (CountConnectedRole(HideSeekRole.Hider, GetActiveRoleSlots()) == 0)
+        {
+            _server.LogMessage("Hide & Seek round complete — all hiders left.");
+            ResetTag(playRoundFanfare: true);
+            return;
+        }
+
+        _server.LogMessage($"Player slot {slot} left during Hide & Seek — tag continues.");
     }
 
     private IReadOnlyList<byte> GetActiveRoleSlots()

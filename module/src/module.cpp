@@ -6,13 +6,17 @@
 #include "voice_sync.hpp"
 #include "world_sync.hpp"
 #include "hide_seek.hpp"
+#include "stage_guard.hpp"
+#include "connection_hud.hpp"
 
 #include <BetterSMS/application.hxx>
+#include <BetterSMS/game.hxx>
 #include <BetterSMS/module.hxx>
 #include <BetterSMS/stage.hxx>
 #include <Dolphin/OS.h>
 #include <JSystem/J2D/J2DOrthoGraph.hxx>
 #include <SMS/System/Application.hxx>
+#include <SMS/Manager/FlagManager.hxx>
 #include <SMS/System/MarDirector.hxx>
 #include <SMS/Player/Mario.hxx>
 
@@ -31,20 +35,26 @@ BETTER_SMS_FOR_CALLBACK static void stageInit(TMarDirector *director) {
     smso::initRemoteActors();
     smso::initMarioVoiceSync();
     smso::initRemoteWaterSync();
-    smso::initWorldSync();
     smso::initHideSeek();
-    OSReport("[SMSOBB] Stage init area=%u episode=%u\n", director->mAreaID, director->mEpisodeID);
+    smso::initStageGuard();
+    smso::applyHotelWarpMissionOverride(director);
+    const u8 missionEp = static_cast<u8>(TFlagManager::smInstance->getFlag(0x40003));
+    OSReport("[SMSOBB] Stage init area=%u load=%u mission=%u\n", director->mAreaID,
+             director->mEpisodeID, missionEp);
 }
 
 BETTER_SMS_FOR_CALLBACK static void stageUpdate(TMarDirector *director) {
     smso::publishMailboxAnchor();
 
     if (gpMarDirector) {
+        smso::guardHideSeekDeathBeforeWarp(director);
         smso::consumeWarpIntent();
-        smso::skipEntryDemoIfPending(director);
-        smso::skipCutscenesIfConnected(director);
+        smso::syncHotelWarpMissionEpisode(director);
         smso::applyPendingWarpPoint(director);
     }
+
+    if (director && smso::isNonGameplayStage(director->mAreaID))
+        return;
 
     if (!gpMarDirector || !gpMarioAddress)
         return;
@@ -74,10 +84,26 @@ BETTER_SMS_FOR_CALLBACK static void stageExit(TApplication *app) {
     OSReport("[SMSOBB] Stage exit\n");
 }
 
+BETTER_SMS_FOR_CALLBACK static void connectionHudInit(TApplication *app) {
+    (void)app;
+    smso::connection_hud::initSystem();
+}
+
+BETTER_SMS_FOR_CALLBACK static void connectionHudUpdate(TApplication *app) {
+    smso::connection_hud::updateSystem(app);
+}
+
+BETTER_SMS_FOR_CALLBACK static void connectionHudDraw(TApplication *app, const J2DOrthoGraph *ortho) {
+    smso::connection_hud::drawSystem(app, ortho);
+}
+
 static void registerCallbacks() {
     BetterSMS::Application::registerContextCallback(TApplication::CONTEXT_GAME_BOOT, appContextHeartbeat);
     BetterSMS::Application::registerContextCallback(TApplication::CONTEXT_GAME_BOOT_LOGO, appContextHeartbeat);
     BetterSMS::Application::registerContextCallback(TApplication::CONTEXT_DIRECT_MAIN_LOOP, appContextHeartbeat);
+    BetterSMS::Game::addInitCallback(connectionHudInit);
+    BetterSMS::Game::addLoopCallback(connectionHudUpdate);
+    BetterSMS::Game::addPostDrawCallback(connectionHudDraw);
     BetterSMS::Stage::addInitCallback(stageInit);
     BetterSMS::Stage::addUpdateCallback(stageUpdate);
     BetterSMS::Stage::addDraw2DCallback(stageDraw2D);
@@ -88,6 +114,8 @@ KURIBO_MODULE_BEGIN("Better Super Mario Sunshine Online", "BSMSO", "v1.0") {
     KURIBO_EXECUTE_ON_LOAD {
         registerCallbacks();
         smso::initCommBuffer();
+        smso::initWorldSync();
+        smso::bootHideSeek();
         OSReport("[SMSOBB] v1.0 loaded (comm @ %p)\n", smso::getCommBuffer());
     }
 }

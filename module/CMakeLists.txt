@@ -18,13 +18,19 @@ set(SMSO_SOURCES
     src/comm_buffer.cpp
     src/puppets.cpp
     src/nametag_system.cpp
+    src/connection_hud.cpp
     src/remote_mario.cpp
     src/remote_actor.cpp
     src/voice_sync.cpp
     src/remote_water_sync.cpp
-    src/world_sync.cpp
     src/hide_seek.cpp
+    src/stage_guard.cpp
+    src/cutscene_skip.cpp
     src/module.cpp
+    src/collectible_scan.cpp
+    src/world_sync.cpp
+    src/red_coin_sync.cpp
+    src/yoshi_sync.cpp
 )
 
 add_executable(_SMSO ${SMSO_SOURCES})

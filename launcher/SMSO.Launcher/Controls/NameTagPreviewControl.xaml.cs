@@ -66,10 +66,10 @@ public partial class NameTagPreviewControl : UserControl
         var visual = new DrawingVisual();
         using (var dc = visual.RenderOpen())
         {
-            if (colorsValid && outlineOffset > 0)
+            var outlineBrush = new SolidColorBrush(colorsValid ? outline : Colors.Black);
+            outlineBrush.Freeze();
+            if (outlineOffset > 0)
             {
-                var outlineBrush = new SolidColorBrush(outline);
-                outlineBrush.Freeze();
                 foreach (var (dx, dy) in BuildOutlineOffsets(outlineOffset, PreviewFontSize))
                 {
                     dc.PushTransform(new TranslateTransform(dx, dy));
@@ -108,31 +108,25 @@ public partial class NameTagPreviewControl : UserControl
 
     private static int CalcOutlineOffset(double fontSize)
     {
-        var offset = (int)(fontSize / 11.0 + 0.35);
-        return Math.Clamp(offset, 1, 2);
+        var offset = fontSize * 0.11 + 0.35;
+        return (int)Math.Clamp(Math.Round(offset), 1, 3);
     }
 
     private static IEnumerable<(double dx, double dy)> BuildOutlineOffsets(int offsetPx, double fontSize)
     {
-        var useDiagonals = fontSize >= 12.0;
-        for (var layer = 1; layer <= offsetPx; layer++)
+        _ = fontSize;
+        for (var dy = -offsetPx; dy <= offsetPx; dy++)
         {
-            for (var dy = -layer; dy <= layer; dy++)
+            for (var dx = -offsetPx; dx <= offsetPx; dx++)
             {
-                for (var dx = -layer; dx <= layer; dx++)
-                {
-                    if (dx == 0 && dy == 0)
-                        continue;
+                if (dx == 0 && dy == 0)
+                    continue;
 
-                    var cheb = Math.Max(Math.Abs(dx), Math.Abs(dy));
-                    if (cheb != layer)
-                        continue;
+                var cheb = Math.Max(Math.Abs(dx), Math.Abs(dy));
+                if (cheb < 1 || cheb > offsetPx)
+                    continue;
 
-                    if (!useDiagonals && dx != 0 && dy != 0)
-                        continue;
-
-                    yield return (dx, dy);
-                }
+                yield return (dx, dy);
             }
         }
     }
