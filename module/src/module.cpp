@@ -37,6 +37,7 @@ BETTER_SMS_FOR_CALLBACK static void stageInit(TMarDirector *director) {
     smso::initRemoteWaterSync();
     smso::initHideSeek();
     smso::initStageGuard();
+    smso::ensureHipDropObjectHooks();
     smso::applyHotelWarpMissionOverride(director);
     const u8 missionEp = static_cast<u8>(TFlagManager::smInstance->getFlag(0x40003));
     OSReport("[SMSOBB] Stage init area=%u load=%u mission=%u\n", director->mAreaID,

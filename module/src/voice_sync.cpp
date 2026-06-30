@@ -2,6 +2,7 @@
 
 #include "comm_buffer.hpp"
 #include "remote_actor.hpp"
+#include "remote_mario_audio.hpp"
 
 #include <Dolphin/MTX.h>
 #include <Dolphin/mem.h>
@@ -98,7 +99,7 @@ static void playRemoteMarioVoice(u8 slot, const MarioVoiceEvent &event) {
         return;
 
     const Vec *pos = reinterpret_cast<const Vec *>(&body->mTranslation);
-    MSoundSESystem::MSoundSE::startSoundActor(event.soundId, pos, 0, nullptr, 0, 4);
+    playRemoteMarioPositionalSound(event.soundId, *pos);
 }
 
 static void consumeRemoteMarioVoices() {

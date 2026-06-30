@@ -48,4 +48,8 @@ constexpr s32 kTurboWaterRipple = 0x34;  // PARTICLE_MS_M_WATRUN_A — doldecomp
 constexpr s32 kTurboDashBoostA = 0xFE;   // doldecomp TMarioEffect::perform — waterboost trail A
 constexpr s32 kTurboDashBoostB = 0xFF;   // doldecomp TMarioEffect::perform — waterboost trail B
 
+constexpr s32 kCoinGetA = 0x37;          // PARTICLE_MS_COINGET_A
+constexpr s32 kCoinGetB = 0x38;          // PARTICLE_MS_COINGET_B
+constexpr s32 kBlueCoinKira = 0x58;      // MAPOBJ_MS_WATCOIN_KIRA
+
 } // namespace smso::particles

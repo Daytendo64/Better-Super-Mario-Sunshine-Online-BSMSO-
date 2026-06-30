@@ -62,4 +62,22 @@ public class RedCoinAuthorityTests
         var missingIdentity = new WorldEventRequest(1, WorldEventType.RedCoinCollected, 2, 3, 0, 255, 0);
         Assert.False(authority.TryAcceptCollected(missingIdentity, out _, out _, out _));
     }
+
+    [Fact]
+    public void ResetStage_AllowsReCollectionAfterEpisodeRetry()
+    {
+        var authority = new RedCoinAuthority();
+
+        var first = new WorldEventRequest(1, WorldEventType.RedCoinCollected, 2, 3, 0, 0, 0x100);
+        Assert.True(authority.TryAcceptCollected(first, out _, out _, out _));
+        Assert.Equal(0b0000_0001, authority.CollectedMask(2, 3));
+
+        authority.ResetStage(2, 3);
+        Assert.Equal(0, authority.CollectedMask(2, 3));
+
+        var retry = new WorldEventRequest(2, WorldEventType.RedCoinCollected, 2, 3, 0, 0, 0x100);
+        Assert.True(authority.TryAcceptCollected(retry, out var payload0, out _, out _));
+        Assert.Equal(0x10, payload0 & 0xF0);
+        Assert.Equal(0b0000_0001, authority.CollectedMask(2, 3));
+    }
 }

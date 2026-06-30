@@ -20,6 +20,9 @@
 
   <ItemGroup>
     <Resource Include="Assets\bsmso.ico" />
+    <Content Include="Assets\bsmso-banner.png">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
   </ItemGroup>
 
   <ItemGroup>

@@ -154,6 +154,13 @@ static bool isLocalBlooperSurf(const TMario *mario) {
     return id == 0x046u || id == 0x09Au;
 }
 
+static s16 readHostGunAngle(TMario *mario) {
+    if (!mario->mFludd || !mario->mAttributes.mHasFludd)
+        return 0;
+    TNozzleBase *nozzle = mario->mFludd->mNozzleList[mario->mFludd->mCurrentNozzle];
+    return nozzle ? nozzle->mGunAngle : 0;
+}
+
 static u8 exportHandIndex(TMario *mario) {
     if ((mario->mState & 0x1C0) == 0x040 &&
         (mario->mAnimationID == 0x48 || mario->mAnimationID == 0x72)) {
@@ -492,6 +499,15 @@ void exportLocalPlayer(TMario *mario, TMarDirector *director) {
     if (waistPack) {
         const u8 rollEnc = encodeSnapshotAngle6(static_cast<s16>(mario->_3D8));
         snap.vfxFlags = packVfxAuxAngle(snap.vfxFlags, rollEnc);
+    }
+
+    // Aux-bit priority: Y-cam pitch (set in buildVfxFlags) > active-spray gun angle > waist roll.
+    // During spray the retail waist callback's FLUDD branch overrides the run branch, so the gun
+    // angle is what matters; mGunAngle is negative while hovering (head aims down) and positive
+    // while aiming up. Pack it raw — the sign convention matches retail (no inversion).
+    if (!yCam && (sprayingWater || drySpray)) {
+        snap.vfxFlags =
+            packVfxAuxAngle(snap.vfxFlags, encodeSnapshotAngle6(readHostGunAngle(mario)));
     }
 
     snap.connected = 1;

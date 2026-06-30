@@ -1,3 +1,5 @@
+using System.Diagnostics;
+
 namespace SMSO.Net;
 
 /// <summary>
@@ -29,11 +31,23 @@ public sealed class RemoteInterpolation
         public ushort DisplayAnimId;
         public PlayerSnapshot LastRaw;
         public PlayerSnapshot PreviousRaw;
-        public long LastPacketMs;
-        public long PreviousPacketMs;
-        public long LastAdvanceMs;
+        public double LastPacketMs;
+        public double PreviousPacketMs;
+        public double LastAdvanceMs;
         public bool HasPrevious;
         public bool HasDisplay;
+    }
+
+    /// <summary>
+    /// High-resolution monotonic clock in milliseconds. <see cref="Environment.TickCount64"/>
+    /// is backed by GetTickCount64 (~15.6 ms granularity on default Windows), which quantizes
+    /// the lerp parameter into coarse steps and produces visibly choppy remote motion. Stopwatch
+    /// is backed by QueryPerformanceCounter (sub-microsecond), so the interpolation parameter
+    /// advances smoothly between packets.
+    /// </summary>
+    private static double NowMs()
+    {
+        return Stopwatch.GetTimestamp() * 1000.0 / Stopwatch.Frequency;
     }
 
     /// <summary>Record a new network sample for a remote slot.</summary>
@@ -41,7 +55,7 @@ public sealed class RemoteInterpolation
     {
         lock (_lock)
         {
-            var now = Environment.TickCount64;
+            var now = NowMs();
             var packet = incoming;
             packet.Slot = slot;
             if (packet.Connected == 0)
@@ -69,22 +83,29 @@ public sealed class RemoteInterpolation
             var dy = packet.Position.Y - state.DisplayPosition.Y;
             var dz = packet.Position.Z - state.DisplayPosition.Z;
             var dist = MathF.Sqrt(dx * dx + dy * dy + dz * dz);
-            if (!state.HasDisplay || dist > SnapDistance || animChanged)
+
+            // Position only hard-snaps on first display, teleport-scale jumps, or when we have no
+            // previous sample to interpolate from. Animation id changes are NOT a reason to snap
+            // position — retail SMS hard-cuts the anim but the actor keeps moving smoothly, and
+            // snapping here pops the body every time a running player jumps/lands/dives.
+            var snapPosition = !state.HasDisplay || dist > SnapDistance || !state.HasPrevious;
+            if (snapPosition)
             {
                 state.DisplayPosition = packet.Position;
                 state.DisplayVelocity = packet.Velocity;
                 state.DisplayRotationY = packet.RotationY;
-                state.DisplayAnimFrameF = packet.AnimFrame;
-                state.DisplayAnimId = packet.AnimId;
                 state.HasDisplay = true;
             }
-            else if (isNew)
+            else if (ShouldSnapRotation(packet.AnimId))
             {
-                state.DisplayAnimFrameF = packet.AnimFrame;
-                state.DisplayAnimId = packet.AnimId;
-                if (ShouldSnapRotation(packet.AnimId))
-                    state.DisplayRotationY = packet.RotationY;
+                state.DisplayRotationY = packet.RotationY;
             }
+
+            // Animation id always snaps immediately (retail-style hard cut); the frame is lerped
+            // per-tick in AdvanceAnimDisplay, so set the authoritative latest frame here.
+            state.DisplayAnimId = packet.AnimId;
+            if (animChanged || isNew)
+                state.DisplayAnimFrameF = packet.AnimFrame;
         }
     }
 
@@ -96,7 +117,7 @@ public sealed class RemoteInterpolation
             if (!_states.TryGetValue(slot, out var state))
                 return default;
 
-            var now = Environment.TickCount64;
+            var now = NowMs();
             AdvanceDisplay(state, now);
             state.LastAdvanceMs = now;
             return BuildDisplaySnapshot(state);
@@ -121,7 +142,7 @@ public sealed class RemoteInterpolation
             _states.Clear();
     }
 
-    private static void AdvanceDisplay(InterpState state, long now)
+    private static void AdvanceDisplay(InterpState state, double now)
     {
         if (!state.HasDisplay)
         {
@@ -137,8 +158,8 @@ public sealed class RemoteInterpolation
         var renderTime = now - RenderDelayMs;
         if (state.HasPrevious && state.LastPacketMs >= state.PreviousPacketMs)
         {
-            var span = Math.Max(1L, state.LastPacketMs - state.PreviousPacketMs);
-            var t = Math.Clamp((renderTime - state.PreviousPacketMs) / (float)span, 0f, 1f);
+            var span = Math.Max(1e-4, state.LastPacketMs - state.PreviousPacketMs);
+            var t = Math.Clamp((float)((renderTime - state.PreviousPacketMs) / span), 0f, 1f);
             state.DisplayPosition = new Vec3
             {
                 X = Lerp(state.PreviousRaw.Position.X, state.LastRaw.Position.X, t),
@@ -161,8 +182,8 @@ public sealed class RemoteInterpolation
         }
         else
         {
-            var elapsedMs = Math.Min(now - state.LastPacketMs, MaxExtrapolateMs);
-            var extrapolate = elapsedMs / 1000f;
+            var elapsedMs = Math.Min(now - state.LastPacketMs, (double)MaxExtrapolateMs);
+            var extrapolate = (float)(elapsedMs / 1000.0);
             state.DisplayPosition = new Vec3
             {
                 X = state.LastRaw.Position.X + state.LastRaw.Velocity.X * extrapolate * ExtrapolateVelocityScale,
@@ -175,7 +196,7 @@ public sealed class RemoteInterpolation
         }
     }
 
-    private static void AdvanceAnimDisplay(InterpState state, long now, bool interpolateBetweenPackets)
+    private static void AdvanceAnimDisplay(InterpState state, double now, bool interpolateBetweenPackets)
     {
         state.DisplayAnimId = state.LastRaw.AnimId;
 
@@ -186,8 +207,8 @@ public sealed class RemoteInterpolation
             state.LastPacketMs > state.PreviousPacketMs)
         {
             var span = state.LastPacketMs - state.PreviousPacketMs;
-            var elapsed = Math.Clamp(now - state.PreviousPacketMs, 0L, span + MaxExtrapolateMs);
-            var t = Math.Clamp(elapsed / (float)Math.Max(1, span), 0f, 1f);
+            var elapsed = Math.Clamp(now - state.PreviousPacketMs, 0.0, span + MaxExtrapolateMs);
+            var t = Math.Clamp((float)(elapsed / Math.Max(1e-4, span)), 0f, 1f);
             state.DisplayAnimFrameF = Lerp(state.PreviousRaw.AnimFrame, state.LastRaw.AnimFrame, t);
         }
         else
@@ -198,17 +219,17 @@ public sealed class RemoteInterpolation
         ExtrapolateAnimAhead(state, now);
     }
 
-    private static void ExtrapolateAnimAhead(InterpState state, long now)
+    private static void ExtrapolateAnimAhead(InterpState state, double now)
     {
         if (IsSpinJumpAnim(state.LastRaw.AnimId))
             return;
 
-        var elapsedMs = Math.Max(0L, now - state.LastPacketMs);
+        var elapsedMs = Math.Max(0.0, now - state.LastPacketMs);
         if (elapsedMs <= 0)
             return;
 
         var rate = DecodeAnimRate(state.LastRaw.PingMs);
-        var extrapSeconds = Math.Min(elapsedMs, MaxExtrapolateMs) / 1000f;
+        var extrapSeconds = (float)(Math.Min(elapsedMs, MaxExtrapolateMs) / 1000.0);
         var extrapFixed = rate * extrapSeconds * 256f;
         if (extrapFixed > MaxAnimExtrapolateFrames * 256f)
             extrapFixed = MaxAnimExtrapolateFrames * 256f;
@@ -229,7 +250,7 @@ public sealed class RemoteInterpolation
         return result;
     }
 
-    private static InterpState CreateState(in PlayerSnapshot incoming, long now)
+    private static InterpState CreateState(in PlayerSnapshot incoming, double now)
     {
         return new InterpState
         {

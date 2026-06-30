@@ -28,6 +28,12 @@ dotnet build launcher\SMSO.sln -c Release
 2. Copy `dist\_BSMSO.kxe` into your ISO folder at `files\Kuribo!\Mods\`
 3. Load order: `BetterSunshineEngine.kxe` → `_BSMSO.kxe` (underscore prefix = child module)
 
+BSMSO uses the custom GameCube ID **`GMSE90`** instead of vanilla NTSC-U **`GMSE01`**. This keeps BSMSO saves and Dolphin per-game settings separate from stock Super Mario Sunshine. The launcher patches `sys/boot.bin` automatically when you launch Dolphin; you can also patch manually:
+
+```powershell
+.\tools\patch-game-id.ps1 "C:\path\to\extracted\iso\sys\main.dol"
+```
+
 Or use:
 
 ```powershell

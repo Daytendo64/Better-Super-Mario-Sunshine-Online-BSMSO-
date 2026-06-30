@@ -21,6 +21,7 @@ set(SMSO_SOURCES
     src/connection_hud.cpp
     src/remote_mario.cpp
     src/remote_actor.cpp
+    src/remote_mario_audio.cpp
     src/voice_sync.cpp
     src/remote_water_sync.cpp
     src/hide_seek.cpp
@@ -28,6 +29,7 @@ set(SMSO_SOURCES
     src/cutscene_skip.cpp
     src/module.cpp
     src/collectible_scan.cpp
+    src/coin_collect_fx.cpp
     src/world_sync.cpp
     src/red_coin_sync.cpp
     src/yoshi_sync.cpp

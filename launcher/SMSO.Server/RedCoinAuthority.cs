@@ -17,6 +17,15 @@ public sealed class RedCoinAuthority
         _stages.Clear();
     }
 
+    /// <summary>
+    /// Clears collected-coin state for one course/episode. Called when no players remain in
+    /// that stage so a re-entry can collect and sync red coins again (matches SMS episode reset).
+    /// </summary>
+    public void ResetStage(byte courseId, byte episodeId)
+    {
+        _stages.Remove((courseId, episodeId));
+    }
+
     public bool TryAcceptCollected(in WorldEventRequest request, out byte payload0, out byte reserved,
         out uint payload1)
     {

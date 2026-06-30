@@ -1,5 +1,6 @@
 #include "world_sync.hpp"
 
+#include "coin_collect_fx.hpp"
 #include "collectible_scan.hpp"
 #include "comm_buffer.hpp"
 #include "red_coin_sync.hpp"
@@ -9,16 +10,22 @@
 #include <SMS/Manager/FlagManager.hxx>
 #include <SMS/Manager/ItemManager.hxx>
 #include <SMS/Manager/ObjManager.hxx>
+#include <SMS/Map/BGCheck.hxx>
 #include <SMS/MapObj/MapObjBase.hxx>
 #include <SMS/MoveBG/Coin.hxx>
 #include <SMS/MoveBG/Shine.hxx>
 #include <SMS/Player/Mario.hxx>
+#include <SMS/Strategic/HitActor.hxx>
 #include <SMS/Strategic/LiveActor.hxx>
 #include <SMS/System/MarDirector.hxx>
 #include <SMS/macros.h>
+#include <BetterSMS/memory.hxx>
+#include <sdk.h>
+#include <Dolphin/OS.h>
 
 extern TMarDirector *gpMarDirector;
 extern TItemManager *gpItemManager;
+extern TMario *gpMarioAddress;
 
 struct TMapObjManager;
 extern TMapObjManager *gpMapObjManager;
@@ -69,6 +76,15 @@ static TVec3f sKnownShinePos[128] = {};
 static bool sApplyingRemoteEvent = false;
 static u16 sLocalWorldEventSequence = 0;
 
+// Unified outbound world-event queue. Both world_sync and red_coin_sync enqueue here
+// through smso::enqueueLocalWorldEvent. A single sequence counter + single consumer
+// (the bridge reads one localPending slot) prevents the two-publisher sequence
+// collisions and same-frame slot overwrites that previously dropped red-coin events.
+constexpr u32 kLocalWorldEventQueueCap = 32;
+static smso::CommWorldEvent sLocalWorldEventQueue[kLocalWorldEventQueueCap] = {};
+static u8 sLocalWorldEventQueueHead = 0;
+static u8 sLocalWorldEventQueueCount = 0;
+
 static u32 sLastGoldCoinCount = 0;
 static u8 sLastCourseId = 0xFF;
 static u8 sLastEpisodeId = 0xFF;
@@ -79,6 +95,70 @@ static u16 sStageSettleFrames = 0;
 static u32 gShineVtable = 0;
 static u32 gCoinBlueVtable = 0;
 static u32 gCoinEmptyVtable = 0;
+
+// TMapObjChangeStageHipDrop vtable — manhole / sub-area transition pads. Excluded
+// from hip-drop replay because stage transitions are owned by the stage-sync system;
+// replaying the pad's receiveMessage would double-trigger the transition.
+static u32 gChangeStageHipDropVtable = 0;
+
+// doldecomp THitMessageType: HIT_MESSAGE_HIP_DROP = 1, HIT_MESSAGE_SUPER_HIP_DROP = 3.
+// hipAttacking() delivers message 1 on a normal pound and both 3 + 1 on a super pound.
+constexpr u32 kHitMessageHipDrop = 1;
+constexpr u32 kHitMessageSuperHipDrop = 3;
+constexpr u32 kHipDropSuperPayloadFlag = 0x80000000u;
+constexpr f32 kHipDropMatchRadius = 96.0f;
+constexpr f32 kHipDropMatchRadiusSq = kHipDropMatchRadius * kHipDropMatchRadius;
+constexpr u32 kVtReceiveMessageOffset = 0x24; // __vt__6TMario receiveMessage slot
+
+static bool sLocalHipDropFired = false;
+static u32 gHipDropHideObjVtable = 0;
+static u32 gBreakableBlockVtable = 0;
+
+using ReceiveMessageFn = bool (*)(THitActor *, THitActor *, u32);
+using TouchPlayerFn = void (*)(TMapObjBase *, THitActor *);
+
+struct VtReceiveHookEntry {
+    u32 vtable;
+    ReceiveMessageFn orig;
+};
+
+static constexpr u32 kMaxVtReceiveHooks = 16;
+static VtReceiveHookEntry sVtReceiveHooks[kMaxVtReceiveHooks] = {};
+static u32 sVtReceiveHookCount = 0;
+static TouchPlayerFn sOrigHipDropHideTouch = nullptr;
+static TouchPlayerFn sOrigBreakableBlockTouch = nullptr;
+static bool sHipDropHooksInstalled = false;
+
+static const u32 kVtMapObjBase = SMS_PORT_REGION(0x803C2AB8, 0x803BA2A8, 0, 0);
+static const u32 kFnMapObjBaseReceive =
+    SMS_PORT_REGION(0x801AF944, 0x801A77FC, 0, 0);
+static const u32 kVtMapObjGeneral = SMS_PORT_REGION(0x803C8B20, 0x803C0310, 0, 0);
+static const u32 kFnMapObjGeneralReceive =
+    SMS_PORT_REGION(0x801B305C, 0x801AAF14, 0, 0);
+static const u32 kVtSuperHipDropBlock = SMS_PORT_REGION(0x803CB520, 0x803C2D10, 0, 0);
+static const u32 kFnSuperHipDropReceive =
+    SMS_PORT_REGION(0x801C2FF0, 0x801BAEA8, 0, 0);
+static const u32 kVtBrickBlock = SMS_PORT_REGION(0x803CB958, 0x803C3148, 0, 0);
+static const u32 kFnBrickBlockReceive =
+    SMS_PORT_REGION(0x801C34B4, 0x801BB36C, 0, 0);
+static const u32 kVtRedCoinSwitch = SMS_PORT_REGION(0x803CA6CC, 0x803C1EBC, 0, 0);
+static const u32 kFnRedCoinSwitchReceive =
+    SMS_PORT_REGION(0x801C0A9C, 0x801B8954, 0, 0);
+static const u32 kVtBreakHideObj = SMS_PORT_REGION(0x803D7050, 0x803CE840, 0, 0);
+static const u32 kFnBreakHideReceive =
+    SMS_PORT_REGION(0x801FED74, 0x801F6C58, 0, 0);
+static const u32 kVtHipDropHideObj = SMS_PORT_REGION(0x803D74B8, 0x803CECA8, 0, 0x803D74B8);
+static const u32 kFnHipDropHideTouch =
+    SMS_PORT_REGION(0x801FFE74, 0x801F7D58, 0, 0x801FFE74);
+// Delfino / Ricco crates — TWoodBarrel overrides receiveMessage (delegates hip-drop to
+// TMapObjGeneral::kill). Hooking TMapObjGeneral alone never sees the virtual dispatch.
+static const u32 kVtWoodBarrel = SMS_PORT_REGION(0x803C28D8, 0x803BA0C8, 0, 0);
+static const u32 kFnWoodBarrelReceive =
+    SMS_PORT_REGION(0x801AEE24, 0x801A6CDC, 0, 0);
+// Hip-breakable blocks use touchPlayer + marioHipAttack(), not receiveMessage.
+static const u32 kVtBreakableBlock = SMS_PORT_REGION(0x803CBEF8, 0x803C36E8, 0, 0);
+static const u32 kFnBreakableBlockTouch =
+    SMS_PORT_REGION(0x801C42E4, 0x801BC19C, 0, 0);
 
 using GetShineIdFn = s32 (*)(u32 shineStage, u32 index, bool);
 using GetShineStageFn = u32 (*)(u8 areaId);
@@ -94,10 +174,19 @@ static IncGoldCoinFlagFn gIncGoldCoinFlag = nullptr;
 static CountShineFn gCountShine = nullptr;
 static CountBlueCoinFn gCountBlueCoin = nullptr;
 
+static void publishLocalWorldEvent(smso::WorldEventType type, u8 courseId, u8 episodeId, u8 payload0,
+                                   u8 reserved, u32 payload1);
+
 static bool worldSyncEnabled(const smso::CommBuffer *buf) {
     return buf && (buf->bridgeFlags & smso::BF_CONNECTED) != 0 &&
            (buf->bridgeFlags & (smso::BF_SYNC_SHINE | smso::BF_SYNC_BLUE_COIN | smso::BF_SYNC_EVENT |
-                                smso::BF_SYNC_STORY | smso::BF_SYNC_MISSION | smso::BF_SYNC_SECRET)) != 0;
+                                smso::BF_SYNC_STORY | smso::BF_SYNC_MISSION | smso::BF_SYNC_SECRET |
+                                smso::BF_SYNC_PROGRESS)) != 0;
+}
+
+static bool objectSyncEnabled(const smso::CommBuffer *buf) {
+    return buf && (buf->bridgeFlags & smso::BF_CONNECTED) != 0 &&
+           (buf->bridgeFlags & smso::BF_SYNC_OBJECTS) != 0;
 }
 
 static bool episodeCollectibleSyncEnabled(const smso::CommBuffer *buf) {
@@ -192,6 +281,281 @@ static bool isLiveCollectible(const TMapObjBase *obj) {
     return !live->mStateFlags.asFlags.mIsObjDead;
 }
 
+static TVec3f hipDropObjWorldPos(const TMapObjBase *obj) {
+    TVec3f pos = obj->mInitialPosition;
+    if (obj)
+        const_cast<TMapObjBase *>(obj)->JSGGetTranslation(reinterpret_cast<Vec *>(&pos));
+    return pos;
+}
+
+static f32 hipDropPosDistSq(const TMapObjBase *obj, const TVec3f &target) {
+    const TVec3f live = hipDropObjWorldPos(obj);
+    const f32 ldx = live.x - target.x;
+    const f32 ldy = live.y - target.y;
+    const f32 ldz = live.z - target.z;
+    const f32 liveDistSq = ldx * ldx + ldy * ldy + ldz * ldz;
+
+    const TVec3f &initial = obj->mInitialPosition;
+    const f32 idx = initial.x - target.x;
+    const f32 idy = initial.y - target.y;
+    const f32 idz = initial.z - target.z;
+    const f32 initialDistSq = idx * idx + idy * idy + idz * idz;
+
+    return liveDistSq < initialDistSq ? liveDistSq : initialDistSq;
+}
+
+static bool isChangeStageHipDropObj(const TMapObjBase *obj) {
+    return obj != nullptr && gChangeStageHipDropVtable != 0 &&
+           *reinterpret_cast<const u32 *>(obj) == gChangeStageHipDropVtable;
+}
+
+struct FindHipDropObjCtx {
+    TVec3f target;
+    u8 mapObjId;
+    TMapObjBase *best;
+    f32 bestDistSq;
+    bool bestIdMatch;
+};
+
+static bool visitFindHipDropObj(TMapObjBase *obj, void *rawCtx) {
+    auto *ctx = reinterpret_cast<FindHipDropObjCtx *>(rawCtx);
+    if (!isLiveCollectible(obj) || isChangeStageHipDropObj(obj))
+        return false;
+
+    const f32 distSq = hipDropPosDistSq(obj, ctx->target);
+    if (distSq > kHipDropMatchRadiusSq)
+        return false;
+
+    const bool idMatch =
+        ctx->mapObjId != 0 && static_cast<u8>(obj->mMapObjID) == ctx->mapObjId;
+    if (ctx->best == nullptr) {
+        ctx->best = obj;
+        ctx->bestDistSq = distSq;
+        ctx->bestIdMatch = idMatch;
+    } else if (idMatch && !ctx->bestIdMatch) {
+        ctx->best = obj;
+        ctx->bestDistSq = distSq;
+        ctx->bestIdMatch = true;
+    } else if (idMatch == ctx->bestIdMatch && distSq < ctx->bestDistSq) {
+        ctx->best = obj;
+        ctx->bestDistSq = distSq;
+    }
+    return false;
+}
+
+// Finds the live managed MapObj nearest to the packed pound position, preferring a
+// matching mMapObjID to disambiguate same-archetype objects (e.g. a row of crates).
+static TMapObjBase *findHipDropTarget(const TVec3f &pos, u8 mapObjId) {
+    FindHipDropObjCtx ctx = {pos, mapObjId, nullptr, kHipDropMatchRadiusSq, false};
+    smso::forEachManagedMapObj(visitFindHipDropObj, &ctx);
+    return ctx.best;
+}
+
+struct MatchPtrCtx {
+    const void *needle;
+    bool found;
+};
+
+static bool visitMatchManagedPtr(TMapObjBase *obj, void *rawCtx) {
+    auto *ctx = reinterpret_cast<MatchPtrCtx *>(rawCtx);
+    if (static_cast<const void *>(obj) == ctx->needle) {
+        ctx->found = true;
+        return true;
+    }
+    return false;
+}
+
+// Confirms a floor-actor pointer is genuinely a managed MapObj before we treat it as
+// TMapObjBase. Only invoked on the single pound frame, so the manager scan is cheap.
+static bool isManagedMapObj(const void *ptr) {
+    if (!smso::isValidMapObjPtr(ptr))
+        return false;
+    MatchPtrCtx ctx = {ptr, false};
+    smso::forEachManagedMapObj(visitMatchManagedPtr, &ctx);
+    return ctx.found;
+}
+
+static u32 packHipDropPublishPayload(const TVec3f &pos, bool superPound) {
+    u32 packed = packWorldPos(pos);
+    if (packed == 0)
+        return 0;
+    if (superPound)
+        packed |= kHipDropSuperPayloadFlag;
+    return packed;
+}
+
+static bool hipDropPayloadIsSuper(u32 packed) {
+    return (packed & kHipDropSuperPayloadFlag) != 0;
+}
+
+static u32 hipDropPayloadPosBits(u32 packed) {
+    return packed & ~kHipDropSuperPayloadFlag;
+}
+
+static void resetLocalHipDropCaptureIfIdle() {
+    const TMario *mario = gpMarioAddress;
+    if (!mario || mario->mState != TMario::STATE_G_POUND)
+        sLocalHipDropFired = false;
+}
+
+static void tryPublishLocalHipDropHit(TMapObjBase *obj, bool superPound) {
+    if (sApplyingRemoteEvent || sLocalHipDropFired || !obj)
+        return;
+
+    smso::CommBuffer *buf = smso::getCommBuffer();
+    if (!buf || (buf->bridgeFlags & smso::BF_CONNECTED) == 0 ||
+        (buf->bridgeFlags & smso::BF_SYNC_OBJECTS) == 0)
+        return;
+
+    if (isChangeStageHipDropObj(obj) || !isLiveCollectible(obj))
+        return;
+
+    const u32 packed = packHipDropPublishPayload(hipDropObjWorldPos(obj), superPound);
+    if (packed == 0)
+        return;
+
+    publishLocalWorldEvent(smso::WE_HIP_DROP_OBJECT, currentCourseId(), currentEpisodeId(),
+                           static_cast<u8>(obj->mMapObjID), buf->localSlot, packed);
+    sLocalHipDropFired = true;
+    const TVec3f pos = hipDropObjWorldPos(obj);
+    OSReport("[SMSOBB] hip-drop publish id=%u slot=%u pos=(%.0f,%.0f,%.0f)\n",
+             static_cast<u32>(obj->mMapObjID), static_cast<u32>(buf->localSlot), pos.x, pos.y,
+             pos.z);
+}
+
+static void tryCaptureLocalHipDropFromMessage(THitActor *receiver, THitActor *sender, u32 msg) {
+    if (!receiver || sender != reinterpret_cast<THitActor *>(gpMarioAddress))
+        return;
+    if (msg != kHitMessageHipDrop && msg != kHitMessageSuperHipDrop)
+        return;
+    if (!isManagedMapObj(receiver))
+        return;
+
+    tryPublishLocalHipDropHit(reinterpret_cast<TMapObjBase *>(receiver),
+                              msg == kHitMessageSuperHipDrop);
+}
+
+static void tryCaptureLocalHipDropFromTouch(TMapObjBase *obj, THitActor *player) {
+    if (!obj || player != reinterpret_cast<THitActor *>(gpMarioAddress))
+        return;
+    if (!gpMarioAddress || gpMarioAddress->mState != TMario::STATE_G_POUND)
+        return;
+    tryPublishLocalHipDropHit(obj, false);
+}
+
+static ReceiveMessageFn lookupReceiveMessageOrig(u32 vtable) {
+    for (u32 i = 0; i < sVtReceiveHookCount; ++i) {
+        if (sVtReceiveHooks[i].vtable == vtable)
+            return sVtReceiveHooks[i].orig;
+    }
+    return nullptr;
+}
+
+static bool smso_receiveMessage_captureHook(THitActor *self, THitActor *sender, u32 msg) {
+    tryCaptureLocalHipDropFromMessage(self, sender, msg);
+    const ReceiveMessageFn orig = lookupReceiveMessageOrig(*reinterpret_cast<const u32 *>(self));
+    if (orig)
+        return orig(self, sender, msg);
+    return false;
+}
+
+static void smso_hipDropHideTouch_captureHook(TMapObjBase *self, THitActor *player) {
+    tryCaptureLocalHipDropFromTouch(self, player);
+    if (sOrigHipDropHideTouch)
+        sOrigHipDropHideTouch(self, player);
+}
+
+static void smso_breakableBlockTouch_captureHook(TMapObjBase *self, THitActor *player) {
+    tryCaptureLocalHipDropFromTouch(self, player);
+    if (sOrigBreakableBlockTouch)
+        sOrigBreakableBlockTouch(self, player);
+}
+
+static u32 findVtSlotForFn(u32 vtable, u32 fn) {
+    for (u32 off = 0x1C; off <= 0x48; off += 4) {
+        const u32 entry = *reinterpret_cast<const u32 *>(vtable + off);
+        if (entry == fn)
+            return off;
+    }
+    return 0;
+}
+
+static void registerTouchPlayerHook(u32 vtable, u32 origFn, TouchPlayerFn *origOut,
+                                    TouchPlayerFn hookFn) {
+    if (vtable == 0 || origFn == 0 || *origOut != nullptr)
+        return;
+
+    u32 touchOff = findVtSlotForFn(vtable, origFn);
+    if (touchOff == 0)
+        touchOff = 0x30;
+    u32 *touchSlot = reinterpret_cast<u32 *>(vtable + touchOff);
+    *origOut = reinterpret_cast<TouchPlayerFn>(*touchSlot);
+    BetterSMS::PowerPC::writeU32(touchSlot, reinterpret_cast<u32>(hookFn));
+}
+
+static void registerReceiveMessageHook(u32 vtable, u32 origFn) {
+    if (vtable == 0 || origFn == 0 || sVtReceiveHookCount >= kMaxVtReceiveHooks)
+        return;
+
+    for (u32 i = 0; i < sVtReceiveHookCount; ++i) {
+        if (sVtReceiveHooks[i].vtable == vtable)
+            return;
+    }
+
+    u32 off = findVtSlotForFn(vtable, origFn);
+    if (off == 0)
+        off = kVtReceiveMessageOffset;
+
+    u32 *slot = reinterpret_cast<u32 *>(vtable + off);
+    sVtReceiveHooks[sVtReceiveHookCount++] = {vtable,
+                                              reinterpret_cast<ReceiveMessageFn>(*slot)};
+    BetterSMS::PowerPC::writeU32(slot, reinterpret_cast<u32>(&smso_receiveMessage_captureHook));
+}
+
+static void replayRemoteHipDropHit(TMapObjBase *obj, bool superPound) {
+    TMario *mario = gpMarioAddress;
+    if (!mario || !obj)
+        return;
+
+    // Object handlers call marioHipAttack() / SMS_IsMarioStatusHipDrop(), which read
+    // gpMarioAddress — not the remote puppet. Spoof hip-drop status on the local body
+    // for the duration of the replayed hit.
+    const u32 savedState = mario->mState;
+    mario->mState = TMario::STATE_G_POUND;
+    THitActor *sender = static_cast<THitActor *>(mario);
+
+    const u32 vt = *reinterpret_cast<const u32 *>(obj);
+    if (gHipDropHideObjVtable != 0 && vt == gHipDropHideObjVtable) {
+        obj->touchPlayer(sender);
+    } else if (gBreakableBlockVtable != 0 && vt == gBreakableBlockVtable) {
+        obj->touchPlayer(sender);
+    } else {
+        if (superPound)
+            obj->receiveMessage(sender, kHitMessageSuperHipDrop);
+        obj->receiveMessage(sender, kHitMessageHipDrop);
+    }
+
+    mario->mState = savedState;
+}
+
+static void initHipDropObjectHooks() {
+    registerReceiveMessageHook(kVtMapObjBase, kFnMapObjBaseReceive);
+    registerReceiveMessageHook(kVtMapObjGeneral, kFnMapObjGeneralReceive);
+    registerReceiveMessageHook(kVtWoodBarrel, kFnWoodBarrelReceive);
+    registerReceiveMessageHook(kVtSuperHipDropBlock, kFnSuperHipDropReceive);
+    registerReceiveMessageHook(kVtBrickBlock, kFnBrickBlockReceive);
+    registerReceiveMessageHook(kVtRedCoinSwitch, kFnRedCoinSwitchReceive);
+    registerReceiveMessageHook(kVtBreakHideObj, kFnBreakHideReceive);
+
+    gHipDropHideObjVtable = kVtHipDropHideObj;
+    registerTouchPlayerHook(kVtHipDropHideObj, kFnHipDropHideTouch, &sOrigHipDropHideTouch,
+                            &smso_hipDropHideTouch_captureHook);
+
+    gBreakableBlockVtable = kVtBreakableBlock;
+    registerTouchPlayerHook(kVtBreakableBlock, kFnBreakableBlockTouch, &sOrigBreakableBlockTouch,
+                            &smso_breakableBlockTouch_captureHook);
+}
+
 static bool isCollectibleBlueCoin(const TMapObjBase *obj) {
     if (!isLiveCollectible(obj))
         return false;
@@ -242,6 +606,39 @@ static void hideBlueCoinAtIndex(u8 flagIndex) {
 
     HideBlueCtx ctx = {flagIndex, false};
     smso::forEachManagedMapObj(visitHideBlueCoinByFlagIndex, &ctx);
+}
+
+struct FindBlueCoinCtx {
+    u8 flagIndex;
+    TMapObjBase *coin;
+};
+
+static bool visitFindBlueCoinByFlagIndex(TMapObjBase *obj, void *rawCtx) {
+    auto *findCtx = reinterpret_cast<FindBlueCoinCtx *>(rawCtx);
+    if (!isCollectibleBlueCoin(obj))
+        return false;
+
+    auto *coin = reinterpret_cast<TCoin *>(obj);
+    const u8 coinIndex = static_cast<u8>(coin->_154);
+    const u8 mapObjId = static_cast<u8>(obj->mMapObjID);
+    if (coinIndex != findCtx->flagIndex && mapObjId != findCtx->flagIndex)
+        return false;
+
+    findCtx->coin = obj;
+    return true;
+}
+
+static bool tryResolveBlueCoinWorldPos(u8 flagIndex, TVec3f *outPos) {
+    if (flagIndex >= kMaxStageBlueCoins || !outPos)
+        return false;
+
+    FindBlueCoinCtx ctx = {flagIndex, nullptr};
+    smso::forEachManagedMapObj(visitFindBlueCoinByFlagIndex, &ctx);
+    if (!ctx.coin)
+        return false;
+
+    *outPos = ctx.coin->mInitialPosition;
+    return true;
 }
 
 static s32 shineGlobalIdForActor(const TShine *shine) {
@@ -794,6 +1191,7 @@ static void resetLocalTrackersForStage(u8 courseId, u8 episodeId) {
     sPendingShineCapture = {};
     clearRemoteShineCollect();
     clearKnownShinePositions();
+    sLocalHipDropFired = false;
     for (u32 i = 0; i < sizeof(sShineBits); ++i)
         sShineBits[i] = 0;
 
@@ -818,16 +1216,16 @@ static void publishLocalWorldEvent(smso::WorldEventType type, u8 courseId, u8 ep
         return;
 
     smso::CommBuffer *buf = smso::getCommBuffer();
-    if (!worldSyncEnabled(buf))
+    if (!buf || (buf->bridgeFlags & smso::BF_CONNECTED) == 0)
         return;
 
     switch (type) {
     case smso::WE_SHINE_COLLECTED:
-        if ((buf->bridgeFlags & smso::BF_SYNC_SHINE) == 0)
+        if (!worldSyncEnabled(buf) || (buf->bridgeFlags & smso::BF_SYNC_SHINE) == 0)
             return;
         break;
     case smso::WE_BLUE_COIN_COLLECTED:
-        if ((buf->bridgeFlags & smso::BF_SYNC_BLUE_COIN) == 0)
+        if (!worldSyncEnabled(buf) || (buf->bridgeFlags & smso::BF_SYNC_BLUE_COIN) == 0)
             return;
         break;
     case smso::WE_GOLD_COIN_COLLECTED:
@@ -838,19 +1236,62 @@ static void publishLocalWorldEvent(smso::WorldEventType type, u8 courseId, u8 ep
         if ((buf->bridgeFlags & (smso::BF_SYNC_EVENT | smso::BF_SYNC_MISSION)) == 0)
             return;
         break;
+    case smso::WE_HIP_DROP_OBJECT:
+        if (!objectSyncEnabled(buf))
+            return;
+        break;
     default:
-        return;
+        if (!worldSyncEnabled(buf))
+            return;
+        break;
     }
 
-    smso::CommWorldEvent &event = buf->worldSync.localPending;
+    if (sLocalWorldEventQueueCount >= kLocalWorldEventQueueCap)
+        return;
+
+    const u8 writeIndex = static_cast<u8>(
+        (sLocalWorldEventQueueHead + sLocalWorldEventQueueCount) % kLocalWorldEventQueueCap);
+    smso::CommWorldEvent &event = sLocalWorldEventQueue[writeIndex];
     event.eventId = 0;
-    event.sequence = ++sLocalWorldEventSequence;
+    event.sequence = 0;
     event.type = static_cast<u8>(type);
     event.courseId = courseId;
     event.episodeId = episodeId;
     event.payload0 = payload0;
     event.reserved = reserved;
     event.payload1 = payload1;
+    ++sLocalWorldEventQueueCount;
+}
+
+static bool localPendingSlotIsFree(const smso::CommBuffer *buf) {
+    if (!buf)
+        return false;
+    const smso::CommWorldEvent &slot = buf->worldSync.localPending;
+    // The bridge zeroes the slot (sequence + type) once it has published the event, so an
+    // empty slot means the previous event was consumed and we can hand over the next one.
+    return slot.sequence == 0 || slot.type == 0;
+}
+
+// Flush at most one queued event into the localPending mailbox slot. The bridge polls the
+// comm buffer and publishes localPending on a sequence change, then clears the slot. By
+// only writing when the slot is free we guarantee no outbound event is overwritten before
+// the bridge relays it to the server.
+static void flushLocalWorldEventQueue() {
+    if (sLocalWorldEventQueueCount == 0)
+        return;
+
+    smso::CommBuffer *buf = smso::getCommBuffer();
+    if (!buf || (buf->bridgeFlags & smso::BF_CONNECTED) == 0)
+        return;
+    if (!localPendingSlotIsFree(buf))
+        return;
+
+    smso::CommWorldEvent &slot = buf->worldSync.localPending;
+    slot = sLocalWorldEventQueue[sLocalWorldEventQueueHead];
+    slot.sequence = ++sLocalWorldEventSequence;
+    sLocalWorldEventQueueHead = static_cast<u8>(
+        (sLocalWorldEventQueueHead + 1) % kLocalWorldEventQueueCap);
+    --sLocalWorldEventQueueCount;
 }
 
 static void refreshHudCounters() {
@@ -902,6 +1343,12 @@ static bool applyWorldEvent(const smso::CommWorldEvent &event) {
         const u8 flagIndex = event.payload0;
         const bool alreadySet = fm->getBlueCoinFlag(event.courseId, flagIndex);
         const bool locallyTracked = blueCoinWasSet(flagIndex);
+        const smso::CommBuffer *buf = smso::getCommBuffer();
+        const u8 localSlot = buf ? buf->localSlot : 0;
+        const bool remoteCollector = event.reserved != localSlot;
+
+        TVec3f coinPos{};
+        const bool haveCoinPos = tryResolveBlueCoinWorldPos(flagIndex, &coinPos);
 
         if (!alreadySet) {
             fm->setBlueCoinFlag(event.courseId, flagIndex);
@@ -913,6 +1360,9 @@ static bool applyWorldEvent(const smso::CommWorldEvent &event) {
         // Skip hide on host echo after a local pickup — vanilla is still driving the coin actor.
         if (event.courseId == currentCourseId() && (!alreadySet || !locallyTracked))
             hideBlueCoinAtIndex(flagIndex);
+
+        if (remoteCollector && !locallyTracked && haveCoinPos)
+            smso::playRemoteCoinCollectParticles(coinPos, true);
         break;
     }
 
@@ -928,6 +1378,38 @@ static bool applyWorldEvent(const smso::CommWorldEvent &event) {
     case smso::WE_RED_COIN_COLLECTED:
         applied = applyRedCoinWorldEvent(event);
         break;
+
+    case smso::WE_HIP_DROP_OBJECT: {
+        if (!sameStage(event.courseId, event.episodeId)) {
+            applied = false;
+            break;
+        }
+        smso::CommBuffer *buf = smso::getCommBuffer();
+        const u8 localSlot = buf ? buf->localSlot : 0;
+        if (event.reserved == localSlot)
+            break;
+        if (!buf || (buf->bridgeFlags & smso::BF_SYNC_OBJECTS) == 0)
+            break;
+
+        const u32 packedPos = hipDropPayloadPosBits(event.payload1);
+        TMapObjBase *obj = findHipDropTarget(unpackWorldPos(packedPos), event.payload0);
+        if (!obj || isChangeStageHipDropObj(obj) || !isLiveCollectible(obj)) {
+            OSReport("[SMSOBB] hip-drop apply miss course=%u/%u id=%u packed=0x%08X\n",
+                     event.courseId, event.episodeId, event.payload0, packedPos);
+            applied = false;
+            break;
+        }
+
+        OSReport("[SMSOBB] hip-drop apply hit vt=0x%08X id=%u from slot=%u\n",
+                 *reinterpret_cast<const u32 *>(obj), event.payload0, event.reserved);
+
+        const u32 objVt = *reinterpret_cast<const u32 *>(obj);
+        if (objVt == smso::redCoinSwitchVtable())
+            smso::applyRemoteRedCoinSwitchHit(obj);
+        else
+            replayRemoteHipDropHit(obj, hipDropPayloadIsSuper(event.payload1));
+        break;
+    }
 
     default:
         applied = false;
@@ -964,6 +1446,7 @@ static void captureLocalWorldProgress() {
 
     trackLocalShineCollection();
     smso::flushDeferredRedCoinEvents();
+    resetLocalHipDropCaptureIfIdle();
 
     const u32 goldCoins = static_cast<u32>(fm->getFlag(0x40002u));
     if (goldCoins > sLastGoldCoinCount) {
@@ -993,7 +1476,8 @@ static void captureLocalWorldProgress() {
             if (!fm->getBlueCoinFlag(courseId, coinIndex) || blueCoinWasSet(coinIndex))
                 continue;
             markBlueCoinSet(coinIndex);
-            publishLocalWorldEvent(smso::WE_BLUE_COIN_COLLECTED, courseId, episodeId, coinIndex, 0, 0);
+            publishLocalWorldEvent(smso::WE_BLUE_COIN_COLLECTED, courseId, episodeId, coinIndex,
+                                   buf->localSlot, 0);
         }
     }
 
@@ -1003,9 +1487,21 @@ static void captureLocalWorldProgress() {
     reconcileCollectibleActors(fm, courseId);
 }
 
+void ensureHipDropObjectHooksImpl() {
+    if (sHipDropHooksInstalled)
+        return;
+    initHipDropObjectHooks();
+    sHipDropHooksInstalled = true;
+    OSReport("[SMSOBB] hip-drop object hooks installed (%u receive vtables)\n", sVtReceiveHookCount);
+}
+
 } // namespace
 
 namespace smso {
+
+void ensureHipDropObjectHooks() {
+    ensureHipDropObjectHooksImpl();
+}
 
 bool isRemoteShineCollectActive(u8 slot) {
     return sRemoteShineCollect.shine != nullptr && sRemoteShineCollect.collectorSlot == slot;
@@ -1062,24 +1558,45 @@ void initWorldSync() {
     gShineVtable = SMS_PORT_REGION(0x803C97EC, 0x803C0FDC, 0, 0);
     gCoinBlueVtable = SMS_PORT_REGION(0x803C99D0, 0x803C11C0, 0, 0);
     gCoinEmptyVtable = SMS_PORT_REGION(0x803C9D98, 0x803C1588, 0, 0);
+    gChangeStageHipDropVtable = SMS_PORT_REGION(0x803CADA4, 0x803C2594, 0, 0x803CADA4);
     sLastCourseId = 0xFF;
     sLastEpisodeId = 0xFF;
 }
 
 void processWorldEvents() {
     CommBuffer *buf = getCommBuffer();
-    if (!worldSyncEnabled(buf))
+    if (!buf || (buf->bridgeFlags & smso::BF_CONNECTED) == 0)
         return;
 
-    captureLocalWorldProgress();
+    const bool progressSync = worldSyncEnabled(buf);
+    const bool objectsSync = objectSyncEnabled(buf);
+    if (!progressSync && !objectsSync)
+        return;
+
+    if (progressSync)
+        captureLocalWorldProgress();
+    else
+        resetLocalHipDropCaptureIfIdle();
+
+    flushLocalWorldEventQueue();
 
     CommWorldEvent &incoming = buf->worldSync.incoming;
-    if (incoming.eventId != 0 && incoming.type != 0 &&
-        incoming.eventId > buf->worldSync.lastAppliedEventId) {
-        if (applyWorldEvent(incoming))
-            buf->worldSync.lastAppliedEventId = incoming.eventId;
+    if (incoming.eventId != 0 && incoming.type != 0) {
+        if (incoming.eventId > buf->worldSync.lastAppliedEventId) {
+            if (applyWorldEvent(incoming))
+                buf->worldSync.lastAppliedEventId = incoming.eventId;
+        }
+        // Always free the incoming slot once we have observed it so the bridge can deliver
+        // the next queued remote event. Without this, a duplicate or stale eventId would
+        // pin the slot and stall the incoming queue.
         incoming = {};
     }
+}
+
+void enqueueLocalWorldEvent(u8 type, u8 courseId, u8 episodeId, u8 payload0, u8 reserved,
+                            u32 payload1) {
+    publishLocalWorldEvent(static_cast<smso::WorldEventType>(type), courseId, episodeId, payload0,
+                           reserved, payload1);
 }
 
 } // namespace smso

@@ -1,4 +1,3 @@
-using System.Linq;
 using SMSO.Net;
 
 namespace SMSO.Bridge;
@@ -8,6 +7,10 @@ public sealed class BridgeWorker : IDisposable
     private readonly DolphinBridge _bridge;
     private readonly RemoteInterpolation _interpolation = new();
     private readonly object _bufferLock = new();
+
+    /// <summary>Reusable disconnected remote slot (shares a single Name buffer; never mutated).</summary>
+    private static readonly PlayerSnapshot s_emptyRemote = new() { Name = new byte[16], Connected = 0 };
+
     private readonly Dictionary<byte, PlayerSnapshot> _remoteRaw = new();
     private readonly Dictionary<byte, NameTagAppearance> _remoteAppearances = new();
     private readonly MarioVoiceEvent[] _remoteMarioVoiceEvents = CommBuffer.CreateRemoteMarioVoiceEventArray();
@@ -29,12 +32,18 @@ public sealed class BridgeWorker : IDisposable
     private bool _dolphinRunning;
     private bool _pendingConnectionWrite;
     private bool _loggedConnectionPending;
+    private bool _pendingSyncWrite;
+    private bool _pendingSyncFlags;
+    private bool _pendingSyncObjects;
+    private bool _pendingSyncProgress;
     private bool _remoteClearPending;
     private PlayerSnapshot[]? _cachedRemoteSnapshots;
     private byte _lastRestoredStageId;
     private byte _lastRestoredEpisodeId;
     private ushort _lastLocalMarioVoiceSequence;
     private ushort _lastLocalWorldEventSequence;
+    private readonly Queue<CommWorldEvent> _pendingIncomingWorldEvents = new();
+    private readonly object _incomingWorldEventLock = new();
     private GameModeStatePacket _gameModeState = GameModeStatePacket.CreateDefault();
     private ushort _lastGameModeSeq;
     private NameTagAppearance _savedLocalAppearance = NameTagAppearance.CreateDefault();
@@ -439,39 +448,44 @@ public sealed class BridgeWorker : IDisposable
                 return;
             }
 
-            for (int i = 0; i < _workingBuffer.RemoteSnapshots.Length; i++)
-            {
-                _workingBuffer.RemoteSnapshots[i] = new PlayerSnapshot { Name = new byte[16], Connected = 0 };
-            }
-
-            for (int i = 0; i < _workingBuffer.RemoteNameTagAppearances.Length; i++)
-                _workingBuffer.RemoteNameTagAppearances[i] = default;
-
-            foreach (var slot in _remoteRaw.Keys.OrderBy(s => s))
+            // Iterate remote slots by index (0..MaxRemoteSlots-1) instead of clearing the whole
+            // array + OrderBy every tick. Reuse a single empty snapshot (shared Name buffer) so
+            // we don't allocate 9 PlayerSnapshots + 9 byte[16] every 60 Hz flush.
+            var remoteSnapshots = _workingBuffer.RemoteSnapshots;
+            var remoteAppearancesBuf = _workingBuffer.RemoteNameTagAppearances;
+            for (int slot = 0; slot < remoteSnapshots.Length; slot++)
             {
                 if (slot == _workingBuffer.LocalSlot)
+                {
+                    remoteSnapshots[slot] = s_emptyRemote;
+                    if (slot < remoteAppearancesBuf.Length)
+                        remoteAppearancesBuf[slot] = default;
                     continue;
-
-                PlayerSnapshot snap;
-                if (_interpolation.HasSlot(slot))
-                {
-                    snap = _interpolation.Advance(slot);
                 }
-                else if (_remoteRaw.TryGetValue(slot, out var raw))
+
+                if (_remoteRaw.TryGetValue((byte)slot, out _))
                 {
-                    snap = raw;
+                    PlayerSnapshot snap;
+                    if (_interpolation.HasSlot((byte)slot))
+                        snap = _interpolation.Advance((byte)slot);
+                    else
+                        snap = _remoteRaw[(byte)slot];
+
+                    snap.Connected = 1;
+                    snap.Slot = (byte)slot;
+                    remoteSnapshots[slot] = snap;
+                    if (slot < remoteAppearancesBuf.Length &&
+                        _remoteAppearances.TryGetValue((byte)slot, out var appearance))
+                    {
+                        remoteAppearancesBuf[slot] = appearance;
+                    }
                 }
                 else
                 {
-                    continue;
+                    remoteSnapshots[slot] = s_emptyRemote;
+                    if (slot < remoteAppearancesBuf.Length)
+                        remoteAppearancesBuf[slot] = default;
                 }
-
-                snap.Connected = 1;
-                snap.Slot = slot;
-                if (slot < _workingBuffer.RemoteSnapshots.Length)
-                    _workingBuffer.RemoteSnapshots[slot] = snap;
-                if (_remoteAppearances.TryGetValue(slot, out var appearance))
-                    _workingBuffer.RemoteNameTagAppearances[slot] = appearance;
             }
 
             if (_gameModeState.GameMode == GameMode.HideSeek)
@@ -537,35 +551,64 @@ public sealed class BridgeWorker : IDisposable
         lock (_bufferLock)
         {
             if (!EnsureWorkingBuffer()) return;
-            if (syncFlags)
-            {
-                _workingBuffer.BridgeFlags |= BridgeFlags.SyncShine | BridgeFlags.SyncBlueCoin |
-                                              BridgeFlags.SyncEvent | BridgeFlags.SyncStory |
-                                              BridgeFlags.SyncMission | BridgeFlags.SyncSecret;
-            }
-            else
-            {
-                _workingBuffer.BridgeFlags &= ~(BridgeFlags.SyncShine | BridgeFlags.SyncBlueCoin |
-                                                BridgeFlags.SyncEvent | BridgeFlags.SyncStory |
-                                                BridgeFlags.SyncMission | BridgeFlags.SyncSecret);
-            }
-
-            if (syncObjects) _workingBuffer.BridgeFlags |= BridgeFlags.SyncObjects;
-            else _workingBuffer.BridgeFlags &= ~BridgeFlags.SyncObjects;
-            if (syncProgress) _workingBuffer.BridgeFlags |= BridgeFlags.SyncProgress;
-            else _workingBuffer.BridgeFlags &= ~BridgeFlags.SyncProgress;
+            ApplySyncFlagsToWorkingBuffer(syncFlags, syncObjects, syncProgress);
         }
 
         if (TryWriteWorkingBuffer())
+        {
             Log?.Invoke($"Bridge sync flags applied: flags={syncFlags} objects={syncObjects} progress={syncProgress}");
+            _pendingSyncWrite = false;
+        }
+        else
+        {
+            // Dolphin not linked yet — replay on link restore (same pattern as connection flags).
+            _pendingSyncWrite = true;
+            _pendingSyncFlags = syncFlags;
+            _pendingSyncObjects = syncObjects;
+            _pendingSyncProgress = syncProgress;
+        }
+    }
+
+    private void ApplySyncFlagsToWorkingBuffer(bool syncFlags, bool syncObjects, bool syncProgress)
+    {
+        if (syncFlags)
+        {
+            _workingBuffer.BridgeFlags |= BridgeFlags.SyncShine | BridgeFlags.SyncBlueCoin |
+                                          BridgeFlags.SyncEvent | BridgeFlags.SyncStory |
+                                          BridgeFlags.SyncMission | BridgeFlags.SyncSecret;
+        }
+        else
+        {
+            _workingBuffer.BridgeFlags &= ~(BridgeFlags.SyncShine | BridgeFlags.SyncBlueCoin |
+                                            BridgeFlags.SyncEvent | BridgeFlags.SyncStory |
+                                            BridgeFlags.SyncMission | BridgeFlags.SyncSecret);
+        }
+
+        if (syncObjects) _workingBuffer.BridgeFlags |= BridgeFlags.SyncObjects;
+        else _workingBuffer.BridgeFlags &= ~BridgeFlags.SyncObjects;
+        if (syncProgress) _workingBuffer.BridgeFlags |= BridgeFlags.SyncProgress;
+        else _workingBuffer.BridgeFlags &= ~BridgeFlags.SyncProgress;
     }
 
     private async Task PollLoop(CancellationToken ct)
     {
+        // PeriodicTimer is backed by Stopwatch (QueryPerformanceCounter) and ticks on a steady
+        // cadence independent of the ~15.6 ms default system timer. Task.Delay(16) instead
+        // quantizes to the system tick, making bridge flushes irregular and remote motion choppy.
+        PeriodicTimer? timer = null;
+        int timerPeriodMs = 0;
         try
         {
             while (!ct.IsCancellationRequested)
             {
+                var desiredPeriodMs = _dolphinRunning ? ProtocolConstants.BridgePollMs : 250;
+                if (timer == null || timerPeriodMs != desiredPeriodMs)
+                {
+                    timer?.Dispose();
+                    timerPeriodMs = desiredPeriodMs;
+                    timer = new PeriodicTimer(TimeSpan.FromMilliseconds(desiredPeriodMs));
+                }
+
                 try
                 {
                     if (_dolphinRunning)
@@ -588,6 +631,7 @@ public sealed class BridgeWorker : IDisposable
                                 LocalSnapshotReady?.Invoke(buffer.LocalSnapshot);
                             MaybePublishLocalMarioVoice(buffer.LocalMarioVoiceEvent);
                             MaybePublishLocalWorldEvent(buffer.WorldSync.LocalPending);
+                            DrainPendingIncomingWorldEvents(buffer);
 
                             MaybeRestoreRemoteSnapshotsAfterStageChange(buffer);
                         }
@@ -602,7 +646,7 @@ public sealed class BridgeWorker : IDisposable
                     Log?.Invoke($"Bridge poll error: {ex.Message}");
                 }
 
-                await Task.Delay(_dolphinRunning ? ProtocolConstants.BridgePollMs : 250, ct);
+                await timer.WaitForNextTickAsync(ct);
             }
         }
         catch (OperationCanceledException)
@@ -612,6 +656,10 @@ public sealed class BridgeWorker : IDisposable
         catch (Exception ex)
         {
             Log?.Invoke($"Bridge worker stopped: {ex.Message}");
+        }
+        finally
+        {
+            timer?.Dispose();
         }
     }
 
@@ -647,6 +695,7 @@ public sealed class BridgeWorker : IDisposable
             SetLinkState(DolphinLinkState.Attached);
 
         TryFlushPendingConnectionWrite();
+        TryFlushPendingSyncWrite();
     }
 
     private void TryFlushPendingConnectionWrite()
@@ -663,6 +712,28 @@ public sealed class BridgeWorker : IDisposable
         _pendingConnectionWrite = false;
         _loggedConnectionPending = false;
         Log?.Invoke("Dolphin link restored — applied queued connection flags");
+    }
+
+    private void TryFlushPendingSyncWrite()
+    {
+        if (!_pendingSyncWrite)
+            return;
+
+        if (LinkState != DolphinLinkState.ModuleReady)
+            return;
+
+        lock (_bufferLock)
+        {
+            if (!EnsureWorkingBuffer())
+                return;
+            ApplySyncFlagsToWorkingBuffer(_pendingSyncFlags, _pendingSyncObjects, _pendingSyncProgress);
+        }
+
+        if (!TryWriteWorkingBuffer())
+            return;
+
+        _pendingSyncWrite = false;
+        Log?.Invoke($"Dolphin link restored — applied queued sync flags={_pendingSyncFlags} objects={_pendingSyncObjects} progress={_pendingSyncProgress}");
     }
 
     private bool TryApplyPendingWarp()
@@ -751,19 +822,35 @@ public sealed class BridgeWorker : IDisposable
             worldEvent.Payload0,
             worldEvent.Reserved,
             worldEvent.Payload1));
+
+        // Hand the slot back to the module. The module only writes the next queued event once
+        // this slot is empty, so clearing it after publishing is what lets outbound events
+        // advance one per frame without overwriting each other.
+        _bridge.TryClearLocalPendingWorldEvent();
+    }
+
+    private void DrainPendingIncomingWorldEvents(CommBuffer liveBuffer)
+    {
+        CommWorldEvent next;
+        lock (_incomingWorldEventLock)
+        {
+            if (_pendingIncomingWorldEvents.Count == 0)
+                return;
+            // The module zeroes the incoming slot (EventId/Type) once it has processed the
+            // event. Only stage the next queued remote event when the slot is free, otherwise
+            // we would overwrite an unprocessed event and lose it.
+            if (liveBuffer.WorldSync.Incoming.EventId != 0)
+                return;
+            next = _pendingIncomingWorldEvents.Dequeue();
+        }
+
+        _bridge.TryWriteIncomingWorldEventOnly(next);
     }
 
     public void PushIncomingWorldEvent(in WorldEventPacket packet)
     {
-        lock (_bufferLock)
-        {
-            if (!EnsureWorkingBuffer())
-                return;
-
-            _workingBuffer.WorldSync.Incoming = packet.ToIncomingEvent();
-            if (_hasWorkingBuffer)
-                _bridge.TryWriteIncomingWorldEventOnly(_workingBuffer.WorldSync.Incoming);
-        }
+        lock (_incomingWorldEventLock)
+            _pendingIncomingWorldEvents.Enqueue(packet.ToIncomingEvent());
     }
 
     public bool TryGetLastAppliedEventId(out uint lastAppliedEventId)

@@ -33,6 +33,9 @@ public partial class MainWindow : Window
     private Point _hideSeekDragStartPoint;
     private bool _suppressHideSeekUiSync;
     private bool _tagRunning;
+    private static readonly Random _random = new();
+    private byte? _lastRandomTagSlot;
+    private readonly Queue<byte> _recentRandomLevelCourseIds = new();
 
     public MainWindow()
     {
@@ -394,7 +397,10 @@ public partial class MainWindow : Window
             ClientWarpTargetCombo.SelectedItem = clientWarpMatch ?? _clientWarpTargets.FirstOrDefault();
 
             if (GameModeCombo.SelectedIndex == 1)
+            {
                 SyncHideSeekRoleListsFromRoster(rosterShrunk: rosterShrunk);
+                UpdateStartStopTagButtonState();
+            }
 
             if (rosterShrunk && (_session.IsConnected || _session.IsHosting))
                 MainTabControl.SelectedItem = SettingsTab;
@@ -1274,12 +1280,18 @@ public partial class MainWindow : Window
         if (GameModeCombo.SelectedIndex != 1)
         {
             StartStopTagButton.IsEnabled = false;
+            RandomTagButton.IsEnabled = false;
+            RandomLevelButton.IsEnabled = false;
             return;
         }
+
+        var canHostActions = _session.IsHosting;
+        RandomLevelButton.IsEnabled = canHostActions;
 
         var hiderCount = (HideSeekHidersList.ItemsSource as ObservableCollection<RosterViewModel>)?.Count ?? 0;
         var seekerCount = (HideSeekSeekersList.ItemsSource as ObservableCollection<RosterViewModel>)?.Count ?? 0;
         StartStopTagButton.IsEnabled = _tagRunning || (hiderCount >= 1 && seekerCount >= 1);
+        RandomTagButton.IsEnabled = canHostActions && _rosterItems.Count >= 2;
     }
 
     private void StartStopTagButton_Click(object sender, RoutedEventArgs e)
@@ -1308,6 +1320,80 @@ public partial class MainWindow : Window
         _session.ResetHideSeekTag();
         SyncHideSeekRoleListsFromRoster(forceAllHiders: true);
         HideSeekStatusText.Text = "Everyone reset to hiders. Timer cleared.";
+    }
+
+    private void RandomTagButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (!_session.IsHosting || GameModeCombo.SelectedIndex != 1)
+            return;
+
+        var players = _rosterItems.OrderBy(r => r.Slot).ToArray();
+        if (players.Length < 2)
+        {
+            HideSeekStatusText.Text = "Need at least 2 connected players to pick a random seeker.";
+            return;
+        }
+
+        // Never pick the same seeker twice in a row — the previous pick is exempt this round.
+        var pool = players.Where(p => p.Slot != _lastRandomTagSlot).ToArray();
+        if (pool.Length == 0)
+            pool = players;
+
+        var chosen = pool[_random.Next(pool.Length)];
+        _lastRandomTagSlot = chosen.Slot;
+
+        var roles = new Dictionary<byte, HideSeekRole>();
+        foreach (var row in players)
+            roles[row.Slot] = row.Slot == chosen.Slot ? HideSeekRole.Seeker : HideSeekRole.Hider;
+
+        _session.SetHideSeekRoles(roles);
+        HideSeekStatusText.Text = $"Random seeker: {chosen.Username} (use Start Tag when ready).";
+        UpdateStartStopTagButtonState();
+    }
+
+    private void RandomLevelButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (!_session.IsHosting || _levels == null)
+            return;
+
+        const int levelCooldownRounds = 3;
+        const byte defaultEpisodeId = 7; // 0-indexed: episodeId 7 == "Episode 8"
+        // Per-course episode overrides (0-indexed episode IDs).
+        var episodeOverrides = new Dictionary<byte, byte>
+        {
+            { 9, 5 }, // Noki Bay  -> Episode 6
+        };
+
+        static byte TargetEpisode(CourseEntry c, Dictionary<byte, byte> overrides) =>
+            overrides.TryGetValue(c.CourseId, out var ep) ? ep : defaultEpisodeId;
+
+        bool HasTargetEpisode(CourseEntry c) =>
+            c.Warpable && c.Episodes.Any(ep => ep.EpisodeId == TargetEpisode(c, episodeOverrides));
+
+        var all = _levels.Courses.Where(HasTargetEpisode).ToList();
+        if (all.Count == 0)
+        {
+            HideSeekStatusText.Text = "No random levels are available.";
+            return;
+        }
+
+        // A picked level is exempt for `levelCooldownRounds` subsequent rounds. The queue
+        // holds the most recent picks; once it overflows, the oldest becomes eligible again.
+        var exempt = _recentRandomLevelCourseIds.ToHashSet();
+        var pool = all.Where(c => !exempt.Contains(c.CourseId)).ToList();
+        if (pool.Count == 0)
+            pool = all;
+
+        var course = pool[_random.Next(pool.Count)];
+        var episodeId = TargetEpisode(course, episodeOverrides);
+
+        _recentRandomLevelCourseIds.Enqueue(course.CourseId);
+        while (_recentRandomLevelCourseIds.Count > levelCooldownRounds)
+            _recentRandomLevelCourseIds.Dequeue();
+
+        _session.HostWarp(ProtocolConstants.WarpAllSlots, course.CourseId, episodeId);
+        var episodeLabel = _levels.GetEpisodeDisplayName(course.CourseId, episodeId);
+        HideSeekStatusText.Text = $"Warping everyone to {course.DisplayName} — {episodeLabel}";
     }
 
     private void HideSeekRoleList_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)

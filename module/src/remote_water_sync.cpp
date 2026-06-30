@@ -20,7 +20,7 @@ namespace {
 constexpr u32 kModelWaterCullRadiusOffset = 0x5E08;
 constexpr f32 kVanillaWaterCullRadius = 5000.0f;
 constexpr f32 kRemoteSprayReachMargin = 2000.0f;
-constexpr s32 kRemoteWaterDropletMaxPerRequest = 6;
+constexpr s32 kRemoteWaterDropletMaxPerRequest = 48;
 constexpr u8 kRemoteYoshiJuiceTintUnset = 0xFF;
 // doldecomp TModelWaterManager::perform — 0x8 drawWaterVolume (drawTouching tint),
 // 0x80 drawRefracAndSpec (TEVREG0 tint). Not Mario perform flag 0x200.

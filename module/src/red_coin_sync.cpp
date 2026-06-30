@@ -1,5 +1,6 @@
 #include "red_coin_sync.hpp"
 
+#include "coin_collect_fx.hpp"
 #include "collectible_scan.hpp"
 #include "comm_buffer.hpp"
 #include "world_sync.hpp"
@@ -10,12 +11,15 @@
 #include <SMS/Manager/ObjManager.hxx>
 #include <SMS/MapObj/MapObjBase.hxx>
 #include <SMS/MoveBG/Coin.hxx>
+#include <SMS/Player/Mario.hxx>
+#include <SMS/Strategic/HitActor.hxx>
 #include <SMS/Strategic/LiveActor.hxx>
 #include <SMS/System/MarDirector.hxx>
 #include <SMS/macros.h>
 
 extern TMarDirector *gpMarDirector;
 extern TItemManager *gpItemManager;
+extern TMario *gpMarioAddress;
 
 struct TMapObjManager;
 extern TMapObjManager *gpMapObjManager;
@@ -31,7 +35,6 @@ constexpr u8 kMaxStageRedCoins = 8;
 constexpr u8 kInvalidHudSlot = 0xFF;
 
 static bool sApplyingRemoteEvent = false;
-static u16 sLocalWorldEventSequence = 0;
 
 static u32 sLastRedCoinCount = 0;
 static u8 sLastCourseId = 0xFF;
@@ -45,10 +48,6 @@ static u8 sPrevLiveCoinCount = 0;
 
 static smso::CommWorldEvent sDeferredRedCoinEvents[16] = {};
 static u8 sDeferredRedCoinCount = 0;
-
-static smso::CommWorldEvent sQueuedLocalEvents[8] = {};
-static u8 sQueuedLocalEventCount = 0;
-static u8 sQueuedLocalEventRead = 0;
 
 struct StageRedCoinEntry {
     u16 mapObjId;
@@ -65,10 +64,13 @@ static TVec3f sCollectedPositions[kMaxStageRedCoins] = {};
 static u8 sCollectedPositionCount = 0;
 
 using ProcessDownCoinFn = void (*)(TGCConsole2 *, int);
+using StartAppearRedCoinFn = void (*)(TGCConsole2 *);
 
 static ProcessDownCoinFn gProcessDownCoin = nullptr;
+static StartAppearRedCoinFn gStartAppearRedCoin = nullptr;
 static u32 gCoinRedVtable = 0;
 static u32 gCoinEmptyVtable = 0;
+static u32 gRedCoinSwitchVtable = 0;
 
 static u8 currentCourseId() {
     return gpMarDirector ? gpMarDirector->mAreaID : 0;
@@ -183,6 +185,19 @@ static void sortStageRedCoinSnapshot() {
         sStageRedCoins[i].stableIndex = i;
 }
 
+static bool visitAppearCoinEmpty(TMapObjBase *obj, void *) {
+    if (*reinterpret_cast<const u32 *>(obj) != gCoinEmptyVtable)
+        return false;
+    const auto *live = reinterpret_cast<const TLiveActor *>(obj);
+    if (live->mStateFlags.asFlags.mIsObjDead)
+        obj->makeObjAppeared();
+    return false;
+}
+
+static void appearAllRedCoinEmptySlots() {
+    forEachManagedMapObj(visitAppearCoinEmpty, nullptr);
+}
+
 static void buildSnapshotFromSorted(const SortedCoinCtx &sorted) {
     sStageRedCoinCount = sorted.count;
     for (u8 i = 0; i < sorted.count; ++i) {
@@ -222,8 +237,6 @@ static void resetRedCoinTrackersForStage(u8 courseId, u8 episodeId) {
     sStageRedCoinCount = 0;
     sCollectedMask = 0;
     sCollectedPositionCount = 0;
-    sQueuedLocalEventCount = 0;
-    sQueuedLocalEventRead = 0;
     sPrevLiveCoinCount = 0;
     for (u32 i = 0; i < kMaxStageRedCoins; ++i) {
         sStageRedCoins[i] = {};
@@ -238,43 +251,6 @@ static void resetRedCoinTrackersForStage(u8 courseId, u8 episodeId) {
     sLastRedCoinCount = static_cast<u32>(fm->Type6Flag.mRedCoinCount);
 }
 
-static void enqueueLocalRedCoinEvent(smso::WorldEventType type, u8 courseId, u8 episodeId, u8 payload0,
-                                     u8 stableIndex, u32 payload1) {
-    if (sQueuedLocalEventCount >= sizeof(sQueuedLocalEvents) / sizeof(sQueuedLocalEvents[0]))
-        return;
-
-    const u8 writeIndex =
-        static_cast<u8>((sQueuedLocalEventRead + sQueuedLocalEventCount) %
-                        (sizeof(sQueuedLocalEvents) / sizeof(sQueuedLocalEvents[0])));
-    smso::CommWorldEvent &event = sQueuedLocalEvents[writeIndex];
-    event.eventId = 0;
-    event.sequence = 0;
-    event.type = static_cast<u8>(type);
-    event.courseId = courseId;
-    event.episodeId = episodeId;
-    event.payload0 = payload0;
-    event.reserved = stableIndex;
-    event.payload1 = payload1;
-    ++sQueuedLocalEventCount;
-}
-
-static void flushOneQueuedLocalRedCoinEvent() {
-    if (sQueuedLocalEventCount == 0)
-        return;
-
-    smso::CommBuffer *buf = smso::getCommBuffer();
-    if (!buf)
-        return;
-
-    smso::CommWorldEvent &pending = buf->worldSync.localPending;
-    pending = sQueuedLocalEvents[sQueuedLocalEventRead];
-    pending.sequence = ++sLocalWorldEventSequence;
-    sQueuedLocalEventRead =
-        static_cast<u8>((sQueuedLocalEventRead + 1) %
-                        (sizeof(sQueuedLocalEvents) / sizeof(sQueuedLocalEvents[0])));
-    --sQueuedLocalEventCount;
-}
-
 static void publishLocalRedCoinEvent(smso::WorldEventType type, u8 courseId, u8 episodeId, u8 payload0,
                                      u8 stableIndex, u32 payload1) {
     if (sApplyingRemoteEvent)
@@ -284,7 +260,8 @@ static void publishLocalRedCoinEvent(smso::WorldEventType type, u8 courseId, u8 
     if (!redCoinPublishEnabled(buf))
         return;
 
-    enqueueLocalRedCoinEvent(type, courseId, episodeId, payload0, stableIndex, payload1);
+    smso::enqueueLocalWorldEvent(static_cast<u8>(type), courseId, episodeId, payload0, stableIndex,
+                                 payload1);
 }
 
 static bool isPositionAlreadyCollected(const TVec3f &pos) {
@@ -565,6 +542,11 @@ static void applySingleRedCoinCollected(TFlagManager *fm, TGCConsole2 *console, 
             slot = stableIndex;
         gProcessDownCoin(console, static_cast<int>(slot));
     }
+
+    if (havePos)
+        smso::playRemoteCoinCollectParticles(collectedPos, false);
+    else if (stableIndex < sStageRedCoinCount)
+        smso::playRemoteCoinCollectParticles(sStageRedCoins[stableIndex].initialPos, false);
 }
 
 static TCoin *findRemovedLiveCoin() {
@@ -703,10 +685,42 @@ void flushDeferredRedCoinEvents();
 void initRedCoinSync() {
     gProcessDownCoin =
         reinterpret_cast<ProcessDownCoinFn>(SMS_PORT_REGION(0x801466F0, 0x8013B32C, 0, 0));
+    gStartAppearRedCoin = reinterpret_cast<StartAppearRedCoinFn>(
+        SMS_PORT_REGION(0x8014A9BC, 0x8013F64C, 0, 0));
     gCoinRedVtable = SMS_PORT_REGION(0x803C9BB4, 0x803C13A4, 0, 0);
     gCoinEmptyVtable = SMS_PORT_REGION(0x803C9D98, 0x803C1588, 0, 0);
+    gRedCoinSwitchVtable = SMS_PORT_REGION(0x803CA6CC, 0x803C1EBC, 0, 0);
     sLastCourseId = 0xFF;
     sLastEpisodeId = 0xFF;
+}
+
+u32 redCoinSwitchVtable() {
+    return gRedCoinSwitchVtable;
+}
+
+void applyRemoteRedCoinSwitchHit(TMapObjBase *switchObj) {
+    TFlagManager *fm = TFlagManager::smInstance;
+    if (!fm || fm->Type5Flag.mRedCoinSwitchPressed)
+        return;
+
+    TMario *mario = gpMarioAddress;
+    if (switchObj && mario) {
+        const u32 savedState = mario->mState;
+        mario->mState = TMario::STATE_G_POUND;
+        switchObj->receiveMessage(reinterpret_cast<THitActor *>(mario), 1);
+        mario->mState = savedState;
+    }
+
+    if (!fm->Type5Flag.mRedCoinSwitchPressed) {
+        fm->Type5Flag.mRedCoinSwitchPressed = true;
+        TGCConsole2 *console = gpMarDirector ? gpMarDirector->mGCConsole : nullptr;
+        if (gStartAppearRedCoin && console)
+            gStartAppearRedCoin(console);
+        appearAllRedCoinEmptySlots();
+    }
+
+    sStageSettleFrames = kStageSettleFrames;
+    sStageSnapshotReady = false;
 }
 
 void captureLocalRedCoinProgress() {
@@ -745,7 +759,6 @@ void captureLocalRedCoinProgress() {
     }
 
     flushDeferredRedCoinEvents();
-    flushOneQueuedLocalRedCoinEvent();
 }
 
 bool applyRedCoinWorldEvent(const CommWorldEvent &event) {

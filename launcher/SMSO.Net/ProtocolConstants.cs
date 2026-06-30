@@ -4,15 +4,15 @@ public static class ProtocolConstants
 {
     public const uint Magic = 0x534D534F;
     public const ushort ProtocolVersion = 1;
-    public const ushort CommVersion = 6;
+    public const ushort CommVersion = 7;
     public const int DefaultPort = 27015;
-    public const int StableMaxPlayers = 4;
+    public const int StableMaxPlayers = 10;
     public const int MaxPlayers = 10;
-    public const int MaxRemoteSlots = 9;
+    public const int MaxRemoteSlots = 10;
     public const int MarioVoiceEventSize = 12;
-    public const int CommMarioVoiceEventsOffset = 788;
-    public const int CommMarioVoiceEventsSize = MarioVoiceEventSize * MaxPlayers;
-    public const int CommGameModeStateSize = 13;
+    public const int CommMarioVoiceEventsOffset = 862;
+    public const int CommMarioVoiceEventsSize = MarioVoiceEventSize * (MaxRemoteSlots + 1);
+    public const int CommGameModeStateSize = 9 + MaxPlayers;
     public const int CommGameModeStateOffset = CommMarioVoiceEventsOffset + CommMarioVoiceEventsSize;
     public const int CommWorldEventSize = 15;
     public const int CommWorldSyncSize = CommWorldEventSize * 2 + 4;
@@ -25,14 +25,15 @@ public static class ProtocolConstants
     public const int CommBufferSize = CommRosterHudOffset + CommRosterHudSyncSize;
     public const int WorldEventClientPayloadSize = 11;
     public const int WorldEventBroadcastPayloadSize = 13;
-    public const int CommNameTagAppearancesOffset = 688;
-    public const int CommNameTagAppearancesSize = 100;
+    public const int CommNameTagAppearancesOffset = 752;
+    public const int CommNameTagAppearancesSize = 10 * (MaxRemoteSlots + 1);
     public const int CommBridgeControlOffset = 6;
     public const int CommBridgeControlSize = 26;
     public const int CommRemoteSnapshotsOffset = 112;
-    public const int CommRemoteSnapshotsSize = 576;
+    public const int CommRemoteSnapshotsSize = PlayerSnapshotSize * MaxRemoteSlots;
     public const int UdpSnapshotPayloadOffset = 10;
     public const int PlayerSnapshotSize = 64;
+    public const int UdpPingPayloadSize = 8;
     public const int MaxTcpPayloadSize = 4096;
     public const uint DefaultMailboxAddress = 0x817FC000;
     public const int SnapshotRateHz = 60;
@@ -155,5 +156,6 @@ public enum WorldEventType : byte
     TriggerFlag = 5,
     SecretComplete = 6,
     GoldCoinCollected = 7,
+    HipDropObject = 8,
     RedCoinCollected = 9,
 }

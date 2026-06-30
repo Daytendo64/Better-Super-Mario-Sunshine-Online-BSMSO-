@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using Microsoft.Win32;
+using SMSO.Net;
 
 namespace SMSO.Launcher;
 
@@ -11,13 +12,175 @@ internal static class DolphinConfigService
     private const string ConfigDirectoryName = "Config";
     private const string GameSettingsDirectoryName = "GameSettings";
     private const string DolphinIniName = "Dolphin.ini";
-    private const string SunshineGameSettingsIniName = "GMS.ini";
     private const string CoreSection = "Core";
     private const string RamOverrideEnableKey = "RAMOverrideEnable";
     private const string Mem1SizeKey = "MEM1Size";
     private const string Mem2SizeKey = "MEM2Size";
     private const string TargetMem1Size = "0x03000000"; // 48 MiB, conservative GDEV-size MEM1.
     private const string TargetMem2Size = "0x04000000";
+
+    private static readonly string[] LegacyGameSettingsIniNames =
+    {
+        "GMS.ini",
+        $"{GameIdentity.VanillaNtscUGameId}.ini",
+    };
+
+    public static bool EnsureBsmsGameIdentity(
+        string gamePath,
+        Action<string>? log,
+        out bool gameIdChanged,
+        out string? error)
+    {
+        error = null;
+        gameIdChanged = false;
+
+        if (string.IsNullOrWhiteSpace(gamePath))
+            return true;
+
+        var trimmed = gamePath.Trim().Trim('"');
+        if (!File.Exists(trimmed) && !Directory.Exists(trimmed))
+        {
+            error = $"Game path not found: {trimmed}";
+            return false;
+        }
+
+        try
+        {
+            if (!GameIdentity.TryResolveBootBinPath(trimmed, out var bootBinPath))
+            {
+                error = "Could not locate sys/boot.bin for the configured game path.";
+                return false;
+            }
+
+            if (GameIdentity.TryReadGameId(bootBinPath, out var currentId) &&
+                string.Equals(currentId, GameIdentity.BsmsGameId, StringComparison.Ordinal))
+            {
+                log?.Invoke($"BSMSO game ID already set to {GameIdentity.BsmsGameId} ({bootBinPath})");
+                return true;
+            }
+
+            if (!GameIdentity.TryPatchGameId(bootBinPath, GameIdentity.BsmsGameId, out error))
+                return false;
+
+            gameIdChanged = true;
+            log?.Invoke(
+                $"Patched BSMSO game ID to {GameIdentity.BsmsGameId} ({bootBinPath}; was {currentId})");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            error = $"Failed to patch BSMSO game ID: {ex.Message}";
+            return false;
+        }
+    }
+
+    public static void ClearDolphinGameListCache(string dolphinPath, Action<string>? log = null)
+    {
+        try
+        {
+            var cleared = 0;
+            foreach (var cacheDirectory in ResolveCacheDirectories(dolphinPath))
+            {
+                cleared += ClearCacheDirectory(cacheDirectory);
+            }
+
+            if (cleared > 0)
+                log?.Invoke($"Cleared Dolphin game list cache ({cleared} files) so GMSE90 is detected.");
+        }
+        catch (Exception ex)
+        {
+            log?.Invoke($"Could not clear Dolphin game list cache: {ex.Message}");
+        }
+    }
+
+    public static bool EnsureBsmsGameBanner(
+        string gamePath,
+        Action<string>? log,
+        out string? error)
+    {
+        error = null;
+
+        if (string.IsNullOrWhiteSpace(gamePath))
+            return true;
+
+        var trimmed = gamePath.Trim().Trim('"');
+        if (!File.Exists(trimmed) && !Directory.Exists(trimmed))
+        {
+            error = $"Game path not found: {trimmed}";
+            return false;
+        }
+
+        var bannerAssetPath = ResolveBannerAssetPath();
+        if (!File.Exists(bannerAssetPath))
+        {
+            error = $"BSMSO banner asset not found: {bannerAssetPath}";
+            return false;
+        }
+
+        try
+        {
+            if (!TryResolveSysDirectory(trimmed, out var sysDirectory, out var gameFileStem))
+            {
+                error = "Could not locate sys/ for the configured game path.";
+                return false;
+            }
+
+            var deployed = 0;
+            if (CopyBannerIfChanged(bannerAssetPath, Path.Combine(sysDirectory, $"{gameFileStem}.png")))
+                deployed++;
+            if (CopyBannerIfChanged(bannerAssetPath, Path.Combine(sysDirectory, "icon.png")))
+                deployed++;
+
+            log?.Invoke(
+                deployed > 0
+                    ? $"Installed BSMSO Dolphin banner in {sysDirectory} ({gameFileStem}.png, icon.png)."
+                    : $"BSMSO Dolphin banner already installed in {sysDirectory}.");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            error = $"Failed to install BSMSO Dolphin banner: {ex.Message}";
+            return false;
+        }
+    }
+
+    public static bool EnsureBsmsGameCover(
+        string dolphinPath,
+        Action<string>? log,
+        out string? error)
+    {
+        error = null;
+
+        var bannerAssetPath = ResolveBannerAssetPath();
+        if (!File.Exists(bannerAssetPath))
+        {
+            error = $"BSMSO banner asset not found: {bannerAssetPath}";
+            return false;
+        }
+
+        try
+        {
+            var deployed = 0;
+            foreach (var cacheDirectory in ResolveCacheDirectories(dolphinPath))
+            {
+                var coverDirectory = Path.Combine(cacheDirectory, "GameCovers");
+                Directory.CreateDirectory(coverDirectory);
+                var coverPath = Path.Combine(coverDirectory, $"{GameIdentity.BsmsGameId}.png");
+                if (CopyBannerIfChanged(bannerAssetPath, coverPath))
+                    deployed++;
+            }
+
+            if (deployed > 0)
+                log?.Invoke($"Installed BSMSO cover art as {GameIdentity.BsmsGameId}.png in Dolphin GameCovers.");
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            error = $"Failed to install BSMSO Dolphin cover art: {ex.Message}";
+            return false;
+        }
+    }
 
     public static bool EnsureMultiplayerMemoryConfig(
         string dolphinPath,
@@ -40,14 +203,21 @@ internal static class DolphinConfigService
             Directory.CreateDirectory(configDirectory);
 
             var dolphinIni = Path.Combine(configDirectory, DolphinIniName);
-            var gameSettingsDirectory = Path.Combine(configDirectory, GameSettingsDirectoryName);
-            Directory.CreateDirectory(gameSettingsDirectory);
-            var sunshineIni = Path.Combine(gameSettingsDirectory, SunshineGameSettingsIniName);
-
             var dolphinChanged = EnsureRamOverrideIni(dolphinIni);
-            var gameChanged = EnsureRamOverrideIni(sunshineIni);
+
+            var gameChanged = false;
+            string? configuredIni = null;
+            foreach (var gameSettingsDirectory in ResolveGameSettingsDirectories(userDirectory))
+            {
+                Directory.CreateDirectory(gameSettingsDirectory);
+                var bsmsGameIni = Path.Combine(gameSettingsDirectory, $"{GameIdentity.BsmsGameId}.ini");
+                MigrateLegacyGameSettings(gameSettingsDirectory, bsmsGameIni);
+                gameChanged |= EnsureRamOverrideIni(bsmsGameIni);
+                configuredIni ??= bsmsGameIni;
+            }
+
             var verb = dolphinChanged || gameChanged ? "Configured" : "Dolphin RAM override already configured for";
-            log?.Invoke($"{verb} BSMSO: MEM1={TargetMem1Size}, MEM2={TargetMem2Size} ({dolphinIni}; {sunshineIni})");
+            log?.Invoke($"{verb} BSMSO: MEM1={TargetMem1Size}, MEM2={TargetMem2Size} ({dolphinIni}; {configuredIni})");
 
             return true;
         }
@@ -82,6 +252,123 @@ internal static class DolphinConfigService
             "Dolphin Emulator");
 
         return Directory.Exists(documentsPath) ? documentsPath : roamingPath;
+    }
+
+    internal static IEnumerable<string> ResolveGameSettingsDirectories(string userDirectory)
+    {
+        var directories = new List<string>();
+        var rootSettings = Path.Combine(userDirectory, GameSettingsDirectoryName);
+        var configSettings = Path.Combine(userDirectory, ConfigDirectoryName, GameSettingsDirectoryName);
+
+        if (Directory.Exists(rootSettings))
+            directories.Add(rootSettings);
+
+        if (Directory.Exists(configSettings) ||
+            Directory.Exists(Path.Combine(userDirectory, ConfigDirectoryName)))
+        {
+            directories.Add(configSettings);
+        }
+
+        if (directories.Count == 0)
+            directories.Add(configSettings);
+
+        return directories;
+    }
+
+    private static IEnumerable<string> ResolveCacheDirectories(string dolphinExePath)
+    {
+        var directories = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        var userDirectory = ResolveUserDirectory(dolphinExePath);
+        directories.Add(Path.Combine(userDirectory, "Cache"));
+
+        var roamingDirectory = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "Dolphin Emulator");
+        if (!string.Equals(userDirectory, roamingDirectory, StringComparison.OrdinalIgnoreCase))
+            directories.Add(Path.Combine(roamingDirectory, "Cache"));
+
+        return directories;
+    }
+
+    private static int ClearCacheDirectory(string cacheDirectory)
+    {
+        if (!Directory.Exists(cacheDirectory))
+            return 0;
+
+        var removed = 0;
+        foreach (var cacheFile in Directory.EnumerateFiles(cacheDirectory))
+        {
+            var name = Path.GetFileName(cacheFile);
+            if (string.Equals(name, "gamelist.cache", StringComparison.OrdinalIgnoreCase) ||
+                name.EndsWith(".uidcache", StringComparison.OrdinalIgnoreCase))
+            {
+                File.Delete(cacheFile);
+                removed++;
+            }
+        }
+
+        return removed;
+    }
+
+    internal static string ResolveBannerAssetPath() =>
+        Path.Combine(AppContext.BaseDirectory, "Assets", "bsmso-banner.png");
+
+    private static bool TryResolveSysDirectory(
+        string gamePath,
+        out string sysDirectory,
+        out string gameFileStem)
+    {
+        sysDirectory = string.Empty;
+        gameFileStem = string.Empty;
+
+        if (File.Exists(gamePath))
+        {
+            sysDirectory = Path.GetDirectoryName(gamePath) ?? string.Empty;
+            gameFileStem = Path.GetFileNameWithoutExtension(gamePath);
+            return Directory.Exists(sysDirectory) && gameFileStem.Length > 0;
+        }
+
+        if (!GameIdentity.TryResolveBootBinPath(gamePath, out var bootBinPath))
+            return false;
+
+        sysDirectory = Path.GetDirectoryName(bootBinPath) ?? string.Empty;
+        gameFileStem = "main";
+        return Directory.Exists(sysDirectory);
+    }
+
+    private static bool CopyBannerIfChanged(string sourcePath, string destinationPath)
+    {
+        var sourceInfo = new FileInfo(sourcePath);
+        if (File.Exists(destinationPath))
+        {
+            var destinationInfo = new FileInfo(destinationPath);
+            if (sourceInfo.Length == destinationInfo.Length &&
+                sourceInfo.LastWriteTimeUtc <= destinationInfo.LastWriteTimeUtc)
+            {
+                return false;
+            }
+        }
+
+        Directory.CreateDirectory(Path.GetDirectoryName(destinationPath)!);
+        File.Copy(sourcePath, destinationPath, overwrite: true);
+        return true;
+    }
+
+    private static void MigrateLegacyGameSettings(string gameSettingsDirectory, string targetIniPath)
+    {
+        if (File.Exists(targetIniPath))
+            return;
+
+        foreach (var legacyName in LegacyGameSettingsIniNames)
+        {
+            var legacyPath = Path.Combine(gameSettingsDirectory, legacyName);
+            if (!File.Exists(legacyPath))
+                continue;
+
+            File.Copy(legacyPath, targetIniPath);
+            return;
+        }
     }
 
     private static bool EnsureRamOverrideIni(string path)

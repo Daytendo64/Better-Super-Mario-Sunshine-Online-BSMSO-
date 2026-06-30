@@ -19,6 +19,12 @@ public sealed class NetClient : IDisposable
     private IPEndPoint? _udpServerEndpoint;
     private volatile bool _isDisconnecting;
     private readonly object _snapshotLock = new();
+    private readonly object _udpScratchLock = new();
+    private readonly byte[] _udpSendScratch =
+        new byte[ProtocolConstants.UdpSnapshotPayloadOffset + ProtocolConstants.PlayerSnapshotSize];
+    private readonly byte[] _udpPingScratch =
+        new byte[ProtocolConstants.UdpSnapshotPayloadOffset + ProtocolConstants.UdpPingPayloadSize];
+    private int _udpPingTickCount;
     private readonly Dictionary<byte, uint> _lastReceivedSnapshotSeq = new();
     private readonly HashSet<byte> _knownRosterSlots = new();
     private PlayerSnapshot _pendingSnapshot;
@@ -202,6 +208,14 @@ public sealed class NetClient : IDisposable
         {
             TrySendPendingSnapshot();
 
+            // Probe UDP RTT roughly once per second on the same loop so latency shown in the roster
+            // reflects the path snapshots actually travel (TCP heartbeat remains a liveness backstop).
+            if (++_udpPingTickCount >= 60)
+            {
+                _udpPingTickCount = 0;
+                SendUdpPing();
+            }
+
             try
             {
                 await timer.WaitForNextTickAsync(ct).ConfigureAwait(false);
@@ -210,6 +224,42 @@ public sealed class NetClient : IDisposable
             {
                 break;
             }
+        }
+    }
+
+    private void SendUdpPing()
+    {
+        if (_udp == null || _udpServerEndpoint == null || _isDisconnecting)
+            return;
+
+        lock (_udpScratchLock)
+        {
+            PacketSerializer.WriteUdpPingInto(_udpPingScratch, _assignedSlot,
+                DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+            try
+            {
+                _udp.Send(_udpPingScratch, _udpPingScratch.Length, _udpServerEndpoint);
+            }
+            catch (Exception ex) when (!_isDisconnecting)
+            {
+                Log?.Invoke($"UDP ping send error: {ex.Message}");
+            }
+        }
+    }
+
+    private void HandleUdpPong(ReadOnlySpan<byte> buffer)
+    {
+        if (buffer.Length < ProtocolConstants.UdpSnapshotPayloadOffset + ProtocolConstants.UdpPingPayloadSize)
+            return;
+
+        var sentMs = BinaryPrimitives.ReadInt64LittleEndian(
+            buffer.Slice(ProtocolConstants.UdpSnapshotPayloadOffset, ProtocolConstants.UdpPingPayloadSize));
+        var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var rtt = nowMs - sentMs;
+        if (rtt >= 0 && rtt < 5000)
+        {
+            var sample = (ushort)Math.Min(999, rtt);
+            MeasuredPingMs = MeasuredPingMs == 0 ? sample : (ushort)((MeasuredPingMs * 3 + sample) / 4);
         }
     }
 
@@ -234,14 +284,17 @@ public sealed class NetClient : IDisposable
         if (_udp == null || _udpServerEndpoint == null || _isDisconnecting)
             return;
 
-        var bytes = PacketSerializer.BuildUdpSnapshot(_assignedSlot, ++_snapshotSeq, snap);
-        try
+        lock (_udpScratchLock)
         {
-            _udp.Send(bytes, bytes.Length, _udpServerEndpoint);
-        }
-        catch (Exception ex) when (!_isDisconnecting)
-        {
-            Log?.Invoke($"UDP snapshot send error: {ex.Message}");
+            PacketSerializer.WriteUdpSnapshotInto(_udpSendScratch, _assignedSlot, ++_snapshotSeq, snap);
+            try
+            {
+                _udp.Send(_udpSendScratch, _udpSendScratch.Length, _udpServerEndpoint);
+            }
+            catch (Exception ex) when (!_isDisconnecting)
+            {
+                Log?.Invoke($"UDP snapshot send error: {ex.Message}");
+            }
         }
     }
 
@@ -528,7 +581,14 @@ public sealed class NetClient : IDisposable
                 if (BinaryPrimitives.ReadUInt32LittleEndian(result.Buffer.AsSpan(0, 4)) != ProtocolConstants.Magic)
                     continue;
 
-                if ((UdpPacketId)result.Buffer[4] != UdpPacketId.PlayerSnapshot ||
+                var packetId = (UdpPacketId)result.Buffer[4];
+                if (packetId == UdpPacketId.Pong)
+                {
+                    HandleUdpPong(result.Buffer);
+                    continue;
+                }
+
+                if (packetId != UdpPacketId.PlayerSnapshot ||
                     result.Buffer.Length <
                     ProtocolConstants.UdpSnapshotPayloadOffset + ProtocolConstants.PlayerSnapshotSize)
                 {

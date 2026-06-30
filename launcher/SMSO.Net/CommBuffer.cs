@@ -24,17 +24,17 @@ public struct CommBuffer
 
     public PlayerSnapshot LocalSnapshot;
 
-    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 9)]
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = ProtocolConstants.MaxRemoteSlots)]
     public PlayerSnapshot[] RemoteSnapshots;
 
     public NameTagAppearance LocalNameTagAppearance;
 
-    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 9)]
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = ProtocolConstants.MaxRemoteSlots)]
     public NameTagAppearance[] RemoteNameTagAppearances;
 
     public MarioVoiceEvent LocalMarioVoiceEvent;
 
-    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 9)]
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = ProtocolConstants.MaxRemoteSlots)]
     public MarioVoiceEvent[] RemoteMarioVoiceEvents;
 
     public CommGameModeState GameModeState;
@@ -63,7 +63,7 @@ public struct CommBuffer
 
     public static NameTagAppearance[] CreateRemoteAppearanceArray()
     {
-        var arr = new NameTagAppearance[9];
+        var arr = new NameTagAppearance[ProtocolConstants.MaxRemoteSlots];
         for (int i = 0; i < arr.Length; i++)
             arr[i] = NameTagAppearance.CreateDefault();
         return arr;
@@ -71,14 +71,14 @@ public struct CommBuffer
 
     public static PlayerSnapshot[] CreateRemoteArray()
     {
-        var arr = new PlayerSnapshot[9];
+        var arr = new PlayerSnapshot[ProtocolConstants.MaxRemoteSlots];
         for (int i = 0; i < arr.Length; i++)
             arr[i] = new PlayerSnapshot { Name = new byte[16] };
         return arr;
     }
 
     public static MarioVoiceEvent[] CreateRemoteMarioVoiceEventArray()
-        => new MarioVoiceEvent[9];
+        => new MarioVoiceEvent[ProtocolConstants.MaxRemoteSlots];
 
     public string GetLocalPlayerName()
     {

@@ -1,4 +1,5 @@
 #include "remote_actor.hpp"
+#include "remote_mario_audio.hpp"
 #include "world_sync.hpp"
 #include "comm_buffer.hpp"
 #include "hide_seek.hpp"
@@ -64,21 +65,23 @@ static const char kPlayerGroupName[] =
 
 // Full TMario puppets are heavy (model + ~199 anims + cap + Yoshi), ~612 KiB each
 // in practice. We pre-spawn the whole pool once per stage (SMSO 2 makeMarios()
-// principle) and reuse them for the whole stage. Four bodies cover a five-player
-// session and leave a spare in a four-player one; 4 * ~612 KiB ≈ 2.45 MiB fits
-// inside the ~3.5 MiB expanded-MEM1 arena below.
-constexpr u32 kSessionMaxRemotes = 4;
-constexpr size_t kRemoteActorDedicatedHeapSize = 0x00380000u;
+// principle) and reuse them for the whole stage. A full MAX_PLAYERS session has
+// MAX_PLAYERS-1 remotes, so the pool holds that many bodies; 9 * ~612 KiB ≈ 5.4 MiB
+// fits inside the 7.5 MiB expanded-MEM1 arena below with ~2 MiB of runtime margin.
+constexpr u32 kSessionMaxRemotes = MAX_PLAYERS - 1;
+constexpr size_t kRemoteActorDedicatedHeapSize = 0x00780000u;
 constexpr size_t kStageHeapReserveMargin = 0x00060000u;
 constexpr size_t kStageHeapReserveMarginTight = 0x00020000u;
 constexpr size_t kRemoteBodySpawnMinFree = 0x00090000u;
 // Dolphin expanded MEM1 (48 MiB) puppet-pool arena. Retail SMS only configures
 // CPU BATs for the stock 24 MiB, so this region faults until we add a data BAT
-// for it (see ensureExtendedMem1Mapping). 0x81810000 sits inside the 8 MiB block
-// based at 0x81800000; 0x380000 = 3.5 MiB holds four ~612 KiB bodies and ends at
-// 0x81B90000, well within the block (ends 0x82000000).
+// for it (see ensureExtendedMem1Mapping). 0x81810000 sits in the block based at
+// 0x81000000; ensureExtendedMem1Mapping widens DBAT2 from 8 -> 16 MiB, exposing
+// 0x81000000-0x81FFFFFF -> phys 0x01000000-0x01FFFFFF (Dolphin backs the full
+// 48 MiB). 0x780000 = 7.5 MiB holds nine ~612 KiB bodies and ends at 0x81F90000,
+// well within the widened 16 MiB block (ends 0x82000000).
 constexpr u32 kRemoteActorExpandedHeapAddress = 0x81810000u;
-constexpr size_t kRemoteActorExpandedHeapSize = 0x00380000u;
+constexpr size_t kRemoteActorExpandedHeapSize = 0x00780000u;
 // Only attempt the extended arena when Dolphin actually backs >24 MiB of MEM1.
 constexpr u32 kMinMem1ForExpandedHeap = 0x02800000u; // 40 MiB
 
@@ -109,6 +112,12 @@ constexpr u8 kFluddSprayEmitHz = 30; // remote FLUDD spray + turbo dash particle
 constexpr u8 kFluddSprayEmitInterval = 60 / kFluddSprayEmitHz;
 constexpr u8 kFluddSpraySoundHz = 30;
 constexpr u8 kFluddSpraySoundInterval = 60 / kFluddSpraySoundHz;
+// Remote swim VFX cadence. Retail swimMain() fires bubbles + a surface ripple each
+// frame for one local Mario; rate-limiting keeps 9 simultaneous swimmers affordable.
+constexpr u8 kSwimBubbleEmitHz = 30;
+constexpr u8 kSwimBubbleEmitInterval = 60 / kSwimBubbleEmitHz; // every 2 frames
+constexpr u8 kSwimRippleEmitHz = 10;
+constexpr u8 kSwimRippleEmitInterval = 60 / kSwimRippleEmitHz; // every 6 frames
 constexpr u8 kRemoteDismissInvalidStreak = 3;
 
 // doldecomp MarioStatus.hpp status type+id mask (low 9 bits of mState).
@@ -192,6 +201,8 @@ static void syncSurfGessoBaseMtx(TMario *mario, void *gesso) {
 
 struct RemoteActorSlot;
 
+static void syncRemoteNozzleGunAngle(TMario *mario, s16 pitch);
+
 static bool ensureRemoteActorHeap();
 static void releaseRemoteSurfGessoClone(RemoteActorSlot &slot);
 static void *createRemoteSurfGessoClone(u8 gessoType, J3DModel **outModel);
@@ -245,6 +256,20 @@ static bool remoteMarioInWater(const TMario *mario) {
     if (mario->mAttributes.mIsWater || mario->mAttributes.mIsShallowWater)
         return true;
     return remoteStatusId(mario->mState) == kStatusIdSurf;
+}
+
+// Deep-water swimming (surface paddle + dive). STATE_WATERBORN (0x2000) is the
+// reliable in-water flag set by the host's water collision and carried on the
+// synced mState; it is distinct from Blooper surf (status id 0x046, no WATERBORN),
+// which the surf VFX branch already handles.
+static bool isRemoteSwimming(const TMario *mario) {
+    if (!mario)
+        return false;
+    if ((mario->mState & TMario::STATE_WATERBORN) == 0)
+        return false;
+    if (isBlooperSurfState(mario->mState))
+        return false;
+    return true;
 }
 
 static bool isSideFlipSequenceAnim(u16 animId) {
@@ -406,6 +431,7 @@ struct RemoteActorSlot {
     s16 yaw;
     s16 turnRootYaw;
     s16 syncHeadLook;
+    s16 syncGunAngle;
     f32 syncWaistPitch;
     f32 syncWaistRoll;
     u8 lastWaterTank;
@@ -436,6 +462,8 @@ struct RemoteActorSlot {
     u16 appearRevealFrames;
     u16 lastSoundVfx;
     u8 fluddSprayTick;
+    u8 swimVfxTick;
+    bool wasInWater;
     u8 syncedSprayPressure;
     u8 invalidSnapshotStreak;
     f32 remoteSprayPressure;
@@ -563,6 +591,18 @@ static bool isRunningAnim(const TMario *mario) {
 
 static bool snapshotPacksHeadLook(u16 vfxFlags) {
     return (vfxFlags & VFX_Y_CAM) != 0;
+}
+
+// During active spray (water or dry-pump), the vfx aux bits carry the host's FLUDD gun angle
+// (mGunAngle) instead of waist roll. Retail MarioHeadCtrl/MarioWaistCtrl read getGunAngle()
+// to aim the head and chest; mGunAngle is negative while hovering (looks down) and positive
+// while aiming up. Y-cam already packs the L-button pitch as the gun angle elsewhere, so this
+// only covers non-Y-cam spray. Run+spray intentionally prefers gun angle over waist roll here
+// because the retail waist callback's FLUDD branch overrides the run branch while spraying.
+static bool snapshotPacksGunAngle(u16 vfxFlags) {
+    if (vfxFlags & VFX_Y_CAM)
+        return false;
+    return (vfxFlags & (VFX_WATER_SPRAY | VFX_FLUDD_EMPTY)) != 0;
 }
 
 static bool snapshotPacksWaistPitch(u16 vfxFlags, u16 animId) {
@@ -848,7 +888,7 @@ static void syncRemoteAnimation(TMario *body, RemoteActorSlot *slot, const Playe
         animId = TMario::ANIMATION_IDLE;
 
     if (animChanged || animId != body->mAnimationID)
-        body->setAnimation(animId, rate * 2.0f);
+        body->setAnimation(animId, rate);
 
     if (!body->mModelData || !body->mModelData->mFrameCtrl)
         return;
@@ -884,9 +924,17 @@ static void syncRemoteAnimation(TMario *body, RemoteActorSlot *slot, const Playe
 
     if ((yCam || pumpUpper) && !isBlooperSurfState(body->mState) &&
         !snapshotHostOnYoshi(snap.nozzleId, snap.vfxFlags)) {
-        // Y-cam and hold-pump both pack the upper BCK frame in water; freeze locally.
-        // snap.water carries surf gesso type while blooper surfing — never treat as upper frame.
-        const f32 syncedUpper = static_cast<f32>(snap.water) / 8.0f;
+        // Y-cam and pump/hold drive the upper (FLUDD pump) BCK authoritatively.
+        // The host packs the upper BCK frame into snap.water EXCEPT while spraying —
+        // while spraying snap.water carries spray pressure (see puppets.cpp), and the
+        // upper frame is packed in the pingMs high byte (upperEnc) instead. Using the
+        // pressure value as a frame is what froze the pump during hover; read the frame
+        // from upperEnc whenever the host is spraying so the pump keeps animating.
+        const bool hostSpraying = (snap.vfxFlags & (VFX_WATER_SPRAY | VFX_FLUDD_EMPTY)) != 0;
+        const bool upperFromWater = yCam || (pumpUpper && !hostSpraying);
+        const f32 syncedUpper = upperFromWater
+            ? (static_cast<f32>(snap.water) / 8.0f)
+            : upperFrame;
         body->mModelData->mFrameCtrl[1].mCurFrame = syncedUpper;
         body->mModelData->mFrameCtrl[1].mFrameRate = 0.0f;
         if (slot)
@@ -917,8 +965,23 @@ static void syncRemoteHeadWaist(TMario *body, RemoteActorSlot &slot, const Playe
     if (snapshotPacksHeadLook(snap.vfxFlags)) {
         slot.syncHeadLook = decodeSnapshotAngle(highEnc);
         body->_100 = slot.syncHeadLook;
+        slot.syncGunAngle = 0;
         return;
     }
+
+    if (snapshotPacksGunAngle(snap.vfxFlags)) {
+        // FLUDD vertical aim (mGunAngle) packed in vfx aux bits during spray/hover. Applied to
+        // the nozzle here (before joint callbacks run) so retail MarioHeadCtrl's gunAngle<0
+        // branch tilts the head down while hovering and the chest/spray follow the host's aim.
+        slot.syncGunAngle = decodeSnapshotAngle6(unpackVfxAuxAngle(snap.vfxFlags));
+        syncRemoteNozzleGunAngle(body, slot.syncGunAngle);
+        slot.syncHeadLook = 0;
+        return;
+    }
+
+    slot.syncGunAngle = 0;
+    // Clear any stale FLUDD aim so the head/chest don't keep tilting after spray ends.
+    syncRemoteNozzleGunAngle(body, 0);
 
     if (snapshotPacksWaistPitchForState(snap.vfxFlags, snap.animId, body->mState)) {
         slot.syncWaistPitch = static_cast<f32>(decodeSnapshotAngle(highEnc));
@@ -1194,11 +1257,16 @@ static void syncRemoteNozzleGunAngle(TMario *mario, s16 pitch) {
     if (!fludd)
         return;
 
-    TNozzleBase *nozzle = fludd->mNozzleList[fludd->mCurrentNozzle];
-    if (!nozzle)
-        return;
-
-    nozzle->mGunAngle = pitch;
+    // Apply to every nozzle, not just mCurrentNozzle. Retail MarioHeadCtrl/MarioWaistCtrl
+    // read getCurrentNozzle()->getGunAngle(), and a transient mCurrentNozzle mismatch (host
+    // switched nozzles this frame, remote hasn't yet) would otherwise read a stale/zero angle
+    // on the wrong nozzle and flip the head up. Keeping all nozzles in sync is cheap and only
+    // the current one is ever read.
+    for (u8 i = 0; i < 6; ++i) {
+        TNozzleBase *nozzle = fludd->mNozzleList[i];
+        if (nozzle)
+            nozzle->mGunAngle = pitch;
+    }
 }
 
 // Retail MarioWaistCtrl skips Y-cam on remotes (gpMarioOriginal check). This mirrors the
@@ -1292,6 +1360,13 @@ static void applySyncedHeadWaist(TMario *mario, const RemoteActorSlot *slot) {
 
     if (slot->vfxFlags & VFX_Y_CAM) {
         mario->_100 = slot->syncHeadLook;
+        return;
+    }
+
+    if (snapshotPacksGunAngle(slot->vfxFlags)) {
+        // Re-assert the synced FLUDD gun angle immediately before the joint callbacks run so
+        // retail MarioHeadCtrl/MarioWaistCtrl aim the head and chest with the host's pitch.
+        syncRemoteNozzleGunAngle(mario, slot->syncGunAngle);
         return;
     }
 
@@ -1600,6 +1675,9 @@ static void playRemoteFluddActorSound(u32 soundId, TMario *body) {
     if (!gpMSound || !body || !gpMSound->gateCheck(soundId))
         return;
 
+    if (!isRemoteMarioSoundAudible(body->mTranslation))
+        return;
+
     auto *actor = reinterpret_cast<JAIActor *>(body);
     if (MSoundSESystem::MSoundSE::checkMonoSound(soundId, actor))
         return;
@@ -1633,8 +1711,8 @@ static void updateRemoteFluddSounds(TMario *body, TWaterGun *fludd, RemoteActorS
 
     if (spraying && (slot.fluddSprayTick % kFluddSpraySoundInterval) == 0) {
         const Vec *pos = reinterpret_cast<const Vec *>(&body->mTranslation);
-        if ((vfx & VFX_HOVER) && gpMSound->gateCheck(MSD_SE_PO_HOVER))
-            MSoundSESystem::MSoundSE::startSoundActor(MSD_SE_PO_HOVER, pos, 0, nullptr, 0, 4);
+        if (vfx & VFX_HOVER)
+            playRemoteMarioPositionalSound(MSD_SE_PO_HOVER, *pos);
         else if ((vfx & VFX_ROCKET) && gpMSound->gateCheck(MSD_SE_PO_ROCKET_TRIGGER))
             playRemoteFluddActorSound(MSD_SE_PO_ROCKET_TRIGGER, body);
         else if ((vfx & VFX_TURBO) && gpMSound->gateCheck(MSD_SE_PO_SNIPER_TRIGGER))
@@ -1757,20 +1835,55 @@ static void emitRemoteSpinJumpBlur(TMario *body) {
     body->emitBlurSpinJump();
 }
 
+// Deep-water swim VFX — body bubbles + surface ripple. Mirrors the retail swimMain
+// path (swimmingBubbleEffect / rippleEffect) on the puppet body. Matrices are posed
+// by remoteCalcAnim() before this runs, so bubble binding matches the host.
+static void emitRemoteSwimVfx(TMario *body, const RemoteActorSlot *slot) {
+    if (!body)
+        return;
+
+    // Remotes skip thinkHeight(), so mWaterHeight is stale (0). Swimming keeps Mario
+    // at the surface; mirror the body y so retail ripple/splash placement lands on
+    // the surface instead of y=0.
+    body->mWaterHeight = body->mTranslation.y;
+
+    const u8 tick = slot ? slot->swimVfxTick : 0;
+    if ((tick % kSwimBubbleEmitInterval) == 0)
+        body->swimmingBubbleEffect();
+    if ((tick % kSwimRippleEmitInterval) == 0)
+        body->rippleEffect();
+}
+
 // Looping movement VFX — called each perform tick (retail slippingBasic / rotating equivalent).
-static void syncRemoteContinuousParticles(TMario *body, const RemoteActorSlot *slot) {
+static void syncRemoteContinuousParticles(TMario *body, RemoteActorSlot *slot) {
     if (!body || !gpMarioParticleManager)
         return;
 
     const u32 state = body->mState;
     const u16 animId = body->mAnimationID;
     const u16 vfxFlags = slot ? slot->vfxFlags : static_cast<u16>(0);
-    if ((vfxFlags & VFX_DEAD) != 0)
+    if ((vfxFlags & VFX_DEAD) != 0) {
+        if (slot)
+            slot->wasInWater = false;
         return;
+    }
 
     const bool turboDashActive =
         slot && (vfxFlags & VFX_TURBO) != 0 && (vfxFlags & VFX_WATER_SPRAY) != 0 && body->mFludd &&
         body->mFludd->mCurrentNozzle == TWaterGun::Turbo;
+
+    // Water-entry splash (one-shot) + swim tick bookkeeping. Blooper surf is a
+    // separate non-WATERBORN status and is handled by the surf branch below.
+    const bool swimming = isRemoteSwimming(body);
+    if (slot) {
+        if (swimming && !slot->wasInWater) {
+            body->mWaterHeight = body->mTranslation.y;
+            body->inOutWaterEffect(body->mTranslation.y);
+        }
+        slot->wasInWater = swimming;
+        if (swimming)
+            ++slot->swimVfxTick;
+    }
 
     if (turboDashActive && remoteMarioInWater(body)) {
         if (isWaterSurfaceRun(state))
@@ -1780,12 +1893,17 @@ static void syncRemoteContinuousParticles(TMario *body, const RemoteActorSlot *s
         return;
     }
 
+    // Slide/surf take priority over swim: a wet belly-slide can also carry
+    // WATERBORN, and Blooper surf is its own status. Deep-water swim VFX
+    // (bubbles + surface ripple) only fires when no other movement VFX matched.
     if (isDrySlideState(state, vfxFlags) && !turboDashActive) {
         emitRemoteDrySlideVfx(body);
     } else if (isWetSlideState(state, vfxFlags) && !turboDashActive) {
         emitRemoteWetSlideVfx(body);
     } else if (isWaterSurfaceRun(state) && !turboDashActive) {
         emitRemoteSurfVfx(body, slot);
+    } else if (swimming && !turboDashActive) {
+        emitRemoteSwimVfx(body, slot);
     } else if (isSpinJumpPlayback(animId, state)) {
         // doldecomp rotating()/rotateJumping() call emitBlurSpinJump() every frame.
         emitRemoteSpinJumpBlur(body);
@@ -2222,8 +2340,17 @@ static void emitRemoteFluddVfx(TMario *body, TWaterGun *fludd, RemoteActorSlot *
     }
 
     emitRemoteSprayVfx(fludd, vfxFlags, body, slot);
-    if (slot)
-        emitRemoteWaterDroplets(fludd, *slot, emitThisFrame);
+    if (slot) {
+        // Droplets must be emitted every frame (60 Hz) to match local Mario's FLUDD.
+        // Each water particle that lands calls gpPollution->clean() (doldecomp
+        // ModelWaterManager splashGround/splashWall), so the graffiti clean rate is
+        // directly proportional to droplet count. The previous 30 Hz throttle made
+        // remote graffiti clean at ~half the local rate, so the host finished cleaning
+        // (and revealed the blue coin) before remote screens caught up. Cosmetic spray
+        // particles above still run at 30 Hz via emitThisFrame; only the cleaning
+        // droplets are promoted to per-frame.
+        emitRemoteWaterDroplets(fludd, *slot, /*emitThisFrame=*/true);
+    }
 
     if (slot) {
         const u16 prev = slot->lastSoundVfx;
@@ -2477,6 +2604,7 @@ static void resetRemoteRuntimeState(RemoteActorSlot &slot, bool stageAppear) {
     slot.yaw = 0;
     slot.turnRootYaw = 0;
     slot.syncHeadLook = 0;
+    slot.syncGunAngle = 0;
     slot.syncWaistPitch = 0.0f;
     slot.syncWaistRoll = 0.0f;
     slot.lastWaterTank = 0;
@@ -2505,6 +2633,8 @@ static void resetRemoteRuntimeState(RemoteActorSlot &slot, bool stageAppear) {
     slot.appearRevealFrames = 0;
     slot.lastSoundVfx = 0xFFFF;
     slot.fluddSprayTick = 0;
+    slot.swimVfxTick = 0;
+    slot.wasInWater = false;
     slot.syncedSprayPressure = 0;
     slot.invalidSnapshotStreak = 0;
     slot.remoteSprayPressure = 0.0f;

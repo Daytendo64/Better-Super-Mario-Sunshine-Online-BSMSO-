@@ -150,6 +150,22 @@ public class PacketTests
     }
 
     [Fact]
+    public void WorldEventBroadcast_HipDropObject_RoundTrip()
+    {
+        // payload0 = object mMapObjID, reserved = pounder slot, payload1 = packed world pos.
+        var pound = new WorldEventPacket(7, WorldEventType.HipDropObject, 2, 1, 0x3A, 4, 0x123456);
+
+        var frame = PacketSerializer.BuildWorldEventBroadcast(pound);
+        Assert.True(PacketSerializer.TryUnwrapTcp(frame, out _, out var payload));
+        Assert.True(PacketSerializer.TryReadWorldEventBroadcast(payload, out var restored));
+
+        Assert.Equal(WorldEventType.HipDropObject, restored.Type);
+        Assert.Equal((byte)0x3A, restored.Payload0);
+        Assert.Equal((byte)4, restored.Reserved);
+        Assert.Equal(0x123456u, restored.Payload1);
+    }
+
+    [Fact]
     public void WorldStateReplay_RoundTrip_PreservesEvents()
     {
         var events = new[]

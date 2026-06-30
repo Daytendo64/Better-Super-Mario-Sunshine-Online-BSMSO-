@@ -2,17 +2,24 @@
 
 #include <Dolphin/mem.h>
 #include <Dolphin/types.h>
+#include <stddef.h>
 
 namespace smso {
 
 constexpr u32 COMM_MAGIC = 0x534D534F; // "SMSO"
-constexpr u16 COMM_VERSION = 6;
+constexpr u16 COMM_VERSION = 7;
 // Legacy scan hint for the launcher; the live buffer lives in module BSS.
 constexpr u32 COMM_GUEST_ADDRESS = 0x817FC000;
-constexpr u32 MAX_REMOTE_SLOTS = 9;
+// Maximum connected players (slots 0..MAX_PLAYERS-1). roleBySlot and roster logic key off this.
+constexpr u32 MAX_PLAYERS = 10;
+// Remote snapshot slots are indexed directly by network slot id, so the array must hold every
+// possible slot index (0..MAX_PLAYERS-1). Keep >= MAX_PLAYERS.
+constexpr u32 MAX_REMOTE_SLOTS = MAX_PLAYERS;
 constexpr u32 MARIO_VOICE_EVENT_SIZE = 12;
-constexpr u32 COMM_MARIO_VOICE_EVENTS_OFFSET = 788;
+constexpr u32 COMM_MARIO_VOICE_EVENTS_OFFSET = 862;
 constexpr u32 COMM_MARIO_VOICE_EVENTS_SIZE = MARIO_VOICE_EVENT_SIZE * (MAX_REMOTE_SLOTS + 1);
+constexpr u32 PLAYER_SNAPSHOT_SIZE = 64;
+constexpr u32 MAX_PLAYER_NAME = 16;
 enum GameMode : u8 {
     GM_NORMAL = 0,
     GM_HIDE_SEEK = 1,
@@ -30,7 +37,9 @@ enum GameModeFlags : u8 {
     GMF_ROUND_FANFARE = 1 << 3,
 };
 
-constexpr u32 COMM_GAME_MODE_STATE_SIZE = 13;
+// GameModeState: mode(1)+flags(1)+localRole(1)+lastTaggedSlot(1)+tagEventId(1)+roundStartMs(4)
+// + roleBySlot[MAX_PLAYERS](10) = 19 bytes.
+constexpr u32 COMM_GAME_MODE_STATE_SIZE = 9 + MAX_PLAYERS;
 constexpr u32 COMM_GAME_MODE_STATE_OFFSET = COMM_MARIO_VOICE_EVENTS_OFFSET + COMM_MARIO_VOICE_EVENTS_SIZE;
 constexpr u32 COMM_WORLD_EVENT_SIZE = 15;
 constexpr u32 COMM_WORLD_SYNC_SIZE = COMM_WORLD_EVENT_SIZE * 2 + 4;
@@ -40,10 +49,12 @@ constexpr u32 COMM_ROSTER_HUD_RING_SLOTS = 8;
 constexpr u32 COMM_ROSTER_HUD_SYNC_SIZE = 2 + COMM_ROSTER_HUD_RING_SLOTS * COMM_ROSTER_HUD_EVENT_SIZE;
 constexpr u32 COMM_ROSTER_HUD_OFFSET = COMM_WORLD_SYNC_OFFSET + COMM_WORLD_SYNC_SIZE;
 constexpr u32 COMM_BUFFER_SIZE = COMM_ROSTER_HUD_OFFSET + COMM_ROSTER_HUD_SYNC_SIZE;
-constexpr u32 COMM_NAME_TAG_APPEARANCES_OFFSET = 688;
-constexpr u32 COMM_NAME_TAG_APPEARANCES_SIZE = 100;
-constexpr u32 PLAYER_SNAPSHOT_SIZE = 64;
-constexpr u32 MAX_PLAYER_NAME = 16;
+// localNameTagAppearance starts right after remoteSnapshots[10] (48 + 64 + 64*10 = 752).
+constexpr u32 COMM_NAME_TAG_APPEARANCES_OFFSET = 752;
+// local(10) + remote[10](100) = 110.
+constexpr u32 COMM_NAME_TAG_APPEARANCES_SIZE = 10 + 10 * MAX_REMOTE_SLOTS;
+constexpr u32 COMM_REMOTE_SNAPSHOTS_OFFSET = 112;
+constexpr u32 COMM_REMOTE_SNAPSHOTS_SIZE = PLAYER_SNAPSHOT_SIZE * MAX_REMOTE_SLOTS;
 
 enum BridgeFlags : u32 {
     BF_CONNECTED = 1 << 0,
@@ -86,12 +97,17 @@ enum VfxFlags : u16 {
     VFX_NO_FLUDD = 1 << 9,         // FLUDD pack hidden on Mario's back (see shouldShowFluddPackOnMario)
 };
 
-// Bits 8-9 are persistent VFX flags. Bits 10-15 pack Y-cam pitch / run waist roll so
-// auxiliary angle data never clobbers VFX_WET_SLIDE or VFX_NO_FLUDD during movement.
+// Bits 8-9 are persistent VFX flags. Bits 10-15 pack Y-cam pitch, active-spray FLUDD gun
+// angle (mGunAngle), or run waist roll so auxiliary angle data never clobbers VFX_WET_SLIDE
+// or VFX_NO_FLUDD during movement.
 constexpr u16 kVfxPersistentHighMask = static_cast<u16>(VFX_WET_SLIDE | VFX_NO_FLUDD);
 constexpr u16 kVfxAuxAngleShift = 10;
 
 // pingMs high byte and vfxFlags bits 10-15 pack s16 angles into 0..63.
+// Aux-bit priority on the wire: VFX_Y_CAM L-button pitch > active-spray (VFX_WATER_SPRAY /
+// VFX_FLUDD_EMPTY) FLUDD gun angle > run/ride-shell/blooper waist roll. The gun angle is what
+// retail MarioHeadCtrl/MarioWaistCtrl read to aim the head and chest during hover/spray;
+// mGunAngle is negative while hovering (head aims down) — sync raw, no sign inversion.
 // NOTE: pingMs is NOT network latency — low byte is BCK rate*64, high byte is head/waist aux.
 constexpr s16 kSnapshotAngleMin = static_cast<s16>(-0x6000);
 constexpr s16 kSnapshotAngleMax = static_cast<s16>(0x6000);
@@ -464,7 +480,7 @@ struct GameModeState {
     u8 lastTaggedSlot;
     u8 tagEventId;
     u32 roundStartMs;
-    u8 roleBySlot[4];
+    u8 roleBySlot[MAX_PLAYERS];
 };
 
 static_assert(sizeof(GameModeState) == COMM_GAME_MODE_STATE_SIZE, "GameModeState size mismatch");
@@ -477,6 +493,12 @@ enum WorldEventType : u8 {
     WE_TRIGGER_FLAG = 5,
     WE_SECRET_COMPLETE = 6,
     WE_GOLD_COIN_COLLECTED = 7,
+    // Mario ground-pounded a managed object (crate / super hip-drop block / hide
+    // object / switch / etc.). payload0 = object mMapObjID, reserved = pounder
+    // slot, payload1 = packed world position of the object (packCollectibleWorldPos).
+    // Remotes replay via THitActor::receiveMessage(gpMario, HIT_MESSAGE_HIP_DROP).
+    // payload1 bit 31 set when the pound was a super hip-drop.
+    WE_HIP_DROP_OBJECT = 8,
     WE_RED_COIN_COLLECTED = 9,
 };
 
@@ -553,6 +575,14 @@ struct CommBuffer {
 static_assert(sizeof(PlayerSnapshot) == PLAYER_SNAPSHOT_SIZE, "PlayerSnapshot must be 64 bytes");
 static_assert(sizeof(CommBuffer) == COMM_BUFFER_SIZE, "CommBuffer size mismatch");
 static_assert(sizeof(CommMailboxAnchor) == 12, "CommMailboxAnchor must be 12 bytes");
+static_assert(offsetof(CommBuffer, remoteSnapshots) == COMM_REMOTE_SNAPSHOTS_OFFSET,
+              "remoteSnapshots offset mismatch");
+static_assert(offsetof(CommBuffer, localNameTagAppearance) == COMM_NAME_TAG_APPEARANCES_OFFSET,
+              "name-tag appearance offset mismatch");
+static_assert(offsetof(CommBuffer, localMarioVoiceEvent) == COMM_MARIO_VOICE_EVENTS_OFFSET,
+              "mario voice events offset mismatch");
+static_assert(offsetof(CommBuffer, gameModeState) == COMM_GAME_MODE_STATE_OFFSET,
+              "game mode state offset mismatch");
 
 CommBuffer *getCommBuffer();
 void publishMailboxAnchor();

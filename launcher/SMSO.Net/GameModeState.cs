@@ -118,7 +118,7 @@ public struct CommGameModeState
     public byte TagEventId;
     public uint RoundStartMs;
 
-    [System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.ByValArray, SizeConst = 4)]
+    [System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.ByValArray, SizeConst = ProtocolConstants.StableMaxPlayers)]
     public byte[] RoleBySlot;
 
     public static CommGameModeState CreateDefault()

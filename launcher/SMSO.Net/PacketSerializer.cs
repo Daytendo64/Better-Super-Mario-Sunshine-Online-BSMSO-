@@ -105,7 +105,8 @@ public static class PacketSerializer
 
     public static byte[] BuildGameModeState(in GameModeStatePacket state)
     {
-        var payload = new byte[14];
+        // mode(1)+flags(1)+seq(2)+roundStartMs(4)+tagEventId(1)+roles[StableMaxPlayers]+lastTaggedSlot(1)
+        var payload = new byte[9 + ProtocolConstants.StableMaxPlayers + 1];
         payload[0] = (byte)state.GameMode;
         payload[1] = (byte)state.Flags;
         BinaryPrimitives.WriteUInt16LittleEndian(payload.AsSpan(2, 2), state.Seq);
@@ -113,14 +114,14 @@ public static class PacketSerializer
         payload[8] = state.TagEventId;
         for (int i = 0; i < ProtocolConstants.StableMaxPlayers; i++)
             payload[9 + i] = state.GetRole((byte)i);
-        payload[13] = state.LastTaggedSlot;
+        payload[9 + ProtocolConstants.StableMaxPlayers] = state.LastTaggedSlot;
         return WrapTcp(TcpPacketId.GameModeState, payload);
     }
 
     public static bool TryReadGameModeState(ReadOnlySpan<byte> payload, out GameModeStatePacket state)
     {
         state = GameModeStatePacket.CreateDefault();
-        if (payload.Length < 14)
+        if (payload.Length < 9 + ProtocolConstants.StableMaxPlayers + 1)
             return false;
 
         state.GameMode = (GameMode)payload[0];
@@ -130,7 +131,7 @@ public static class PacketSerializer
         state.TagEventId = payload[8];
         for (int i = 0; i < ProtocolConstants.StableMaxPlayers; i++)
             state.SetRole((byte)i, (HideSeekRole)payload[9 + i]);
-        state.LastTaggedSlot = payload[13];
+        state.LastTaggedSlot = payload[9 + ProtocolConstants.StableMaxPlayers];
         return true;
     }
 
@@ -295,12 +296,43 @@ public static class PacketSerializer
     public static byte[] BuildUdpSnapshot(byte slot, uint seq, in PlayerSnapshot snap)
     {
         var bytes = new byte[ProtocolConstants.UdpSnapshotPayloadOffset + ProtocolConstants.PlayerSnapshotSize];
-        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(0, 4), ProtocolConstants.Magic);
-        bytes[4] = (byte)UdpPacketId.PlayerSnapshot;
-        bytes[5] = slot;
-        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(6, 4), seq);
-        SnapshotToBytes(snap, bytes.AsSpan(ProtocolConstants.UdpSnapshotPayloadOffset, ProtocolConstants.PlayerSnapshotSize));
+        WriteUdpSnapshotInto(bytes, slot, seq, snap);
         return bytes;
+    }
+
+    /// <summary>
+    /// Write a 74-byte UDP snapshot frame into a caller-provided buffer to avoid allocating a
+    /// new array on every 60 Hz send. The buffer must be at least
+    /// <see cref="ProtocolConstants.UdpSnapshotPayloadOffset"/> + <see cref="ProtocolConstants.PlayerSnapshotSize"/> bytes.
+    /// </summary>
+    public static void WriteUdpSnapshotInto(Span<byte> dest, byte slot, uint seq, in PlayerSnapshot snap)
+    {
+        if (dest.Length < ProtocolConstants.UdpSnapshotPayloadOffset + ProtocolConstants.PlayerSnapshotSize)
+            throw new ArgumentException("UDP snapshot buffer is too small.", nameof(dest));
+
+        BinaryPrimitives.WriteUInt32LittleEndian(dest.Slice(0, 4), ProtocolConstants.Magic);
+        dest[4] = (byte)UdpPacketId.PlayerSnapshot;
+        dest[5] = slot;
+        BinaryPrimitives.WriteUInt32LittleEndian(dest.Slice(6, 4), seq);
+        SnapshotToBytes(snap, dest.Slice(ProtocolConstants.UdpSnapshotPayloadOffset, ProtocolConstants.PlayerSnapshotSize));
+    }
+
+    /// <summary>
+    /// Write a UDP Ping frame (magic + Ping id + slot + zero seq + 8-byte LE timestamp) for RTT
+    /// measurement on the UDP path. The server echoes the timestamp back as a Pong.
+    /// </summary>
+    public static void WriteUdpPingInto(Span<byte> dest, byte slot, long timestampMs)
+    {
+        if (dest.Length < ProtocolConstants.UdpSnapshotPayloadOffset + ProtocolConstants.UdpPingPayloadSize)
+            throw new ArgumentException("UDP ping buffer is too small.", nameof(dest));
+
+        BinaryPrimitives.WriteUInt32LittleEndian(dest.Slice(0, 4), ProtocolConstants.Magic);
+        dest[4] = (byte)UdpPacketId.Ping;
+        dest[5] = slot;
+        BinaryPrimitives.WriteUInt32LittleEndian(dest.Slice(6, 4), 0u);
+        BinaryPrimitives.WriteInt64LittleEndian(
+            dest.Slice(ProtocolConstants.UdpSnapshotPayloadOffset, ProtocolConstants.UdpPingPayloadSize),
+            timestampMs);
     }
 
     public static byte[] SnapshotToBytes(PlayerSnapshot snap)

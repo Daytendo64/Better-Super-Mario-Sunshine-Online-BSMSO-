@@ -20,12 +20,13 @@ public sealed class DolphinBridge : IDisposable
     private bool _loggedMailboxFound;
     private int _aliveCheckCounter;
     private readonly byte[] _readScratch = new byte[ProtocolConstants.CommBufferSize];
-    private readonly byte[] _remoteSnapScratch = new byte[ProtocolConstants.CommRemoteSnapshotsSize];
-    private readonly byte[] _nameTagScratch = new byte[ProtocolConstants.CommNameTagAppearancesSize];
-    private readonly byte[] _remoteVoiceScratch =
-        new byte[ProtocolConstants.MarioVoiceEventSize * ProtocolConstants.MaxRemoteSlots];
-    private readonly byte[] _gameModeScratch = new byte[ProtocolConstants.CommGameModeStateSize];
+    private readonly byte[] _remoteSyncSnapNameScratch =
+        new byte[ProtocolConstants.CommRemoteSnapshotsSize + ProtocolConstants.CommNameTagAppearancesSize];
+    private readonly byte[] _remoteSyncVoiceModeScratch =
+        new byte[ProtocolConstants.MarioVoiceEventSize * ProtocolConstants.MaxRemoteSlots +
+                 ProtocolConstants.CommGameModeStateSize];
     private readonly byte[] _incomingWorldEventScratch = new byte[ProtocolConstants.CommWorldEventSize];
+    private readonly byte[] _localPendingClearScratch = new byte[ProtocolConstants.CommWorldEventSize];
 
     private const int AttachFailureBackoffMs = 500;
     private const int AttachStatusLogCooldownMs = 6000;
@@ -480,31 +481,35 @@ public sealed class DolphinBridge : IDisposable
             if (!_mailbox.IsResolved && !TryResolveMailboxAddressLocked())
                 return false;
 
-            CommBufferEndian.WriteRemoteSnapshotsInto(_remoteSnapScratch, remotes);
-            CommBufferEndian.WriteNameTagAppearancesInto(_nameTagScratch, localAppearance, remoteAppearances);
-            CommBufferEndian.WriteRemoteMarioVoiceEventsInto(_remoteVoiceScratch, remoteVoiceEvents);
-            CommBufferEndian.WriteGameModeStateInto(_gameModeScratch, gameMode);
+            // Remote snapshots (112..688) and name-tag appearances (688..788) are contiguous, so a
+            // single WriteProcessMemory covers both atomically — no partial state where remotes
+            // updated but nametags lag (or vice versa). The local voice event (788..800) is left
+            // untouched (the module owns it). Remote voice (800..908) + game mode (908..921) are
+            // likewise contiguous and written as one block.
+            var voiceRegionSize = ProtocolConstants.MarioVoiceEventSize * ProtocolConstants.MaxRemoteSlots;
+
+            CommBufferEndian.WriteRemoteSnapshotsInto(
+                _remoteSyncSnapNameScratch.AsSpan(0, ProtocolConstants.CommRemoteSnapshotsSize), remotes);
+            CommBufferEndian.WriteNameTagAppearancesInto(
+                _remoteSyncSnapNameScratch.AsSpan(ProtocolConstants.CommRemoteSnapshotsSize,
+                    ProtocolConstants.CommNameTagAppearancesSize),
+                localAppearance, remoteAppearances);
+            CommBufferEndian.WriteRemoteMarioVoiceEventsInto(
+                _remoteSyncVoiceModeScratch.AsSpan(0, voiceRegionSize), remoteVoiceEvents);
+            CommBufferEndian.WriteGameModeStateInto(
+                _remoteSyncVoiceModeScratch.AsSpan(voiceRegionSize, ProtocolConstants.CommGameModeStateSize),
+                gameMode);
 
             var host = MailboxHost.ToUInt64();
             if (!TryWriteProcessMemoryLocked(
                     new UIntPtr(host + ProtocolConstants.CommRemoteSnapshotsOffset),
-                    _remoteSnapScratch))
-                return false;
-
-            if (!TryWriteProcessMemoryLocked(
-                    new UIntPtr(host + ProtocolConstants.CommNameTagAppearancesOffset),
-                    _nameTagScratch))
-                return false;
-
-            if (!TryWriteProcessMemoryLocked(
-                    new UIntPtr(host + ProtocolConstants.CommMarioVoiceEventsOffset +
-                                ProtocolConstants.MarioVoiceEventSize),
-                    _remoteVoiceScratch))
+                    _remoteSyncSnapNameScratch))
                 return false;
 
             return TryWriteProcessMemoryLocked(
-                new UIntPtr(host + ProtocolConstants.CommGameModeStateOffset),
-                _gameModeScratch);
+                new UIntPtr(host + ProtocolConstants.CommMarioVoiceEventsOffset +
+                            ProtocolConstants.MarioVoiceEventSize),
+                _remoteSyncVoiceModeScratch);
         }
     }
 
@@ -587,6 +592,28 @@ public sealed class DolphinBridge : IDisposable
             CommBufferEndian.WriteIncomingWorldEventInto(_incomingWorldEventScratch, incoming);
             var address = new UIntPtr(MailboxHost.ToUInt64() + ProtocolConstants.CommIncomingWorldEventOffset);
             return TryWriteProcessMemoryLocked(address, _incomingWorldEventScratch);
+        }
+    }
+
+    /// <summary>
+    /// Zeroes the localPending world-event slot in Dolphin RAM after the bridge has published
+    /// it to the network. The module only writes the next queued event when this slot is empty,
+    /// so clearing it is the handshake that lets the module advance without overwriting an
+    /// unconsumed event (which previously dropped red-coin collections).
+    /// </summary>
+    public bool TryClearLocalPendingWorldEvent()
+    {
+        lock (_processLock)
+        {
+            if (_processHandle == IntPtr.Zero)
+                return false;
+
+            if (!_mailbox.IsResolved && !TryResolveMailboxAddressLocked())
+                return false;
+
+            Array.Clear(_localPendingClearScratch, 0, _localPendingClearScratch.Length);
+            var address = new UIntPtr(MailboxHost.ToUInt64() + ProtocolConstants.CommWorldSyncOffset);
+            return TryWriteProcessMemoryLocked(address, _localPendingClearScratch);
         }
     }
 

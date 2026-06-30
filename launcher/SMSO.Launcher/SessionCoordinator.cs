@@ -466,6 +466,17 @@ public sealed class SessionCoordinator : IDisposable
 
         ApplyDolphinPathsFromConfig(dolphinPath);
 
+        if (!DolphinConfigService.EnsureBsmsGameIdentity(isoPath, m => Log?.Invoke(m), out _, out error))
+            return false;
+
+        if (!DolphinConfigService.EnsureBsmsGameBanner(isoPath, m => Log?.Invoke(m), out var bannerError))
+            Log?.Invoke($"Warning: {bannerError}");
+
+        if (!DolphinConfigService.EnsureBsmsGameCover(dolphinPath, m => Log?.Invoke(m), out var coverError))
+            Log?.Invoke($"Warning: {coverError}");
+
+        DolphinConfigService.ClearDolphinGameListCache(dolphinPath, m => Log?.Invoke(m));
+
         if (!DolphinConfigService.EnsureMultiplayerMemoryConfig(dolphinPath, m => Log?.Invoke(m), out error))
             return false;
 

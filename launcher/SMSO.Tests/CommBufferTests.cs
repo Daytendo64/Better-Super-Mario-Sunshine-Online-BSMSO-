@@ -26,11 +26,11 @@ public class CommBufferTests
     }
 
     [Fact]
-    public void StableRuntimeCap_FitsReservedRemoteSlots()
+    public void PlayerLimit_FitsReservedRemoteSlots()
     {
-        Assert.Equal(4, ProtocolConstants.StableMaxPlayers);
-        Assert.True(ProtocolConstants.MaxPlayers > ProtocolConstants.StableMaxPlayers);
-        Assert.True(ProtocolConstants.MaxRemoteSlots >= ProtocolConstants.StableMaxPlayers - 1);
+        Assert.Equal(10, ProtocolConstants.StableMaxPlayers);
+        Assert.Equal(ProtocolConstants.StableMaxPlayers, ProtocolConstants.MaxPlayers);
+        Assert.True(ProtocolConstants.MaxRemoteSlots >= ProtocolConstants.MaxPlayers);
     }
 
     [Fact]
@@ -156,10 +156,10 @@ public class CommBufferTests
     }
 
     [Fact]
-    public void DolphinEndian_RoundTrip_PreservesFourPlayerRemoteSlots()
+    public void DolphinEndian_RoundTrip_PreservesAllRemoteSlots()
     {
         var buf = CommBuffer.CreateDefault();
-        for (byte slot = 1; slot <= 3; slot++)
+        for (byte slot = 1; slot <= ProtocolConstants.MaxRemoteSlots - 1; slot++)
         {
             buf.RemoteSnapshots[slot] = new PlayerSnapshot
             {
@@ -194,7 +194,7 @@ public class CommBufferTests
 
         var restored = CommBufferEndian.FromDolphinBytes(CommBufferEndian.ToDolphinBytes(buf));
 
-        for (byte slot = 1; slot <= 3; slot++)
+        for (byte slot = 1; slot <= ProtocolConstants.MaxRemoteSlots - 1; slot++)
         {
             Assert.Equal(1, restored.RemoteSnapshots[slot].Connected);
             Assert.Equal(slot, restored.RemoteSnapshots[slot].Slot);

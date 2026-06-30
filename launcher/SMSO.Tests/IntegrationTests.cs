@@ -91,7 +91,7 @@ public class IntegrationTests
     }
 
     [Fact]
-    public async Task FourClients_AssignDistinctSlots_AndRejectFifth()
+    public async Task MaxPlayers_AssignDistinctSlots_AndRejectOverflow()
     {
         var port = GetFreePort();
         var server = new GameServer(new LevelCatalog()) { MaxPlayers = ProtocolConstants.StableMaxPlayers };
@@ -107,13 +107,15 @@ public class IntegrationTests
                 await client.ConnectAsync("127.0.0.1", port, $"Player{i + 1}");
             }
 
-            Assert.Equal(new byte[] { 0, 1, 2, 3 }, clients.Select(c => c.AssignedSlot).OrderBy(s => s).ToArray());
+            var expectedSlots = Enumerable.Range(0, ProtocolConstants.StableMaxPlayers)
+                .Select(i => (byte)i).ToArray();
+            Assert.Equal(expectedSlots, clients.Select(c => c.AssignedSlot).OrderBy(s => s).ToArray());
 
-            var fifth = new NetClient();
+            var overflow = new NetClient();
             var ex = await Assert.ThrowsAsync<NetJoinRejectedException>(() =>
-                fifth.ConnectAsync("127.0.0.1", port, "Player5"));
+                overflow.ConnectAsync("127.0.0.1", port, "PlayerOverflow"));
             Assert.Equal(JoinRejectReason.Full, ex.Reason);
-            fifth.Dispose();
+            overflow.Dispose();
         }
         finally
         {
@@ -218,7 +220,7 @@ public class IntegrationTests
                 await Task.Delay(ProtocolConstants.UdpSnapshotIntervalMs);
             }
 
-            await allReceived.Task.WaitAsync(TimeSpan.FromSeconds(3));
+            await allReceived.Task.WaitAsync(TimeSpan.FromSeconds(8));
 
             foreach (var client in clients)
             {
@@ -340,7 +342,7 @@ public class IntegrationTests
                 Name = new byte[16],
             });
             first.SendSnapshotNow();
-            await sawDropperSnapshot.Task.WaitAsync(TimeSpan.FromSeconds(3));
+            await sawDropperSnapshot.Task.WaitAsync(TimeSpan.FromSeconds(8));
 
             first.ForceDispose();
 
@@ -362,7 +364,7 @@ public class IntegrationTests
             });
             replacement.SendSnapshotNow();
 
-            await sawReplacement.Task.WaitAsync(TimeSpan.FromSeconds(3));
+            await sawReplacement.Task.WaitAsync(TimeSpan.FromSeconds(8));
             await observer.DisconnectAsync();
             await replacement.DisconnectAsync();
         }

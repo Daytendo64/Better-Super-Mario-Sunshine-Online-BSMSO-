@@ -560,14 +560,22 @@
                                             </Border>
                                         </StackPanel>
                                     </Grid>
-                                    <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                                    <WrapPanel Margin="0,0,0,8">
                                         <Button x:Name="StartStopTagButton" Content="Start Tag"
                                                 Style="{StaticResource SmsPrimaryButton}" Margin="0,0,8,0"
                                                 Click="StartStopTagButton_Click"/>
                                         <Button x:Name="ResetTagButton" Content="Reset Tag"
-                                                Style="{StaticResource SmsSecondaryButton}"
+                                                Style="{StaticResource SmsSecondaryButton}" Margin="0,0,8,0"
                                                 Click="ResetTagButton_Click"/>
-                                    </StackPanel>
+                                        <Button x:Name="RandomTagButton" Content="Random Tagger"
+                                                Style="{StaticResource SmsPrimaryButton}" Margin="0,0,8,0"
+                                                Click="RandomTagButton_Click"
+                                                ToolTip="Pick a random connected player as the seeker (never the same one twice in a row)."/>
+                                        <Button x:Name="RandomLevelButton" Content="Random Level"
+                                                Style="{StaticResource SmsDangerButton}"
+                                                Click="RandomLevelButton_Click"
+                                                ToolTip="Warp everyone to a random level (per-course episode override, never the same level within 3 rounds)."/>
+                                    </WrapPanel>
                                     <TextBlock x:Name="HideSeekStatusText" Style="{StaticResource SmsHintText}" TextWrapping="Wrap"/>
                                 </StackPanel>
                             </StackPanel>

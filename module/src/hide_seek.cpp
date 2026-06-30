@@ -224,7 +224,7 @@ static void playTagStartSound(TMario *mario) {
 }
 
 static bool tryGetHideSeekSlotWorldPos(const CommBuffer *buf, u8 slot, Vec &out) {
-    if (!buf || slot >= 4)
+    if (!buf || slot >= MAX_PLAYERS)
         return false;
 
     if (slot == buf->localSlot) {
@@ -640,7 +640,7 @@ static bool isLocalSlotSeeker(const CommBuffer *buf) {
     if (gm.localRole == HSR_SEEKER)
         return true;
 
-    return buf->localSlot < 4 && gm.roleBySlot[buf->localSlot] == HSR_SEEKER;
+    return buf->localSlot < MAX_PLAYERS && gm.roleBySlot[buf->localSlot] == HSR_SEEKER;
 }
 
 static void bindModelToHeadBone(J3DModel *model, Mtx *jointMtx) {
@@ -1154,7 +1154,7 @@ bool shouldDrawHideSeekNameTag(u8 remoteSlot) {
     if (buf->gameModeState.mode != GM_HIDE_SEEK)
         return true;
 
-    if (remoteSlot >= 4)
+    if (remoteSlot >= MAX_PLAYERS)
         return true;
 
     if (buf->gameModeState.localRole == HSR_HIDER)
@@ -1165,7 +1165,7 @@ bool shouldDrawHideSeekNameTag(u8 remoteSlot) {
 
 bool isHideSeekSeekerSlot(u8 slot) {
     const CommBuffer *buf = getCommBuffer();
-    if (buf->gameModeState.mode != GM_HIDE_SEEK || slot >= 4)
+    if (buf->gameModeState.mode != GM_HIDE_SEEK || slot >= MAX_PLAYERS)
         return false;
     return buf->gameModeState.roleBySlot[slot] == HSR_SEEKER;
 }
