@@ -914,6 +914,7 @@ public sealed class SessionCoordinator : IDisposable
         if (stageChanged)
             FlushPendingEpisodeWorldEvents(snap.StageId, snap.EpisodeId);
         SendLocalSnapshot(snap);
+        _bridgeWorker.FlushRemoteSnapshotsToDolphin();
     }
 
     private void OnLocalMarioVoice(MarioVoiceEvent voiceEvent)

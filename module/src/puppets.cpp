@@ -1,5 +1,5 @@
 #include "puppets.hpp"
-#include "comm_buffer.hpp"
+#include "blooper_surf_sync.hpp"
 #include "hide_seek.hpp"
 #include "stage_guard.hpp"
 #include "yoshi_sync.hpp"
@@ -142,16 +142,6 @@ static f32 readFluddSwitchSpeed(TWaterGun *fludd) {
 
 static f32 readFluddDeploy(TWaterGun *fludd) {
     return *reinterpret_cast<f32 *>(reinterpret_cast<u8 *>(fludd) + kFluddDeployOffset);
-}
-
-static bool isLocalBlooperSurf(const TMario *mario) {
-    if (!mario)
-        return false;
-    const u32 state = mario->mState;
-    if ((state & 0x10000u) == 0)
-        return false;
-    const u32 id = state & 0x1FFu;
-    return id == 0x046u || id == 0x09Au;
 }
 
 static s16 readHostGunAngle(TMario *mario) {
@@ -462,7 +452,7 @@ void exportLocalPlayer(TMario *mario, TMarDirector *director) {
             }
         }
     }
-    const bool blooperSurf = isLocalBlooperSurf(mario);
+    const bool blooperSurf = smso::isLocalBlooperSurf(mario);
     const bool waistPack = !yCam && (mario->mAnimationID == 0x48 || mario->mAnimationID == 0x72 ||
                                      mario->mAnimationID == 0x6D || blooperSurf);
     const bool running = waistPack && (mario->mAnimationID == 0x48 || mario->mAnimationID == 0x72);
@@ -491,10 +481,12 @@ void exportLocalPlayer(TMario *mario, TMarDirector *director) {
         snap.water = encodeSprayPressure(sprayPressure);
     else if (drySpray)
         snap.water = 0;
-    else if (isLocalBlooperSurf(mario))
-        snap.water = mario->mSurfGessoID & 0x03u;
+    else if (smso::isLocalBlooperSurf(mario))
+        snap.water = smso::exportBlooperSurfWaterByte(mario);
     else
         snap.water = tankEnc;
+
+    smso::exportBlooperSurfSnapshotFields(mario, snap);
 
     if (waistPack) {
         const u8 rollEnc = encodeSnapshotAngle6(static_cast<s16>(mario->_3D8));

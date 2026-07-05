@@ -1,4 +1,5 @@
 #include "remote_actor.hpp"
+#include "blooper_surf_sync.hpp"
 #include "remote_mario_audio.hpp"
 #include "world_sync.hpp"
 #include "comm_buffer.hpp"
@@ -8,9 +9,12 @@
 #include "voice_sync.hpp"
 #include "yoshi_sync.hpp"
 
+class JKRHeap;
+
 #ifdef SMSO_REMOTE_ENEMY_MARIO
 
 #include <BetterSMS/libs/constmath.hxx>
+#include <BetterSMS/module.hxx>
 #include <BetterSMS/player.hxx>
 #include <BetterSMS/settings.hxx>
 #include <Dolphin/MTX.h>
@@ -122,81 +126,9 @@ constexpr u8 kRemoteDismissInvalidStreak = 3;
 
 // doldecomp MarioStatus.hpp status type+id mask (low 9 bits of mState).
 constexpr u32 kStatusTypeAndIdMask = 0x1FFu;
-constexpr u32 kStatusIdSurf = 0x046u;
-constexpr u32 kStatusIdSurfJump = 0x09Au;
-// doldecomp MarioStatus.hpp — blooper surf draw + lean (calcBaseMtx / calcAnim / calcView).
-constexpr u32 kMarioStatusFlagSurfDraw = 0x10000u;
-constexpr u32 kMapObjManagerRedGessoOffset = 0x9Cu;
-constexpr u32 kMapObjManagerYellowGessoOffset = 0xA0u;
-constexpr u32 kMapObjManagerGreenGessoOffset = 0xA4u;
 
 static u32 remoteStatusId(u32 state) {
     return state & kStatusTypeAndIdMask;
-}
-
-// doldecomp MARIO_STATUS_SURF (0x810446) and jump-off substate (0x281089A).
-static bool isBlooperSurfState(u32 state) {
-    if ((state & kMarioStatusFlagSurfDraw) == 0)
-        return false;
-    const u32 id = remoteStatusId(state);
-    return id == kStatusIdSurf || id == kStatusIdSurfJump;
-}
-
-static void *resolveSurfGessoTemplate(u8 gessoType) {
-    if (!gpMapObjManager)
-        return nullptr;
-
-    const u8 *mgr = reinterpret_cast<const u8 *>(gpMapObjManager);
-    switch (gessoType) {
-    default:
-    case 0:
-        return *reinterpret_cast<void *const *>(mgr + kMapObjManagerRedGessoOffset);
-    case 1:
-        return *reinterpret_cast<void *const *>(mgr + kMapObjManagerYellowGessoOffset);
-    case 2:
-        return *reinterpret_cast<void *const *>(mgr + kMapObjManagerGreenGessoOffset);
-    }
-}
-
-// doldecomp M3DUtil/MActor.hpp — only fields needed to mirror Mario base mtx onto the surf mesh.
-struct RemoteSurfGessoActor {
-    void *anmData;
-    J3DModel *model;
-};
-
-using RemoteSurfGessoSetBckFn = void (*)(void *, const char *);
-using RemoteSurfGessoSetFrameRateFn = void (*)(void *, f32, int);
-using RemoteSurfGessoPerformFn = void (*)(void *, u32, JDrama::TGraphics *);
-
-static RemoteSurfGessoSetBckFn sSurfGessoSetBck =
-    reinterpret_cast<RemoteSurfGessoSetBckFn>(SMS_PORT_REGION(0x80238E40, 0, 0, 0));
-static RemoteSurfGessoSetFrameRateFn sSurfGessoSetFrameRate =
-    reinterpret_cast<RemoteSurfGessoSetFrameRateFn>(SMS_PORT_REGION(0x80238E7C, 0, 0, 0));
-static RemoteSurfGessoPerformFn sSurfGessoPerform =
-    reinterpret_cast<RemoteSurfGessoPerformFn>(SMS_PORT_REGION(0x802391BC, 0, 0, 0));
-
-// doldecomp M3DUtil/MActor.hpp — retail object size; each remote slot owns its own clone.
-constexpr size_t kRemoteSurfGessoActorSize = 0x48u;
-constexpr u8 kSurfGessoCloneTypeNone = 0xFFu;
-
-using RemoteSurfGessoActorCtorFn = void (*)(void *, void *);
-using RemoteSurfGessoActorSetModelFn = void (*)(void *, J3DModel *, u32);
-using RemoteSurfGessoModelDtorFn = void (*)(J3DModel *);
-
-static RemoteSurfGessoActorCtorFn sSurfGessoActorCtor =
-    reinterpret_cast<RemoteSurfGessoActorCtorFn>(SMS_PORT_REGION(0x8023A408, 0x80232194, 0, 0));
-static RemoteSurfGessoActorSetModelFn sSurfGessoActorSetModel =
-    reinterpret_cast<RemoteSurfGessoActorSetModelFn>(
-        SMS_PORT_REGION(0x8023A110, 0x80231E9C, 0, 0));
-static RemoteSurfGessoModelDtorFn sSurfGessoModelDtor =
-    reinterpret_cast<RemoteSurfGessoModelDtorFn>(SMS_PORT_REGION(0x802DDEA0, 0x802D6048, 0, 0));
-
-static void syncSurfGessoBaseMtx(TMario *mario, void *gesso) {
-    auto *actor = reinterpret_cast<RemoteSurfGessoActor *>(gesso);
-    if (!actor || !actor->model || !mario->mModelData || !mario->mModelData->mModel)
-        return;
-
-    MTXCopy(mario->mModelData->mModel->mBaseMtx, actor->model->mBaseMtx);
 }
 
 struct RemoteActorSlot;
@@ -204,46 +136,9 @@ struct RemoteActorSlot;
 static void syncRemoteNozzleGunAngle(TMario *mario, s16 pitch);
 
 static bool ensureRemoteActorHeap();
-static void releaseRemoteSurfGessoClone(RemoteActorSlot &slot);
-static void *createRemoteSurfGessoClone(u8 gessoType, J3DModel **outModel);
-static void *ensureRemoteSurfGessoClone(RemoteActorSlot &slot, u8 gessoType);
-
-// doldecomp TMario::getGesso — remotes cannot share the stage MActor template when
-// multiple players surf the same blooper color; each slot keeps its own MActor+model.
-static void bindRemoteSurfGesso(TMario *body, RemoteActorSlot *slot, u8 gessoType, bool active) {
-    if (!body)
-        return;
-
-    if (!active) {
-        if (slot)
-            releaseRemoteSurfGessoClone(*slot);
-        body->mSurfGesso = nullptr;
-        body->mSurfGessoID = 0;
-        return;
-    }
-
-    void *gesso = nullptr;
-    if (slot)
-        gesso = ensureRemoteSurfGessoClone(*slot, gessoType);
-    else
-        gesso = resolveSurfGessoTemplate(gessoType);
-    if (!gesso) {
-        body->mSurfGesso = nullptr;
-        body->mSurfGessoID = 0;
-        return;
-    }
-
-    body->mSurfGessoID = gessoType;
-    body->mSurfGesso = gesso;
-
-    if (!slot) {
-        sSurfGessoSetBck(gesso, "surfgeso_run1");
-        sSurfGessoSetFrameRate(gesso, 0.5f, 0);
-    }
-}
 
 static u32 stripSurfDrawFlag(u32 state) {
-    return state & ~kMarioStatusFlagSurfDraw;
+    return state & ~smso::kBlooperSurfDrawFlag;
 }
 
 static bool remoteMarioInWater(const TMario *mario) {
@@ -255,7 +150,7 @@ static bool remoteMarioInWater(const TMario *mario) {
         return true;
     if (mario->mAttributes.mIsWater || mario->mAttributes.mIsShallowWater)
         return true;
-    return remoteStatusId(mario->mState) == kStatusIdSurf;
+    return smso::isBlooperSurfState(mario->mState);
 }
 
 // Deep-water swimming (surface paddle + dive). STATE_WATERBORN (0x2000) is the
@@ -267,7 +162,7 @@ static bool isRemoteSwimming(const TMario *mario) {
         return false;
     if ((mario->mState & TMario::STATE_WATERBORN) == 0)
         return false;
-    if (isBlooperSurfState(mario->mState))
+    if (smso::isBlooperSurfState(mario->mState))
         return false;
     return true;
 }
@@ -315,8 +210,12 @@ constexpr u16 kStageAppearHideFrames = 0xB4u;
 constexpr u16 kWarpInAppearHideFrames = 190u;
 constexpr u8 kShirtShapeIndex = 10u;
 constexpr s16 kSpinYawStepPerFrame = 4096; // retail rotating()/rotateJumping() use mStatusTimer * 0x1000
-constexpr f32 kRemoteAnimResyncBehindFrames = 0.75f;
-constexpr f32 kRemoteAnimResyncAheadFrames = 2.5f;
+constexpr f32 kRemoteMotionSnapDistance = 4.0f;
+constexpr f32 kRemotePositionBlendRate = 24.0f;
+constexpr f32 kRemoteVelocityBlendRate = 20.0f;
+constexpr f32 kRemoteRotationBlendRate = 30.0f;
+constexpr f32 kRemoteAnimResyncBehindFrames = 1.25f;
+constexpr f32 kRemoteAnimResyncAheadFrames = 4.0f;
 constexpr f32 kRemoteAnimLoopSpanFrames = 256.0f;
 constexpr f32 kRemoteAnimLoopSnapFrames = 8.0f;
 constexpr u16 kAnimHipAttack = 0x3D;
@@ -326,7 +225,6 @@ constexpr u32 kStatusRotateR = 0x00000442u;
 constexpr u32 kInvalidTrackState = 0xFFFFFFFFu;
 constexpr u16 kAnimRun1 = 0x48;
 constexpr u16 kAnimRun2 = 0x72;
-constexpr u16 kAnimRideShell = 0x6D;
 constexpr u16 kCapModelHat = 1;
 // doldecomp calcBaseMtx dereferences mHolder when this flag is set (tree / bar climb).
 constexpr u32 kHolderDependentStateFlag = 0x100000;
@@ -440,10 +338,7 @@ struct RemoteActorSlot {
     u8 lastMovementState;
     u8 fluddSecondNozzle;
     u16 vfxFlags;
-    u8 surfGessoType;
-    void *surfGessoCloneActor;
-    J3DModel *surfGessoCloneModel;
-    u8 surfGessoCloneType;
+    BlooperSurfSlot surf;
     u8 lastHealth;
     u16 lastVfxFlags;
     u32 lastState;
@@ -468,6 +363,13 @@ struct RemoteActorSlot {
     u8 invalidSnapshotStreak;
     f32 remoteSprayPressure;
     bool inWarpTransition;
+    Vec3 targetPos;
+    Vec3 targetVel;
+    Vec3 displayPos;
+    Vec3 displayVel;
+    f32 targetRotY;
+    f32 displayRotY;
+    bool displayMotionInit;
     RemoteYoshiSlot yoshi;
 };
 
@@ -608,13 +510,13 @@ static bool snapshotPacksGunAngle(u16 vfxFlags) {
 static bool snapshotPacksWaistPitch(u16 vfxFlags, u16 animId) {
     if (vfxFlags & VFX_Y_CAM)
         return false;
-    return animId == kAnimRun1 || animId == kAnimRun2 || animId == kAnimRideShell;
+    return animId == kAnimRun1 || animId == kAnimRun2 || animId == smso::kBlooperSurfRideShellAnim;
 }
 
 static bool snapshotPacksWaistPitchForState(u16 vfxFlags, u16 animId, u32 state) {
     if (snapshotPacksWaistPitch(vfxFlags, animId))
         return true;
-    return isBlooperSurfState(state);
+    return smso::isBlooperSurfState(state);
 }
 
 static bool isRemoteBody(const TMario *mario) {
@@ -886,6 +788,10 @@ static void syncRemoteAnimation(TMario *body, RemoteActorSlot *slot, const Playe
     u16 animId = snap.animId;
     if (snapshotHostOnYoshi(snap.nozzleId, snap.vfxFlags) && !remoteBodyRidingYoshi(body))
         animId = TMario::ANIMATION_IDLE;
+    else if (smso::snapshotIsBlooperSurfing(snap) &&
+             smso::isBlooperSurfRideState(smso::snapshotMarioState(snap)) &&
+             animId != smso::kBlooperSurfRideShellAnim)
+        animId = smso::kBlooperSurfRideShellAnim;
 
     if (animChanged || animId != body->mAnimationID)
         body->setAnimation(animId, rate);
@@ -922,7 +828,7 @@ static void syncRemoteAnimation(TMario *body, RemoteActorSlot *slot, const Playe
         slot->syncUpperFrame = 0.0f;
     }
 
-    if ((yCam || pumpUpper) && !isBlooperSurfState(body->mState) &&
+    if ((yCam || pumpUpper) && !smso::isBlooperSurfState(body->mState) &&
         !snapshotHostOnYoshi(snap.nozzleId, snap.vfxFlags)) {
         // Y-cam and pump/hold drive the upper (FLUDD pump) BCK authoritatively.
         // The host packs the upper BCK frame into snap.water EXCEPT while spraying —
@@ -1030,7 +936,7 @@ static u32 sanitizeRemoteState(u32 state) {
     case 0x239u: // STATE_FIRE_RVR
     case 0x8B8u: // STATE_THROWN
         state = (state & ~0x1FFu) | (TMario::STATE_IDLE & 0x1FFu);
-        state &= ~kMarioStatusFlagSurfDraw;
+        state &= ~smso::kBlooperSurfDrawFlag;
         break;
     default:
         break;
@@ -1099,6 +1005,77 @@ static void ensureCapOnHead(TMario *mario) {
 
 static s16 resolveSnapshotYaw(const PlayerSnapshot &snap) {
     return static_cast<s16>(snap.rotationY);
+}
+
+static f32 remoteMotionDeltaTime() {
+    const f32 fps = BetterSMS::getFrameRate();
+    return fps > 1.0f ? (1.0f / fps) : (1.0f / 60.0f);
+}
+
+static f32 expDecayAlpha(f32 rate, f32 dt) {
+    return 1.0f - expf(-rate * dt);
+}
+
+static f32 lerpAngleShortest(f32 from, f32 to, f32 t) {
+    f32 delta = to - from;
+    while (delta > 32768.0f)
+        delta -= 65536.0f;
+    while (delta < -32768.0f)
+        delta += 65536.0f;
+    return from + delta * t;
+}
+
+static void hardSnapRemoteDisplayMotion(RemoteActorSlot &slot, const Vec3 &pos, const Vec3 &vel,
+                                        f32 rotY) {
+    slot.targetPos = pos;
+    slot.targetVel = vel;
+    slot.targetRotY = rotY;
+    slot.displayPos = pos;
+    slot.displayVel = vel;
+    slot.displayRotY = rotY;
+    slot.displayMotionInit = true;
+}
+
+static void advanceRemoteDisplayMotion(RemoteActorSlot &slot, TMario *body) {
+    if (!body)
+        return;
+
+    if (!slot.displayMotionInit) {
+        hardSnapRemoteDisplayMotion(slot, slot.targetPos, slot.targetVel, slot.targetRotY);
+        body->mTranslation.x = slot.displayPos.x;
+        body->mTranslation.y = slot.displayPos.y;
+        body->mTranslation.z = slot.displayPos.z;
+        body->mSpeed.x = slot.displayVel.x;
+        body->mSpeed.y = slot.displayVel.y;
+        body->mSpeed.z = slot.displayVel.z;
+        body->mForwardSpeed =
+            sqrtf(slot.displayVel.x * slot.displayVel.x + slot.displayVel.z * slot.displayVel.z);
+        return;
+    }
+
+    const f32 dt = remoteMotionDeltaTime();
+    const f32 posAlpha = expDecayAlpha(kRemotePositionBlendRate, dt);
+    const f32 velAlpha = expDecayAlpha(kRemoteVelocityBlendRate, dt);
+    const f32 rotAlpha = expDecayAlpha(kRemoteRotationBlendRate, dt);
+
+    slot.displayPos.x += (slot.targetPos.x - slot.displayPos.x) * posAlpha;
+    slot.displayPos.y += (slot.targetPos.y - slot.displayPos.y) * posAlpha;
+    slot.displayPos.z += (slot.targetPos.z - slot.displayPos.z) * posAlpha;
+
+    slot.displayVel.x += (slot.targetVel.x - slot.displayVel.x) * velAlpha;
+    slot.displayVel.y += (slot.targetVel.y - slot.displayVel.y) * velAlpha;
+    slot.displayVel.z += (slot.targetVel.z - slot.displayVel.z) * velAlpha;
+
+    slot.displayRotY = lerpAngleShortest(slot.displayRotY, slot.targetRotY, rotAlpha);
+
+    body->mTranslation.x = slot.displayPos.x;
+    body->mTranslation.y = slot.displayPos.y;
+    body->mTranslation.z = slot.displayPos.z;
+    body->mSpeed.x = slot.displayVel.x;
+    body->mSpeed.y = slot.displayVel.y;
+    body->mSpeed.z = slot.displayVel.z;
+    body->mForwardSpeed =
+        sqrtf(slot.displayVel.x * slot.displayVel.x + slot.displayVel.z * slot.displayVel.z);
 }
 
 static s16 decodeYCamPitch(u16 vfxFlags) {
@@ -1313,7 +1290,7 @@ static int RemoteWaistCtrl(J3DNode *node, int stage) {
     }
 
     const u16 anim = mario->mAnimationID;
-    if ((anim == kAnimRun1 || anim == kAnimRun2 || anim == kAnimRideShell) &&
+    if ((anim == kAnimRun1 || anim == kAnimRun2 || anim == smso::kBlooperSurfRideShellAnim) &&
         !mario->mAttributes.mIsFluddEmitting) {
         const s16 roll = static_cast<s16>(mario->_3D8);
         const s16 pitch = static_cast<s16>(mario->_3DC);
@@ -1370,8 +1347,8 @@ static void applySyncedHeadWaist(TMario *mario, const RemoteActorSlot *slot) {
         return;
     }
 
-    if (isRunningAnim(mario) || mario->mAnimationID == kAnimRideShell ||
-        isBlooperSurfState(mario->mState)) {
+    if (isRunningAnim(mario) || mario->mAnimationID == smso::kBlooperSurfRideShellAnim ||
+        smso::isBlooperSurfState(mario->mState)) {
         mario->_3DC = slot->syncWaistPitch;
         mario->_3D8 = slot->syncWaistRoll;
     }
@@ -1414,12 +1391,8 @@ static void remoteCalcAnim(TMario *mario, RemoteActorSlot *slot, JDrama::TGraphi
     applyRemoteRunHandBlend(mario);
     remoteBindHandsAndCap(mario, graphics, slot && slot->hideSeekSeekerLook);
 
-    // doldecomp TMario::calcAnim — ride_shell blooper mesh follows Mario base mtx.
-    if (slot && (slot->vfxFlags & VFX_DEAD) == 0 && isBlooperSurfState(mario->mState) &&
-        mario->mSurfGesso && mario->mModelData && mario->mModelData->mModel) {
-        syncSurfGessoBaseMtx(mario, mario->mSurfGesso);
-        sSurfGessoPerform(mario->mSurfGesso, 2, graphics);
-    }
+    if (slot && (slot->vfxFlags & VFX_DEAD) == 0)
+        smso::updateRemoteBlooperSurfFrame(mario, &slot->surf, graphics);
 
     calcRemoteYoshiAnim(mario, slot ? &slot->yoshi : nullptr);
 }
@@ -1748,10 +1721,6 @@ static bool isDrySlideState(u32 state, u16 vfxFlags) {
     }
 }
 
-static bool isWaterSurfaceRun(u32 state) {
-    return remoteStatusId(state) == kStatusIdSurf;
-}
-
 static bool isTurnState(u32 state) {
     const u32 id = remoteStatusId(state);
     return id == kStatusIdTurnMid || id == kStatusIdTurnEnd;
@@ -1813,6 +1782,7 @@ static void emitRemoteSurfVfx(TMario *body, const RemoteActorSlot *slot) {
     if (slot && (slot->vfxFlags & VFX_DEAD) != 0)
         return;
 
+    body->mWaterHeight = body->mTranslation.y;
     body->surfingEffect();
 }
 
@@ -1886,7 +1856,7 @@ static void syncRemoteContinuousParticles(TMario *body, RemoteActorSlot *slot) {
     }
 
     if (turboDashActive && remoteMarioInWater(body)) {
-        if (isWaterSurfaceRun(state))
+        if (smso::remoteBlooperSurfUsesVfx(state))
             emitRemoteSurfVfx(body, slot);
         else if ((vfxFlags & VFX_WET_SLIDE) != 0)
             emitRemoteWetSlideVfx(body);
@@ -1900,7 +1870,7 @@ static void syncRemoteContinuousParticles(TMario *body, RemoteActorSlot *slot) {
         emitRemoteDrySlideVfx(body);
     } else if (isWetSlideState(state, vfxFlags) && !turboDashActive) {
         emitRemoteWetSlideVfx(body);
-    } else if (isWaterSurfaceRun(state) && !turboDashActive) {
+    } else if (smso::remoteBlooperSurfUsesVfx(state) && !turboDashActive) {
         emitRemoteSurfVfx(body, slot);
     } else if (swimming && !turboDashActive) {
         emitRemoteSwimVfx(body, slot);
@@ -2613,8 +2583,7 @@ static void resetRemoteRuntimeState(RemoteActorSlot &slot, bool stageAppear) {
     slot.lastMovementState = 0xFF;
     slot.fluddSecondNozzle = 0;
     slot.vfxFlags = 0;
-    slot.surfGessoType = 0;
-    releaseRemoteSurfGessoClone(slot);
+    smso::resetBlooperSurfSlot(slot.surf);
     slot.lastHealth = 0xFF;
     slot.lastVfxFlags = 0xFFFF;
     slot.lastState = kInvalidTrackState;
@@ -2642,6 +2611,7 @@ static void resetRemoteRuntimeState(RemoteActorSlot &slot, bool stageAppear) {
     slot.hideSeekSeekerLook = false;
     slot.hideSeekSeekerLookWas = false;
     slot.inWarpTransition = false;
+    slot.displayMotionInit = false;
     slot.yoshi = {};
 }
 
@@ -3141,97 +3111,6 @@ static TMario *spawnRemoteBody() {
     return body;
 }
 
-static void releaseRemoteSurfGessoClone(RemoteActorSlot &slot) {
-    if (!slot.surfGessoCloneActor && !slot.surfGessoCloneModel) {
-        slot.surfGessoCloneType = kSurfGessoCloneTypeNone;
-        return;
-    }
-
-    if (gRemoteActorHeap) {
-        JKRHeap *previousHeap = JKRHeap::sCurrentHeap;
-        gRemoteActorHeap->becomeCurrentHeap();
-
-        if (slot.surfGessoCloneModel) {
-            sSurfGessoModelDtor(slot.surfGessoCloneModel);
-            operator delete(slot.surfGessoCloneModel);
-        }
-        if (slot.surfGessoCloneActor)
-            operator delete(slot.surfGessoCloneActor);
-
-        if (previousHeap)
-            previousHeap->becomeCurrentHeap();
-    }
-
-    slot.surfGessoCloneActor = nullptr;
-    slot.surfGessoCloneModel = nullptr;
-    slot.surfGessoCloneType = kSurfGessoCloneTypeNone;
-}
-
-static void *createRemoteSurfGessoClone(u8 gessoType, J3DModel **outModel) {
-    if (outModel)
-        *outModel = nullptr;
-
-    void *templateActor = resolveSurfGessoTemplate(gessoType);
-    if (!templateActor)
-        return nullptr;
-
-    auto *templateSurf = reinterpret_cast<RemoteSurfGessoActor *>(templateActor);
-    if (!templateSurf->anmData || !templateSurf->model || !templateSurf->model->mModelData)
-        return nullptr;
-
-    if (!gRemoteActorHeap && !ensureRemoteActorHeap())
-        return nullptr;
-    if (!gRemoteActorHeap)
-        return nullptr;
-
-    JKRHeap *previousHeap = JKRHeap::sCurrentHeap;
-    gRemoteActorHeap->becomeCurrentHeap();
-
-    J3DModel *model =
-        new (gRemoteActorHeap, 4) J3DModel(templateSurf->model->mModelData, 0, 0);
-    void *actorMem = operator new(kRemoteSurfGessoActorSize, gRemoteActorHeap, 4);
-    if (!model || !actorMem) {
-        if (model) {
-            sSurfGessoModelDtor(model);
-            operator delete(model);
-        }
-        if (actorMem)
-            operator delete(actorMem);
-        if (previousHeap)
-            previousHeap->becomeCurrentHeap();
-        return nullptr;
-    }
-
-    sSurfGessoActorCtor(actorMem, templateSurf->anmData);
-    sSurfGessoActorSetModel(actorMem, model, 0);
-    sSurfGessoSetBck(actorMem, "surfgeso_run1");
-    sSurfGessoSetFrameRate(actorMem, 0.5f, 0);
-
-    if (previousHeap)
-        previousHeap->becomeCurrentHeap();
-
-    if (outModel)
-        *outModel = model;
-    return actorMem;
-}
-
-static void *ensureRemoteSurfGessoClone(RemoteActorSlot &slot, u8 gessoType) {
-    if (slot.surfGessoCloneActor && slot.surfGessoCloneType == gessoType)
-        return slot.surfGessoCloneActor;
-
-    releaseRemoteSurfGessoClone(slot);
-
-    J3DModel *model = nullptr;
-    void *actor = createRemoteSurfGessoClone(gessoType, &model);
-    if (!actor)
-        return nullptr;
-
-    slot.surfGessoCloneActor = actor;
-    slot.surfGessoCloneModel = model;
-    slot.surfGessoCloneType = gessoType;
-    return actor;
-}
-
 // Park an idle pool body well outside any playfield and hide it, so a reused
 // body can never flash at a stale position for a frame before its first
 // snapshot lands.
@@ -3383,13 +3262,17 @@ static void applySnapshotToBody(RemoteActorSlot &slot, const PlayerSnapshot &sna
     const bool incomingWarp = isRemoteWarpTransitionState(rawState);
 
     if (!incomingWarp) {
-        body->mTranslation.x = snap.position.x;
-        body->mTranslation.y = snap.position.y;
-        body->mTranslation.z = snap.position.z;
-        body->mSpeed.x = snap.velocity.x;
-        body->mSpeed.y = snap.velocity.y;
-        body->mSpeed.z = snap.velocity.z;
-        body->mForwardSpeed = sqrtf(snap.velocity.x * snap.velocity.x + snap.velocity.z * snap.velocity.z);
+        slot.targetPos = snap.position;
+        slot.targetVel = snap.velocity;
+        slot.targetRotY = snap.rotationY;
+
+        const f32 dx = snap.position.x - slot.displayPos.x;
+        const f32 dy = snap.position.y - slot.displayPos.y;
+        const f32 dz = snap.position.z - slot.displayPos.z;
+        const f32 dist = sqrtf(dx * dx + dy * dy + dz * dz);
+        if (!slot.displayMotionInit || dist > kRemoteMotionSnapDistance)
+            hardSnapRemoteDisplayMotion(slot, snap.position, snap.velocity, snap.rotationY);
+
         slot.inWarpTransition = false;
         if (slot.appearRevealFrames == 0 && isRemoteBodyDrawVisible(&slot))
             setBodyVisible(body, true);
@@ -3426,15 +3309,8 @@ static void applySnapshotToBody(RemoteActorSlot &slot, const PlayerSnapshot &sna
     applyRemoteFacing(body, slot.yaw, snap.animId, body->mState, &slot);
 
     const bool isDead = (snap.vfxFlags & VFX_DEAD) != 0;
-    const bool surfing = !isDead && isBlooperSurfState(rawState);
-
-    if (surfing) {
-        slot.surfGessoType = static_cast<u8>(snap.water & 0x03u);
-        bindRemoteSurfGesso(body, &slot, slot.surfGessoType, true);
-    } else if (slot.surfGessoType != 0 || body->mSurfGesso || isDead) {
-        slot.surfGessoType = 0;
-        bindRemoteSurfGesso(body, &slot, 0, false);
-    }
+    smso::applyRemoteBlooperSurfSnapshot(body, slot.surf, snap);
+    const bool surfing = !isDead && smso::snapshotIsBlooperSurfing(snap);
 
     applyRemoteCosmetics(body, snap.slot);
     if (!isHideSeekActive())
@@ -3639,7 +3515,7 @@ static int TMario_perform_remote(TMario *mario, u32 flags, JDrama::TGraphics *gr
     bool strippedSurfDraw = false;
     // Remote mSurfGesso is an MActor mesh clone, not a live TSurfGesso. Retail calcView /
     // entryModels would dispatch TSurfGesso::perform through the wrong vtable and crash.
-    if (isBlooperSurfState(mario->mState)) {
+    if (smso::isBlooperSurfState(mario->mState)) {
         savedSurfState = mario->mState;
         mario->mState = stripSurfDrawFlag(savedSurfState);
         strippedSurfDraw = true;
@@ -3750,6 +3626,7 @@ SMS_WRITE_32(SMS_PORT_REGION(0x803dd6AC, 0x803d4e8C, 0, 0),
 namespace smso {
 
 void initRemoteActors() {
+    initBlooperSurfSync();
     gPlayerGroup = nullptr;
     gRemotePerformGroupRegistered = false;
     gRemotePerformDrawDiag = 0;
@@ -3861,6 +3738,9 @@ void updateRemoteActors(TMarDirector *director) {
 
         applySnapshotToBody(slot, snap);
 
+        if (!slot.inWarpTransition)
+            advanceRemoteDisplayMotion(slot, slot.body);
+
         if (slot.appearRevealFrames == 0 && !slot.pendingStageAppear && !slot.pendingWarpInVfx)
             setBodyVisible(slot.body, true);
         else
@@ -3960,6 +3840,14 @@ bool getRemoteHeadAnchorPosition(u8 slot, f32 &x, f32 &y, f32 &z) {
     return true;
 }
 
+JKRHeap *borrowRemoteActorHeap() {
+    if (!gRemoteHeapReserved) {
+        gRemoteHeapReserved = true;
+        ensureRemoteActorHeap();
+    }
+    return gRemoteActorHeap;
+}
+
 } // namespace smso
 
 #else
@@ -3994,6 +3882,10 @@ bool getRemoteHeadAnchorPosition(u8 slot, f32 &x, f32 &y, f32 &z) {
     (void)y;
     (void)z;
     return false;
+}
+
+JKRHeap *borrowRemoteActorHeap() {
+    return nullptr;
 }
 
 } // namespace smso

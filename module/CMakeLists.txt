@@ -24,6 +24,7 @@ set(SMSO_SOURCES
     src/remote_mario_audio.cpp
     src/voice_sync.cpp
     src/remote_water_sync.cpp
+    src/blooper_surf_sync.cpp
     src/hide_seek.cpp
     src/stage_guard.cpp
     src/cutscene_skip.cpp

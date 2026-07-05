@@ -232,6 +232,7 @@ static void printLayer(int x, int y, int fontSize, const char *text, JUtility::T
     printer.private_initiate(gpSystemFont, 1, kJ2DPrintDefaultLeading, topColor, bottom);
     printer.initiate();
     printer.setFontSize(fontSize, fontSize);
+    printer.syncCharMetrics();
     printer.print(x, y, "%s", text);
 }
 
@@ -282,6 +283,7 @@ static int measureTextWidth(int fontSize, const char *text) {
     measure.private_initiate(gpSystemFont, 1, kJ2DPrintDefaultLeading, white, white);
     measure.initiate();
     measure.setFontSize(fontSize, fontSize);
+    measure.syncCharMetrics();
 
     f32 width = measure.getWidth("%s", text);
     const int baseFontWidth = gpSystemFont->getWidth();

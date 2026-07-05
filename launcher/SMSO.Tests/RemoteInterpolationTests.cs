@@ -115,6 +115,31 @@ public class RemoteInterpolationTests
         Assert.Equal(1.0f, RemoteInterpolation.DecodeAnimRate((ushort)(64 | (200 << 8))));
     }
 
+    [Fact]
+    public void Advance_HermiteBlendsVelocityBetweenPackets()
+    {
+        var interp = new RemoteInterpolation();
+
+        var first = MakeSnapshot(animId: 0x48, animFrame: 0);
+        first.Position = new Vec3 { X = 0f, Y = 0f, Z = 0f };
+        first.Velocity = new Vec3 { X = 10f, Y = 0f, Z = 0f };
+
+        interp.PushPacket(1, first);
+        Thread.Sleep(20);
+
+        var second = MakeSnapshot(animId: 0x48, animFrame: 256);
+        second.Position = new Vec3 { X = 1f, Y = 0f, Z = 0f };
+        second.Velocity = new Vec3 { X = 10f, Y = 0f, Z = 0f };
+
+        interp.PushPacket(1, second);
+        // Render delay is 33 ms; wait long enough that render time lands mid-span.
+        Thread.Sleep(25);
+
+        var display = interp.Advance(1);
+        Assert.InRange(display.Position.X, 0.1f, 1.0f);
+        Assert.NotEqual(0f, display.Position.X);
+    }
+
     private static PlayerSnapshot MakeSnapshot(ushort animId, ushort animFrame, ushort pingMs = 64)
     {
         return new PlayerSnapshot

@@ -722,3 +722,60 @@ public sealed class HideSeekServiceTests
         }
     }
 }
+
+public sealed class HideSeekRandomTagExemptionTests
+{
+    [Theory]
+    [InlineData(2, 1)]
+    [InlineData(4, 1)]
+    [InlineData(5, 2)]
+    [InlineData(6, 2)]
+    [InlineData(7, 3)]
+    [InlineData(8, 3)]
+    [InlineData(9, 4)]
+    [InlineData(10, 4)]
+    public void GetExemptRounds_ScalesWithPlayerCount(int playerCount, int expectedRounds)
+    {
+        Assert.Equal(expectedRounds, HideSeekRandomTagExemption.GetExemptRounds(playerCount));
+    }
+
+    [Fact]
+    public void RegisterPick_ExemptsPreviousSeekerForOneRoundWithFourPlayers()
+    {
+        var rounds = new Dictionary<byte, int>();
+
+        HideSeekRandomTagExemption.RegisterPick(rounds, 0, 4);
+        Assert.Contains((byte)0, HideSeekRandomTagExemption.GetExemptSlots(rounds));
+
+        HideSeekRandomTagExemption.RegisterPick(rounds, 1, 4);
+        Assert.DoesNotContain((byte)0, HideSeekRandomTagExemption.GetExemptSlots(rounds));
+        Assert.Contains((byte)1, HideSeekRandomTagExemption.GetExemptSlots(rounds));
+    }
+
+    [Fact]
+    public void RegisterPick_ExemptsPreviousSeekerForTwoRoundsWithSixPlayers()
+    {
+        var rounds = new Dictionary<byte, int>();
+
+        HideSeekRandomTagExemption.RegisterPick(rounds, 0, 6);
+        Assert.Contains((byte)0, HideSeekRandomTagExemption.GetExemptSlots(rounds));
+
+        HideSeekRandomTagExemption.RegisterPick(rounds, 1, 6);
+        Assert.Contains((byte)0, HideSeekRandomTagExemption.GetExemptSlots(rounds));
+        Assert.Contains((byte)1, HideSeekRandomTagExemption.GetExemptSlots(rounds));
+
+        HideSeekRandomTagExemption.RegisterPick(rounds, 2, 6);
+        Assert.DoesNotContain((byte)0, HideSeekRandomTagExemption.GetExemptSlots(rounds));
+        Assert.Contains((byte)1, HideSeekRandomTagExemption.GetExemptSlots(rounds));
+        Assert.Contains((byte)2, HideSeekRandomTagExemption.GetExemptSlots(rounds));
+    }
+
+    [Fact]
+    public void PruneDisconnected_RemovesStaleSlots()
+    {
+        var rounds = new Dictionary<byte, int> { [0] = 2, [3] = 1 };
+        HideSeekRandomTagExemption.PruneDisconnected(rounds, new[] { (byte)0, (byte)1 });
+        Assert.Single(rounds);
+        Assert.True(rounds.ContainsKey(0));
+    }
+}

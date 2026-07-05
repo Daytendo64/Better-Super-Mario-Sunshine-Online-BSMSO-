@@ -34,7 +34,7 @@ public partial class MainWindow : Window
     private bool _suppressHideSeekUiSync;
     private bool _tagRunning;
     private static readonly Random _random = new();
-    private byte? _lastRandomTagSlot;
+    private readonly Dictionary<byte, int> _randomTagExemptRoundsBySlot = new();
     private readonly Queue<byte> _recentRandomLevelCourseIds = new();
 
     public MainWindow()
@@ -1318,6 +1318,7 @@ public partial class MainWindow : Window
             return;
 
         _session.ResetHideSeekTag();
+        HideSeekRandomTagExemption.Clear(_randomTagExemptRoundsBySlot);
         SyncHideSeekRoleListsFromRoster(forceAllHiders: true);
         HideSeekStatusText.Text = "Everyone reset to hiders. Timer cleared.";
     }
@@ -1334,13 +1335,15 @@ public partial class MainWindow : Window
             return;
         }
 
-        // Never pick the same seeker twice in a row — the previous pick is exempt this round.
-        var pool = players.Where(p => p.Slot != _lastRandomTagSlot).ToArray();
+        HideSeekRandomTagExemption.PruneDisconnected(_randomTagExemptRoundsBySlot, players.Select(p => p.Slot));
+
+        var exempt = HideSeekRandomTagExemption.GetExemptSlots(_randomTagExemptRoundsBySlot).ToHashSet();
+        var pool = players.Where(p => !exempt.Contains(p.Slot)).ToArray();
         if (pool.Length == 0)
             pool = players;
 
         var chosen = pool[_random.Next(pool.Length)];
-        _lastRandomTagSlot = chosen.Slot;
+        HideSeekRandomTagExemption.RegisterPick(_randomTagExemptRoundsBySlot, chosen.Slot, players.Length);
 
         var roles = new Dictionary<byte, HideSeekRole>();
         foreach (var row in players)

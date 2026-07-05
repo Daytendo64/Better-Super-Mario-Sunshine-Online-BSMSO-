@@ -354,6 +354,7 @@ static f32 measureTextWidth(const char *text, int fontSize, JUtility::TColor col
     measure.private_initiate(gpSystemFont, 1, kJ2DPrintDefaultLeading, color, color);
     measure.initiate();
     measure.setFontSize(fontSize, fontSize);
+    measure.syncCharMetrics();
 
     // J2DPrint::getWidth() parses without initchar(), so unk34/unk38 stay at the
     // font's base cell size. print() calls initchar() first and renders scaled.
@@ -422,6 +423,7 @@ static void printLayer(int x, int y, int fontSize, const char *text, JUtility::T
     printer.private_initiate(gpSystemFont, 1, kJ2DPrintDefaultLeading, topColor, bottom);
     printer.initiate();
     printer.setFontSize(fontSize, fontSize);
+    printer.syncCharMetrics();
     printer.print(x, y, "%s", text);
 }
 

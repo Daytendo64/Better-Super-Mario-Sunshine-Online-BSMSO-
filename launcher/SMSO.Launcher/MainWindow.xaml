@@ -628,59 +628,179 @@
             </TabItem>
 
             <TabItem Header="Help">
-                <ScrollViewer Margin="20,12,20,20" VerticalScrollBarVisibility="Auto">
-                    <StackPanel MaxWidth="720">
-                        <Border Background="{StaticResource SmsCard}" CornerRadius="12" Padding="18" Margin="0,0,0,12"
-                                BorderBrush="{StaticResource SmsBorder}" BorderThickness="1">
-                            <StackPanel>
-                                <TextBlock Text="Setup" FontWeight="SemiBold" FontSize="14" Foreground="{StaticResource SmsAccent}" Margin="0,0,0,8"/>
-                                <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,8">
-                                    BSMSO (Better Super Mario Sunshine Online) requires a Better Sunshine Engine (BSE) patched NTSC-U ISO.
-                                    Install both modules into files/Kuribo!/Mods/ on your extracted ISO:
-                                    BetterSunshineEngine.kxe first, then _BSMSO.kxe (child module).
-                                </TextBlock>
-                                <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap">
-                                    <Hyperlink NavigateUri="https://github.com/DotKuribo/BetterSunshineEngine" RequestNavigate="HelpLink_RequestNavigate">Better Sunshine Engine</Hyperlink>
-                                    <Run Text=" — download the release, patch your ISO, then add the BSMSO module from this project (tools\build.ps1 → dist\_BSMSO.kxe)."/>
-                                </TextBlock>
+                <TabControl Margin="12,8,12,12">
+                    <TabItem Header="Start here">
+                        <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="8,12,8,8">
+                            <Grid MaxWidth="900">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <Border Grid.Column="0" Background="{StaticResource SmsCard}" CornerRadius="12" Padding="16" Margin="0,0,6,0"
+                                        BorderBrush="{StaticResource SmsBorder}" BorderThickness="1">
+                                    <StackPanel>
+                                        <TextBlock Text="Downloads" FontWeight="SemiBold" FontSize="14" Foreground="{StaticResource SmsAccent}" Margin="0,0,0,8"/>
+                                        <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,8"
+                                                   Text="You need: BSMSO release zip, Dolphin x64, and a legally owned NTSC-U Super Mario Sunshine disc image (GMSE01). BSE is included in the BSMSO zip."/>
+                                        <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4">
+                                            <Run FontWeight="SemiBold" Text="BSMSO — "/>
+                                            <Hyperlink NavigateUri="https://github.com/Daytendo64/Better-Super-Mario-Sunshine-Online-BSMSO-/releases" RequestNavigate="HelpLink_RequestNavigate">GitHub Releases</Hyperlink>
+                                        </TextBlock>
+                                        <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4">
+                                            <Run FontWeight="SemiBold" Text="Dolphin — "/>
+                                            <Hyperlink NavigateUri="https://dolphin-emu.org/download" RequestNavigate="HelpLink_RequestNavigate">dolphin-emu.org</Hyperlink>
+                                        </TextBlock>
+                                        <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap">
+                                            <Run FontWeight="SemiBold" Text="BSE (if needed) — "/>
+                                            <Hyperlink NavigateUri="https://github.com/DotKuribo/BetterSunshineEngine/releases" RequestNavigate="HelpLink_RequestNavigate">BSE Releases</Hyperlink>
+                                        </TextBlock>
+                                    </StackPanel>
+                                </Border>
+                                <Border Grid.Column="1" Background="{StaticResource SmsCard}" CornerRadius="12" Padding="16" Margin="6,0,0,0"
+                                        BorderBrush="{StaticResource SmsBorder}" BorderThickness="1">
+                                    <StackPanel>
+                                        <TextBlock Text="Every session" FontWeight="SemiBold" FontSize="14" Foreground="{StaticResource SmsAccent}" Margin="0,0,0,8"/>
+                                        <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
+                                                   Text="1. Set username, Dolphin path, and game path in Settings."/>
+                                        <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
+                                                   Text="2. Launch Dolphin — wait for title screen or in-game."/>
+                                        <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
+                                                   Text="3. Host Server or Connect (port 27015)."/>
+                                        <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap"
+                                                   Text="4. Each player runs their own Dolphin. Wait for everyone to finish loading before warping again."/>
+                                    </StackPanel>
+                                </Border>
+                            </Grid>
+                        </ScrollViewer>
+                    </TabItem>
+                    <TabItem Header="Game files">
+                        <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="8,12,8,8">
+                            <Grid MaxWidth="900">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <Border Grid.Column="0" Background="{StaticResource SmsCard}" CornerRadius="12" Padding="16" Margin="0,0,6,0"
+                                        BorderBrush="{StaticResource SmsBorder}" BorderThickness="1">
+                                    <StackPanel>
+                                        <TextBlock Text="Extract with Dolphin" FontWeight="SemiBold" FontSize="14" Foreground="{StaticResource SmsAccent}" Margin="0,0,0,8"/>
+                                        <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
+                                                   Text="1. Add your NTSC-U SMS ISO to Dolphin's game list."/>
+                                        <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
+                                                   Text="2. Right-click the game → Properties → Filesystem tab."/>
+                                        <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
+                                                   Text="3. Click Extract All Files (or Extract Contents) and pick a folder."/>
+                                        <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap"
+                                                   Text="4. You should see sys\ and files\ inside that folder. Use this folder as your game path in BSMSO Settings."/>
+                                    </StackPanel>
+                                </Border>
+                                <Border Grid.Column="1" Background="{StaticResource SmsCard}" CornerRadius="12" Padding="16" Margin="6,0,0,0"
+                                        BorderBrush="{StaticResource SmsBorder}" BorderThickness="1">
+                                    <StackPanel>
+                                        <TextBlock Text="No ISO rebuild needed" FontWeight="SemiBold" FontSize="14" Foreground="{StaticResource SmsAccent}" Margin="0,0,0,8"/>
+                                        <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,8"
+                                                   Text="You do not need to repack a .iso or .gcm after installing mods. Dolphin and BSMSO can run directly from the extracted folder."/>
+                                        <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
+                                                   Text="Copy BetterSunshineEngine.kxe and _BSMSO.kxe into:"/>
+                                        <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,8" FontFamily="Consolas"
+                                                   Text="files\Kuribo!\Mods\"/>
+                                        <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
+                                                   Text="BSE must load before _BSMSO.kxe. Point Settings at the extracted folder (or sys\main.dol inside it)."/>
+                                        <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap"
+                                                   Text="To update mods later, replace the .kxe files and restart Dolphin. BSMSO uses game ID GMSE90 (launcher patches automatically). Do not use SMSCoop with BSMSO."/>
+                                    </StackPanel>
+                                </Border>
+                            </Grid>
+                        </ScrollViewer>
+                    </TabItem>
+                    <TabItem Header="Online play">
+                        <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="8,12,8,8">
+                            <Grid MaxWidth="900">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <Border Grid.Column="0" Background="{StaticResource SmsCard}" CornerRadius="12" Padding="16" Margin="0,0,6,0"
+                                        BorderBrush="{StaticResource SmsBorder}" BorderThickness="1">
+                                    <StackPanel>
+                                        <TextBlock Text="Radmin VPN (recommended)" FontWeight="SemiBold" FontSize="14" Foreground="{StaticResource SmsAccent}" Margin="0,0,0,8"/>
+                                        <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,8">
+                                            <Run Text="Virtual LAN — no router setup. Install from "/>
+                                            <Hyperlink NavigateUri="https://www.radmin-vpn.com/" RequestNavigate="HelpLink_RequestNavigate">radmin-vpn.com</Hyperlink>
+                                            <Run Text=" on every PC."/>
+                                        </TextBlock>
+                                        <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4" FontWeight="SemiBold" Text="Host"/>
+                                        <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="8,0,0,4"
+                                                   Text="Create network → share name, password, and your Radmin IP (26.x.x.x)."/>
+                                        <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="8,0,0,8"
+                                                   Text="Launch Dolphin → Host Server. Allow firewall for BSMSO and Dolphin."/>
+                                        <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4" FontWeight="SemiBold" Text="Clients"/>
+                                        <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="8,0,0,4"
+                                                   Text="Join network → Settings: host's Radmin IP, port 27015."/>
+                                        <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="8,0,0,0"
+                                                   Text="Launch Dolphin → Connect. Usernames must be unique (3–16 letters, numbers, underscore)."/>
+                                    </StackPanel>
+                                </Border>
+                                <Border Grid.Column="1" Background="{StaticResource SmsCard}" CornerRadius="12" Padding="16" Margin="6,0,0,0"
+                                        BorderBrush="{StaticResource SmsBorder}" BorderThickness="1">
+                                    <StackPanel>
+                                        <TextBlock Text="Port forwarding" FontWeight="SemiBold" FontSize="14" Foreground="{StaticResource SmsAccent}" Margin="0,0,0,8"/>
+                                        <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,8"
+                                                   Text="Alternative if you skip VPN: host forwards TCP and UDP 27015 on their router to their PC."/>
+                                        <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
+                                                   Text="Share public IP + port 27015. Clients enter that in Settings."/>
+                                        <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,8"
+                                                   Text="Allow BSMSO.Launcher.exe and Dolphin.exe through Windows Firewall when hosting."/>
+                                        <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" FontWeight="SemiBold" Text="Module updates"/>
+                                        <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,4,0,0"
+                                                   Text="Replace _BSMSO.kxe in files\Kuribo!\Mods\ and fully restart Dolphin."/>
+                                    </StackPanel>
+                                </Border>
+                            </Grid>
+                        </ScrollViewer>
+                    </TabItem>
+                    <TabItem Header="Support">
+                        <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="8,12,8,8">
+                            <StackPanel MaxWidth="900">
+                                <Border Background="{StaticResource SmsCard}" CornerRadius="12" Padding="16" Margin="0,0,0,12"
+                                        BorderBrush="{StaticResource SmsBorder}" BorderThickness="1">
+                                    <StackPanel>
+                                        <TextBlock Text="Troubleshooting" FontWeight="SemiBold" FontSize="14" Foreground="{StaticResource SmsAccent}" Margin="0,0,0,8"/>
+                                        <Grid>
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="*"/>
+                                                <ColumnDefinition Width="*"/>
+                                            </Grid.ColumnDefinitions>
+                                            <StackPanel Grid.Column="0" Margin="0,0,8,0">
+                                                <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
+                                                           Text="• Black screen — check Dolphin log; BSE must load before _BSMSO.kxe in Mods\."/>
+                                                <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
+                                                           Text="• Cannot connect — verify host IP (Radmin IP with VPN, public IP with port forward)."/>
+                                                <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap"
+                                                           Text="• Bridge not attached — launch Dolphin from BSMSO first; load into the game before Host/Connect."/>
+                                            </StackPanel>
+                                            <StackPanel Grid.Column="1" Margin="8,0,0,0">
+                                                <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
+                                                           Text="• Warp blocked — wait until all players finish loading."/>
+                                                <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
+                                                           Text="• Name rejected — use 3–16 alphanumeric characters and underscore; no duplicates."/>
+                                                <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap"
+                                                           Text="• Antivirus — memory reads for sync can trigger false positives on unsigned builds."/>
+                                            </StackPanel>
+                                        </Grid>
+                                    </StackPanel>
+                                </Border>
+                                <TextBlock x:Name="VersionText" Foreground="{StaticResource SmsForegroundMuted}" Margin="0,0,0,8"/>
+                                <StackPanel Orientation="Horizontal">
+                                    <Button Content="Open Logs Folder" Click="OpenLogs_Click"/>
+                                    <Button Content="Export Diagnostics" Click="ExportDiagnostics_Click"/>
+                                </StackPanel>
+                                <TextBox x:Name="DiagnosticsBox" Height="120" Margin="0,10,0,0" IsReadOnly="True"
+                                         VerticalScrollBarVisibility="Auto" TextWrapping="Wrap"/>
                             </StackPanel>
-                        </Border>
-                        <Border Background="{StaticResource SmsCard}" CornerRadius="12" Padding="18" Margin="0,0,0,12"
-                                BorderBrush="{StaticResource SmsBorder}" BorderThickness="1">
-                            <StackPanel>
-                                <TextBlock Text="Module updates" FontWeight="SemiBold" FontSize="14" Foreground="{StaticResource SmsAccent}" Margin="0,0,0,8"/>
-                                <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap">
-                                    Copy the latest _BSMSO.kxe into your ISO Mods folder, then restart Dolphin.
-                                </TextBlock>
-                            </StackPanel>
-                        </Border>
-                        <Border Background="{StaticResource SmsCard}" CornerRadius="12" Padding="18" Margin="0,0,0,12"
-                                BorderBrush="{StaticResource SmsBorder}" BorderThickness="1">
-                            <StackPanel>
-                                <TextBlock Text="Port forwarding" FontWeight="SemiBold" FontSize="14" Foreground="{StaticResource SmsAccent}" Margin="0,0,0,8"/>
-                                <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap"
-                                           Text="Forward TCP and UDP port 27015 to your host machine for WAN play."/>
-                            </StackPanel>
-                        </Border>
-                        <Border Background="{StaticResource SmsCard}" CornerRadius="12" Padding="18" Margin="0,0,0,16"
-                                BorderBrush="{StaticResource SmsBorder}" BorderThickness="1">
-                            <StackPanel>
-                                <TextBlock Text="Troubleshooting" FontWeight="SemiBold" FontSize="14" Foreground="{StaticResource SmsAccent}" Margin="0,0,0,8"/>
-                                <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap">
-                                    Launch Dolphin from BSMSO before hosting or connecting. Usernames may include punctuation. Duplicate usernames are rejected.
-                                    Warps are blocked while a player is loading. Do not use SMSCoop alongside BSMSO.
-                                </TextBlock>
-                            </StackPanel>
-                        </Border>
-                        <TextBlock x:Name="VersionText" Foreground="{StaticResource SmsForegroundMuted}" Margin="0,0,0,12"/>
-                        <StackPanel Orientation="Horizontal">
-                            <Button Content="Open Logs Folder" Click="OpenLogs_Click"/>
-                            <Button Content="Export Diagnostics" Click="ExportDiagnostics_Click"/>
-                        </StackPanel>
-                        <TextBox x:Name="DiagnosticsBox" Height="180" Margin="0,12,0,0" IsReadOnly="True"
-                                 VerticalScrollBarVisibility="Auto" TextWrapping="Wrap"/>
-                    </StackPanel>
-                </ScrollViewer>
+                        </ScrollViewer>
+                    </TabItem>
+                </TabControl>
             </TabItem>
         </TabControl>
 

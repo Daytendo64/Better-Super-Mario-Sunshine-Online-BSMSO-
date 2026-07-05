@@ -214,6 +214,9 @@ public sealed class BridgeWorker : IDisposable
             _remoteRaw[slot] = snap;
             _remoteAppearances[slot] = appearance;
         }
+
+        // Push smoothed state to Dolphin immediately instead of waiting for the next poll tick.
+        FlushInterpolatedRemotes(force: true);
     }
 
     public void RemoveRemoteSnapshot(byte slot)

@@ -12,9 +12,11 @@ public sealed class RemoteInterpolation
     private readonly object _lock = new();
     private readonly Dictionary<byte, InterpState> _states = new();
     private const float SnapDistance = 4.0f;
-    private const int RenderDelayMs = 20;
-    private const int MaxExtrapolateMs = 150;
-    private const float ExtrapolateVelocityScale = 0.92f;
+    // One network tick of buffering (~33 ms @ 60 Hz) gives two samples to Hermite-blend.
+    private const int RenderDelayMs = 33;
+    private const int MaxExtrapolateMs = 200;
+    private const float ExtrapolateVelocityScale = 0.95f;
+    private const double MinInterpolationSpanMs = 8.0;
     private const float MaxAnimExtrapolateFrames = 4.0f;
     private const ushort AnimTurn = 0xBC;
     private const ushort AnimTurnEnd = 0xBD;
@@ -158,14 +160,16 @@ public sealed class RemoteInterpolation
         var renderTime = now - RenderDelayMs;
         if (state.HasPrevious && state.LastPacketMs >= state.PreviousPacketMs)
         {
-            var span = Math.Max(1e-4, state.LastPacketMs - state.PreviousPacketMs);
-            var t = Math.Clamp((float)((renderTime - state.PreviousPacketMs) / span), 0f, 1f);
-            state.DisplayPosition = new Vec3
-            {
-                X = Lerp(state.PreviousRaw.Position.X, state.LastRaw.Position.X, t),
-                Y = Lerp(state.PreviousRaw.Position.Y, state.LastRaw.Position.Y, t),
-                Z = Lerp(state.PreviousRaw.Position.Z, state.LastRaw.Position.Z, t),
-            };
+            var spanMs = Math.Max(MinInterpolationSpanMs, state.LastPacketMs - state.PreviousPacketMs);
+            var spanSeconds = (float)(spanMs / 1000.0);
+            var t = Math.Clamp((float)((renderTime - state.PreviousPacketMs) / spanMs), 0f, 1f);
+            state.DisplayPosition = HermitePosition(
+                state.PreviousRaw.Position,
+                state.LastRaw.Position,
+                state.PreviousRaw.Velocity,
+                state.LastRaw.Velocity,
+                spanSeconds,
+                t);
             state.DisplayVelocity = new Vec3
             {
                 X = Lerp(state.PreviousRaw.Velocity.X, state.LastRaw.Velocity.X, t),
@@ -178,7 +182,7 @@ public sealed class RemoteInterpolation
             if (ShouldSnapRotation(state.LastRaw.AnimId))
                 state.DisplayRotationY = state.LastRaw.RotationY;
             else
-                state.DisplayRotationY = Lerp(state.PreviousRaw.RotationY, state.LastRaw.RotationY, t);
+                state.DisplayRotationY = LerpAngle(state.PreviousRaw.RotationY, state.LastRaw.RotationY, t);
         }
         else
         {
@@ -309,4 +313,31 @@ public sealed class RemoteInterpolation
     }
 
     private static float Lerp(float a, float b, float t) => a + (b - a) * t;
+
+    /// <summary>Cubic Hermite position blend using endpoint velocities as tangents.</summary>
+    private static Vec3 HermitePosition(Vec3 p0, Vec3 p1, Vec3 v0, Vec3 v1, float spanSeconds, float t)
+    {
+        var t2 = t * t;
+        var t3 = t2 * t;
+        var h00 = 2f * t3 - 3f * t2 + 1f;
+        var h10 = t3 - 2f * t2 + t;
+        var h01 = -2f * t3 + 3f * t2;
+        var h11 = t3 - t2;
+        return new Vec3
+        {
+            X = h00 * p0.X + h10 * v0.X * spanSeconds + h01 * p1.X + h11 * v1.X * spanSeconds,
+            Y = h00 * p0.Y + h10 * v0.Y * spanSeconds + h01 * p1.Y + h11 * v1.Y * spanSeconds,
+            Z = h00 * p0.Z + h10 * v0.Z * spanSeconds + h01 * p1.Z + h11 * v1.Z * spanSeconds,
+        };
+    }
+
+    private static float LerpAngle(float from, float to, float t)
+    {
+        var delta = to - from;
+        while (delta > 32768f)
+            delta -= 65536f;
+        while (delta < -32768f)
+            delta += 65536f;
+        return from + delta * t;
+    }
 }
