@@ -13,6 +13,10 @@ struct RemoteYoshiSlot {
     u8 type;
     bool hostSpraying;
     u8 sprayPressureEnc;
+    u8 lastTongueState;
+    u8 lastMouthActorEnc;
+    u8 lastYoshiBck;
+    u32 lastFruitEatEventId;
 };
 
 namespace JDrama {
@@ -34,5 +38,9 @@ void calcRemoteYoshiAnim(TMario *body, const RemoteYoshiSlot *slot);
 
 // Tongue emit matrix after mounted calc + mTongue->calcAnim (doldecomp getTongueMtx).
 Mtx *getRemoteYoshiSprayEmitMtx(TMario *body);
+
+bool applyRemoteYoshiFruitWorldEvent(u8 actorTypeEnc, u32 packedPos);
+
+void resetLocalYoshiFruitSync();
 
 } // namespace smso

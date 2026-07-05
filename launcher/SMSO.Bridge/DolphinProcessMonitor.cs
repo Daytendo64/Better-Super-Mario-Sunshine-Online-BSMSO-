@@ -1,6 +1,7 @@
 using System;
 using System.Diagnostics;
 using System.IO;
+using SMSO.Net;
 
 namespace SMSO.Bridge;
 
@@ -134,8 +135,14 @@ public sealed class DolphinProcessMonitor : IDisposable
             try
             {
                 isoPath = Path.GetFullPath(isoPath.Trim().Trim('"'));
-                if (File.Exists(isoPath))
-                    arguments = $"-e \"{isoPath}\"";
+                if (GameIdentity.TryResolveDolphinLaunchPath(isoPath, out var launchPath))
+                    arguments = $"-e \"{launchPath}\"";
+                else if (File.Exists(isoPath) || Directory.Exists(isoPath))
+                {
+                    error =
+                        "Game path must be a .iso/.gcm disc image, sys\\main.dol, or an extracted folder containing sys\\main.dol.";
+                    return false;
+                }
             }
             catch (Exception ex)
             {

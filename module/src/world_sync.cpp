@@ -5,6 +5,7 @@
 #include "comm_buffer.hpp"
 #include "red_coin_sync.hpp"
 #include "remote_actor.hpp"
+#include "yoshi_sync.hpp"
 
 #include <SMS/GC2D/GCConsole2.hxx>
 #include <SMS/Manager/FlagManager.hxx>
@@ -1191,6 +1192,7 @@ static void resetLocalTrackersForStage(u8 courseId, u8 episodeId) {
     sPendingShineCapture = {};
     clearRemoteShineCollect();
     clearKnownShinePositions();
+    smso::resetLocalYoshiFruitSync();
     sLocalHipDropFired = false;
     for (u32 i = 0; i < sizeof(sShineBits); ++i)
         sShineBits[i] = 0;
@@ -1238,6 +1240,10 @@ static void publishLocalWorldEvent(smso::WorldEventType type, u8 courseId, u8 ep
         break;
     case smso::WE_HIP_DROP_OBJECT:
         if (!objectSyncEnabled(buf))
+            return;
+        break;
+    case smso::WE_YOSHI_FRUIT_TAKEN:
+        if (!worldSyncEnabled(buf))
             return;
         break;
     default:
@@ -1408,6 +1414,23 @@ static bool applyWorldEvent(const smso::CommWorldEvent &event) {
             smso::applyRemoteRedCoinSwitchHit(obj);
         else
             replayRemoteHipDropHit(obj, hipDropPayloadIsSuper(event.payload1));
+        break;
+    }
+
+    case smso::WE_YOSHI_FRUIT_TAKEN: {
+        if (!sameStage(event.courseId, event.episodeId)) {
+            applied = false;
+            break;
+        }
+        smso::CommBuffer *buf = smso::getCommBuffer();
+        const u8 localSlot = buf ? buf->localSlot : 0;
+        if (event.reserved == localSlot)
+            break;
+        if (!buf || !worldSyncEnabled(buf))
+            break;
+
+        if (!smso::applyRemoteYoshiFruitWorldEvent(event.payload0, event.payload1))
+            applied = false;
         break;
     }
 

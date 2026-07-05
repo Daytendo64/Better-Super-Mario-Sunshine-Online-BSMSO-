@@ -95,6 +95,8 @@ enum VfxFlags : u16 {
     VFX_NOZZLE_SWITCHING = 1 << 7, // host mSwitchToSecondNozzleSpeed != 0
     VFX_WET_SLIDE = 1 << 8,        // belly CATCH slide in water / on wet ground
     VFX_NO_FLUDD = 1 << 9,         // FLUDD pack hidden on Mario's back (see shouldShowFluddPackOnMario)
+    // Host riding Yoshi with a fruit in TYoshiTongue::mActorTypeInMouth — episodeId is fruit encode.
+    VFX_YOSHI_FRUIT_MOUTH = 1 << 10,
 };
 
 // Bits 8-9 are persistent VFX flags. Bits 10-15 pack Y-cam pitch, active-spray FLUDD gun
@@ -204,6 +206,41 @@ inline u8 unpackAnimAuxHand(u8 packed) {
 inline f32 unpackAnimAuxDeploy(u8 packed) {
     return static_cast<f32>((packed >> kAnimAuxDeployShift) & 0x0F) /
            static_cast<f32>(kAnimAuxDeployScale);
+}
+
+// When snapshotHostOnYoshi, health/stageId/episodeId/velocity carry TYoshiTongue sync.
+// health: bits 0-1 hand, 2-4 tongue state (doldecomp TYoshiTongue::STATE_*), 5-7 progress/8.
+// stageId: exact mProgress (0..255) while tongue is active, else host stage area id.
+// episodeId: fruit mouth actor encode (see yoshi_sync.cpp) while set, else host episode id.
+// velocity: tongue tip offset from Mario while tongue is active, else Mario speed.
+constexpr u8 kYoshiTongueHandMask = 0x03;
+constexpr u8 kYoshiTongueStateShift = 2;
+constexpr u8 kYoshiTongueStateMask = 0x07;
+constexpr u8 kYoshiTongueProgressShift = 5;
+constexpr u8 kYoshiTongueProgressMask = 0x07;
+
+inline u8 packYoshiTongueHealth(u8 handIndex, u16 tongueState, u16 tongueProgress) {
+    const u8 hand = handIndex & kYoshiTongueHandMask;
+    const u8 state = static_cast<u8>((tongueState & kYoshiTongueStateMask) << kYoshiTongueStateShift);
+    const u8 progress =
+        static_cast<u8>(((tongueProgress / 8) & kYoshiTongueProgressMask) << kYoshiTongueProgressShift);
+    return static_cast<u8>(hand | state | progress);
+}
+
+inline u8 unpackYoshiTongueHand(u8 packed) {
+    return packed & kYoshiTongueHandMask;
+}
+
+inline u8 unpackYoshiTongueState(u8 packed) {
+    return static_cast<u8>((packed >> kYoshiTongueStateShift) & kYoshiTongueStateMask);
+}
+
+inline u8 unpackYoshiTongueProgressCoarse(u8 packed) {
+    return static_cast<u8>(((packed >> kYoshiTongueProgressShift) & kYoshiTongueProgressMask) * 8);
+}
+
+inline bool yoshiTongueIsActive(u8 tongueState) {
+    return tongueState != 0;
 }
 
 // When VFX_WATER_SPRAY is set, the water byte carries nozzle pressure (0..255), not tank level.
@@ -500,6 +537,9 @@ enum WorldEventType : u8 {
     // payload1 bit 31 set when the pound was a super hip-drop.
     WE_HIP_DROP_OBJECT = 8,
     WE_RED_COIN_COLLECTED = 9,
+    // Host Yoshi ate a fruit with the tongue. payload0 = encoded fruit actor type,
+    // payload1 = packed fruit world position (packCollectibleWorldPos), reserved = eater slot.
+    WE_YOSHI_FRUIT_TAKEN = 10,
 };
 
 struct CommWorldEvent {

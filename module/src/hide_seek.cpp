@@ -821,19 +821,6 @@ static void installHideSeekDeathHooks() {
             }
         }
 
-        if (!shouldAllowMoveStage(director)) {
-            static u32 s_blockedMoveStageLogCooldown = 0;
-            if (s_blockedMoveStageLogCooldown == 0) {
-                OSReport("[SMSO] Blocked moveStage — only local Mario may leave via loading zones\n");
-                s_blockedMoveStageLogCooldown = 120;
-            } else {
-                --s_blockedMoveStageLogCooldown;
-            }
-            gpApplication.mNextScene = gpApplication.mCurrentScene;
-            smso::clearBlockedLoadingZoneTransition(director);
-            smso::clearAuthorizedStageMovePending();
-            return;
-        }
         smso::performSmsoMoveStage(director);
         smso::clearAuthorizedStageMovePending();
     });

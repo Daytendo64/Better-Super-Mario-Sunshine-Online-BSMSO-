@@ -3,7 +3,6 @@
 #include "hide_seek.hpp"
 
 #include <Dolphin/OS.h>
-#include <JSystem/JGeometry/JGMVec.hxx>
 #include <SMS/Player/Mario.hxx>
 #include <SMS/System/Application.hxx>
 #include <SMS/Manager/FlagManager.hxx>
@@ -18,13 +17,6 @@ namespace smso {
 namespace {
 
 static bool s_pendingAuthorizedStageMove = false;
-
-static f32 vecDistSq(const TVec3f &a, const TVec3f &b) {
-    const f32 dx = a.x - b.x;
-    const f32 dy = a.y - b.y;
-    const f32 dz = a.z - b.z;
-    return dx * dx + dy * dy + dz * dz;
-}
 
 static bool isLocalMarioInStageExitState() {
     if (!gpMarioAddress)
@@ -84,56 +76,17 @@ bool isSmsoAuthorizedStageTransition() {
     return isHideSeekAuthorizedStageTransition() || launcherWarp || s_pendingAuthorizedStageMove;
 }
 
-bool shouldAllowMoveStage(TMarDirector *director) {
-    if (isNonGameplayStage(gpApplication.mCurrentScene.mAreaID))
-        return true;
-
-    if (isSmsoAuthorizedStageTransition())
-        return true;
-
-    const u8 nextArea = gpApplication.mNextScene.mAreaID;
-    const u8 nextEp = gpApplication.mNextScene.mEpisodeID;
-    const u8 curArea = gpApplication.mCurrentScene.mAreaID;
-    const u8 curEp = gpApplication.mCurrentScene.mEpisodeID;
-    if (nextArea == curArea && nextEp == curEp)
-        return true;
-
-    // Remote puppets are no longer in Player Group, so in-game loading zones only
-    // schedule moveStage for the local Mario. Permit cross-scene moves while online.
-    CommBuffer *buf = getCommBuffer();
-    if (buf && (buf->bridgeFlags & BF_CONNECTED) != 0)
-        return true;
-
-    // Solo fallback: director can sit in WARPING (0x09) after setNextStage even when
-    // Mario's status id no longer matches our exit-state table.
-    if (director && director->mGameState == 0x09u)
-        return true;
-
-    return isLocalMarioInStageExitState();
-}
-
 void authorizeLauncherStageMove() {
     s_pendingAuthorizedStageMove = true;
 }
 
 void initStageGuard() {
     s_pendingAuthorizedStageMove = false;
-    OSReport("[SMSO] Stage guard installed — loading zones are local-only (moveStage gate)\n");
+    OSReport("[SMSO] Stage guard installed — hub episode-select routing active\n");
 }
 
 void clearAuthorizedStageMovePending() {
     s_pendingAuthorizedStageMove = false;
-}
-
-void clearBlockedLoadingZoneTransition(TMarDirector *director) {
-    if (!director)
-        return;
-
-    // Blocked moveStage leaves mNextScene reverted but mGameState can stay WARPING
-    // (0x09) while a loading zone keeps calling setNextStage. Bridge treats that as
-    // DS_WARPING and stops writing remote snapshots — remotes never activate.
-    if (director->mGameState == 0x09u)
-        director->mGameState = 0x04u;
 }
 
 // BSE moveStage_override (area.cpp) inlined here — SMSO is a separate Kuribo module and
@@ -141,6 +94,14 @@ void clearBlockedLoadingZoneTransition(TMarDirector *director) {
 void performSmsoMoveStage(TMarDirector *director) {
     if (!director)
         return;
+
+    const u8 nextArea = gpApplication.mNextScene.mAreaID;
+    const u8 nextEp = gpApplication.mNextScene.mEpisodeID;
+    const u8 curArea = gpApplication.mCurrentScene.mAreaID;
+    const u8 curEp = gpApplication.mCurrentScene.mEpisodeID;
+    if (nextArea != curArea || nextEp != curEp) {
+        OSReport("[SMSO] moveStage next=%u/%u cur=%u/%u\n", nextArea, nextEp, curArea, curEp);
+    }
 
     if (isNonGameplayStage(gpApplication.mCurrentScene.mAreaID)) {
         director->moveStage();

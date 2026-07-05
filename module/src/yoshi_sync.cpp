@@ -1,9 +1,15 @@
 #include "yoshi_sync.hpp"
 
+#include "collectible_scan.hpp"
 #include "remote_water_sync.hpp"
+#include "world_sync.hpp"
+#include <SMS/MapObj/MapObjBase.hxx>
 #include <SMS/Player/Mario.hxx>
 #include <SMS/Player/NozzleBase.hxx>
 #include <SMS/Player/Yoshi.hxx>
+#include <SMS/Strategic/HitActor.hxx>
+#include <SMS/Strategic/LiveActor.hxx>
+#include <SMS/System/MarDirector.hxx>
 #include <SMS/macros.h>
 #include <SMS/raw_fn.hxx>
 
@@ -14,6 +20,7 @@
 #include <JSystem/JUtility/JUTColor.hxx>
 
 extern JUtility::TColor bodyColor[4];
+extern TMarDirector *gpMarDirector;
 
 namespace {
 
@@ -25,14 +32,30 @@ constexpr int kYoshiMirrorJointB = 32;
 // doldecomp TYoshi @ 0x3C — tongue joint index for getTongueMtx().
 constexpr u32 kYoshiJointIdxTongueOffset = 0x3C;
 constexpr u32 kYoshiTonguePtrOffset = 0x38;
+constexpr u32 kTongueStateOffset = 0x7C;
+constexpr u32 kTongueProgressOffset = 0x7E;
+constexpr u32 kTongueActorTypeInMouthOffset = 0xD0;
+constexpr u32 kTongueHeadPosOffset = 0xA0;
+constexpr u32 kTongueHeadDirOffset = 0xAC;
+constexpr u32 kTongueTipPosOffset = 0xB8;
+constexpr f32 kYoshiFruitMatchRadiusSq = 450.0f * 450.0f;
 
 using YoshiTongueCalcAnimFn = void (*)(void *, Mtx *);
+using YoshiTongueViewCalcFn = void (*)(void *);
+using YoshiTongueEntryFn = void (*)(void *);
 using YoshiThinkUpperFn = void (*)(TYoshi *);
+using YoshiDoEatFn = void (*)(TYoshi *, u32);
 
 static YoshiTongueCalcAnimFn sYoshiTongueCalcAnim =
     reinterpret_cast<YoshiTongueCalcAnimFn>(SMS_PORT_REGION(0x8026764C, 0x8025F3D8, 0, 0));
+static YoshiTongueViewCalcFn sYoshiTongueViewCalc =
+    reinterpret_cast<YoshiTongueViewCalcFn>(SMS_PORT_REGION(0x802675F0, 0x8025F37C, 0, 0));
+static YoshiTongueEntryFn sYoshiTongueEntry =
+    reinterpret_cast<YoshiTongueEntryFn>(SMS_PORT_REGION(0x80267594, 0x8025F320, 0, 0));
 static YoshiThinkUpperFn sYoshiThinkUpper =
     reinterpret_cast<YoshiThinkUpperFn>(SMS_PORT_REGION(0x8026FC90, 0x80267A1C, 0, 0));
+static YoshiDoEatFn sYoshiDoEat =
+    reinterpret_cast<YoshiDoEatFn>(SMS_PORT_REGION(0x8026F60C, 0x80267398, 0, 0));
 
 static void *remoteYoshiTongue(TYoshi *yoshi) {
     if (!yoshi)
@@ -43,6 +66,129 @@ static void *remoteYoshiTongue(TYoshi *yoshi) {
 static u16 remoteYoshiTongueJointIndex(const TYoshi *yoshi) {
     return *reinterpret_cast<const u16 *>(reinterpret_cast<const u8 *>(yoshi) +
                                           kYoshiJointIdxTongueOffset);
+}
+
+static u16 *remoteYoshiTongueStatePtr(void *tongue) {
+    return reinterpret_cast<u16 *>(reinterpret_cast<u8 *>(tongue) + kTongueStateOffset);
+}
+
+static u16 *remoteYoshiTongueProgressPtr(void *tongue) {
+    return reinterpret_cast<u16 *>(reinterpret_cast<u8 *>(tongue) + kTongueProgressOffset);
+}
+
+static u32 *remoteYoshiTongueActorTypeInMouthPtr(void *tongue) {
+    return reinterpret_cast<u32 *>(reinterpret_cast<u8 *>(tongue) + kTongueActorTypeInMouthOffset);
+}
+
+static Vec *remoteYoshiTongueTipPos(void *tongue) {
+    return reinterpret_cast<Vec *>(reinterpret_cast<u8 *>(tongue) + kTongueTipPosOffset);
+}
+
+static Vec *remoteYoshiTongueHeadPos(void *tongue) {
+    return reinterpret_cast<Vec *>(reinterpret_cast<u8 *>(tongue) + kTongueHeadPosOffset);
+}
+
+static bool isYoshiFruitActorType(u32 actorType) {
+    return actorType >= 0x40000390u && actorType <= 0x40000396u;
+}
+
+static u8 encodeYoshiFruitActorType(u32 actorType) {
+    switch (actorType) {
+    case 0x40000390:
+        return 1;
+    case 0x40000391:
+        return 2;
+    case 0x40000392:
+        return 3;
+    case 0x40000393:
+        return 4;
+    case 0x40000394:
+        return 5;
+    case 0x40000395:
+        return 6;
+    case 0x40000396:
+        return 7;
+    default:
+        return 0;
+    }
+}
+
+static u32 decodeYoshiFruitActorType(u8 enc) {
+    switch (enc) {
+    case 1:
+        return 0x40000390;
+    case 2:
+        return 0x40000391;
+    case 3:
+        return 0x40000392;
+    case 4:
+        return 0x40000393;
+    case 5:
+        return 0x40000394;
+    case 6:
+        return 0x40000395;
+    case 7:
+        return 0x40000396;
+    default:
+        return 0;
+    }
+}
+
+static u32 localFruitEatEventId = 0;
+static u8 localPublishedMouthEnc = 0;
+
+static bool isYoshiEatBck(u8 bckId) {
+    return bckId == 10 || bckId == 12 || bckId == 15;
+}
+
+static u8 snapshotMouthFruitEnc(const smso::PlayerSnapshot &snap) {
+    if ((snap.vfxFlags & smso::VFX_YOSHI_FRUIT_MOUTH) == 0)
+        return 0;
+    const u8 enc = snap.episodeId;
+    return enc >= 1 && enc <= 7 ? enc : 0;
+}
+
+static void publishLocalYoshiFruitTaken(u8 actorTypeEnc, const Vec &tipPos, u8 slot) {
+    if (actorTypeEnc == 0)
+        return;
+
+    const u32 packedPos = smso::packCollectibleWorldPos(tipPos.x, tipPos.y, tipPos.z);
+    const u32 eventId = (static_cast<u32>(actorTypeEnc) << 24) | (packedPos & 0x00FFFFFFu);
+    if (eventId == localFruitEatEventId)
+        return;
+    localFruitEatEventId = eventId;
+
+    smso::CommBuffer *buf = smso::getCommBuffer();
+    const u8 courseId = buf && gpMarDirector ? gpMarDirector->mAreaID : 0;
+    const u8 episodeId = buf && gpMarDirector ? gpMarDirector->mEpisodeID : 0;
+    smso::enqueueLocalWorldEvent(static_cast<u8>(smso::WE_YOSHI_FRUIT_TAKEN), courseId, episodeId,
+                                 actorTypeEnc, slot, packedPos);
+}
+
+static void performRemoteYoshiTongueDraw(void *tongue) {
+    if (!tongue || !sYoshiTongueViewCalc || !sYoshiTongueEntry)
+        return;
+
+    const u16 state = *remoteYoshiTongueStatePtr(tongue);
+    if (state == 0)
+        return;
+
+    sYoshiTongueViewCalc(tongue);
+    sYoshiTongueEntry(tongue);
+}
+
+static void applyRemoteYoshiTongueTipFromOffset(TMario *body, void *tongue, const smso::Vec3 &offset) {
+    if (!body || !tongue)
+        return;
+
+    Vec *tip = remoteYoshiTongueTipPos(tongue);
+    Vec *head = remoteYoshiTongueHeadPos(tongue);
+    tip->x = body->mTranslation.x + offset.x;
+    tip->y = body->mTranslation.y + offset.y;
+    tip->z = body->mTranslation.z + offset.z;
+    head->x = body->mTranslation.x;
+    head->y = body->mTranslation.y;
+    head->z = body->mTranslation.z;
 }
 
 static void calcRemoteYoshiTongueAnim(TYoshi *yoshi, J3DModel *model) {
@@ -167,6 +313,10 @@ static void resetRemoteYoshiToEgg(TYoshi *yoshi, RemoteYoshiSlot &slot) {
     slot.type = 0xFF;
     slot.hostSpraying = false;
     slot.sprayPressureEnc = 0;
+    slot.lastTongueState = 0;
+    slot.lastMouthActorEnc = 0;
+    slot.lastYoshiBck = 0;
+    slot.lastFruitEatEventId = 0;
 }
 
 static void stagePuppetFluddForYoshiThinkUpper(TMario *body, const RemoteYoshiSlot *slot) {
@@ -309,13 +459,14 @@ static void viewCalcRemoteMountedYoshi(TYoshi *yoshi) {
     if (!yoshi || !yoshi->mActor)
         return;
 
-    // doldecomp TYoshi::viewCalc minus mTongue->viewCalc() — tongue is unsafe on puppets.
     yoshi->mActor->viewCalc();
     J3DModel **mirrors = yoshiMirrorModels(yoshi);
     if (mirrors[0])
         mirrors[0]->viewCalc();
     if (mirrors[1])
         mirrors[1]->viewCalc();
+
+    performRemoteYoshiTongueDraw(remoteYoshiTongue(yoshi));
 }
 
 // MOUNTED subset of doldecomp TYoshi::calcAnim — skips thinkAnimation (gamepad) and
@@ -421,34 +572,86 @@ void exportYoshiSnapshotFields(TMario *mario, PlayerSnapshot &snap) {
     if (yoshi->mActor)
         snap.water = static_cast<u8>(yoshi->mActor->getCurAnmIdx(MActor::BCK) & 0xFF);
 
-    // While riding, repurpose health high nibble for TYoshiTongue state/progress (doldecomp
-    // Tongue.hpp @ 0x7C/0x7E). Low nibble keeps hand index from puppets export.
     void *tongue = remoteYoshiTongue(yoshi);
+    u16 tongueState = 0;
+    u16 tongueProgress = 0;
+    u32 mouthActorType = 0;
     if (tongue) {
-        const u16 tState = *reinterpret_cast<const u16 *>(reinterpret_cast<const u8 *>(tongue) + 0x7C);
-        const u16 tProg = *reinterpret_cast<const u16 *>(reinterpret_cast<const u8 *>(tongue) + 0x7E);
-        const u8 tonguePack =
-            static_cast<u8>((tState & 0x0F) | static_cast<u8>((tProg >> 4) & 0xF0));
-        snap.health = static_cast<u8>((snap.health & 0x0F) | (tonguePack & 0xF0));
+        tongueState = *remoteYoshiTongueStatePtr(tongue);
+        tongueProgress = *remoteYoshiTongueProgressPtr(tongue);
+        mouthActorType = *remoteYoshiTongueActorTypeInMouthPtr(tongue);
+    }
+
+  const u8 hand = unpackAnimAuxHand(snap.health);
+    snap.health = packYoshiTongueHealth(hand, tongueState, tongueProgress);
+
+    if (yoshiTongueIsActive(static_cast<u8>(tongueState))) {
+        snap.stageId = static_cast<u8>(tongueProgress > 255 ? 255 : tongueProgress);
+        const Vec *tip = remoteYoshiTongueTipPos(tongue);
+        snap.velocity.x = tip->x - mario->mTranslation.x;
+        snap.velocity.y = tip->y - mario->mTranslation.y;
+        snap.velocity.z = tip->z - mario->mTranslation.z;
+    }
+
+    const u8 mouthEnc = encodeYoshiFruitActorType(mouthActorType);
+    if (mouthEnc != 0) {
+        snap.episodeId = mouthEnc;
+        snap.vfxFlags |= smso::VFX_YOSHI_FRUIT_MOUTH;
+        const Vec *tip = remoteYoshiTongueTipPos(tongue);
+        if (mouthEnc != localPublishedMouthEnc) {
+            localPublishedMouthEnc = mouthEnc;
+            smso::CommBuffer *buf = smso::getCommBuffer();
+            publishLocalYoshiFruitTaken(mouthEnc, *tip, buf ? buf->localSlot : 0);
+        }
+    } else {
+        snap.vfxFlags &= ~static_cast<u16>(smso::VFX_YOSHI_FRUIT_MOUTH);
+        localPublishedMouthEnc = 0;
     }
 }
 
-static void applyRemoteYoshiTongueFromSnapshot(TYoshi *yoshi, u8 packedHealth) {
-    void *tongue = remoteYoshiTongue(yoshi);
+static void applyRemoteYoshiTongueFromSnapshot(TMario *body, void *tongue, const PlayerSnapshot &snap) {
     if (!tongue)
         return;
 
-    const u8 tonguePack = static_cast<u8>(packedHealth >> 4);
-    u16 *state = reinterpret_cast<u16 *>(reinterpret_cast<u8 *>(tongue) + 0x7C);
-    u16 *progress = reinterpret_cast<u16 *>(reinterpret_cast<u8 *>(tongue) + 0x7E);
-    if (tonguePack == 0) {
+    const u8 tongueState = unpackYoshiTongueState(snap.health);
+    u16 *state = remoteYoshiTongueStatePtr(tongue);
+    u16 *progress = remoteYoshiTongueProgressPtr(tongue);
+    u32 *mouthType = remoteYoshiTongueActorTypeInMouthPtr(tongue);
+
+    if (!yoshiTongueIsActive(tongueState)) {
         *state = 0;
         *progress = 0;
+        *mouthType = 0;
         return;
     }
 
-    *state = tonguePack & 0x0F;
-    *progress = static_cast<u16>((tonguePack >> 4) * 16);
+    *state = tongueState;
+    *progress = snap.stageId != 0 ? snap.stageId : unpackYoshiTongueProgressCoarse(snap.health);
+    if (*progress == 0 && tongueState != 0)
+        *progress = 1;
+
+    const u8 mouthEnc = snapshotMouthFruitEnc(snap);
+    *mouthType = decodeYoshiFruitActorType(mouthEnc);
+    applyRemoteYoshiTongueTipFromOffset(body, tongue, snap.velocity);
+}
+
+static void applyRemoteYoshiEatFromSnapshot(TYoshi *yoshi, RemoteYoshiSlot &slot,
+                                            const PlayerSnapshot &snap) {
+    const u8 mouthEnc = snapshotMouthFruitEnc(snap);
+    const u8 bck = snap.water;
+
+    if (isYoshiEatBck(bck) && !isYoshiEatBck(slot.lastYoshiBck)) {
+        const u8 eatEnc = mouthEnc != 0 ? mouthEnc : slot.lastMouthActorEnc;
+        const u32 actorType = decodeYoshiFruitActorType(eatEnc);
+        if (actorType != 0 && sYoshiDoEat)
+            sYoshiDoEat(yoshi, actorType);
+    }
+
+    slot.lastYoshiBck = bck;
+    if (mouthEnc != 0)
+        slot.lastMouthActorEnc = mouthEnc;
+    else if (!isYoshiEatBck(bck) && unpackYoshiTongueState(snap.health) == 0)
+        slot.lastMouthActorEnc = 0;
 }
 
 void syncRemoteYoshiFromSnapshot(TMario *body, RemoteYoshiSlot &slot, const PlayerSnapshot &snap) {
@@ -470,7 +673,8 @@ void syncRemoteYoshiFromSnapshot(TMario *body, RemoteYoshiSlot &slot, const Play
     if (static_cast<u8>(yoshi->mType & 0x0F) != yoshiType)
         applyYoshiColor(yoshi, yoshiType);
 
-    applyRemoteYoshiTongueFromSnapshot(yoshi, snap.health);
+    applyRemoteYoshiTongueFromSnapshot(body, remoteYoshiTongue(yoshi), snap);
+    applyRemoteYoshiEatFromSnapshot(yoshi, slot, snap);
 
     slot.hostSpraying = (snap.vfxFlags & VFX_WATER_SPRAY) != 0 &&
                         (snap.vfxFlags & VFX_FLUDD_EMPTY) == 0;
@@ -522,8 +726,95 @@ void performRemoteYoshiDraw(TMario *body, u32 flags, JDrama::TGraphics *graphics
 
     if (flags & 0x4)
         viewCalcRemoteMountedYoshi(yoshi);
-    if (flags & 0x200 && remoteMountedYoshiDrawAllowed(yoshi))
+    if (flags & 0x200 && remoteMountedYoshiDrawAllowed(yoshi)) {
         entry__6TYoshiFv(yoshi);
+        performRemoteYoshiTongueDraw(remoteYoshiTongue(yoshi));
+    }
+}
+
+struct FindYoshiFruitCtx {
+    u32 actorType;
+    TVec3f target;
+    TMapObjBase *best;
+    f32 bestDistSq;
+};
+
+static TVec3f mapObjWorldPos(const TMapObjBase *obj) {
+    TVec3f pos = obj->mInitialPosition;
+    if (obj)
+        const_cast<TMapObjBase *>(obj)->JSGGetTranslation(reinterpret_cast<Vec *>(&pos));
+    return pos;
+}
+
+static bool visitFindYoshiFruit(TMapObjBase *obj, void *rawCtx) {
+    auto *ctx = reinterpret_cast<FindYoshiFruitCtx *>(rawCtx);
+    if (!obj || !smso::isValidMapObjPtr(obj))
+        return false;
+
+    auto *hit = reinterpret_cast<THitActor *>(obj);
+    if (!TMapObjBase::isFruit(hit))
+        return false;
+
+    const u32 objectId = hit->mObjectID;
+    if (!isYoshiFruitActorType(objectId))
+        return false;
+
+    const TVec3f pos = mapObjWorldPos(obj);
+    const f32 dx = pos.x - ctx->target.x;
+    const f32 dy = pos.y - ctx->target.y;
+    const f32 dz = pos.z - ctx->target.z;
+    const f32 distSq = dx * dx + dy * dy + dz * dz;
+    if (distSq > kYoshiFruitMatchRadiusSq)
+        return false;
+
+    if (ctx->actorType != 0 && objectId != ctx->actorType)
+        return false;
+
+    if (!ctx->best || distSq < ctx->bestDistSq) {
+        ctx->best = obj;
+        ctx->bestDistSq = distSq;
+    }
+    return false;
+}
+
+static TMapObjBase *findYoshiFruitNear(const TVec3f &pos, u32 actorType) {
+    FindYoshiFruitCtx ctx = {actorType, pos, nullptr, kYoshiFruitMatchRadiusSq};
+    smso::forEachManagedMapObj(visitFindYoshiFruit, &ctx);
+    return ctx.best;
+}
+
+static void hideYoshiFruitActor(TMapObjBase *obj) {
+    if (!obj)
+        return;
+
+    obj->makeObjDead();
+
+    auto *live = reinterpret_cast<TLiveActor *>(obj);
+    live->mStateFlags.asFlags.mClipFromScene = true;
+    live->mStateFlags.asFlags.mIsObjDead = true;
+}
+
+bool applyRemoteYoshiFruitWorldEvent(u8 actorTypeEnc, u32 packedPos) {
+    if (actorTypeEnc == 0 || !smso::isValidPackedWorldPos(packedPos))
+        return false;
+
+    f32 x = 0.0f;
+    f32 y = 0.0f;
+    f32 z = 0.0f;
+    smso::unpackCollectibleWorldPos(packedPos, x, y, z);
+    const TVec3f target = {x, y, z};
+    TMapObjBase *fruit =
+        findYoshiFruitNear(target, decodeYoshiFruitActorType(actorTypeEnc));
+    if (!fruit)
+        return false;
+
+    hideYoshiFruitActor(fruit);
+    return true;
+}
+
+void resetLocalYoshiFruitSync() {
+    localFruitEatEventId = 0;
+    localPublishedMouthEnc = 0;
 }
 
 } // namespace smso

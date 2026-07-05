@@ -158,4 +158,5 @@ public enum WorldEventType : byte
     GoldCoinCollected = 7,
     HipDropObject = 8,
     RedCoinCollected = 9,
+    YoshiFruitTaken = 10,
 }

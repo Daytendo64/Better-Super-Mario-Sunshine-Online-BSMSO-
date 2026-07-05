@@ -675,42 +675,58 @@
                     </TabItem>
                     <TabItem Header="Game files">
                         <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="8,12,8,8">
-                            <Grid MaxWidth="900">
-                                <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="*"/>
-                                    <ColumnDefinition Width="*"/>
-                                </Grid.ColumnDefinitions>
-                                <Border Grid.Column="0" Background="{StaticResource SmsCard}" CornerRadius="12" Padding="16" Margin="0,0,6,0"
+                            <StackPanel MaxWidth="900">
+                                <Grid Margin="0,0,0,12">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <Border Grid.Column="0" Background="{StaticResource SmsCard}" CornerRadius="12" Padding="16" Margin="0,0,6,0"
+                                            BorderBrush="{StaticResource SmsBorder}" BorderThickness="1">
+                                        <StackPanel>
+                                            <TextBlock Text="Extract with Dolphin" FontWeight="SemiBold" FontSize="14" Foreground="{StaticResource SmsAccent}" Margin="0,0,0,8"/>
+                                            <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
+                                                       Text="1. Add your NTSC-U SMS ISO to Dolphin's game list."/>
+                                            <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
+                                                       Text="2. Right-click the game → Properties → Filesystem tab."/>
+                                            <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
+                                                       Text="3. Click Extract All Files (or Extract Contents) and pick a folder."/>
+                                            <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap"
+                                                       Text="4. Confirm the folder contains sys\ and files\ subfolders."/>
+                                        </StackPanel>
+                                    </Border>
+                                    <Border Grid.Column="1" Background="{StaticResource SmsCard}" CornerRadius="12" Padding="16" Margin="6,0,0,0"
+                                            BorderBrush="{StaticResource SmsBorder}" BorderThickness="1">
+                                        <StackPanel>
+                                            <TextBlock Text="Why no rebuild?" FontWeight="SemiBold" FontSize="14" Foreground="{StaticResource SmsAccent}" Margin="0,0,0,8"/>
+                                            <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
+                                                       Text="Mods live as loose files under files\Kuribo!\Mods\. Dolphin can load them from an extracted folder — you never need to repack a .iso or .gcm."/>
+                                            <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap"
+                                                       Text="If you keep pointing BSMSO at a disc image file, new .kxe files inside the image won't load until you extract or rebuild. Use the extracted folder workflow below instead."/>
+                                        </StackPanel>
+                                    </Border>
+                                </Grid>
+                                <Border Background="{StaticResource SmsCard}" CornerRadius="12" Padding="16"
                                         BorderBrush="{StaticResource SmsBorder}" BorderThickness="1">
                                     <StackPanel>
-                                        <TextBlock Text="Extract with Dolphin" FontWeight="SemiBold" FontSize="14" Foreground="{StaticResource SmsAccent}" Margin="0,0,0,8"/>
+                                        <TextBlock Text="Install mods and play from the extracted folder" FontWeight="SemiBold" FontSize="14" Foreground="{StaticResource SmsAccent}" Margin="0,0,0,8"/>
                                         <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
-                                                   Text="1. Add your NTSC-U SMS ISO to Dolphin's game list."/>
+                                                   Text="1. In File Explorer, open your extracted SMS folder."/>
                                         <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
-                                                   Text="2. Right-click the game → Properties → Filesystem tab."/>
+                                                   Text="2. Go to files\Kuribo!\Mods\ (create Kuribo! and Mods if they are missing)."/>
                                         <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
-                                                   Text="3. Click Extract All Files (or Extract Contents) and pick a folder."/>
+                                                   Text="3. Copy BetterSunshineEngine.kxe and _BSMSO.kxe from the BSMSO zip into Mods. BSE must be present before _BSMSO.kxe."/>
+                                        <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
+                                                   Text="4. In BSMSO Settings, set Dolphin path to Dolphin.exe."/>
+                                        <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
+                                                   Text="5. For Game ISO, click Browse… → open your extracted folder → sys\ → select main.dol. (You can paste the extracted folder path and BSMSO will find sys\main.dol automatically.)"/>
+                                        <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
+                                                   Text="6. Click Launch Dolphin. BSMSO patches sys\boot.bin to GMSE90 and starts the game from the extracted files."/>
                                         <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap"
-                                                   Text="4. You should see sys\ and files\ inside that folder. Use this folder as your game path in BSMSO Settings."/>
+                                                   Text="7. To update mods later, replace the .kxe files in that same Mods folder and fully restart Dolphin. Do not use SMSCoop with BSMSO."/>
                                     </StackPanel>
                                 </Border>
-                                <Border Grid.Column="1" Background="{StaticResource SmsCard}" CornerRadius="12" Padding="16" Margin="6,0,0,0"
-                                        BorderBrush="{StaticResource SmsBorder}" BorderThickness="1">
-                                    <StackPanel>
-                                        <TextBlock Text="No ISO rebuild needed" FontWeight="SemiBold" FontSize="14" Foreground="{StaticResource SmsAccent}" Margin="0,0,0,8"/>
-                                        <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,8"
-                                                   Text="You do not need to repack a .iso or .gcm after installing mods. Dolphin and BSMSO can run directly from the extracted folder."/>
-                                        <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
-                                                   Text="Copy BetterSunshineEngine.kxe and _BSMSO.kxe into:"/>
-                                        <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,8" FontFamily="Consolas"
-                                                   Text="files\Kuribo!\Mods\"/>
-                                        <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
-                                                   Text="BSE must load before _BSMSO.kxe. Point Settings at the extracted folder (or sys\main.dol inside it)."/>
-                                        <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap"
-                                                   Text="To update mods later, replace the .kxe files and restart Dolphin. BSMSO uses game ID GMSE90 (launcher patches automatically). Do not use SMSCoop with BSMSO."/>
-                                    </StackPanel>
-                                </Border>
-                            </Grid>
+                            </StackPanel>
                         </ScrollViewer>
                     </TabItem>
                     <TabItem Header="Online play">

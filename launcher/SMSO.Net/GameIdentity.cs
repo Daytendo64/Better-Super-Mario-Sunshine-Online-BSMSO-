@@ -92,6 +92,40 @@ public static class GameIdentity
         path.EndsWith(".gcm", StringComparison.OrdinalIgnoreCase) ||
         path.EndsWith(".gcz", StringComparison.OrdinalIgnoreCase);
 
+    /// <summary>
+    /// Resolves the path Dolphin should receive on <c>-e</c>: a disc image, main.dol, or
+    /// sys/main.dol inside an extracted game folder.
+    /// </summary>
+    public static bool TryResolveDolphinLaunchPath(string gamePath, out string launchPath)
+    {
+        launchPath = string.Empty;
+        if (string.IsNullOrWhiteSpace(gamePath))
+            return false;
+
+        var trimmed = gamePath.Trim().Trim('"');
+        if (File.Exists(trimmed))
+        {
+            if (IsDiscImagePath(trimmed) ||
+                string.Equals(Path.GetFileName(trimmed), "main.dol", StringComparison.OrdinalIgnoreCase))
+            {
+                launchPath = trimmed;
+                return true;
+            }
+
+            return false;
+        }
+
+        if (!Directory.Exists(trimmed))
+            return false;
+
+        var mainDol = Path.Combine(trimmed, "sys", "main.dol");
+        if (!File.Exists(mainDol))
+            return false;
+
+        launchPath = mainDol;
+        return true;
+    }
+
     private static bool TryReadBootBinGameId(string bootBinPath, out string gameId)
     {
         gameId = string.Empty;

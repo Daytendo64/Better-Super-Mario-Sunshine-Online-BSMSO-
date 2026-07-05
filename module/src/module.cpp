@@ -8,6 +8,7 @@
 #include "hide_seek.hpp"
 #include "stage_guard.hpp"
 #include "connection_hud.hpp"
+#include "cutscene_skip.hpp"
 
 #include <BetterSMS/application.hxx>
 #include <BetterSMS/game.hxx>
@@ -25,6 +26,7 @@ extern TMario *gpMarioAddress;
 
 BETTER_SMS_FOR_CALLBACK static bool appContextHeartbeat(TApplication *app) {
     (void)app;
+    smso::updateCutsceneSkipPatches();
     smso::publishMailboxAnchor();
     return true;
 }
@@ -39,6 +41,7 @@ BETTER_SMS_FOR_CALLBACK static void stageInit(TMarDirector *director) {
     smso::initStageGuard();
     smso::ensureHipDropObjectHooks();
     smso::applyHotelWarpMissionOverride(director);
+    smso::updateCutsceneSkipPatches();
     const u8 missionEp = static_cast<u8>(TFlagManager::smInstance->getFlag(0x40003));
     OSReport("[SMSOBB] Stage init area=%u load=%u mission=%u\n", director->mAreaID,
              director->mEpisodeID, missionEp);
@@ -60,6 +63,7 @@ BETTER_SMS_FOR_CALLBACK static void stageUpdate(TMarDirector *director) {
     if (!gpMarDirector || !gpMarioAddress)
         return;
 
+    smso::updateCutsceneSkipPatches();
     smso::exportLocalPlayer(gpMarioAddress, director);
     smso::updatePuppets(director);
     smso::updateRemoteActors(director);
@@ -117,6 +121,7 @@ KURIBO_MODULE_BEGIN("Better Super Mario Sunshine Online", "BSMSO", "v1.0") {
         smso::initCommBuffer();
         smso::initWorldSync();
         smso::bootHideSeek();
+        smso::updateCutsceneSkipPatches();
         OSReport("[SMSOBB] v1.0 loaded (comm @ %p)\n", smso::getCommBuffer());
     }
 }

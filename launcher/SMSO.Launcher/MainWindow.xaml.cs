@@ -419,7 +419,11 @@ public partial class MainWindow : Window
 
     private void BrowseIso_Click(object sender, RoutedEventArgs e)
     {
-        var dlg = new OpenFileDialog { Filter = "GameCube ISO|*.iso;*.gcm;*.dol" };
+        var dlg = new OpenFileDialog
+        {
+            Filter = "GameCube disc|*.iso;*.gcm;*.gcz|Extracted game (main.dol)|main.dol|All files|*.*",
+            Title = "Select disc image or sys\\main.dol from extracted folder",
+        };
         if (dlg.ShowDialog() == true)
         {
             IsoPathBox.Text = dlg.FileName;
@@ -542,9 +546,18 @@ public partial class MainWindow : Window
             return false;
         }
 
-        if (!File.Exists(iso))
+        if (!GameIdentity.TryResolveDolphinLaunchPath(iso, out _))
         {
-            error = $"Game ISO not found:\n{iso}";
+            if (Directory.Exists(iso))
+            {
+                error =
+                    $"Extracted game folder is missing sys\\main.dol:\n{iso}\n\nBrowse to sys\\main.dol or fix the folder contents.";
+            }
+            else
+            {
+                error =
+                    $"Game path not found or unsupported:\n{iso}\n\nUse a .iso/.gcm file, sys\\main.dol, or an extracted folder containing sys\\main.dol.";
+            }
             return false;
         }
 

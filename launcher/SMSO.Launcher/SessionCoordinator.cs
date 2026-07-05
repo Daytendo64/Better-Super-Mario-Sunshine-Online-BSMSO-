@@ -490,10 +490,11 @@ public sealed class SessionCoordinator : IDisposable
         _bridge.TryAttach();
 
         Log?.Invoke($"Launched Dolphin: {dolphinPath} (PID {processId})");
-        if (!string.IsNullOrWhiteSpace(isoPath) && File.Exists(isoPath.Trim().Trim('"')))
-            Log?.Invoke($"Loading game: {isoPath}");
+        if (!string.IsNullOrWhiteSpace(isoPath) &&
+            GameIdentity.TryResolveDolphinLaunchPath(isoPath.Trim().Trim('"'), out var launchPath))
+            Log?.Invoke($"Loading game: {launchPath}");
         else if (!string.IsNullOrWhiteSpace(isoPath))
-            Log?.Invoke("ISO path not found — Dolphin opened without loading a game");
+            Log?.Invoke("Game path not found — Dolphin opened without loading a game");
 
         return true;
     }

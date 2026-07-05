@@ -28,6 +28,27 @@ public sealed class GameIdentityTests
     }
 
     [Fact]
+    public void TryResolveDolphinLaunchPath_FromExtractedFolder_FindsMainDol()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "smso-launch-" + Guid.NewGuid().ToString("N"));
+        var sysDir = Path.Combine(root, "sys");
+        Directory.CreateDirectory(sysDir);
+
+        var mainDol = Path.Combine(sysDir, "main.dol");
+        File.WriteAllBytes(mainDol, new byte[] { 0x01 });
+
+        try
+        {
+            Assert.True(GameIdentity.TryResolveDolphinLaunchPath(root, out var launchPath));
+            Assert.Equal(mainDol, launchPath);
+        }
+        finally
+        {
+            Directory.Delete(root, true);
+        }
+    }
+
+    [Fact]
     public void TryPatchGameId_BootBin_UpdatesFirstSixBytes()
     {
         var bootBin = Path.Combine(Path.GetTempPath(), "smso-boot-" + Guid.NewGuid().ToString("N") + ".bin");

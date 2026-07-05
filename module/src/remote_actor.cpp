@@ -1489,10 +1489,11 @@ static void mergeRemoteSwitchProgress(f32 *local, f32 network, bool towardSpray,
 }
 
 static void syncRemoteAnimAux(TMario *body, TWaterGun *fludd, u8 animAux, bool showFluddOnBack) {
-    const u8 hand = unpackAnimAuxHand(animAux);
+    const bool onYoshi = body && body->onYoshi();
+    const u8 hand = onYoshi ? unpackYoshiTongueHand(animAux) : unpackAnimAuxHand(animAux);
     body->changeHand(static_cast<int>(hand));
 
-    if (!fludd || !showFluddOnBack)
+    if (!fludd || !showFluddOnBack || onYoshi)
         return;
 
     f32 *deploy = getFluddDeploy(fludd);

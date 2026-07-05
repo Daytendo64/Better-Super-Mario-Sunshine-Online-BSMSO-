@@ -273,8 +273,8 @@ static u16 buildVfxFlags(TMario *mario) {
 }
 
 static u8 mapGameStateToDolphin(u8 gameState) {
-    // During normal stage play, publish Active even if a blocked loading zone left
-    // mGameState stuck in WARPING — keeps bridge remote sync alive (SMSO visibility).
+    // During normal stage play, publish Active even if a loading zone left mGameState in
+    // WARPING — keeps bridge remote sync alive while warpin cutscenes finish.
     if (gpMarDirector && gpMarDirector->mCurState == TMarDirector::STATE_NORMAL)
         return DS_ACTIVE;
 
