@@ -907,13 +907,21 @@ public sealed class SessionCoordinator : IDisposable
 
     private void OnLocalSnapshot(PlayerSnapshot snap)
     {
+        var logicalStage = YoshiSnapshotCodec.LogicalStageId(snap, snap.StageId);
+        var logicalEpisode = YoshiSnapshotCodec.LogicalEpisodeId(snap, snap.EpisodeId);
+        var lastLogicalStage = _hasLastLocalSnapshot
+            ? YoshiSnapshotCodec.LogicalStageId(_lastLocalSnapshot, _lastLocalSnapshot.StageId)
+            : logicalStage;
+        var lastLogicalEpisode = _hasLastLocalSnapshot
+            ? YoshiSnapshotCodec.LogicalEpisodeId(_lastLocalSnapshot, _lastLocalSnapshot.EpisodeId)
+            : logicalEpisode;
+
         var stageChanged = _hasLastLocalSnapshot &&
-                           (snap.StageId != _lastLocalSnapshot.StageId ||
-                            snap.EpisodeId != _lastLocalSnapshot.EpisodeId);
+                           (logicalStage != lastLogicalStage || logicalEpisode != lastLogicalEpisode);
         _lastLocalSnapshot = snap;
         _hasLastLocalSnapshot = true;
         if (stageChanged)
-            FlushPendingEpisodeWorldEvents(snap.StageId, snap.EpisodeId);
+            FlushPendingEpisodeWorldEvents(logicalStage, logicalEpisode);
         SendLocalSnapshot(snap);
         _bridgeWorker.FlushRemoteSnapshotsToDolphin();
     }
@@ -990,8 +998,9 @@ public sealed class SessionCoordinator : IDisposable
         if (!forceApply &&
             IsEpisodeScopedWorldEvent(worldEvent.Type) &&
             _hasLastLocalSnapshot &&
-            (worldEvent.CourseId != _lastLocalSnapshot.StageId ||
-             worldEvent.EpisodeId != _lastLocalSnapshot.EpisodeId))
+            (worldEvent.CourseId != YoshiSnapshotCodec.LogicalStageId(_lastLocalSnapshot, _lastLocalSnapshot.StageId) ||
+             worldEvent.EpisodeId != YoshiSnapshotCodec.LogicalEpisodeId(_lastLocalSnapshot,
+                 _lastLocalSnapshot.EpisodeId)))
         {
             if (_pendingEpisodeWorldEvents.All(pending => pending.EventId != worldEvent.EventId))
                 _pendingEpisodeWorldEvents.Add(worldEvent);
@@ -1062,7 +1071,10 @@ public sealed class SessionCoordinator : IDisposable
                 var state = _bridgeWorker.LinkState == DolphinLinkState.ModuleReady
                     ? DolphinState.Active
                     : DolphinState.Booting;
-                _server.UpdatePlayerState(LocalSlot, snap.StageId, snap.EpisodeId, state,
+                _server.UpdatePlayerState(LocalSlot,
+                    YoshiSnapshotCodec.LogicalStageId(snap, snap.StageId),
+                    YoshiSnapshotCodec.LogicalEpisodeId(snap, snap.EpisodeId),
+                    state,
                     _client?.MeasuredPingMs ?? 0);
             }
         }

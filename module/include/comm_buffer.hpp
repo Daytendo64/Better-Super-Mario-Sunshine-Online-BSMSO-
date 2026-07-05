@@ -95,15 +95,32 @@ enum VfxFlags : u16 {
     VFX_NOZZLE_SWITCHING = 1 << 7, // host mSwitchToSecondNozzleSpeed != 0
     VFX_WET_SLIDE = 1 << 8,        // belly CATCH slide in water / on wet ground
     VFX_NO_FLUDD = 1 << 9,         // FLUDD pack hidden on Mario's back (see shouldShowFluddPackOnMario)
-    // Host riding Yoshi with a fruit in TYoshiTongue::mActorTypeInMouth — episodeId is fruit encode.
+    // Host riding Yoshi with fruit in mouth — fruit actor encode (1..7) in vfx bits 11..13.
     VFX_YOSHI_FRUIT_MOUTH = 1 << 10,
 };
 
 // Bits 8-9 are persistent VFX flags. Bits 10-15 pack Y-cam pitch, active-spray FLUDD gun
-// angle (mGunAngle), or run waist roll so auxiliary angle data never clobbers VFX_WET_SLIDE
-// or VFX_NO_FLUDD during movement.
+// angle (mGunAngle), run waist roll, or Yoshi fruit encode (bits 11..13 when fruit mouth).
 constexpr u16 kVfxPersistentHighMask = static_cast<u16>(VFX_WET_SLIDE | VFX_NO_FLUDD);
 constexpr u16 kVfxAuxAngleShift = 10;
+constexpr u16 kVfxYoshiFruitEncShift = 11;
+
+inline u16 packYoshiFruitMouthVfx(u16 vfxFlags, u8 fruitEnc) {
+    u16 packed = static_cast<u16>(vfxFlags & (0x00FFu | kVfxPersistentHighMask));
+    packed |= VFX_YOSHI_FRUIT_MOUTH;
+    packed |= static_cast<u16>((static_cast<u16>(fruitEnc) & 0x07u) << kVfxYoshiFruitEncShift);
+    return packed;
+}
+
+inline u8 unpackYoshiFruitEnc(u16 vfxFlags) {
+    if ((vfxFlags & VFX_YOSHI_FRUIT_MOUTH) == 0)
+        return 0;
+    return static_cast<u8>((vfxFlags >> kVfxYoshiFruitEncShift) & 0x07u);
+}
+
+inline void clearYoshiFruitMouthVfx(u16 &vfxFlags) {
+    vfxFlags = static_cast<u16>(vfxFlags & ~(static_cast<u16>(0x3Fu) << kVfxAuxAngleShift));
+}
 
 // pingMs high byte and vfxFlags bits 10-15 pack s16 angles into 0..63.
 // Aux-bit priority on the wire: VFX_Y_CAM L-button pitch > active-spray (VFX_WATER_SPRAY /
@@ -208,10 +225,11 @@ inline f32 unpackAnimAuxDeploy(u8 packed) {
            static_cast<f32>(kAnimAuxDeployScale);
 }
 
-// When snapshotHostOnYoshi, health/stageId/episodeId/velocity carry TYoshiTongue sync.
+// When snapshotHostOnYoshi, health/episodeId/velocity/pingMs carry TYoshiTongue sync.
 // health: bits 0-1 hand, 2-4 tongue state (doldecomp TYoshiTongue::STATE_*), 5-7 progress/8.
-// stageId: exact mProgress (0..255) while tongue is active, else host stage area id.
-// episodeId: fruit mouth actor encode (see yoshi_sync.cpp) while set, else host episode id.
+// stageId / episodeId: always the host's real area + scenario. Fruit-in-mouth uses
+// VFX_YOSHI_FRUIT_MOUTH plus bits 11..13 (unpackYoshiFruitEnc).
+// pingMs low byte: exact tongue mProgress (0..255) while tongue is active; otherwise BCK rate*64.
 // velocity: tongue tip offset from Mario while tongue is active, else Mario speed.
 constexpr u8 kYoshiTongueHandMask = 0x03;
 constexpr u8 kYoshiTongueStateShift = 2;

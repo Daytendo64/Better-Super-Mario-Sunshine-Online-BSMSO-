@@ -26,9 +26,15 @@ extern TMario *gpMarioAddress;
 
 BETTER_SMS_FOR_CALLBACK static bool appContextHeartbeat(TApplication *app) {
     (void)app;
-    smso::updateCutsceneSkipPatches();
     smso::publishMailboxAnchor();
     return true;
+}
+
+BETTER_SMS_FOR_CALLBACK static void movieLoopCutsceneSkipRefresh(TApplication *app) {
+    (void)app;
+    // Runs from gameLoopCallbackHandler immediately before director->direct(), including
+    // CONTEXT_DIRECT_MOVIE where stage callbacks are inactive.
+    smso::updateCutsceneSkipPatches();
 }
 
 BETTER_SMS_FOR_CALLBACK static void stageInit(TMarDirector *director) {
@@ -81,6 +87,7 @@ BETTER_SMS_FOR_CALLBACK static void stageDraw2D(TMarDirector *director, const J2
 
 BETTER_SMS_FOR_CALLBACK static void stageExit(TApplication *app) {
     (void)app;
+    smso::updateCutsceneSkipPatches();
     smso::clearPuppets();
     smso::clearRemoteMarioVisuals();
     smso::clearRemoteActors();
@@ -107,6 +114,7 @@ static void registerCallbacks() {
     BetterSMS::Application::registerContextCallback(TApplication::CONTEXT_GAME_BOOT_LOGO, appContextHeartbeat);
     BetterSMS::Application::registerContextCallback(TApplication::CONTEXT_DIRECT_MAIN_LOOP, appContextHeartbeat);
     BetterSMS::Game::addInitCallback(connectionHudInit);
+    BetterSMS::Game::addLoopCallback(movieLoopCutsceneSkipRefresh);
     BetterSMS::Game::addLoopCallback(connectionHudUpdate);
     BetterSMS::Game::addPostDrawCallback(connectionHudDraw);
     BetterSMS::Stage::addInitCallback(stageInit);

@@ -14,7 +14,7 @@ extern TMario *gpMarioAddress;
 
 namespace {
 
-// User Gecko codes (NTSC-U), applied at runtime when auto-skip is allowed.
+// User Gecko codes (NTSC-U).
 // 042B5EF4 38600001  -> li r3, 1 @ 0x802B5EF4 (TMovieDirector::direct)
 // 042B5E8C 38600001  -> li r3, 1 @ 0x802B5E8C (TMovieDirector::direct)
 constexpr u32 kMovieSkipPatch = 0x38600001u;
@@ -31,6 +31,11 @@ constexpr u32 kDebsAlertVanillaWord = 0x41800078u;
 constexpr u8 kCoronaMountainAreaId = 52; // 0x34
 constexpr u8 kDelfinoPlazaAreaId = 1;
 constexpr u8 kFloodedPlazaEpisodeId = 9; // dolpic9 load scenario
+
+// Default to skip enabled; runtime may temporarily restore vanilla for first Corona FMV.
+SMS_WRITE_32(SMS_PORT_REGION(kMovieSkipPatchAddr1, 0x802ADE88, 0, 0), kMovieSkipPatch);
+SMS_WRITE_32(SMS_PORT_REGION(kMovieSkipPatchAddr2, 0x802ADE20, 0, 0), kMovieSkipPatch);
+SMS_WRITE_32(SMS_PORT_REGION(kDebsAlertSkipPatchAddr, 0x80135CF8, 0, 0), kDebsAlertSkipPatch);
 
 struct RuntimePatchSite {
     u32 memAddr;
@@ -53,10 +58,11 @@ static void flushPatchSite(u32 *site) {
 static void setRuntimePatch(const RuntimePatchSite &site, bool skipEnabled) {
     u32 *mem = reinterpret_cast<u32 *>(SMS_PORT_REGION(site.memAddr, 0, 0, 0));
     const u32 desired = skipEnabled ? site.patchWord : site.vanillaWord;
-    if (*mem != desired) {
+    if (*mem != desired)
         *mem = desired;
-        flushPatchSite(mem);
-    }
+    // Always flush: SMS_WRITE_32 may already match `desired` in RAM while the icache
+    // still holds vanilla TMovieDirector::direct code from boot.
+    flushPatchSite(mem);
 }
 
 static bool isFloodedPlazaScene(u8 areaId, u8 episodeId) {
@@ -76,70 +82,14 @@ static bool isFloodedPlazaContext() {
     return false;
 }
 
-static bool isCoronaMountainArea(u8 areaId) { return areaId == kCoronaMountainAreaId; }
-
-static bool isCoronaMountainContext() {
-    if (isCoronaMountainArea(gpApplication.mCurrentScene.mAreaID))
-        return true;
-    if (isCoronaMountainArea(gpApplication.mNextScene.mAreaID))
-        return true;
-    if (gpMarDirector && isCoronaMountainArea(gpMarDirector->mAreaID))
-        return true;
-    return false;
+// Only block skip for the flooded-plaza -> Corona loading FMV (not the whole visit).
+static bool isCoronaLoadingMoviePending() {
+    return gpApplication.mNextScene.mAreaID == kCoronaMountainAreaId &&
+           gpApplication.mCurrentScene.mAreaID != kCoronaMountainAreaId &&
+           isFloodedPlazaContext();
 }
 
-static bool isCoronaFirstVisitCutscenePending() {
-    if (!isCoronaMountainContext())
-        return false;
-
-    if (isCoronaMountainArea(gpApplication.mNextScene.mAreaID) && isFloodedPlazaContext())
-        return true;
-
-    if (isCoronaMountainArea(gpApplication.mCurrentScene.mAreaID) && isFloodedPlazaContext())
-        return true;
-
-    if (gpMarDirector && isCoronaMountainArea(gpMarDirector->mAreaID) && gpMarioAddress &&
-        isFloodedPlazaScene(gpApplication.mPrevScene.mAreaID,
-                            gpApplication.mPrevScene.mEpisodeID) &&
-        (gpMarioAddress->mState & TMario::STATE_CUTSCENE) != 0)
-        return true;
-
-    return false;
-}
-
-using SMSGetShineIDofExStageFn = u8 (*)(u8);
-
-static SMSGetShineIDofExStageFn shineIdOfExStageFn() {
-    return reinterpret_cast<SMSGetShineIDofExStageFn>(
-        SMS_PORT_REGION(0x802A8A98, 0x802A0798, 0, 0));
-}
-
-static bool isPendingExStageIntroMovie() {
-    const u8 nextArea = gpApplication.mNextScene.mAreaID;
-    SMSGetShineIDofExStageFn getShineId = shineIdOfExStageFn();
-    if (!getShineId)
-        return false;
-
-    const u8 shineId = getShineId(nextArea);
-    if (shineId == 0xFF)
-        return false;
-
-    TFlagManager *fm = TFlagManager::smInstance;
-    if (!fm)
-        return false;
-
-    return !fm->getShineFlag(shineId);
-}
-
-static bool shouldBlockMovieAutoSkip() {
-    if (isPendingExStageIntroMovie())
-        return true;
-    if (isCoronaFirstVisitCutscenePending())
-        return true;
-    return false;
-}
-
-static bool shouldBlockDebsAutoSkip() { return isCoronaFirstVisitCutscenePending(); }
+static bool shouldBlockMovieAutoSkip() { return isCoronaLoadingMoviePending(); }
 
 } // namespace
 
@@ -147,11 +97,10 @@ namespace smso {
 
 void updateCutsceneSkipPatches() {
     const bool movieSkipEnabled = !shouldBlockMovieAutoSkip();
-    const bool debsSkipEnabled = !shouldBlockDebsAutoSkip();
 
     setRuntimePatch(sMoviePatch1, movieSkipEnabled);
     setRuntimePatch(sMoviePatch2, movieSkipEnabled);
-    setRuntimePatch(sDebsPatch, debsSkipEnabled);
+    setRuntimePatch(sDebsPatch, true);
 }
 
 } // namespace smso

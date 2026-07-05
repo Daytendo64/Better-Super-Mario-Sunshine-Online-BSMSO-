@@ -487,6 +487,8 @@ void exportLocalPlayer(TMario *mario, TMarDirector *director) {
         snap.water = tankEnc;
 
     smso::exportBlooperSurfSnapshotFields(mario, snap);
+    smso::exportYoshiTongueProgressPingLow(mario, snap);
+    smso::exportYoshiBckFramePingHigh(mario, snap);
 
     if (waistPack) {
         const u8 rollEnc = encodeSnapshotAngle6(static_cast<s16>(mario->_3D8));

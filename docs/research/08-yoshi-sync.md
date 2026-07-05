@@ -13,11 +13,11 @@ Host riding Yoshi: **`VFX_NO_FLUDD`** + current nozzle **`TWaterGun::Yoshi`**.
 | `animId` | Yoshi-riding Mario BCK indices (0xB6..0xC6) — **only valid when `TMario::onYoshi()`** |
 | `water` | Host Yoshi BCK index while riding |
 | `health` | bits 0–1 hand, 2–4 `TYoshiTongue` state, 5–7 coarse `mProgress/8` |
-| `stageId` | exact tongue `mProgress` (0–255) while tongue active, else host area id |
-| `episodeId` | encoded fruit actor type (1–7) while `VFX_YOSHI_FRUIT_MOUTH`, else host episode |
+| `stageId` / `episodeId` | Host real area + scenario (never tongue progress) |
 | `velocity` | tongue tip offset from Mario while tongue active, else Mario speed |
-| `vfxFlags` | `VFX_YOSHI_FRUIT_MOUTH` when `episodeId` carries fruit encode |
-| `pingMs` high byte | Yoshi spray pressure while `VFX_WATER_SPRAY` |
+| `vfxFlags` | `VFX_YOSHI_FRUIT_MOUTH` + bits 11–13 fruit encode (`unpackYoshiFruitEnc`) |
+| `pingMs` low byte | exact tongue `mProgress` (0–255) while tongue active, else BCK rate×64 |
+| `pingMs` high byte | Yoshi BCK frame×8 while riding and not spraying, else spray pressure / aux |
 | `VFX_NO_FLUDD` | FLUDD pack hidden on Mario's back |
 
 Fruit actor encodes (`doldecomp` `TYoshiTongue::mActorTypeInMouth`):
@@ -29,37 +29,50 @@ Fruit actor encodes (`doldecomp` `TYoshiTongue::mActorTypeInMouth`):
 | … | … |
 | 7 | `0x40000396` |
 
-## Tongue sync (`TYoshiTongue`, doldecomp `Tongue.hpp`)
+## Tongue sync (`TYoshiTongue`, doldecomp `Tongue.cpp`)
 
 Retail fields replicated on remotes:
 
 - `mState` @ `0x7C` — IDLE / EXTENDING / GRABBED / RETRACTING / …
-- `mProgress` @ `0x7E` — extension/retract animation timer
+- `mProgress` @ `0x7E` — extension/retract animation timer (exact value in `pingMs` low byte)
 - `mActorTypeInMouth` @ `0xD0` — grabbed fruit (or other actor) type
-- `mTipPos` @ `0xB8` — world-space tongue tip (via `velocity` offset from Mario)
+- `mHeadPos` / `mHeadDir` / `mTipPos` — tip via `velocity` offset; head dir derived from offset
 
-Remote puppets run retail `calcAnim`, `viewCalc`, and `entry` on the tongue object so the mesh tracks the host.
+### Safe vs unsafe retail calls on puppet tongues
+
+| Function | Safe on remote? | Notes |
+|----------|-----------------|-------|
+| `calcAnim(mtx)` | **Yes** | Matrix math from synced head/tip/state |
+| `viewCalc()` | **Yes** | Only `mModel`/`mTipModel->viewCalc()` — does **not** scan stage |
+| `entry()` | **Yes** | Draws tongue mesh when state ≠ IDLE |
+| `movement()` | **No** | Calls `findTarget()`, `canGo()`, mutates stage actors |
+| `findTarget()` | **No** | Scans `mCollisions[]` for grabbables |
+| `thinkUpper()` / `emitTongue()` | **No** | Local-input tongue emit loop |
+
+After `TYoshi::initInLoadAfter()`, remote puppet tongues are **removed from 敵グループ** so retail collision/movement paths never run on network bodies.
 
 ## Fruit eating
 
 1. **Continuous sync** — snapshot fields above keep tongue pose and mouth actor aligned.
-2. **Eat animation** — remotes call retail `TYoshi::doEat(actorType)` when host Yoshi BCK transitions into eat anims (10 / 12 / 15).
+2. **Eat animation** — remotes switch Yoshi BCK to eat anims (10 / 12 / 15) on transition; **never** call retail `doEat()` (mutates stage fruit).
 3. **World event `WE_YOSHI_FRUIT_TAKEN` (10)** — published once per fruit grab (payload0 = encode, payload1 = packed tip position, reserved = eater slot). Remotes hide the nearest matching `TMapObjBase` fruit within 450 units.
 
-## Remote apply (`yoshi_sync.cpp` + `remote_water_sync.cpp`)
+## Remote apply (`yoshi_sync.cpp` + `remote_actor.cpp`)
 
-1. **Before** `syncRemoteAnimation`: mount puppet via `TYoshi::MOUNTED` + `setBckFromIndex`/`thinkBtp` (no `changeAnimation` — avoids `mBodyAnmSound` init).
-2. `initInLoadAfter()` at puppet spawn and once per slot on first mount (tongue/mirror rig).
-3. Each frame: sync juice, color, translation, host Yoshi BCK; **safe mounted calc** (mirror rig + tongue `calcAnim` for eat/spray matrix).
-4. While host sprays: retail `thinkUpper` for mouth BCK only — puppet FLUDD nozzle/pressure is **staged and restored** inside calc (never `mHasFludd`, never `movement()`/`perform()`).
-5. **Juice spray VFX** (`emitRemoteYoshiJuiceSpray`): spray cone + model-water droplets from `getRemoteYoshiSprayEmitMtx()`.
-6. Dismount: reset companion to `STATE_EGG`.
-7. `syncRemoteAnimAux` uses `unpackYoshiTongueHand` (not FLUDD deploy) while `onYoshi()`.
+1. **Before** `syncRemoteAnimation`: mount puppet via `TYoshi::MOUNTED` + `setBckFromIndex`/`thinkBtp` (no `ride()` — avoids BGM/voice side effects).
+2. `initInLoadAfter()` once per slot on first mount; then remove puppet tongue from 敵グループ.
+3. Each frame: sync juice, color (`thinkBtp` matches current BCK), translation, host Yoshi BCK frame (`pingMs >> 8`).
+4. **Mounted calc subset** of `TYoshi::calcAnim`: mirror rig + tongue `calcAnim` (no `thinkUpper`).
+5. **Draw**: retail `TYoshi::entry` for tev/color + tongue `entry`; tongue `viewCalc` in view pass.
+6. While host sprays juice: staged FLUDD nozzle pressure from `pingMs` high byte.
+7. Dismount: reset companion to `STATE_EGG`.
+8. `syncRemoteAnimAux` uses `unpackYoshiTongueHand` while `onYoshi()`.
+9. `syncRemoteAnimation` / `syncRemoteHeadWaist` must **not** decode `pingMs` as Mario BCK rate/head angles while host rides Yoshi.
 
 ## Crash fix (2026-06-27)
 
-Remote clients crashed because `syncRemoteAnimation` ran **before** Yoshi mount and fed yoshi-riding `animId` values into retail `TMario::setAnimation` while `onYoshi()` was still false (`MarioDraw.cpp`).
+Remote clients crashed because `syncRemoteAnimation` ran **before** Yoshi mount and fed yoshi-riding `animId` values into retail `TMario::setAnimation` while `onYoshi()` was still false.
 
 Fix: reorder apply so Yoshi mount precedes animation sync; fallback to `ANIMATION_IDLE` if mount is not ready.
 
-Sources: doldecomp `Yoshi.cpp`, `Tongue.cpp`, BSE `stage.cpp`, SMSO `remote_actor.cpp`, `world_sync.cpp`.
+Sources: doldecomp `Yoshi.cpp`, `Tongue.cpp`, BSE `stage.cpp`, SMSO `remote_actor.cpp`, `yoshi_sync.cpp`, `world_sync.cpp`.

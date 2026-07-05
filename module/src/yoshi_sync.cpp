@@ -6,15 +6,20 @@
 #include <SMS/MapObj/MapObjBase.hxx>
 #include <SMS/Player/Mario.hxx>
 #include <SMS/Player/NozzleBase.hxx>
+#include <SMS/Player/NozzleTrigger.hxx>
+#include <SMS/Player/Watergun.hxx>
 #include <SMS/Player/Yoshi.hxx>
 #include <SMS/Strategic/HitActor.hxx>
 #include <SMS/Strategic/LiveActor.hxx>
 #include <SMS/System/MarDirector.hxx>
 #include <SMS/macros.h>
-#include <SMS/raw_fn.hxx>
 
 #include <JSystem/J3D/J3DModel.hxx>
 #include <JSystem/JDrama/JDRGraphics.hxx>
+#include <JSystem/JDrama/JDRNameRefGen.hxx>
+#include <JSystem/JDrama/JDRViewObjPtrListT.hxx>
+#include <Dolphin/OS.h>
+#include <math.h>
 #include <Dolphin/MTX.h>
 #include <Dolphin/types.h>
 #include <JSystem/JUtility/JUTColor.hxx>
@@ -26,7 +31,9 @@ namespace {
 
 constexpr u8 kYoshiNozzleId = static_cast<u8>(TWaterGun::Yoshi);
 constexpr u8 kYoshiJuiceScale = 31;
+constexpr f32 kRemoteYoshiAnimResyncFrames = 2.0f;
 constexpr int kYoshiRideAnimId = 0x16;
+
 constexpr int kYoshiMirrorJointA = 37;
 constexpr int kYoshiMirrorJointB = 32;
 // doldecomp TYoshi @ 0x3C — tongue joint index for getTongueMtx().
@@ -41,21 +48,100 @@ constexpr u32 kTongueTipPosOffset = 0xB8;
 constexpr f32 kYoshiFruitMatchRadiusSq = 450.0f * 450.0f;
 
 using YoshiTongueCalcAnimFn = void (*)(void *, Mtx *);
-using YoshiTongueViewCalcFn = void (*)(void *);
-using YoshiTongueEntryFn = void (*)(void *);
+using YoshiTongueVoidFn = void (*)(void *);
+using YoshiEntryFn = void (*)(TYoshi *);
 using YoshiThinkUpperFn = void (*)(TYoshi *);
-using YoshiDoEatFn = void (*)(TYoshi *, u32);
 
 static YoshiTongueCalcAnimFn sYoshiTongueCalcAnim =
     reinterpret_cast<YoshiTongueCalcAnimFn>(SMS_PORT_REGION(0x8026764C, 0x8025F3D8, 0, 0));
-static YoshiTongueViewCalcFn sYoshiTongueViewCalc =
-    reinterpret_cast<YoshiTongueViewCalcFn>(SMS_PORT_REGION(0x802675F0, 0x8025F37C, 0, 0));
-static YoshiTongueEntryFn sYoshiTongueEntry =
-    reinterpret_cast<YoshiTongueEntryFn>(SMS_PORT_REGION(0x80267594, 0x8025F320, 0, 0));
+static YoshiTongueVoidFn sYoshiTongueViewCalc =
+    reinterpret_cast<YoshiTongueVoidFn>(SMS_PORT_REGION(0x802675F0, 0x8025F37C, 0, 0));
+static YoshiEntryFn sYoshiEntry =
+    reinterpret_cast<YoshiEntryFn>(SMS_PORT_REGION(0x8026DF9C, 0x80265D28, 0, 0));
 static YoshiThinkUpperFn sYoshiThinkUpper =
     reinterpret_cast<YoshiThinkUpperFn>(SMS_PORT_REGION(0x8026FC90, 0x80267A1C, 0, 0));
-static YoshiDoEatFn sYoshiDoEat =
-    reinterpret_cast<YoshiDoEatFn>(SMS_PORT_REGION(0x8026F60C, 0x80267398, 0, 0));
+
+struct StagedYoshiThinkFludd {
+    u8 nozzle;
+    s32 water;
+    f32 deformPressure;
+    f32 triggerFill;
+    u8 sprayState;
+};
+
+static void stageRemoteYoshiThinkUpperFludd(TMario *body, const RemoteYoshiSlot *slot,
+                                            StagedYoshiThinkFludd &saved) {
+    if (!body || !body->mFludd || !slot)
+        return;
+
+    TWaterGun *fludd = body->mFludd;
+    saved.nozzle = fludd->mCurrentNozzle;
+    saved.water = fludd->mCurrentWater;
+    saved.deformPressure = 0.0f;
+    saved.triggerFill = 0.0f;
+    saved.sprayState = TNozzleTrigger::INACTIVE;
+
+    TNozzleBase *yoshiNozzle = fludd->mNozzleList[TWaterGun::Yoshi];
+    if (yoshiNozzle)
+        saved.deformPressure = yoshiNozzle->_378;
+
+    const bool tongueActive = smso::yoshiTongueIsActive(slot->lastTongueState);
+    f32 mouthPressure = 0.0f;
+    if (slot->hostSpraying)
+        mouthPressure = smso::decodeSprayPressure(slot->sprayPressureEnc);
+    else if (tongueActive)
+        mouthPressure = 1.0f;
+
+    fludd->mCurrentNozzle = TWaterGun::Yoshi;
+    if (!yoshiNozzle)
+        return;
+
+    fludd->mCurrentWater = yoshiNozzle->mEmitParams.mAmountMax.get();
+    if (mouthPressure <= 0.01f) {
+        yoshiNozzle->_378 = 0.0f;
+        return;
+    }
+
+    yoshiNozzle->_378 = mouthPressure;
+
+    auto *trigger = reinterpret_cast<TNozzleTrigger *>(yoshiNozzle);
+    saved.triggerFill = trigger->mTriggerFill;
+    saved.sprayState = trigger->mSprayState;
+    const f32 maxPressure = trigger->mEmitParams.mInsidePressureMax.get();
+    if (maxPressure > 0.0f)
+        trigger->mTriggerFill = mouthPressure * maxPressure;
+    trigger->mSprayState = TNozzleTrigger::ACTIVE;
+}
+
+static void restoreRemoteYoshiThinkUpperFludd(TMario *body, const StagedYoshiThinkFludd &saved) {
+    if (!body || !body->mFludd)
+        return;
+
+    TWaterGun *fludd = body->mFludd;
+    fludd->mCurrentNozzle = saved.nozzle;
+    fludd->mCurrentWater = saved.water;
+
+    TNozzleBase *yoshiNozzle = fludd->mNozzleList[TWaterGun::Yoshi];
+    if (!yoshiNozzle)
+        return;
+
+    yoshiNozzle->_378 = saved.deformPressure;
+    auto *trigger = reinterpret_cast<TNozzleTrigger *>(yoshiNozzle);
+    trigger->mTriggerFill = saved.triggerFill;
+    trigger->mSprayState = saved.sprayState;
+}
+
+static void calcRemoteYoshiThinkUpper(TMario *body, TYoshi *yoshi, const RemoteYoshiSlot *slot) {
+    if (!body || !yoshi || !slot || !sYoshiThinkUpper)
+        return;
+
+    StagedYoshiThinkFludd staged = {};
+    stageRemoteYoshiThinkUpperFludd(body, slot, staged);
+    sYoshiThinkUpper(yoshi);
+    restoreRemoteYoshiThinkUpperFludd(body, staged);
+}
+
+static constexpr const char kEnemyGroupName[] = "敵グループ";
 
 static void *remoteYoshiTongue(TYoshi *yoshi) {
     if (!yoshi)
@@ -86,6 +172,10 @@ static Vec *remoteYoshiTongueTipPos(void *tongue) {
 
 static Vec *remoteYoshiTongueHeadPos(void *tongue) {
     return reinterpret_cast<Vec *>(reinterpret_cast<u8 *>(tongue) + kTongueHeadPosOffset);
+}
+
+static Vec *remoteYoshiTongueHeadDir(void *tongue) {
+    return reinterpret_cast<Vec *>(reinterpret_cast<u8 *>(tongue) + kTongueHeadDirOffset);
 }
 
 static bool isYoshiFruitActorType(u32 actorType) {
@@ -142,10 +232,7 @@ static bool isYoshiEatBck(u8 bckId) {
 }
 
 static u8 snapshotMouthFruitEnc(const smso::PlayerSnapshot &snap) {
-    if ((snap.vfxFlags & smso::VFX_YOSHI_FRUIT_MOUTH) == 0)
-        return 0;
-    const u8 enc = snap.episodeId;
-    return enc >= 1 && enc <= 7 ? enc : 0;
+    return smso::unpackYoshiFruitEnc(snap.vfxFlags);
 }
 
 static void publishLocalYoshiFruitTaken(u8 actorTypeEnc, const Vec &tipPos, u8 slot) {
@@ -165,16 +252,12 @@ static void publishLocalYoshiFruitTaken(u8 actorTypeEnc, const Vec &tipPos, u8 s
                                  actorTypeEnc, slot, packedPos);
 }
 
-static void performRemoteYoshiTongueDraw(void *tongue) {
-    if (!tongue || !sYoshiTongueViewCalc || !sYoshiTongueEntry)
+// doldecomp TYoshiTongue::viewCalc only calls mModel/mTipModel->viewCalc() — safe on remotes.
+// movement()/findTarget() are the stage-scanning paths and must never run on puppets.
+static void performRemoteYoshiTongueViewCalc(void *tongue) {
+    if (!tongue || !sYoshiTongueViewCalc)
         return;
-
-    const u16 state = *remoteYoshiTongueStatePtr(tongue);
-    if (state == 0)
-        return;
-
     sYoshiTongueViewCalc(tongue);
-    sYoshiTongueEntry(tongue);
 }
 
 static void applyRemoteYoshiTongueTipFromOffset(TMario *body, void *tongue, const smso::Vec3 &offset) {
@@ -183,12 +266,26 @@ static void applyRemoteYoshiTongueTipFromOffset(TMario *body, void *tongue, cons
 
     Vec *tip = remoteYoshiTongueTipPos(tongue);
     Vec *head = remoteYoshiTongueHeadPos(tongue);
+    Vec *headDir = remoteYoshiTongueHeadDir(tongue);
     tip->x = body->mTranslation.x + offset.x;
     tip->y = body->mTranslation.y + offset.y;
     tip->z = body->mTranslation.z + offset.z;
     head->x = body->mTranslation.x;
     head->y = body->mTranslation.y;
     head->z = body->mTranslation.z;
+
+    const f32 lenSq = offset.x * offset.x + offset.y * offset.y + offset.z * offset.z;
+    if (lenSq > 1.0f) {
+        const f32 invLen = 1.0f / sqrtf(lenSq);
+        headDir->x = offset.x * invLen;
+        headDir->y = offset.y * invLen;
+        headDir->z = offset.z * invLen;
+    } else {
+        const f32 yaw = body->mRotation.y;
+        headDir->x = sinf(yaw);
+        headDir->y = 0.0f;
+        headDir->z = cosf(yaw);
+    }
 }
 
 static void calcRemoteYoshiTongueAnim(TYoshi *yoshi, J3DModel *model) {
@@ -199,6 +296,7 @@ static void calcRemoteYoshiTongueAnim(TYoshi *yoshi, J3DModel *model) {
     const u16 joint = remoteYoshiTongueJointIndex(yoshi);
     Mtx tongueBase;
     MTXCopy(model->mJointArray[joint], tongueBase);
+    // calcAnim only — updates tongue joint matrices from synced state/progress (no viewCalc).
     sYoshiTongueCalcAnim(tongue, &tongueBase);
 }
 
@@ -279,7 +377,7 @@ static void offFlag1OnAllShapes(J3DModelData *data) {
     }
 }
 
-static void applyYoshiColor(TYoshi *yoshi, u8 type) {
+static void applyYoshiColor(TYoshi *yoshi, u8 type, u8 bckId) {
     const u8 clamped = clampYoshiType(type);
     yoshi->mType = static_cast<s8>(clamped);
 
@@ -288,7 +386,33 @@ static void applyYoshiColor(TYoshi *yoshi, u8 type) {
     yoshi->mRedComponent = static_cast<f32>(color.r);
     yoshi->mGreenComponent = static_cast<f32>(color.g);
     yoshi->mBlueComponent = static_cast<f32>(color.b);
-    yoshi->thinkBtp(4);
+    yoshi->thinkBtp(bckId > 0 ? static_cast<int>(bckId) : kYoshiRideAnimId);
+}
+
+static void removeRemoteYoshiTongueFromEnemyGroup(void *tongue) {
+    if (!tongue)
+        return;
+
+    JDrama::TNameRefGen *gen = JDrama::TNameRefGen::getInstance();
+    if (!gen)
+        return;
+
+    JDrama::TNameRef *ref = gen->getNameRef(kEnemyGroupName);
+    if (!ref) {
+        JDrama::TNameRef *root = gen->getRootNameRef();
+        if (root)
+            ref = root->search(kEnemyGroupName);
+    }
+    if (!ref)
+        return;
+
+    auto *group = reinterpret_cast<JDrama::TViewObjPtrListT<JDrama::TViewObj> *>(ref);
+    for (auto it = group->mViewObjList.begin(); it != group->mViewObjList.end(); ++it) {
+        if (static_cast<void *>(*it) == tongue) {
+            group->mViewObjList.erase(it);
+            return;
+        }
+    }
 }
 
 static void ensureRemoteYoshiDrawable(TYoshi *yoshi) {
@@ -319,61 +443,6 @@ static void resetRemoteYoshiToEgg(TYoshi *yoshi, RemoteYoshiSlot &slot) {
     slot.lastFruitEatEventId = 0;
 }
 
-static void stagePuppetFluddForYoshiThinkUpper(TMario *body, const RemoteYoshiSlot *slot) {
-    if (!body || !body->mFludd || !slot)
-        return;
-
-    TWaterGun *fludd = body->mFludd;
-    fludd->mCurrentNozzle = TWaterGun::Yoshi;
-
-    TNozzleBase *nozzle = fludd->mNozzleList[TWaterGun::Yoshi];
-    if (!nozzle)
-        return;
-
-    fludd->mCurrentWater = nozzle->mEmitParams.mAmountMax.get();
-    if (slot->hostSpraying) {
-        const f32 pressure =
-            slot->sprayPressureEnc > 0 ? static_cast<f32>(slot->sprayPressureEnc) / 255.0f : 0.0f;
-        nozzle->_378 = pressure;
-    } else {
-        // doldecomp TYoshi::thinkUpper — unk378 <= 0 exits spray mouth BCK back to idle.
-        nozzle->_378 = 0.0f;
-    }
-}
-
-struct PuppetFluddThinkUpperState {
-    u8 nozzle;
-    s32 water;
-    f32 pressure;
-    bool valid;
-};
-
-static PuppetFluddThinkUpperState stashPuppetFluddForThinkUpper(TMario *body) {
-    PuppetFluddThinkUpperState saved = {};
-    if (!body || !body->mFludd)
-        return saved;
-
-    TWaterGun *fludd = body->mFludd;
-    saved.valid = true;
-    saved.nozzle = fludd->mCurrentNozzle;
-    saved.water = fludd->mCurrentWater;
-    TNozzleBase *nozzle = fludd->mNozzleList[TWaterGun::Yoshi];
-    saved.pressure = nozzle ? nozzle->_378 : 0.0f;
-    return saved;
-}
-
-static void restorePuppetFluddAfterThinkUpper(TMario *body, const PuppetFluddThinkUpperState &saved) {
-    if (!saved.valid || !body || !body->mFludd)
-        return;
-
-    TWaterGun *fludd = body->mFludd;
-    fludd->mCurrentNozzle = saved.nozzle;
-    fludd->mCurrentWater = saved.water;
-    TNozzleBase *nozzle = fludd->mNozzleList[TWaterGun::Yoshi];
-    if (nozzle)
-        nozzle->_378 = saved.pressure;
-}
-
 static void applyRemoteYoshiJuice(TYoshi *yoshi, u8 packedMovement) {
     if (yoshi->mMaxJuice <= 0)
         yoshi->mMaxJuice = 21300;
@@ -390,8 +459,10 @@ static bool ensureRemoteYoshiStageReady(TYoshi *yoshi, RemoteYoshiSlot &slot) {
     if (!yoshi || !yoshi->mActor)
         return false;
     if (!slot.stageInitDone) {
-        // doldecomp TYoshi::initInLoadAfter — tongue mirror + riding rig after stage load.
+        // doldecomp TYoshi::initInLoadAfter — riding rig + tongue mirror actors after stage load.
         yoshi->initInLoadAfter();
+        // Puppet tongues must not stay in 敵グループ — retail movement()/findTarget() mutates stage.
+        removeRemoteYoshiTongueFromEnemyGroup(remoteYoshiTongue(yoshi));
         slot.stageInitDone = true;
     }
     return true;
@@ -466,11 +537,24 @@ static void viewCalcRemoteMountedYoshi(TYoshi *yoshi) {
     if (mirrors[1])
         mirrors[1]->viewCalc();
 
-    performRemoteYoshiTongueDraw(remoteYoshiTongue(yoshi));
+    performRemoteYoshiTongueViewCalc(remoteYoshiTongue(yoshi));
 }
 
-// MOUNTED subset of doldecomp TYoshi::calcAnim — skips thinkAnimation (gamepad) and
-// mBodyAnmSound->animeLoop(). thinkUpper runs only while host sprays (mouth BCK).
+static void drawRemoteMountedYoshi(TYoshi *yoshi) {
+    if (!yoshi || !yoshi->mActor || !remoteMountedYoshiDrawAllowed(yoshi) || !sYoshiEntry)
+        return;
+
+    const u8 savedType = static_cast<u8>(yoshi->mType & 0x0F);
+    const u8 bckId =
+        static_cast<u8>(yoshi->mActor->getCurAnmIdx(MActor::BCK) & 0xFF);
+    applyYoshiColor(yoshi, savedType, bckId);
+    sYoshiEntry(yoshi);
+    if (static_cast<u8>(yoshi->mType & 0x0F) != savedType)
+        applyYoshiColor(yoshi, savedType, bckId);
+}
+
+// MOUNTED subset of doldecomp TYoshi::calcAnim — omits thinkAnimation/thinkUpper side effects
+// except staged thinkUpper for mouth open (spray/tongue).
 static void calcRemoteYoshiMountedAnim(TMario *body, TYoshi *yoshi, const RemoteYoshiSlot *slot) {
     if (!body || !yoshi || !yoshi->mActor || !yoshi->mActor->mModel)
         return;
@@ -480,14 +564,6 @@ static void calcRemoteYoshiMountedAnim(TMario *body, TYoshi *yoshi, const Remote
     J3DModel *mirrors[2] = {yoshiMirrorModels(yoshi)[0], yoshiMirrorModels(yoshi)[1]};
     if (!mirrors[0] || !mirrors[1])
         return;
-
-    if (slot) {
-        const PuppetFluddThinkUpperState savedFludd = stashPuppetFluddForThinkUpper(body);
-        stagePuppetFluddForYoshiThinkUpper(body, slot);
-        if (sYoshiThinkUpper)
-            sYoshiThinkUpper(yoshi);
-        restorePuppetFluddAfterThinkUpper(body, savedFludd);
-    }
 
     Mtx *taken = body->getTakenMtx();
     if (taken)
@@ -500,6 +576,7 @@ static void calcRemoteYoshiMountedAnim(TMario *body, TYoshi *yoshi, const Remote
     offFlag1OnAllShapes(mirrors[1]->mModelData);
 
     applyMountedYoshiShapeDrawFlags(actor, mirrors[0], mirrors[1]);
+    calcRemoteYoshiThinkUpper(body, yoshi, slot);
     actor->calcAnm();
 
     if (model->mJointArray) {
@@ -519,7 +596,7 @@ static void mountRemoteYoshiPuppet(TMario *body, TYoshi *yoshi, RemoteYoshiSlot 
         return;
 
     yoshi->mMario = body;
-    applyYoshiColor(yoshi, type);
+    applyYoshiColor(yoshi, type, bckId);
 
     if (yoshi->mState != TYoshi::MOUNTED) {
         yoshi->mState = TYoshi::MOUNTED;
@@ -529,10 +606,12 @@ static void mountRemoteYoshiPuppet(TMario *body, TYoshi *yoshi, RemoteYoshiSlot 
     applyRemoteYoshiAnim(yoshi, bckId);
     slot.mounted = true;
     slot.type = type;
+    applyYoshiColor(yoshi, type, bckId);
     syncMountedYoshiTransform(body, yoshi);
 }
 
-static void syncRemoteYoshiAnimFrame(TYoshi *yoshi, const smso::PlayerSnapshot &snap) {
+static void syncRemoteYoshiAnimFrame(TYoshi *yoshi, RemoteYoshiSlot &slot,
+                                     const smso::PlayerSnapshot &snap) {
     if (!yoshi || !yoshi->mActor)
         return;
 
@@ -540,8 +619,22 @@ static void syncRemoteYoshiAnimFrame(TYoshi *yoshi, const smso::PlayerSnapshot &
     if (!frameCtrl)
         return;
 
-    const f32 hostFrame = static_cast<f32>(snap.animFrame) / 256.0f;
-    frameCtrl->mCurFrame = hostFrame;
+    const bool hostSpraying =
+        (snap.vfxFlags & smso::VFX_WATER_SPRAY) != 0 &&
+        (snap.vfxFlags & smso::VFX_FLUDD_EMPTY) == 0;
+    const u8 bckId = snap.water;
+    const bool bckChanged = slot.lastYoshiBck != bckId;
+
+    // While spraying, pingMs high carries juice pressure — advance body BCK locally.
+    if (!hostSpraying) {
+        const f32 hostFrame = static_cast<f32>(snap.pingMs >> 8) / 8.0f;
+        const f32 drift = frameCtrl->mCurFrame - hostFrame;
+        const f32 absDrift = drift < 0.0f ? -drift : drift;
+        if (bckChanged || absDrift > kRemoteYoshiAnimResyncFrames)
+            frameCtrl->mCurFrame = hostFrame;
+    }
+
+    frameCtrl->mFrameRate = 1.0f;
 }
 
 } // namespace
@@ -586,7 +679,6 @@ void exportYoshiSnapshotFields(TMario *mario, PlayerSnapshot &snap) {
     snap.health = packYoshiTongueHealth(hand, tongueState, tongueProgress);
 
     if (yoshiTongueIsActive(static_cast<u8>(tongueState))) {
-        snap.stageId = static_cast<u8>(tongueProgress > 255 ? 255 : tongueProgress);
         const Vec *tip = remoteYoshiTongueTipPos(tongue);
         snap.velocity.x = tip->x - mario->mTranslation.x;
         snap.velocity.y = tip->y - mario->mTranslation.y;
@@ -595,8 +687,7 @@ void exportYoshiSnapshotFields(TMario *mario, PlayerSnapshot &snap) {
 
     const u8 mouthEnc = encodeYoshiFruitActorType(mouthActorType);
     if (mouthEnc != 0) {
-        snap.episodeId = mouthEnc;
-        snap.vfxFlags |= smso::VFX_YOSHI_FRUIT_MOUTH;
+        snap.vfxFlags = smso::packYoshiFruitMouthVfx(snap.vfxFlags, mouthEnc);
         const Vec *tip = remoteYoshiTongueTipPos(tongue);
         if (mouthEnc != localPublishedMouthEnc) {
             localPublishedMouthEnc = mouthEnc;
@@ -604,7 +695,7 @@ void exportYoshiSnapshotFields(TMario *mario, PlayerSnapshot &snap) {
             publishLocalYoshiFruitTaken(mouthEnc, *tip, buf ? buf->localSlot : 0);
         }
     } else {
-        snap.vfxFlags &= ~static_cast<u16>(smso::VFX_YOSHI_FRUIT_MOUTH);
+        smso::clearYoshiFruitMouthVfx(snap.vfxFlags);
         localPublishedMouthEnc = 0;
     }
 }
@@ -626,7 +717,9 @@ static void applyRemoteYoshiTongueFromSnapshot(TMario *body, void *tongue, const
     }
 
     *state = tongueState;
-    *progress = snap.stageId != 0 ? snap.stageId : unpackYoshiTongueProgressCoarse(snap.health);
+    *progress = snapshotYoshiTongueProgressByte(snap);
+    if (*progress == 0)
+        *progress = unpackYoshiTongueProgressCoarse(snap.health);
     if (*progress == 0 && tongueState != 0)
         *progress = 1;
 
@@ -641,10 +734,9 @@ static void applyRemoteYoshiEatFromSnapshot(TYoshi *yoshi, RemoteYoshiSlot &slot
     const u8 bck = snap.water;
 
     if (isYoshiEatBck(bck) && !isYoshiEatBck(slot.lastYoshiBck)) {
-        const u8 eatEnc = mouthEnc != 0 ? mouthEnc : slot.lastMouthActorEnc;
-        const u32 actorType = decodeYoshiFruitActorType(eatEnc);
-        if (actorType != 0 && sYoshiDoEat)
-            sYoshiDoEat(yoshi, actorType);
+        // Visual eat BCK only — retail doEat() mutates stage fruit/actors on every client.
+        if (yoshi->mActor)
+            applyRemoteYoshiAnim(yoshi, bck);
     }
 
     slot.lastYoshiBck = bck;
@@ -668,12 +760,18 @@ void syncRemoteYoshiFromSnapshot(TMario *body, RemoteYoshiSlot &slot, const Play
     const u8 yoshiType = clampYoshiType(unpackSecondNozzle(snap.nozzleId));
     applyRemoteYoshiJuice(yoshi, snap.movementState);
     mountRemoteYoshiPuppet(body, yoshi, slot, yoshiType, snap.water);
-    syncRemoteYoshiAnimFrame(yoshi, snap);
+    syncRemoteYoshiAnimFrame(yoshi, slot, snap);
 
     if (static_cast<u8>(yoshi->mType & 0x0F) != yoshiType)
-        applyYoshiColor(yoshi, yoshiType);
+        applyYoshiColor(yoshi, yoshiType, snap.water);
 
     applyRemoteYoshiTongueFromSnapshot(body, remoteYoshiTongue(yoshi), snap);
+    if (yoshiTongueIsActive(unpackYoshiTongueState(snap.health)) &&
+        slot.lastTongueState != unpackYoshiTongueState(snap.health)) {
+        OSReport("[SMSO] remote tongue state=%u progress=%u\n",
+                 unpackYoshiTongueState(snap.health), snapshotYoshiTongueProgressByte(snap));
+    }
+    slot.lastTongueState = unpackYoshiTongueState(snap.health);
     applyRemoteYoshiEatFromSnapshot(yoshi, slot, snap);
 
     slot.hostSpraying = (snap.vfxFlags & VFX_WATER_SPRAY) != 0 &&
@@ -726,10 +824,8 @@ void performRemoteYoshiDraw(TMario *body, u32 flags, JDrama::TGraphics *graphics
 
     if (flags & 0x4)
         viewCalcRemoteMountedYoshi(yoshi);
-    if (flags & 0x200 && remoteMountedYoshiDrawAllowed(yoshi)) {
-        entry__6TYoshiFv(yoshi);
-        performRemoteYoshiTongueDraw(remoteYoshiTongue(yoshi));
-    }
+    if (flags & 0x200)
+        drawRemoteMountedYoshi(yoshi);
 }
 
 struct FindYoshiFruitCtx {
@@ -815,6 +911,40 @@ bool applyRemoteYoshiFruitWorldEvent(u8 actorTypeEnc, u32 packedPos) {
 void resetLocalYoshiFruitSync() {
     localFruitEatEventId = 0;
     localPublishedMouthEnc = 0;
+}
+
+void exportYoshiTongueProgressPingLow(TMario *mario, PlayerSnapshot &snap) {
+    if (!mario || !mario->onYoshi() || !mario->mYoshi)
+        return;
+
+    void *tongue = remoteYoshiTongue(mario->mYoshi);
+    if (!tongue)
+        return;
+
+    const u8 tongueState = unpackYoshiTongueState(snap.health);
+    if (!yoshiTongueIsActive(tongueState))
+        return;
+
+    const u16 progress = *remoteYoshiTongueProgressPtr(tongue);
+    snap.pingMs = static_cast<u16>(progress > 255 ? 255 : progress) | (snap.pingMs & 0xFF00u);
+}
+
+void exportYoshiBckFramePingHigh(TMario *mario, PlayerSnapshot &snap) {
+    if (!mario || !mario->onYoshi() || !mario->mYoshi || !mario->mYoshi->mActor)
+        return;
+    if ((snap.vfxFlags & smso::VFX_WATER_SPRAY) != 0 &&
+        (snap.vfxFlags & smso::VFX_FLUDD_EMPTY) == 0)
+        return;
+
+    J3DFrameCtrl *frameCtrl = mario->mYoshi->mActor->getFrameCtrl(MActor::BCK);
+    if (!frameCtrl)
+        return;
+
+    f32 frame = frameCtrl->mCurFrame;
+    if (frame < 0.0f)
+        frame = 0.0f;
+    const u8 enc = static_cast<u8>(frame * 8.0f > 255.0f ? 255.0f : frame * 8.0f);
+    snap.pingMs = static_cast<u16>((snap.pingMs & 0xFFu) | (static_cast<u16>(enc) << 8));
 }
 
 } // namespace smso

@@ -138,6 +138,7 @@ public enum VfxFlags : ushort
     NozzleSwitching = 1 << 7,
     WetSlide = 1 << 8,
     NoFludd = 1 << 9, // FLUDD pack hidden on Mario's back (stolen / on Yoshi)
+    YoshiFruitMouth = 1 << 10, // fruit actor encode (1..7) in vfx bits 11..13
 }
 
 public enum RosterHudEventKind : byte

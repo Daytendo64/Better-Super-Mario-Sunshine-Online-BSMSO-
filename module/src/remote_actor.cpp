@@ -775,7 +775,11 @@ static void syncRemoteAnimation(TMario *body, RemoteActorSlot *slot, const Playe
     const f32 snapFrame = static_cast<f32>(snap.animFrame) / 256.0f;
     const u8 rateEnc = static_cast<u8>(snap.pingMs & 0xFF);
     const u8 upperEnc = static_cast<u8>(snap.pingMs >> 8);
-    const f32 rate = rateEnc != 0 ? static_cast<f32>(rateEnc) / 64.0f : 1.0f;
+    const bool hostYoshiTongue =
+        snapshotHostOnYoshi(snap.nozzleId, snap.vfxFlags) &&
+        yoshiTongueIsActive(unpackYoshiTongueState(snap.health));
+    const f32 rate = hostYoshiTongue ? 1.0f
+                                   : (rateEnc != 0 ? static_cast<f32>(rateEnc) / 64.0f : 1.0f);
     const f32 upperFrame = static_cast<f32>(upperEnc) / 8.0f;
     const bool yCam = (snap.vfxFlags & VFX_Y_CAM) != 0;
     const bool pumpUpper = netUpperState <= kUpperStateHoldingPump;
@@ -845,7 +849,9 @@ static void syncRemoteAnimation(TMario *body, RemoteActorSlot *slot, const Playe
         body->mModelData->mFrameCtrl[1].mFrameRate = 0.0f;
         if (slot)
             slot->syncUpperFrame = syncedUpper;
-    } else if (!spinJump && !packedAux && upperEnc != 0) {
+    } else if (!spinJump && !packedAux && upperEnc != 0 &&
+               !snapshotHostOnYoshi(snap.nozzleId, snap.vfxFlags)) {
+        // pingMs high byte carries Yoshi BCK frame while the host rides Yoshi.
         body->mModelData->mFrameCtrl[1].mCurFrame = upperFrame;
         body->mModelData->mFrameCtrl[1].mFrameRate = rate;
         if (slot)
@@ -867,6 +873,12 @@ static void reapplySyncedUpperFrame(TMario *mario, const RemoteActorSlot *slot) 
 
 static void syncRemoteHeadWaist(TMario *body, RemoteActorSlot &slot, const PlayerSnapshot &snap) {
     const u8 highEnc = static_cast<u8>(snap.pingMs >> 8);
+
+    if (snapshotHostOnYoshi(snap.nozzleId, snap.vfxFlags)) {
+        slot.syncGunAngle = 0;
+        syncRemoteNozzleGunAngle(body, 0);
+        return;
+    }
 
     if (snapshotPacksHeadLook(snap.vfxFlags)) {
         slot.syncHeadLook = decodeSnapshotAngle(highEnc);
@@ -2636,8 +2648,22 @@ static bool isStageReady(TMarDirector *director) {
 }
 
 static bool isSameStage(const CommBuffer *buf, const PlayerSnapshot &snap) {
-    return snap.stageId == buf->localSnapshot.stageId &&
-           snap.episodeId == buf->localSnapshot.episodeId;
+    const u8 localArea =
+        gpMarDirector ? gpMarDirector->mAreaID : buf->localSnapshot.stageId;
+    const u8 localEpisode =
+        gpMarDirector ? gpMarDirector->mEpisodeID : buf->localSnapshot.episodeId;
+
+    u8 remoteArea = snap.stageId;
+    // Back-compat: older builds stuffed tongue mProgress into stageId.
+    if (snapshotHostOnYoshi(snap.nozzleId, snap.vfxFlags) &&
+        yoshiTongueIsActive(unpackYoshiTongueState(snap.health)) && remoteArea != localArea)
+        remoteArea = localArea;
+
+    const u8 remoteEpisode = smso::snapshotLogicalEpisodeId(snap, localEpisode);
+    const u8 localResolvedEpisode =
+        smso::snapshotLogicalEpisodeId(buf->localSnapshot, localEpisode);
+
+    return remoteArea == localArea && remoteEpisode == localResolvedEpisode;
 }
 
 static bool isFiniteVec(f32 x, f32 y, f32 z) {
@@ -3261,10 +3287,14 @@ static void applySnapshotToBody(RemoteActorSlot &slot, const PlayerSnapshot &sna
     const u32 rawState = static_cast<u32>(snap.actionId) |
                          (static_cast<u32>(snap.actionIdHi) << 16);
     const bool incomingWarp = isRemoteWarpTransitionState(rawState);
+    const bool hostOnYoshi = snapshotHostOnYoshi(snap.nozzleId, snap.vfxFlags);
+    const bool tongueTipOffset =
+        hostOnYoshi && yoshiTongueIsActive(unpackYoshiTongueState(snap.health));
 
     if (!incomingWarp) {
         slot.targetPos = snap.position;
-        slot.targetVel = snap.velocity;
+        if (!tongueTipOffset)
+            slot.targetVel = snap.velocity;
         slot.targetRotY = snap.rotationY;
 
         const f32 dx = snap.position.x - slot.displayPos.x;
@@ -3272,7 +3302,9 @@ static void applySnapshotToBody(RemoteActorSlot &slot, const PlayerSnapshot &sna
         const f32 dz = snap.position.z - slot.displayPos.z;
         const f32 dist = sqrtf(dx * dx + dy * dy + dz * dz);
         if (!slot.displayMotionInit || dist > kRemoteMotionSnapDistance)
-            hardSnapRemoteDisplayMotion(slot, snap.position, snap.velocity, snap.rotationY);
+            hardSnapRemoteDisplayMotion(slot, snap.position,
+                                        tongueTipOffset ? slot.targetVel : snap.velocity,
+                                        snap.rotationY);
 
         slot.inWarpTransition = false;
         if (slot.appearRevealFrames == 0 && isRemoteBodyDrawVisible(&slot))
@@ -3295,7 +3327,6 @@ static void applySnapshotToBody(RemoteActorSlot &slot, const PlayerSnapshot &sna
         upperState = kUpperStateHoldingPump;
     body->mFluddUsageState = upperState;
 
-    const bool hostOnYoshi = snapshotHostOnYoshi(snap.nozzleId, snap.vfxFlags);
     const bool showFluddOnMarioBack = (snap.vfxFlags & VFX_NO_FLUDD) == 0;
 
     // Mount puppet TYoshi before animation sync — host riding anims (0xB6..0xC6) only

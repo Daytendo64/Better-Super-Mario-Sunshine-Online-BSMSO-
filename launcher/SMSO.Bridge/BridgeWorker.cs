@@ -539,8 +539,9 @@ public sealed class BridgeWorker : IDisposable
 
     private void MaybeRestoreRemoteSnapshotsAfterStageChange(CommBuffer buffer)
     {
-        var stageId = buffer.LocalSnapshot.StageId;
-        var episodeId = buffer.LocalSnapshot.EpisodeId;
+        var stageId = YoshiSnapshotCodec.LogicalStageId(buffer.LocalSnapshot, buffer.LocalSnapshot.StageId);
+        var episodeId =
+            YoshiSnapshotCodec.LogicalEpisodeId(buffer.LocalSnapshot, buffer.LocalSnapshot.EpisodeId);
         if (stageId == _lastRestoredStageId && episodeId == _lastRestoredEpisodeId)
             return;
 
