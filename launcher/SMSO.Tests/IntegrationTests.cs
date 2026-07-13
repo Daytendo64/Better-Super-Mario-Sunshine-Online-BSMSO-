@@ -457,6 +457,218 @@ public class IntegrationTests
         }
     }
 
+    [Theory]
+    [InlineData(9)]
+    [InlineData(10)]
+    public async Task FullLobby_ImmediateReconnectSameName_Succeeds(int maxPlayers)
+    {
+        var port = GetFreePort();
+        var server = new GameServer(new LevelCatalog()) { MaxPlayers = maxPlayers };
+        server.Start(port);
+        var clients = new List<NetClient>();
+        NetClient? reconnected = null;
+
+        try
+        {
+            for (var i = 0; i < maxPlayers; i++)
+                clients.Add(await ConnectAsync(port, $"Plr{i}"));
+
+            var victim = clients[^1];
+            var priorSlot = victim.AssignedSlot;
+            var victimName = $"Plr{maxPlayers - 1}";
+
+            await victim.DisconnectAsync();
+            victim.Dispose();
+            clients.RemoveAt(clients.Count - 1);
+
+            // Immediate reconnect — must not stick on Full / NameTaken at capacity.
+            reconnected = new NetClient();
+            await reconnected.ConnectAsync("127.0.0.1", port, victimName);
+            Assert.True(reconnected.IsConnected);
+            Assert.Equal(priorSlot, reconnected.AssignedSlot);
+            Assert.Equal(maxPlayers, server.SessionCount);
+        }
+        finally
+        {
+            reconnected?.Dispose();
+            foreach (var c in clients)
+                c.Dispose();
+            server.Stop();
+        }
+    }
+
+    [Theory]
+    [InlineData(9)]
+    [InlineData(10)]
+    public async Task FullLobby_AbruptDisconnectGhost_ReconnectReplaces(int maxPlayers)
+    {
+        var port = GetFreePort();
+        var server = new GameServer(new LevelCatalog()) { MaxPlayers = maxPlayers };
+        server.Start(port);
+        var clients = new List<NetClient>();
+        NetClient? reconnected = null;
+
+        try
+        {
+            for (var i = 0; i < maxPlayers; i++)
+                clients.Add(await ConnectAsync(port, $"Ghost{i}"));
+
+            var victim = clients[^1];
+            var priorSlot = victim.AssignedSlot;
+            var victimName = $"Ghost{maxPlayers - 1}";
+
+            // Abrupt close leaves a half-open/ghost session until Poll/reclaim runs.
+            victim.ForceDispose();
+
+            reconnected = new NetClient();
+            // Retry briefly: FIN may need a moment to become Poll-detectable on the server.
+            Exception? lastError = null;
+            for (var attempt = 0; attempt < 20; attempt++)
+            {
+                try
+                {
+                    await reconnected.ConnectAsync("127.0.0.1", port, victimName);
+                    lastError = null;
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    lastError = ex;
+                    reconnected.Dispose();
+                    reconnected = new NetClient();
+                    await Task.Delay(50);
+                }
+            }
+
+            Assert.Null(lastError);
+            Assert.True(reconnected!.IsConnected);
+            Assert.Equal(priorSlot, reconnected.AssignedSlot);
+            Assert.True(server.SessionCount <= maxPlayers);
+        }
+        finally
+        {
+            reconnected?.Dispose();
+            foreach (var c in clients)
+            {
+                try { c.Dispose(); } catch { /* already force-disposed */ }
+            }
+            server.Stop();
+        }
+    }
+
+    [Fact]
+    public async Task AbandonedHandshake_DoesNotPermanentlyBlockJoinAtCapacity()
+    {
+        var port = GetFreePort();
+        var server = new GameServer(new LevelCatalog()) { MaxPlayers = 2 };
+        server.Start(port);
+
+        TcpClient? abandoned = null;
+        NetClient? keeper = null;
+        NetClient? joiner = null;
+
+        try
+        {
+            keeper = await ConnectAsync(port, "Keeper");
+
+            // Occupy the last slot with Handshake only (no JoinRequest).
+            abandoned = new TcpClient();
+            await abandoned.ConnectAsync(IPAddress.Loopback, port);
+            var stream = abandoned.GetStream();
+            var handshake = PacketSerializer.BuildHandshake(Guid.NewGuid());
+            await stream.WriteAsync(handshake);
+
+            // Wait until the server has accepted the abandoned handshake.
+            var deadline = DateTime.UtcNow.AddSeconds(3);
+            while (server.SessionCount < 2 && DateTime.UtcNow < deadline)
+                await Task.Delay(20);
+            Assert.Equal(2, server.SessionCount);
+
+            // Before grace expires, a new join should be rejected as Full.
+            joiner = new NetClient();
+            var fullEx = await Assert.ThrowsAsync<NetJoinRejectedException>(() =>
+                joiner.ConnectAsync("127.0.0.1", port, "Joiner"));
+            Assert.Equal(JoinRejectReason.Full, fullEx.Reason);
+            joiner.Dispose();
+            joiner = null;
+
+            // After abandoned-handshake grace, AssignSlot must reclaim and allow join.
+            await Task.Delay(ProtocolConstants.AbandonedHandshakeGraceMs + 250);
+
+            joiner = new NetClient();
+            await joiner.ConnectAsync("127.0.0.1", port, "Joiner");
+            Assert.True(joiner.IsConnected);
+            Assert.Equal(2, server.SessionCount);
+            Assert.NotEqual(keeper.AssignedSlot, joiner.AssignedSlot);
+        }
+        finally
+        {
+            try { abandoned?.Close(); } catch { }
+            joiner?.Dispose();
+            keeper?.Dispose();
+            server.Stop();
+        }
+    }
+
+    [Fact]
+    public async Task StaleGhostSameName_ReconnectReplacesAndSucceeds()
+    {
+        var port = GetFreePort();
+        var server = new GameServer(new LevelCatalog()) { MaxPlayers = 4 };
+        server.Start(port);
+
+        NetClient? reconnected = null;
+        try
+        {
+            var fillers = new List<NetClient>();
+            for (var i = 0; i < 3; i++)
+                fillers.Add(await ConnectAsync(port, $"Fill{i}"));
+
+            var ghost = await ConnectAsync(port, "GhostName");
+            var priorSlot = ghost.AssignedSlot;
+            ghost.ForceDispose();
+
+            reconnected = new NetClient();
+            Exception? lastError = null;
+            for (var attempt = 0; attempt < 20; attempt++)
+            {
+                try
+                {
+                    await reconnected.ConnectAsync("127.0.0.1", port, "GhostName");
+                    lastError = null;
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    lastError = ex;
+                    reconnected.Dispose();
+                    reconnected = new NetClient();
+                    await Task.Delay(50);
+                }
+            }
+
+            Assert.Null(lastError);
+            Assert.True(reconnected!.IsConnected);
+            Assert.Equal(priorSlot, reconnected.AssignedSlot);
+
+            foreach (var f in fillers)
+                await f.DisconnectAsync();
+            await reconnected.DisconnectAsync();
+        }
+        finally
+        {
+            reconnected?.Dispose();
+            server.Stop();
+        }
+    }
+
+    private static async Task<NetClient> ConnectAsync(int port, string name)
+    {
+        var client = new NetClient();
+        await client.ConnectAsync("127.0.0.1", port, name);
+        return client;
+    }
+
     private static async Task<PlayerRosterEntry[]> WaitForRosterCountAsync(NetClient client, int count)
     {
         var tcs = new TaskCompletionSource<PlayerRosterEntry[]>(TaskCreationOptions.RunContinuationsAsynchronously);

@@ -1,4 +1,5 @@
 using SMSO.Net;
+using SMSO.Net.MarioPack;
 
 namespace SMSO.Bridge;
 
@@ -7,13 +8,16 @@ public sealed class BridgeWorker : IDisposable
     private readonly DolphinBridge _bridge;
     private readonly RemoteInterpolation _interpolation = new();
     private readonly object _bufferLock = new();
+    private readonly object _modelIdWriteLock = new();
 
     /// <summary>Reusable disconnected remote slot (shares a single Name buffer; never mutated).</summary>
     private static readonly PlayerSnapshot s_emptyRemote = new() { Name = new byte[16], Connected = 0 };
 
     private readonly Dictionary<byte, PlayerSnapshot> _remoteRaw = new();
     private readonly Dictionary<byte, NameTagAppearance> _remoteAppearances = new();
+    private readonly Dictionary<byte, byte[]> _remoteMarioModelIds = new();
     private readonly MarioVoiceEvent[] _remoteMarioVoiceEvents = CommBuffer.CreateRemoteMarioVoiceEventArray();
+    private byte[] _localMarioModelId = new byte[ProtocolConstants.MarioModelIdSize];
     private CancellationTokenSource? _cts;
     private Task? _loop;
     private CommBuffer _workingBuffer = CommBuffer.CreateDefault();
@@ -31,6 +35,7 @@ public sealed class BridgeWorker : IDisposable
     private float _pendingWarpFacingY;
     private bool _dolphinRunning;
     private bool _pendingConnectionWrite;
+    private bool _sessionConnected;
     private bool _loggedConnectionPending;
     private bool _pendingSyncWrite;
     private bool _pendingSyncFlags;
@@ -50,6 +55,25 @@ public sealed class BridgeWorker : IDisposable
     private readonly Dictionary<byte, NameTagAppearance> _savedRemoteAppearances = new();
     private int _remoteSyncWriteFailStreak;
     private DateTime _lastRemoteSyncFailLogUtc = DateTime.MinValue;
+    private readonly byte[] _remoteModelIdScratch =
+        new byte[ProtocolConstants.MarioModelIdSize * ProtocolConstants.MaxRemoteSlots];
+    private readonly byte[] _modelIdsWriteLocal = new byte[ProtocolConstants.MarioModelIdSize];
+    private readonly byte[] _modelIdsWriteRemotes =
+        new byte[ProtocolConstants.MarioModelIdSize * ProtocolConstants.MaxRemoteSlots];
+    private readonly byte[] _lastWrittenLocalModelId = new byte[ProtocolConstants.MarioModelIdSize];
+    private readonly byte[] _lastWrittenRemoteModelIds =
+        new byte[ProtocolConstants.MarioModelIdSize * ProtocolConstants.MaxRemoteSlots];
+    private bool _hasLastWrittenModelIds;
+    private int _modelIdVersion;
+    private int _modelIdScratchVersion = -1;
+    private int _modelIdScratchBuildCount;
+    private int _lastWrittenModelIdVersion = -1;
+    private int _lastObservedBridgeWriteCacheEpoch = -1;
+    private bool _moduleReadySeen;
+    private string _appliedLocalModelId = string.Empty;
+    private string _appliedLocalNameTagName = string.Empty;
+    private NameTagAppearance _appliedLocalNameTagAppearance;
+    private bool _hasAppliedLocalNameTag;
     private ushort _rosterHudNextSequence;
 
     public GameModeStatePacket CurrentGameModeState => _gameModeState.Clone();
@@ -105,6 +129,9 @@ public sealed class BridgeWorker : IDisposable
                 _remoteRaw.Clear();
                 Array.Clear(_remoteMarioVoiceEvents, 0, _remoteMarioVoiceEvents.Length);
                 _interpolation.Clear();
+                _hasLastWrittenModelIds = false;
+                _moduleReadySeen = false;
+                _hasAppliedLocalNameTag = false;
             }
             SetLinkState(DolphinLinkState.NotRunning);
             return;
@@ -162,19 +189,48 @@ public sealed class BridgeWorker : IDisposable
                 EnsureWorkingBuffer();
             }
 
+            // Use launcher-session state, not a possibly stale mailbox bit. If the prior
+            // disconnect write missed Dolphin, the live buffer can still say Connected;
+            // treating that as the same session preserves stale sequence/incoming state.
+            var wasConnected = _sessionConnected;
+
             if (connected)
             {
                 _workingBuffer.BridgeFlags |= BridgeFlags.Connected;
-                _workingBuffer.WorldSync.LastAppliedEventId = 0;
-                _workingBuffer.WorldSync.Incoming = default;
-                _workingBuffer.WorldSync.LocalPending = default;
-                _lastLocalWorldEventSequence = 0;
+                // Only clear world-sync mailbox state on a fresh connect transition.
+                // Re-asserting Connected (FlushSnapshotsAfterConnect after JoinAccepted, or
+                // Dolphin relink) must not wipe an in-flight Incoming / LastAppliedEventId
+                // mid join-replay.
+                if (!wasConnected)
+                {
+                    _workingBuffer.WorldSync.LastAppliedEventId = 0;
+                    _workingBuffer.WorldSync.Incoming = default;
+                    _workingBuffer.WorldSync.LocalPending = default;
+                    _lastLocalWorldEventSequence = 0;
+                }
+                _sessionConnected = true;
             }
             else
             {
+                _sessionConnected = false;
                 _workingBuffer.BridgeFlags &= ~BridgeFlags.Connected;
                 _rosterHudNextSequence = 0;
                 _workingBuffer.RosterHud = CommRosterHudSync.CreateDefault();
+                // Drop any staged/in-flight world event so a disconnect mid-replay cannot
+                // leave a collectible apply sitting in the mailbox for the next session.
+                _workingBuffer.WorldSync.Incoming = default;
+                _workingBuffer.WorldSync.LocalPending = default;
+                _workingBuffer.WorldSync.LastAppliedEventId = 0;
+                _lastLocalWorldEventSequence = 0;
+
+                // Clear game-mode seq so a rehost's Seq=1 is not rejected against a stale high seq
+                // left by ResetHideSeekIfActiveOnServer applying Normal before teardown.
+                var wasHideSeek = _gameModeState.GameMode == GameMode.HideSeek;
+                _gameModeState = GameModeStatePacket.CreateDefault();
+                _lastGameModeSeq = 0;
+                if (wasHideSeek)
+                    RestoreSavedNameTagColors();
+                _workingBuffer.GameModeState = GameModeStatePacket.ToCommGameMode(slot, _gameModeState);
             }
 
             if (isHost)
@@ -204,9 +260,12 @@ public sealed class BridgeWorker : IDisposable
         }
     }
 
-    /// <summary>Store latest raw network sample; smoothing runs on bridge poll.</summary>
+    /// <summary>Store latest raw network sample; smoothing runs on bridge poll (~60 Hz).</summary>
     public void PushRemoteSnapshot(byte slot, in PlayerSnapshot snap, in NameTagAppearance appearance)
     {
+        if (slot >= ProtocolConstants.MaxRemoteSlots)
+            return;
+
         _interpolation.PushPacket(slot, snap);
 
         lock (_bufferLock)
@@ -215,8 +274,76 @@ public sealed class BridgeWorker : IDisposable
             _remoteAppearances[slot] = appearance;
         }
 
-        // Push smoothed state to Dolphin immediately instead of waiting for the next poll tick.
-        FlushInterpolatedRemotes(force: true);
+        // Do NOT force-flush here — every UDP packet used to WriteProcessMemory (~540+/sec
+        // at 9 remotes × 60 Hz). The poll loop flushes interpolated remotes once per tick.
+    }
+
+    public void SetRemoteMarioModelId(byte slot, string? modelId)
+    {
+        if (slot >= ProtocolConstants.MaxRemoteSlots)
+            return;
+
+        var encoded = CharacterPack.EncodeModelId(modelId);
+        var changed = false;
+        lock (_bufferLock)
+        {
+            if (_remoteMarioModelIds.TryGetValue(slot, out var existing) &&
+                existing.AsSpan().SequenceEqual(encoded))
+            {
+                // Unchanged — still ensure mailbox has been written at least once.
+                if (_hasLastWrittenModelIds)
+                    return;
+            }
+            else
+            {
+                _remoteMarioModelIds[slot] = encoded;
+                changed = true;
+                unchecked
+                {
+                    ++_modelIdVersion;
+                }
+                if (_hasWorkingBuffer && _workingBuffer.RemoteMarioModelIds != null)
+                {
+                    var offset = slot * ProtocolConstants.MarioModelIdSize;
+                    if (offset + ProtocolConstants.MarioModelIdSize <= _workingBuffer.RemoteMarioModelIds.Length)
+                        encoded.CopyTo(_workingBuffer.RemoteMarioModelIds, offset);
+                }
+            }
+        }
+
+        if (changed || !_hasLastWrittenModelIds)
+            TryWriteMarioModelIds();
+    }
+
+    public void ApplyLocalMarioModelId(string? modelId)
+    {
+        var normalized = CharacterPack.NormalizeModelId(modelId);
+        lock (_bufferLock)
+        {
+            var changed = !string.Equals(_appliedLocalModelId, normalized, StringComparison.Ordinal);
+            if (!changed && _hasLastWrittenModelIds)
+            {
+                return;
+            }
+
+            if (changed)
+            {
+                var encoded = CharacterPack.EncodeModelId(normalized);
+                _localMarioModelId = encoded;
+                _appliedLocalModelId = normalized;
+                unchecked
+                {
+                    ++_modelIdVersion;
+                }
+                if (_hasWorkingBuffer)
+                {
+                    _workingBuffer.LocalMarioModelId ??= new byte[ProtocolConstants.MarioModelIdSize];
+                    encoded.CopyTo(_workingBuffer.LocalMarioModelId, 0);
+                }
+            }
+        }
+
+        TryWriteMarioModelIds();
     }
 
     public void RemoveRemoteSnapshot(byte slot)
@@ -225,13 +352,27 @@ public sealed class BridgeWorker : IDisposable
         {
             _remoteRaw.Remove(slot);
             _remoteAppearances.Remove(slot);
+            if (_remoteMarioModelIds.Remove(slot))
+            {
+                unchecked
+                {
+                    ++_modelIdVersion;
+                }
+            }
             if (slot < _remoteMarioVoiceEvents.Length)
                 _remoteMarioVoiceEvents[slot] = default;
+            if (_hasWorkingBuffer && _workingBuffer.RemoteMarioModelIds != null)
+            {
+                var offset = slot * ProtocolConstants.MarioModelIdSize;
+                if (offset + ProtocolConstants.MarioModelIdSize <= _workingBuffer.RemoteMarioModelIds.Length)
+                    Array.Clear(_workingBuffer.RemoteMarioModelIds, offset, ProtocolConstants.MarioModelIdSize);
+            }
         }
 
         _interpolation.Remove(slot);
         _remoteClearPending = true;
         FlushInterpolatedRemotes(force: true);
+        TryWriteMarioModelIds();
     }
 
     /// <summary>Push roster join/leave to the in-game HUD as soon as TCP roster updates arrive.</summary>
@@ -283,27 +424,35 @@ public sealed class BridgeWorker : IDisposable
 
     public void ApplyLocalNameTagAppearance(string username, in NameTagAppearance appearance)
     {
-        var prefetched = _bridge.TryReadBuffer(out var live) && live.Magic == ProtocolConstants.Magic
-            ? live
-            : (CommBuffer?)null;
+        username ??= string.Empty;
+        NameTagAppearance[]? remotesToWrite = null;
+        NameTagAppearance localToWrite = default;
 
         lock (_bufferLock)
         {
-            if (prefetched.HasValue)
-            {
-                _workingBuffer = prefetched.Value;
-                _hasWorkingBuffer = true;
-            }
-            else if (!EnsureWorkingBuffer())
+            if (_hasAppliedLocalNameTag &&
+                string.Equals(_appliedLocalNameTagName, username, StringComparison.Ordinal) &&
+                NameTagAppearanceEquals(_appliedLocalNameTagAppearance, appearance))
             {
                 return;
             }
 
+            if (!EnsureWorkingBuffer())
+                return;
+
             NameTagColorCodec.WritePureName(_workingBuffer.LocalSnapshot.Name, username);
             _workingBuffer.LocalNameTagAppearance = appearance;
+            _appliedLocalNameTagName = username;
+            _appliedLocalNameTagAppearance = appearance;
+            _hasAppliedLocalNameTag = true;
+
+            // Partial poke only — never full-buffer Read/WriteProcessMemory on the 60 Hz path.
+            localToWrite = appearance;
+            remotesToWrite = _workingBuffer.RemoteNameTagAppearances
+                ?? CommBuffer.CreateRemoteAppearanceArray();
         }
 
-        TryWriteWorkingBuffer();
+        _bridge.TryWriteNameTagAppearancesOnly(localToWrite, remotesToWrite!);
     }
 
     public void ApplyGameModeState(byte localSlot, in GameModeStatePacket packet)
@@ -395,19 +544,138 @@ public sealed class BridgeWorker : IDisposable
         _savedRemoteAppearances.Clear();
     }
 
+    /// <summary>
+    /// Call when the in-game mailbox may have been recreated while Dolphin stayed running
+    /// (Reconnect Link, title return, ForceRelink). Forces model-id / nametag re-poke.
+    /// </summary>
+    public void InvalidateMailboxWriteCaches()
+    {
+        _bridge.InvalidateWriteCaches();
+        _lastObservedBridgeWriteCacheEpoch = _bridge.WriteCacheEpoch;
+        lock (_bufferLock)
+        {
+            _hasLastWrittenModelIds = false;
+            _lastWrittenModelIdVersion = -1;
+            _moduleReadySeen = false;
+            _remoteClearPending = true;
+        }
+    }
+
     public void ClearRemoteSnapshots()
     {
         lock (_bufferLock)
         {
             _remoteRaw.Clear();
             _remoteAppearances.Clear();
+            if (_remoteMarioModelIds.Count > 0)
+            {
+                _remoteMarioModelIds.Clear();
+                unchecked
+                {
+                    ++_modelIdVersion;
+                }
+            }
             Array.Clear(_remoteMarioVoiceEvents, 0, _remoteMarioVoiceEvents.Length);
+            if (_hasWorkingBuffer && _workingBuffer.RemoteMarioModelIds != null)
+                Array.Clear(_workingBuffer.RemoteMarioModelIds, 0, _workingBuffer.RemoteMarioModelIds.Length);
         }
 
         _interpolation.Clear();
         _remoteClearPending = true;
+        _hasLastWrittenModelIds = false;
         FlushInterpolatedRemotes(force: true);
+        TryWriteMarioModelIds();
     }
+
+    private void EnsureRemoteMarioModelIdScratchCurrent_NoLock()
+    {
+        if (_modelIdScratchVersion == _modelIdVersion)
+            return;
+
+        Array.Clear(_remoteModelIdScratch, 0, _remoteModelIdScratch.Length);
+        foreach (var kvp in _remoteMarioModelIds)
+        {
+            var offset = kvp.Key * ProtocolConstants.MarioModelIdSize;
+            if (offset + ProtocolConstants.MarioModelIdSize <= _remoteModelIdScratch.Length)
+                kvp.Value.CopyTo(_remoteModelIdScratch, offset);
+        }
+        _modelIdScratchVersion = _modelIdVersion;
+        ++_modelIdScratchBuildCount;
+    }
+
+    /// <summary>
+    /// Full-buffer writes (connection/sync) must not clobber model ids. Live CommBuffer reads
+    /// often arrive before the first model-id write, so merge from the authoritative dictionaries.
+    /// </summary>
+    private void MergeMarioModelIdsIntoWorkingBuffer_NoLock()
+    {
+        if (!_hasWorkingBuffer)
+            return;
+
+        _workingBuffer.LocalMarioModelId ??= new byte[ProtocolConstants.MarioModelIdSize];
+        _localMarioModelId.CopyTo(_workingBuffer.LocalMarioModelId, 0);
+        EnsureRemoteMarioModelIdScratchCurrent_NoLock();
+        _workingBuffer.RemoteMarioModelIds ??=
+            new byte[ProtocolConstants.MarioModelIdSize * ProtocolConstants.MaxRemoteSlots];
+        _remoteModelIdScratch.CopyTo(_workingBuffer.RemoteMarioModelIds, 0);
+    }
+
+    private void TryWriteMarioModelIds()
+    {
+        lock (_modelIdWriteLock)
+            TryWriteMarioModelIdsSerialized();
+    }
+
+    private void TryWriteMarioModelIdsSerialized()
+    {
+        int writeVersion;
+        lock (_bufferLock)
+        {
+            // This runs on every bridge tick while ModuleReady. Version-check before clearing
+            // or rebuilding the 9-slot scratch map so idle ticks are O(1).
+            if (_hasLastWrittenModelIds && _lastWrittenModelIdVersion == _modelIdVersion)
+                return;
+
+            EnsureRemoteMarioModelIdScratchCurrent_NoLock();
+            writeVersion = _modelIdVersion;
+
+            if (_hasWorkingBuffer)
+            {
+                _workingBuffer.LocalMarioModelId ??= new byte[ProtocolConstants.MarioModelIdSize];
+                _localMarioModelId.CopyTo(_workingBuffer.LocalMarioModelId, 0);
+                _workingBuffer.RemoteMarioModelIds ??=
+                    new byte[ProtocolConstants.MarioModelIdSize * ProtocolConstants.MaxRemoteSlots];
+                _remoteModelIdScratch.CopyTo(_workingBuffer.RemoteMarioModelIds, 0);
+            }
+
+            _localMarioModelId.CopyTo(_modelIdsWriteLocal, 0);
+            _remoteModelIdScratch.CopyTo(_modelIdsWriteRemotes, 0);
+        }
+
+        if (!_bridge.TryWriteMarioModelIdsOnly(_modelIdsWriteLocal, _modelIdsWriteRemotes))
+            return;
+
+        lock (_bufferLock)
+        {
+            if (_modelIdVersion != writeVersion)
+            {
+                _hasLastWrittenModelIds = false;
+                return;
+            }
+
+            _modelIdsWriteLocal.CopyTo(_lastWrittenLocalModelId, 0);
+            _modelIdsWriteRemotes.CopyTo(_lastWrittenRemoteModelIds, 0);
+            _hasLastWrittenModelIds = true;
+            _lastWrittenModelIdVersion = writeVersion;
+        }
+    }
+
+    private static bool NameTagAppearanceEquals(in NameTagAppearance a, in NameTagAppearance b) =>
+        a.TextTopR == b.TextTopR && a.TextTopG == b.TextTopG && a.TextTopB == b.TextTopB &&
+        a.TextBottomR == b.TextBottomR && a.TextBottomG == b.TextBottomG &&
+        a.TextBottomB == b.TextBottomB &&
+        a.OutlineR == b.OutlineR && a.OutlineG == b.OutlineG && a.OutlineB == b.OutlineB &&
+        a.Flags == b.Flags;
 
     /// <summary>Legacy entry: push sample then flush (used when only one update is needed).</summary>
     public void WriteRemoteSnapshots(IReadOnlyDictionary<byte, PlayerSnapshot> remotes)
@@ -450,6 +718,10 @@ public sealed class BridgeWorker : IDisposable
             {
                 return;
             }
+
+            // Live mailbox reads must not clobber the user-selected local nametag / model ids.
+            if (_hasAppliedLocalNameTag)
+                _workingBuffer.LocalNameTagAppearance = _appliedLocalNameTagAppearance;
 
             // Iterate remote slots by index (0..MaxRemoteSlots-1) instead of clearing the whole
             // array + OrderBy every tick. Reuse a single empty snapshot (shared Name buffer) so
@@ -506,10 +778,17 @@ public sealed class BridgeWorker : IDisposable
             remoteVoiceEvents = _remoteMarioVoiceEvents;
         }
 
-        // Only skip during boot — Loading/Warping skips left remotes starved when blocked
-        // loading zones wedged mGameState in WARPING during otherwise normal play.
+        // Only skip full remote sync during boot — Loading/Warping skips left remotes
+        // starved when blocked loading zones wedged mGameState in WARPING during
+        // otherwise normal play. Hide & Seek still needs game-mode (roles / grace /
+        // tag events) written so death/tag paths do not run against a stale mailbox
+        // while Dolphin reports Booting (common during stage transitions at 60fps).
         if (liveBuffer.HasValue && liveBuffer.Value.DolphinState is DolphinState.Booting)
+        {
+            if (commGameMode.Mode == (byte)GameMode.HideSeek)
+                _bridge.TryWriteGameModeStateOnly(commGameMode);
             return;
+        }
 
         if (!_bridge.TryWriteRemoteSyncPayload(
                 remoteCopy,
@@ -669,6 +948,14 @@ public sealed class BridgeWorker : IDisposable
 
     private void UpdateLinkStateFromBridge(CommBuffer? liveBuffer = null)
     {
+        var bridgeWriteCacheEpoch = _bridge.WriteCacheEpoch;
+        if (_lastObservedBridgeWriteCacheEpoch != bridgeWriteCacheEpoch)
+        {
+            _lastObservedBridgeWriteCacheEpoch = bridgeWriteCacheEpoch;
+            lock (_bufferLock)
+                _remoteClearPending = true;
+        }
+
         if (!_dolphinRunning)
         {
             SetLinkState(DolphinLinkState.NotRunning);
@@ -700,6 +987,63 @@ public sealed class BridgeWorker : IDisposable
 
         TryFlushPendingConnectionWrite();
         TryFlushPendingSyncWrite();
+        // Model ids are written via a partial mailbox poke that can fail before attach;
+        // re-push once the module mailbox is live so remotes see packs on first stage load.
+        // Also re-push after mailbox re-init (title return / ForceRelink) — the skip cache
+        // would otherwise think the prior write is still present in a wiped CommBuffer.
+        if (LinkState == DolphinLinkState.ModuleReady)
+        {
+            if (!_moduleReadySeen)
+            {
+                _bridge.InvalidateWriteCaches();
+                _lastObservedBridgeWriteCacheEpoch = _bridge.WriteCacheEpoch;
+                lock (_bufferLock)
+                {
+                    _hasLastWrittenModelIds = false;
+                    _lastWrittenModelIdVersion = -1;
+                    _remoteClearPending = true;
+                    _moduleReadySeen = true;
+                }
+            }
+            else if (liveBuffer.HasValue)
+            {
+                InvalidateModelIdCacheIfLiveMismatch(liveBuffer.Value);
+            }
+
+            TryWriteMarioModelIds();
+        }
+        else
+        {
+            _moduleReadySeen = false;
+        }
+    }
+
+    private void InvalidateModelIdCacheIfLiveMismatch(in CommBuffer live)
+    {
+        lock (_bufferLock)
+        {
+            if (!_hasLastWrittenModelIds)
+                return;
+
+            var liveLocal = live.LocalMarioModelId;
+            if (liveLocal is null ||
+                liveLocal.Length < ProtocolConstants.MarioModelIdSize ||
+                !liveLocal.AsSpan(0, ProtocolConstants.MarioModelIdSize)
+                    .SequenceEqual(_lastWrittenLocalModelId))
+            {
+                _hasLastWrittenModelIds = false;
+                return;
+            }
+
+            var liveRemote = live.RemoteMarioModelIds;
+            if (liveRemote is null ||
+                liveRemote.Length < _lastWrittenRemoteModelIds.Length ||
+                !liveRemote.AsSpan(0, _lastWrittenRemoteModelIds.Length)
+                    .SequenceEqual(_lastWrittenRemoteModelIds))
+            {
+                _hasLastWrittenModelIds = false;
+            }
+        }
     }
 
     private void TryFlushPendingConnectionWrite()
@@ -825,7 +1169,8 @@ public sealed class BridgeWorker : IDisposable
             worldEvent.EpisodeId,
             worldEvent.Payload0,
             worldEvent.Reserved,
-            worldEvent.Payload1));
+            worldEvent.Payload1,
+            worldEvent.Payload2));
 
         // Hand the slot back to the module. The module only writes the next queued event once
         // this slot is empty, so clearing it after publishing is what lets outbound events
@@ -857,6 +1202,16 @@ public sealed class BridgeWorker : IDisposable
             _pendingIncomingWorldEvents.Enqueue(packet.ToIncomingEvent());
     }
 
+    /// <summary>
+    /// Drops all queued remote world events. Call on disconnect so a cancelled join
+    /// replay cannot keep applying shine/red/blue state after the session ends.
+    /// </summary>
+    public void ClearPendingIncomingWorldEvents()
+    {
+        lock (_incomingWorldEventLock)
+            _pendingIncomingWorldEvents.Clear();
+    }
+
     public bool TryGetLastAppliedEventId(out uint lastAppliedEventId)
     {
         lock (_bufferLock)
@@ -872,11 +1227,47 @@ public sealed class BridgeWorker : IDisposable
         }
     }
 
+    /// <summary>Test hook: seed world-sync mailbox fields without Dolphin attached.</summary>
+    internal void DebugSeedWorldSync(uint lastAppliedEventId, uint incomingEventId = 0)
+    {
+        lock (_bufferLock)
+        {
+            EnsureWorkingBuffer();
+            _workingBuffer.WorldSync.LastAppliedEventId = lastAppliedEventId;
+            if (incomingEventId != 0)
+            {
+                _workingBuffer.WorldSync.Incoming = new CommWorldEvent { EventId = incomingEventId };
+            }
+        }
+    }
+
+    /// <summary>Test hook: read world-sync mailbox fields without Dolphin attached.</summary>
+    internal (uint LastApplied, uint IncomingEventId) DebugGetWorldSync()
+    {
+        lock (_bufferLock)
+        {
+            EnsureWorkingBuffer();
+            return (_workingBuffer.WorldSync.LastAppliedEventId, _workingBuffer.WorldSync.Incoming.EventId);
+        }
+    }
+
+    internal int DebugModelIdScratchBuildCount
+    {
+        get
+        {
+            lock (_bufferLock)
+                return _modelIdScratchBuildCount;
+        }
+    }
+
     private bool TryWriteWorkingBuffer()
     {
         CommBuffer copy;
         lock (_bufferLock)
+        {
+            MergeMarioModelIdsIntoWorkingBuffer_NoLock();
             copy = _workingBuffer;
+        }
 
         if (!_bridge.IsAttached)
             return false;

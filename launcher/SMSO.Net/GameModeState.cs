@@ -22,6 +22,11 @@ public enum GameModeFlags : byte
     RoundComplete = 1 << 1,
     TimerReset = 1 << 2,
     RoundFanfare = 1 << 3,
+    /// <summary>
+    /// Start Tag hide grace: seekers frozen, blue wash, proximity tags suppressed.
+    /// Server-authoritative; cleared when GraceRemainingMs hits 0.
+    /// </summary>
+    GraceActive = 1 << 4,
 }
 
 public sealed class GameModeStatePacket
@@ -33,9 +38,12 @@ public sealed class GameModeStatePacket
     public byte TagEventId { get; set; }
     public HideSeekRole[] Roles { get; } = new HideSeekRole[ProtocolConstants.StableMaxPlayers];
     public byte LastTaggedSlot { get; set; } = 0xFF;
+    /// <summary>Milliseconds left in Start Tag grace (0 when inactive).</summary>
+    public ushort GraceRemainingMs { get; set; }
 
     public bool TagActive => (Flags & GameModeFlags.TagActive) != 0;
     public bool RoundComplete => (Flags & GameModeFlags.RoundComplete) != 0;
+    public bool GraceActive => (Flags & GameModeFlags.GraceActive) != 0;
 
     public static GameModeStatePacket CreateDefault()
     {
@@ -55,6 +63,7 @@ public sealed class GameModeStatePacket
             RoundStartMs = RoundStartMs,
             TagEventId = TagEventId,
             LastTaggedSlot = LastTaggedSlot,
+            GraceRemainingMs = GraceRemainingMs,
         };
         Array.Copy(Roles, copy.Roles, Roles.Length);
         return copy;
@@ -93,6 +102,7 @@ public sealed class GameModeStatePacket
         state.LastTaggedSlot = packet.LastTaggedSlot;
         state.TagEventId = packet.TagEventId;
         state.RoundStartMs = packet.RoundStartMs;
+        state.GraceRemainingMs = packet.GraceRemainingMs;
         for (int i = 0; i < ProtocolConstants.StableMaxPlayers; i++)
             state.RoleBySlot[i] = packet.GetRole((byte)i);
         return state;
@@ -121,12 +131,15 @@ public struct CommGameModeState
     [System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.ByValArray, SizeConst = ProtocolConstants.StableMaxPlayers)]
     public byte[] RoleBySlot;
 
+    public ushort GraceRemainingMs;
+
     public static CommGameModeState CreateDefault()
     {
         return new CommGameModeState
         {
             RoleBySlot = new byte[ProtocolConstants.StableMaxPlayers],
             LastTaggedSlot = 0xFF,
+            GraceRemainingMs = 0,
         };
     }
 }

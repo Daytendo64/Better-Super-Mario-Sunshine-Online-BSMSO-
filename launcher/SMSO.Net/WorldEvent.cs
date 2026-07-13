@@ -13,6 +13,7 @@ public struct CommWorldEvent
     public byte Payload0;
     public byte Reserved;
     public uint Payload1;
+    public uint Payload2;
 
     public bool IsEmpty => Sequence == 0 || Type == 0;
 }
@@ -28,7 +29,7 @@ public struct CommWorldSyncState
 public readonly struct WorldEventRequest
 {
     public WorldEventRequest(ushort sequence, WorldEventType type, byte courseId, byte episodeId,
-        byte payload0, byte reserved, uint payload1)
+        byte payload0, byte reserved, uint payload1, uint payload2 = 0)
     {
         Sequence = sequence;
         Type = type;
@@ -37,6 +38,7 @@ public readonly struct WorldEventRequest
         Payload0 = payload0;
         Reserved = reserved;
         Payload1 = payload1;
+        Payload2 = payload2;
     }
 
     public ushort Sequence { get; }
@@ -46,6 +48,7 @@ public readonly struct WorldEventRequest
     public byte Payload0 { get; }
     public byte Reserved { get; }
     public uint Payload1 { get; }
+    public uint Payload2 { get; }
 
     public bool IsEmpty => Sequence == 0 || Type == 0;
 }
@@ -53,7 +56,7 @@ public readonly struct WorldEventRequest
 public readonly struct WorldEventPacket
 {
     public WorldEventPacket(uint eventId, WorldEventType type, byte courseId, byte episodeId,
-        byte payload0, byte reserved, uint payload1)
+        byte payload0, byte reserved, uint payload1, uint payload2 = 0)
     {
         EventId = eventId;
         Type = type;
@@ -62,6 +65,7 @@ public readonly struct WorldEventPacket
         Payload0 = payload0;
         Reserved = reserved;
         Payload1 = payload1;
+        Payload2 = payload2;
     }
 
     public uint EventId { get; }
@@ -71,6 +75,7 @@ public readonly struct WorldEventPacket
     public byte Payload0 { get; }
     public byte Reserved { get; }
     public uint Payload1 { get; }
+    public uint Payload2 { get; }
 
     public CommWorldEvent ToIncomingEvent()
         => new()
@@ -83,5 +88,6 @@ public readonly struct WorldEventPacket
             Payload0 = Payload0,
             Reserved = Reserved,
             Payload1 = Payload1,
+            Payload2 = Payload2,
         };
 }

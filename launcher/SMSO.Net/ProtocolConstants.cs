@@ -4,27 +4,34 @@ public static class ProtocolConstants
 {
     public const uint Magic = 0x534D534F;
     public const ushort ProtocolVersion = 1;
-    public const ushort CommVersion = 7;
+    public const ushort CommVersion = 11;
     public const int DefaultPort = 27015;
     public const int StableMaxPlayers = 10;
     public const int MaxPlayers = 10;
     public const int MaxRemoteSlots = 10;
+    public const int MarioModelIdSize = 8;
     public const int MarioVoiceEventSize = 12;
     public const int CommMarioVoiceEventsOffset = 862;
     public const int CommMarioVoiceEventsSize = MarioVoiceEventSize * (MaxRemoteSlots + 1);
-    public const int CommGameModeStateSize = 9 + MaxPlayers;
+    // mode+flags+localRole+lastTagged+tagEventId+roundStartMs(4)+roleBySlot[N]+graceRemainingMs(2)
+    public const int CommGameModeStateSize = 11 + MaxPlayers;
     public const int CommGameModeStateOffset = CommMarioVoiceEventsOffset + CommMarioVoiceEventsSize;
-    public const int CommWorldEventSize = 15;
+    public const int CommWorldEventSize = 19;
     public const int CommWorldSyncSize = CommWorldEventSize * 2 + 4;
     public const int CommWorldSyncOffset = CommGameModeStateOffset + CommGameModeStateSize;
     public const int CommIncomingWorldEventOffset = CommWorldSyncOffset + CommWorldEventSize;
     public const int CommRosterHudEventSize = 20;
-    public const int CommRosterHudRingSlots = 8;
+    // One slot per player so a full-lobby connect/disconnect wave cannot overwrite unread HUD events.
+    public const int CommRosterHudRingSlots = MaxPlayers;
     public const int CommRosterHudSyncSize = 2 + CommRosterHudEventSize * CommRosterHudRingSlots;
     public const int CommRosterHudOffset = CommWorldSyncOffset + CommWorldSyncSize;
-    public const int CommBufferSize = CommRosterHudOffset + CommRosterHudSyncSize;
-    public const int WorldEventClientPayloadSize = 11;
-    public const int WorldEventBroadcastPayloadSize = 13;
+    public const int CommMarioModelIdsOffset = CommRosterHudOffset + CommRosterHudSyncSize;
+    public const int CommMarioModelIdsSize = MarioModelIdSize * (MaxRemoteSlots + 1);
+    public const int CommBufferSize = CommMarioModelIdsOffset + CommMarioModelIdsSize;
+    public const int RosterEntrySize = 30; // slot(1)+name(16)+stage(1)+ep(1)+state(1)+ping(2)+modelId(8)
+    public const int JoinRequestSize = 16 + MarioModelIdSize;
+    public const int WorldEventClientPayloadSize = 15;
+    public const int WorldEventBroadcastPayloadSize = 17;
     public const int CommNameTagAppearancesOffset = 752;
     public const int CommNameTagAppearancesSize = 10 * (MaxRemoteSlots + 1);
     public const int CommBridgeControlOffset = 6;
@@ -34,7 +41,11 @@ public static class ProtocolConstants
     public const int UdpSnapshotPayloadOffset = 10;
     public const int PlayerSnapshotSize = 64;
     public const int UdpPingPayloadSize = 8;
-    public const int MaxTcpPayloadSize = 4096;
+    // Must fit the worst-case sparse authority snapshot (collectibles + every durable
+    // card bit + stage-scoped trigger bits). 32 KiB truncated the tail — exactly where
+    // story flags are serialized. The frame length is ushort, so retain safe headroom.
+    public const int MaxTcpPayloadSize = 60000;
+    public const int WorldProgressResyncIntervalMs = 45000;
     public const uint DefaultMailboxAddress = 0x817FC000;
     public const int SnapshotRateHz = 60;
     public const int BridgePollMs = 1000 / SnapshotRateHz;
@@ -45,6 +56,11 @@ public static class ProtocolConstants
     public const int ConnectTimeoutMs = 10000;
     public const int RosterBroadcastIntervalMs = 200;
     public const int ReconnectWindowMs = 30000;
+    /// <summary>
+    /// Unnamed handshake sessions older than this are reclaimable so abandoned
+    /// TCP connects cannot permanently block joins when the lobby is at capacity.
+    /// </summary>
+    public const int AbandonedHandshakeGraceMs = 5000;
     public const byte WarpNoTarget = 0xFC;
     public const byte WarpAllSlots = 0xFF;
 }
@@ -69,6 +85,8 @@ public enum TcpPacketId : byte
     ClientTeleportSettings = 16,
     GameModeState = 17,
     WorldStateReplay = 18,
+    /// <summary>Client asks server to rebroadcast authoritative collectible state.</summary>
+    WorldProgressRequest = 19,
 }
 
 public enum UdpPacketId : byte
@@ -160,4 +178,11 @@ public enum WorldEventType : byte
     HipDropObject = 8,
     RedCoinCollected = 9,
     YoshiFruitTaken = 10,
+    MarioFruitKicked = 11,
+    MarioFruitPicked = 12,
+    MarioFruitThrown = 13,
+    MarioFruitDropped = 14,
+    MarioFruitSync = 15,
+    NpcReact = 16,
+    NpcCleaned = 17,
 }

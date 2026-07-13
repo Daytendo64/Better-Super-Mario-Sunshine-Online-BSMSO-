@@ -11,10 +11,12 @@ namespace SMSO.Server;
 public sealed class RedCoinAuthority
 {
     private readonly Dictionary<(byte CourseId, byte EpisodeId), StageState> _stages = new();
+    private readonly object _gate = new();
 
     public void Reset()
     {
-        _stages.Clear();
+        lock (_gate)
+            _stages.Clear();
     }
 
     /// <summary>
@@ -23,7 +25,8 @@ public sealed class RedCoinAuthority
     /// </summary>
     public void ResetStage(byte courseId, byte episodeId)
     {
-        _stages.Remove((courseId, episodeId));
+        lock (_gate)
+            _stages.Remove((courseId, episodeId));
     }
 
     public bool TryAcceptCollected(in WorldEventRequest request, out byte payload0, out byte reserved,
@@ -33,26 +36,46 @@ public sealed class RedCoinAuthority
         reserved = 0;
         payload1 = 0;
 
-        var stableIndex = ResolveStableIndex(request);
-        if (stableIndex >= 8)
-            return false;
+        lock (_gate)
+        {
+            var stableIndex = ResolveStableIndex(request);
+            if (stableIndex >= 8)
+                return false;
 
-        var stage = GetStage(request.CourseId, request.EpisodeId);
-        if ((stage.CollectedMask & (1 << stableIndex)) != 0)
-            return false;
+            var stage = GetStage(request.CourseId, request.EpisodeId);
+            if ((stage.CollectedMask & (1 << stableIndex)) != 0)
+                return false;
 
-        stage.CollectedMask |= (byte)(1 << stableIndex);
-        var authoritativeCount = BitOperations.PopCount(stage.CollectedMask);
+            stage.CollectedMask |= (byte)(1 << stableIndex);
+            var authoritativeCount = BitOperations.PopCount(stage.CollectedMask);
 
-        reserved = stableIndex;
-        var hudSlot = request.Payload0 == 255 ? stableIndex : (byte)(request.Payload0 & 0xF);
-        payload0 = (byte)(hudSlot | (authoritativeCount << 4));
-        payload1 = request.Payload1;
-        return true;
+            reserved = stableIndex;
+            var hudSlot = request.Payload0 == 255 ? stableIndex : (byte)(request.Payload0 & 0xF);
+            payload0 = (byte)(hudSlot | (authoritativeCount << 4));
+            payload1 = request.Payload1;
+            return true;
+        }
     }
 
     internal byte CollectedMask(byte courseId, byte episodeId)
-        => _stages.TryGetValue((courseId, episodeId), out var stage) ? stage.CollectedMask : (byte)0;
+    {
+        lock (_gate)
+            return _stages.TryGetValue((courseId, episodeId), out var stage) ? stage.CollectedMask : (byte)0;
+    }
+
+    public IReadOnlyDictionary<(byte CourseId, byte EpisodeId), byte> AllStages
+    {
+        get
+        {
+            lock (_gate)
+            {
+                var copy = new Dictionary<(byte CourseId, byte EpisodeId), byte>(_stages.Count);
+                foreach (var pair in _stages)
+                    copy[pair.Key] = pair.Value.CollectedMask;
+                return copy;
+            }
+        }
+    }
 
     private StageState GetStage(byte courseId, byte episodeId)
     {

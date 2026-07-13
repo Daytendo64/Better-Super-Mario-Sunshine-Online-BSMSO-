@@ -19,6 +19,7 @@ public sealed class DolphinBridge : IDisposable
     private DateTime _lastAttachStatusLogUtc = DateTime.MinValue;
     private bool _loggedMailboxFound;
     private int _aliveCheckCounter;
+    private readonly byte[] _magicScratch = new byte[4];
     private readonly byte[] _readScratch = new byte[ProtocolConstants.CommBufferSize];
     private readonly byte[] _remoteSyncSnapNameScratch =
         new byte[ProtocolConstants.CommRemoteSnapshotsSize + ProtocolConstants.CommNameTagAppearancesSize];
@@ -27,6 +28,14 @@ public sealed class DolphinBridge : IDisposable
                  ProtocolConstants.CommGameModeStateSize];
     private readonly byte[] _incomingWorldEventScratch = new byte[ProtocolConstants.CommWorldEventSize];
     private readonly byte[] _localPendingClearScratch = new byte[ProtocolConstants.CommWorldEventSize];
+    private readonly byte[] _marioModelIdsScratch = new byte[ProtocolConstants.CommMarioModelIdsSize];
+    private readonly byte[] _lastRemoteSyncSnapName =
+        new byte[ProtocolConstants.CommRemoteSnapshotsSize + ProtocolConstants.CommNameTagAppearancesSize];
+    private readonly byte[] _lastRemoteSyncVoiceMode =
+        new byte[ProtocolConstants.MarioVoiceEventSize * ProtocolConstants.MaxRemoteSlots +
+                 ProtocolConstants.CommGameModeStateSize];
+    private bool _hasLastRemoteSyncPayload;
+    private int _writeCacheEpoch;
 
     private const int AttachFailureBackoffMs = 500;
     private const int AttachStatusLogCooldownMs = 6000;
@@ -45,6 +54,7 @@ public sealed class DolphinBridge : IDisposable
     public string? LastResolveError => _mailbox.LastError;
     public TimeSpan MailboxSearchDuration => _mailbox.SearchDuration;
     public int? TrackedProcessId => _trackedProcessId;
+    public int WriteCacheEpoch => Volatile.Read(ref _writeCacheEpoch);
 
     public void SetGuestMailboxAddress(uint address)
     {
@@ -88,9 +98,13 @@ public sealed class DolphinBridge : IDisposable
 
     public void PrepareForRelink()
     {
-        _nextAttachAttemptUtc = DateTime.MinValue;
-        _mailbox.Invalidate();
-        _loggedMailboxFound = false;
+        lock (_processLock)
+        {
+            _nextAttachAttemptUtc = DateTime.MinValue;
+            _mailbox.Invalidate();
+            _loggedMailboxFound = false;
+            InvalidateWriteCachesLocked();
+        }
     }
 
     public bool ForceRelink()
@@ -209,10 +223,14 @@ public sealed class DolphinBridge : IDisposable
         if (_processHandle == IntPtr.Zero)
             return false;
 
+        var wasResolved = _mailbox.IsResolved;
+        var previousHost = _mailbox.HostAddress;
         _mailbox.Bind(_processHandle, _guestMailboxAddress);
 
         if (_mailbox.TryResolve(force))
         {
+            if (!wasResolved || previousHost != _mailbox.HostAddress)
+                InvalidateWriteCachesLocked();
             if (!_loggedMailboxFound)
             {
                 _loggedMailboxFound = true;
@@ -224,7 +242,20 @@ public sealed class DolphinBridge : IDisposable
         return false;
     }
 
-    public void InvalidateMailbox() => _mailbox.Invalidate();
+    public void InvalidateMailbox()
+    {
+        lock (_processLock)
+        {
+            _mailbox.Invalidate();
+            InvalidateWriteCachesLocked();
+        }
+    }
+
+    public void InvalidateWriteCaches()
+    {
+        lock (_processLock)
+            InvalidateWriteCachesLocked();
+    }
 
     private void LogThrottled(string message)
     {
@@ -279,6 +310,16 @@ public sealed class DolphinBridge : IDisposable
         _mailbox.Reset();
         _executablePathVerified = false;
         _loggedMailboxFound = false;
+        InvalidateWriteCachesLocked();
+    }
+
+    private void InvalidateWriteCachesLocked()
+    {
+        _hasLastRemoteSyncPayload = false;
+        unchecked
+        {
+            ++_writeCacheEpoch;
+        }
     }
 
     private UIntPtr MailboxHost => _mailbox.HostAddress;
@@ -298,6 +339,7 @@ public sealed class DolphinBridge : IDisposable
             return false;
 
         _mailbox.Invalidate();
+        InvalidateWriteCachesLocked();
         return false;
     }
 
@@ -306,27 +348,23 @@ public sealed class DolphinBridge : IDisposable
         if (_mailbox.HostAddress == UIntPtr.Zero)
             return false;
 
-        var magic = new byte[4];
-        return NativeMethods.ReadProcessMemory(_processHandle, MailboxHost, magic, magic.Length, out int read) &&
-               read == magic.Length &&
-               magic.AsSpan().SequenceEqual(CommMagicBytes);
+        return NativeMethods.ReadProcessMemory(
+                   _processHandle, MailboxHost, _magicScratch, _magicScratch.Length, out int read) &&
+               read == _magicScratch.Length &&
+               _magicScratch.AsSpan().SequenceEqual(CommMagicBytes);
     }
 
     public bool TryReadBuffer(out CommBuffer buffer)
     {
-        buffer = CommBuffer.CreateDefault();
         lock (_processLock)
         {
-            if (_processHandle == IntPtr.Zero)
-                return false;
-
             return TryReadBufferLocked(out buffer);
         }
     }
 
     private bool TryReadBufferLocked(out CommBuffer buffer)
     {
-        buffer = CommBuffer.CreateDefault();
+        buffer = default;
         if (_processHandle == IntPtr.Zero)
             return false;
 
@@ -355,6 +393,7 @@ public sealed class DolphinBridge : IDisposable
                 read != _readScratch.Length)
             {
                 _mailbox.Invalidate();
+                InvalidateWriteCachesLocked();
                 if (!TryResolveMailboxAddressLocked(force: true))
                     return false;
 
@@ -371,10 +410,12 @@ public sealed class DolphinBridge : IDisposable
                 }
             }
 
+            ValidateRemoteSyncCacheLocked(_readScratch);
             buffer = CommBufferEndian.FromDolphinBytes(_readScratch);
             if (buffer.Magic != ProtocolConstants.Magic)
             {
                 _mailbox.Invalidate();
+                InvalidateWriteCachesLocked();
                 return false;
             }
 
@@ -386,6 +427,44 @@ public sealed class DolphinBridge : IDisposable
             DetachLocked();
             return false;
         }
+    }
+
+    private void ValidateRemoteSyncCacheLocked(ReadOnlySpan<byte> liveBuffer)
+    {
+        if (!_hasLastRemoteSyncPayload)
+            return;
+        if (RemoteSyncPayloadMatches(
+                liveBuffer, _lastRemoteSyncSnapName, _lastRemoteSyncVoiceMode))
+            return;
+
+        InvalidateWriteCachesLocked();
+    }
+
+    internal static bool RemoteSyncPayloadMatches(
+        ReadOnlySpan<byte> liveBuffer,
+        ReadOnlySpan<byte> expectedSnapshotsAndNames,
+        ReadOnlySpan<byte> expectedVoicesAndMode)
+    {
+        var snapshotAndNameSize =
+            ProtocolConstants.CommRemoteSnapshotsSize + ProtocolConstants.CommNameTagAppearancesSize;
+        var voiceAndModeOffset =
+            ProtocolConstants.CommMarioVoiceEventsOffset + ProtocolConstants.MarioVoiceEventSize;
+        var voiceAndModeSize =
+            ProtocolConstants.MarioVoiceEventSize * ProtocolConstants.MaxRemoteSlots +
+            ProtocolConstants.CommGameModeStateSize;
+        if (liveBuffer.Length < ProtocolConstants.CommBufferSize ||
+            expectedSnapshotsAndNames.Length != snapshotAndNameSize ||
+            expectedVoicesAndMode.Length != voiceAndModeSize)
+        {
+            return false;
+        }
+
+        return liveBuffer
+                   .Slice(ProtocolConstants.CommRemoteSnapshotsOffset, snapshotAndNameSize)
+                   .SequenceEqual(expectedSnapshotsAndNames) &&
+               liveBuffer
+                   .Slice(voiceAndModeOffset, voiceAndModeSize)
+                   .SequenceEqual(expectedVoicesAndMode);
     }
 
     public bool TryWriteBuffer(CommBuffer buffer)
@@ -481,11 +560,11 @@ public sealed class DolphinBridge : IDisposable
             if (!_mailbox.IsResolved && !TryResolveMailboxAddressLocked())
                 return false;
 
-            // Remote snapshots (112..688) and name-tag appearances (688..788) are contiguous, so a
-            // single WriteProcessMemory covers both atomically — no partial state where remotes
-            // updated but nametags lag (or vice versa). The local voice event (788..800) is left
-            // untouched (the module owns it). Remote voice (800..908) + game mode (908..921) are
-            // likewise contiguous and written as one block.
+            // Remote snapshots and name-tag appearances are contiguous, so a single
+            // WriteProcessMemory covers both atomically — no partial state where remotes
+            // updated but nametags lag (or vice versa). The local voice event is left
+            // untouched (the module owns it). Remote voice + game mode are likewise
+            // contiguous and written as one block.
             var voiceRegionSize = ProtocolConstants.MarioVoiceEventSize * ProtocolConstants.MaxRemoteSlots;
 
             CommBufferEndian.WriteRemoteSnapshotsInto(
@@ -500,16 +579,30 @@ public sealed class DolphinBridge : IDisposable
                 _remoteSyncVoiceModeScratch.AsSpan(voiceRegionSize, ProtocolConstants.CommGameModeStateSize),
                 gameMode);
 
+            // Skip WriteProcessMemory when the serialized remote payload is unchanged (idle remotes).
+            if (_hasLastRemoteSyncPayload &&
+                _lastRemoteSyncSnapName.AsSpan().SequenceEqual(_remoteSyncSnapNameScratch) &&
+                _lastRemoteSyncVoiceMode.AsSpan().SequenceEqual(_remoteSyncVoiceModeScratch))
+            {
+                return true;
+            }
+
             var host = MailboxHost.ToUInt64();
             if (!TryWriteProcessMemoryLocked(
                     new UIntPtr(host + ProtocolConstants.CommRemoteSnapshotsOffset),
                     _remoteSyncSnapNameScratch))
                 return false;
 
-            return TryWriteProcessMemoryLocked(
-                new UIntPtr(host + ProtocolConstants.CommMarioVoiceEventsOffset +
-                            ProtocolConstants.MarioVoiceEventSize),
-                _remoteSyncVoiceModeScratch);
+            if (!TryWriteProcessMemoryLocked(
+                    new UIntPtr(host + ProtocolConstants.CommMarioVoiceEventsOffset +
+                                ProtocolConstants.MarioVoiceEventSize),
+                    _remoteSyncVoiceModeScratch))
+                return false;
+
+            _remoteSyncSnapNameScratch.CopyTo(_lastRemoteSyncSnapName, 0);
+            _remoteSyncVoiceModeScratch.CopyTo(_lastRemoteSyncVoiceMode, 0);
+            _hasLastRemoteSyncPayload = true;
+            return true;
         }
     }
 
@@ -525,7 +618,12 @@ public sealed class DolphinBridge : IDisposable
 
             var bytes = CommBufferEndian.ToRemoteSnapshotsDolphinBytes(remotes);
             var address = new UIntPtr(MailboxHost.ToUInt64() + ProtocolConstants.CommRemoteSnapshotsOffset);
-            return TryWriteProcessMemoryLocked(address, bytes);
+            if (!TryWriteProcessMemoryLocked(address, bytes))
+                return false;
+
+            // Partial poke overlaps the remote-sync skip cache — force the next full flush.
+            InvalidateWriteCachesLocked();
+            return true;
         }
     }
 
@@ -541,7 +639,30 @@ public sealed class DolphinBridge : IDisposable
 
             var bytes = CommBufferEndian.ToNameTagAppearancesDolphinBytes(local, remotes);
             var address = new UIntPtr(MailboxHost.ToUInt64() + ProtocolConstants.CommNameTagAppearancesOffset);
-            return TryWriteProcessMemoryLocked(address, bytes);
+            if (!TryWriteProcessMemoryLocked(address, bytes))
+                return false;
+
+            // Nametag region is part of _lastRemoteSyncSnapName. Without invalidating, the next
+            // TryWriteRemoteSyncPayload can SequenceEqual-skip and leave Dolphin with a mix of
+            // fresh nametags + stale cached remotes (or skip a needed remotes rewrite).
+            InvalidateWriteCachesLocked();
+            return true;
+        }
+    }
+
+    public bool TryWriteMarioModelIdsOnly(byte[] localModelId, byte[] remoteModelIds)
+    {
+        lock (_processLock)
+        {
+            if (_processHandle == IntPtr.Zero)
+                return false;
+
+            if (!_mailbox.IsResolved && !TryResolveMailboxAddressLocked())
+                return false;
+
+            CommBufferEndian.WriteMarioModelIdsInto(_marioModelIdsScratch, localModelId, remoteModelIds);
+            var address = new UIntPtr(MailboxHost.ToUInt64() + ProtocolConstants.CommMarioModelIdsOffset);
+            return TryWriteProcessMemoryLocked(address, _marioModelIdsScratch);
         }
     }
 
@@ -559,7 +680,11 @@ public sealed class DolphinBridge : IDisposable
             var address = new UIntPtr(
                 MailboxHost.ToUInt64() + ProtocolConstants.CommMarioVoiceEventsOffset +
                 ProtocolConstants.MarioVoiceEventSize);
-            return TryWriteProcessMemoryLocked(address, bytes);
+            if (!TryWriteProcessMemoryLocked(address, bytes))
+                return false;
+
+            InvalidateWriteCachesLocked();
+            return true;
         }
     }
 
@@ -575,7 +700,12 @@ public sealed class DolphinBridge : IDisposable
 
             var bytes = CommBufferEndian.ToGameModeStateDolphinBytes(state);
             var address = new UIntPtr(MailboxHost.ToUInt64() + ProtocolConstants.CommGameModeStateOffset);
-            return TryWriteProcessMemoryLocked(address, bytes);
+            if (!TryWriteProcessMemoryLocked(address, bytes))
+                return false;
+
+            // Game mode sits in the voice+mode skip-cache block.
+            InvalidateWriteCachesLocked();
+            return true;
         }
     }
 

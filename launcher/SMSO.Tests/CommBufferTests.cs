@@ -31,6 +31,8 @@ public class CommBufferTests
         Assert.Equal(10, ProtocolConstants.StableMaxPlayers);
         Assert.Equal(ProtocolConstants.StableMaxPlayers, ProtocolConstants.MaxPlayers);
         Assert.True(ProtocolConstants.MaxRemoteSlots >= ProtocolConstants.MaxPlayers);
+        Assert.Equal(ProtocolConstants.MaxPlayers, ProtocolConstants.CommRosterHudRingSlots);
+        Assert.Equal(11, ProtocolConstants.CommVersion);
     }
 
     [Fact]

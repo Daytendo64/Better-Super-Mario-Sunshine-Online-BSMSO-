@@ -137,8 +137,13 @@ public static class NameTagColorCodec
     {
         target ??= new byte[16];
         Array.Clear(target, 0, target.Length);
-        var bytes = System.Text.Encoding.UTF8.GetBytes(value ?? string.Empty);
-        Array.Copy(bytes, target, Math.Min(bytes.Length, target.Length));
+        if (target.Length == 0 || string.IsNullOrEmpty(value))
+            return;
+
+        var text = value.AsSpan();
+        while (!text.IsEmpty && System.Text.Encoding.UTF8.GetByteCount(text) > target.Length)
+            text = text[..^1];
+        System.Text.Encoding.UTF8.GetBytes(text, target.AsSpan());
     }
 
     public static NameTagAppearance ToAppearance(byte textTopR, byte textTopG, byte textTopB,

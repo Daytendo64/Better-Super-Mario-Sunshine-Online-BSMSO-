@@ -52,4 +52,16 @@ public class SirenaHotelInteriorMappingTests
         Assert.Equal(expectedArea, areaId);
         Assert.Equal(expectedMission, mission);
     }
+
+    // Random Level must use a beach episode (e.g. catalog 5 Scrubbing) — not 6/7 hotel remaps.
+    [Theory]
+    [InlineData(0)]
+    [InlineData(5)]
+    public void TryResolveWarpDestination_SirenaBeachEpisodesStayOnBeach(byte catalogId)
+    {
+        Assert.False(LevelCatalog.TryResolveWarpDestination(6, catalogId, out var areaId, out var mission));
+        Assert.Equal(6, areaId);
+        Assert.Equal(catalogId, mission);
+        Assert.Equal(catalogId, LevelCatalog.ResolveEpisodeForWarp(6, catalogId));
+    }
 }

@@ -12,6 +12,7 @@
 #include <SMS/System/MarDirector.hxx>
 
 extern TMario *gpMarioAddress;
+extern TMarDirector *gpMarDirector;
 
 namespace smso {
 
@@ -37,6 +38,21 @@ static bool isMarioVoiceSoundId(u32 soundId) {
            (soundId >= 0x0000792C && soundId <= 0x0000792F);
 }
 
+// MSRandPlay ambient clips (idle cry / continuous exert). These fire randomly
+// via setPlayerInfo on the local player and must NOT be networked — holding them
+// until a remote enters hearing range makes a Mario voice play on approach.
+static bool isAmbientMarioVoiceSoundId(u32 soundId) {
+    switch (soundId) {
+    case MSD_SE_MV10A_CRY_SHORT_01:
+    case MSD_SE_MV10A_CRY_SHORT_02:
+    case MSD_SE_MV10A_CRY_SHORT_03:
+    case MSD_SE_MV16_EXERT_CONT_01:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static u8 currentMarioHealthByte() {
     if (!gpMarioAddress)
         return 0;
@@ -59,6 +75,16 @@ static void publishLocalVoiceEvent(u32 soundId, TMarDirector *director) {
     event.reserved1 = 0;
 }
 
+static bool isLocalMarioOwningChannel0Voice() {
+    if (!gpMarioAddress || !gpMarDirector)
+        return false;
+    if (gpMarDirector->mCurState < TMarDirector::STATE_NORMAL)
+        return false;
+    if (gpMarioAddress->mHolder != nullptr)
+        return false;
+    return true;
+}
+
 static void captureLocalMarioVoice(TMarDirector *director) {
     if (!gpMSound)
         return;
@@ -77,6 +103,11 @@ static void captureLocalMarioVoice(TMarDirector *director) {
     const u32 soundId = gpMSound->getMarioVoiceID(kLocalVoiceChannel);
     if (soundId == kInvalidVoiceId || !isMarioVoiceSoundId(soundId))
         return;
+    if (isAmbientMarioVoiceSoundId(soundId))
+        return;
+
+    if (!isLocalMarioOwningChannel0Voice())
+        return;
 
     if (handle == gLastLocalVoiceHandle && soundId == gLastLocalVoiceId)
         return;
@@ -90,16 +121,15 @@ static bool voiceEventMatchesLocalStage(const MarioVoiceEvent &event, const Comm
     return event.stageId == buf->localSnapshot.stageId && event.episodeId == buf->localSnapshot.episodeId;
 }
 
-static void playRemoteMarioVoice(u8 slot, const MarioVoiceEvent &event) {
-    if (!isMarioVoiceSoundId(event.soundId))
-        return;
+static bool playRemoteMarioVoice(u8 slot, const MarioVoiceEvent &event) {
+    if (!isMarioVoiceSoundId(event.soundId) || isAmbientMarioVoiceSoundId(event.soundId))
+        return false;
 
     TMario *body = getRemoteBodyForSlot(slot);
     if (!body)
-        return;
+        return false;
 
-    const Vec *pos = reinterpret_cast<const Vec *>(&body->mTranslation);
-    playRemoteMarioPositionalSound(event.soundId, *pos);
+    return playRemoteMarioVoiceSound(event.soundId, body, slot, event.flags);
 }
 
 static void consumeRemoteMarioVoices() {
@@ -117,11 +147,29 @@ static void consumeRemoteMarioVoices() {
         if (event.sequence == 0 || event.sequence == gLastRemoteVoiceSequence[slot])
             continue;
 
-        gLastRemoteVoiceSequence[slot] = event.sequence;
-        if (!voiceEventMatchesLocalStage(event, buf))
+        // Permanent skips: wrong stage, ambient MSRandPlay clips, or unknown IDs.
+        if (!voiceEventMatchesLocalStage(event, buf) || !isMarioVoiceSoundId(event.soundId) ||
+            isAmbientMarioVoiceSoundId(event.soundId)) {
+            gLastRemoteVoiceSequence[slot] = event.sequence;
             continue;
+        }
 
-        playRemoteMarioVoice(static_cast<u8>(slot), event);
+        TMario *body = getRemoteBodyForSlot(static_cast<u8>(slot));
+        if (!body) {
+            // Puppet not ready yet — keep pending for a later frame.
+            continue;
+        }
+
+        // Out of hearing range: drop, do NOT hold until the player walks in.
+        // Holding made idle/action voices fire the moment a remote entered the
+        // 3500uu audible radius (felt like a Mario SE on approach).
+        if (!isRemoteMarioSoundAudible(body->mTranslation)) {
+            gLastRemoteVoiceSequence[slot] = event.sequence;
+            continue;
+        }
+
+        if (playRemoteMarioVoice(static_cast<u8>(slot), event))
+            gLastRemoteVoiceSequence[slot] = event.sequence;
     }
 }
 
@@ -135,6 +183,9 @@ void initMarioVoiceSync() {
 }
 
 void updateMarioVoiceSync(TMarDirector *director) {
+    // Do not call setPlayerInfo / rebindLocalMarioPlayerInfo every frame.
+    // setPlayerInfo recreates MSRandPlay entries and interrupts continuous
+    // local movement SE (rollout / exert-cont / water-wait).
     captureLocalMarioVoice(director);
     consumeRemoteMarioVoices();
 }

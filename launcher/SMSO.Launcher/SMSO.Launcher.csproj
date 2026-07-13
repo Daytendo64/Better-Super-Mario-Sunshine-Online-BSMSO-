@@ -8,7 +8,7 @@
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <TargetFramework>net7.0-windows</TargetFramework>
+    <TargetFramework>net8.0-windows</TargetFramework>
     <Nullable>enable</Nullable>
     <UseWPF>true</UseWPF>
     <AssemblyName>BSMSO.Launcher</AssemblyName>
@@ -17,6 +17,10 @@
     <ApplicationIcon>Assets\bsmso.ico</ApplicationIcon>
     <ApplicationManifest>app.manifest</ApplicationManifest>
   </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="SMSO.Tests" />
+  </ItemGroup>
 
   <ItemGroup>
     <Resource Include="Assets\bsmso.ico" />
@@ -34,6 +38,10 @@
       <Link>assets\episode-names.ntsc-u.json</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="GCNTools" Version="1.0.2" />
   </ItemGroup>
 
 </Project>

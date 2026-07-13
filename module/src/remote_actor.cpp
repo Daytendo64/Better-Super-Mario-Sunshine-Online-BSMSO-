@@ -1,5 +1,6 @@
 #include "remote_actor.hpp"
 #include "blooper_surf_sync.hpp"
+#include "fruit_sync.hpp"
 #include "remote_mario_audio.hpp"
 #include "world_sync.hpp"
 #include "comm_buffer.hpp"
@@ -46,6 +47,8 @@ class JKRHeap;
 #include <JSystem/JDrama/JDRViewObjPtrListT.hxx>
 #include <JSystem/JSupport/JSUMemoryStream.hxx>
 #include <JSystem/JKernel/JKRHeap.hxx>
+#include "mario_model_system.hpp"
+#include "mario_tex_anim.hpp"
 
 extern TMarDirector *gpMarDirector;
 extern TMario *gpMarioAddress;
@@ -68,26 +71,44 @@ static const char kPlayerGroupName[] =
     "\x83\x76\x83\x8C\x81\x5B\x83\x84\x81\x5B\x83\x4F\x83\x8B\x81\x5B\x83\x76";
 
 // Full TMario puppets are heavy (model + ~199 anims + cap + Yoshi), ~612 KiB each
-// in practice. We pre-spawn the whole pool once per stage (SMSO 2 makeMarios()
-// principle) and reuse them for the whole stage. A full MAX_PLAYERS session has
-// MAX_PLAYERS-1 remotes, so the pool holds that many bodies; 9 * ~612 KiB ≈ 5.4 MiB
-// fits inside the 7.5 MiB expanded-MEM1 arena below with ~2 MiB of runtime margin.
+// in practice. We pre-spawn the pool staggered (at most 1 body per frame) on hub /
+// loading / early gameplay so stage entry never pays 9× initValues in one hitch.
+// Bodies + pack buffers live on the expanded-MEM1 remote heap and are kept across
+// stage exits while BF_CONNECTED — only perform-group membership is cleared.
+// A full MAX_PLAYERS session has MAX_PLAYERS-1 remotes (one body per remote
+// network slot); 9 * ~612 KiB ≈ 5.4 MiB. Custom mario packs (~1.6–1.9 MiB each)
+// also live in this arena via SMSLoadArchive. A 10-player lobby with unique
+// models needs up to 10 packs (~19 MiB) + 9 bodies (~5.5 MiB) ≈ 25 MiB —
+// soft-fail extras to retail when the mapped arena is short.
+//
+// CRITICAL: pool arrays are indexed by network slot id (0..MAX_PLAYERS-1), NOT by
+// a dense 0..MAX_PLAYERS-2 range. Slot 9 must be addressable when localSlot != 9.
+// kSessionMaxRemotes is the expected BODY COUNT (local left null), not the array size.
 constexpr u32 kSessionMaxRemotes = MAX_PLAYERS - 1;
-constexpr size_t kRemoteActorDedicatedHeapSize = 0x00780000u;
-constexpr size_t kStageHeapReserveMargin = 0x00060000u;
-constexpr size_t kStageHeapReserveMarginTight = 0x00020000u;
 constexpr size_t kRemoteBodySpawnMinFree = 0x00090000u;
-// Dolphin expanded MEM1 (48 MiB) puppet-pool arena. Retail SMS only configures
-// CPU BATs for the stock 24 MiB, so this region faults until we add a data BAT
-// for it (see ensureExtendedMem1Mapping). 0x81810000 sits in the block based at
-// 0x81000000; ensureExtendedMem1Mapping widens DBAT2 from 8 -> 16 MiB, exposing
-// 0x81000000-0x81FFFFFF -> phys 0x01000000-0x01FFFFFF (Dolphin backs the full
-// 48 MiB). 0x780000 = 7.5 MiB holds nine ~612 KiB bodies and ends at 0x81F90000,
-// well within the widened 16 MiB block (ends 0x82000000).
+// Dolphin expanded MEM1 (48 MiB) puppet+pack arena. Retail SMS only configures
+// CPU BATs for the stock 24 MiB, so this region faults until we map it
+// (see ensureExtendedMem1Mapping).
+//
+// CRITICAL: the arena MUST start above retail arenaHi (~0x817fe4c0) and the
+// 0x817FC000 mailbox. A 30 MiB heap at 0x81000000 dual-BAT-mapped and probed
+// OK, then froze stage load — it overlapped the live root heap.
+//
+// Primary layout (dual-BAT, ~23.9 MiB):
+//   DBAT0 widened 16→32 MiB covers 0x80000000..0x82000000
+//   DBAT2 installed 16 MiB covers 0x82000000..0x83000000
+//   Arena 0x81810000..0x82FF0000 sits across both BATs, above arenaHi.
+// Fallback (proven): DBAT2 8→16 MiB only, 7.5 MiB @ 0x81810000..0x81F90000.
+//
+// NOTE: A single 64 MiB DBAT0 is impossible (would end at 0x84000000 past MEM1).
+// A 32 MiB BAT at 0x81000000 is also invalid (not naturally 32 MiB-aligned).
 constexpr u32 kRemoteActorExpandedHeapAddress = 0x81810000u;
-constexpr size_t kRemoteActorExpandedHeapSize = 0x00780000u;
+constexpr size_t kRemoteActorExpandedHeapSize = 0x017E0000u; // 23.875 MiB → 0x82FF0000
+constexpr size_t kRemoteActorExpandedHeapSizeFallback = 0x00780000u; // 7.5 MiB proven
 // Only attempt the extended arena when Dolphin actually backs >24 MiB of MEM1.
 constexpr u32 kMinMem1ForExpandedHeap = 0x02800000u; // 40 MiB
+constexpr u32 kMem1CachedEnd = 0x83000000u;          // 48 MiB ceiling
+constexpr u32 kMem1DualBatSplit = 0x82000000u;       // DBAT0 end / DBAT2 start
 
 // u16 @0x114 holds the draw attribute bits (decomp unk114); 0x2 = visible.
 constexpr u32 kAttr114VisibleBit = 0x2;
@@ -122,6 +143,20 @@ constexpr u8 kSwimBubbleEmitHz = 30;
 constexpr u8 kSwimBubbleEmitInterval = 60 / kSwimBubbleEmitHz; // every 2 frames
 constexpr u8 kSwimRippleEmitHz = 10;
 constexpr u8 kSwimRippleEmitInterval = 60 / kSwimRippleEmitHz; // every 6 frames
+// Phase A remote movement SE cadence. Retail re-triggers slip / swim / surf every
+// frame via soundMovement(); rate-limit so 9 remotes stay affordable.
+constexpr u8 kMoveSeSlipHz = 8;
+constexpr u8 kMoveSeSlipInterval = 60 / kMoveSeSlipHz;
+constexpr u8 kMoveSeSwimHz = 5;
+constexpr u8 kMoveSeSwimInterval = 60 / kMoveSeSwimHz;
+constexpr u8 kMoveSeSurfHz = 8;
+constexpr u8 kMoveSeSurfInterval = 60 / kMoveSeSurfHz;
+constexpr u8 kMoveSeFootstepHz = 6;
+constexpr u8 kMoveSeFootstepInterval = 60 / kMoveSeFootstepHz;
+constexpr u8 kMoveSeRollHz = 4;
+constexpr u8 kMoveSeRollInterval = 60 / kMoveSeRollHz;
+constexpr f32 kMoveSeFootstepSpeedMin = 8.0f;
+constexpr f32 kMoveSeRollSpeedMin = 12.0f;
 constexpr u8 kRemoteDismissInvalidStreak = 3;
 
 // doldecomp MarioStatus.hpp status type+id mask (low 9 bits of mState).
@@ -136,6 +171,9 @@ struct RemoteActorSlot;
 static void syncRemoteNozzleGunAngle(TMario *mario, s16 pitch);
 
 static bool ensureRemoteActorHeap();
+static void dismissRemoteBody(u8 slotIndex, RemoteActorSlot &slot);
+static void removeBodyFromViewList(TMario *body);
+static void parkRemoteBody(TMario *body);
 
 static u32 stripSurfDrawFlag(u32 state) {
     return state & ~smso::kBlooperSurfDrawFlag;
@@ -214,6 +252,9 @@ constexpr f32 kRemoteMotionSnapDistance = 4.0f;
 constexpr f32 kRemotePositionBlendRate = 24.0f;
 constexpr f32 kRemoteVelocityBlendRate = 20.0f;
 constexpr f32 kRemoteRotationBlendRate = 30.0f;
+
+constexpr bool kRemoteHotPathOsReport = false; // gate periodic / spammy OSReport in hot paths
+constexpr u32 kVisibilityDiagInterval = 1800;  // 30s @ 60 Hz when hot-path reports enabled
 constexpr f32 kRemoteAnimResyncBehindFrames = 1.25f;
 constexpr f32 kRemoteAnimResyncAheadFrames = 4.0f;
 constexpr f32 kRemoteAnimLoopSpanFrames = 256.0f;
@@ -359,6 +400,11 @@ struct RemoteActorSlot {
     u8 fluddSprayTick;
     u8 swimVfxTick;
     bool wasInWater;
+    // Phase A movement SE bookkeeping (edge + rate-limit; never setPlayerInfo).
+    u8 moveSeTick;
+    u8 footstepPhase; // L/R heel/tip cycle for generic stone walk SE
+    bool wasSurfRide;
+    bool wasSurfJump;
     u8 syncedSprayPressure;
     u8 invalidSnapshotStreak;
     f32 remoteSprayPressure;
@@ -370,20 +416,50 @@ struct RemoteActorSlot {
     f32 targetRotY;
     f32 displayRotY;
     bool displayMotionInit;
+    // Dirty tracking for cheap per-frame path (skip Yoshi/blooper/cosmetics when quiet).
+    u32 lastAppliedState;
+    u16 lastAppliedAnimId;
+    u16 lastAppliedVfx;
+    u8 lastAppliedNozzle;
+    u8 lastAppliedHealth;
+    u8 lastAppliedWater;
+    u8 lastAppliedMovement;
     RemoteYoshiSlot yoshi;
 };
 
 static RemoteActorSlot gActors[MAX_REMOTE_SLOTS];
 
 // Pre-spawned remote puppet pool. Adapted from the SMSO 2 design principle in
-// createMarios.c (makeMarios): every remote body is allocated ONCE, up front,
-// while the heap is freshest, then reused for the whole stage. The previous
-// design spawned bodies lazily mid-gameplay, so by the time the 3rd remote body
-// (the 4th player) was needed the stage heap was already fragmented/low and the
-// spawn intermittently failed — that is why the 4th Mario never appeared.
-static TMario *gBodyPool[kSessionMaxRemotes] = {};
+// createMarios.c (makeMarios): every remote body is allocated up front while the
+// heap is freshest, then reused. Spawns are staggered (1/frame) and prefer an
+// already-cached custom pack so first-residency need not rebuild. The previous
+// design spawned all 9 bodies in one frame and destroyed the heap every stage
+// exit — both caused multi-frame freezes on join / stage entry.
+// Indexed by network slot (0..MAX_REMOTE_SLOTS-1); localSlot entry stays nullptr.
+static TMario *gBodyPool[MAX_REMOTE_SLOTS] = {};
+// Model id that was mounted when each pool body was initValues()'d (empty = retail).
+static char gBodyPoolModelIds[MAX_REMOTE_SLOTS][8] = {};
+// True when the pool body was constructed under a bound custom pack (not soft-fail retail).
+static bool gBodyPoolIsCustom[MAX_REMOTE_SLOTS] = {};
+// Capless packs (Yoshi/Birdo): retail hat BMDs stay for initValues; hide meshes.
+static bool gBodyPoolHideCaps[MAX_REMOTE_SLOTS] = {};
+// Once true for a slot, mid-stage CommBuffer id changes must not rebuild the body
+// until requestRemoteMarioModelReapply (or dismiss / next stage). Cleared when the
+// body is dismissed back to the pool so a later first-residency can re-apply.
+static bool gBodyModelApplied[MAX_REMOTE_SLOTS] = {};
+// Frames spent assigned with an empty (retail) id before freezing. Lets a late
+// CommBuffer model-id write win over retail-prewarm without allowing mid-stage
+// hot-swaps after the grace window (reapply still unlocks on a later non-empty id).
+static u8 gBodyRetailGraceFrames[MAX_REMOTE_SLOTS] = {};
+constexpr u8 kRemoteModelRetailGraceFrames = 180; // 3s @ 60 Hz (roster/pack install race)
+// Cooldown between soft-fail retries (pack missing / heap low / spawn fail) so we
+// do not SMSLoadArchive every frame while still recovering when the pack appears.
+static u8 gBodyModelRetryCooldown[MAX_REMOTE_SLOTS] = {};
+constexpr u8 kRemoteModelRetryCooldownFrames = 45; // 0.75s @ 60 Hz
 static u32 gBodyPoolCount = 0;
-static bool gBodyPoolPrewarmAttempted = false;
+// Staggered prewarm: walk slots one spawn per frame until the pool is full.
+static u32 gBodyPoolPrewarmIndex = 0;
+static bool gBodyPoolPrewarmComplete = false;
 static u32 gVisibilityDiagFrame = 0;
 static bool gRemoteHeapReserved = false;
 static JDrama::TViewObjPtrListT<JDrama::TViewObj> *gPlayerGroup = nullptr;
@@ -395,27 +471,52 @@ static JKRHeap *gRemoteActorHeap = nullptr;
 static bool gRemoteActorHeapOwned = false;
 static bool gReportedHeapShortage = false;
 static bool gExpandedHeapFailed = false;
-// Set once the extended-MEM1 data BAT is installed and verified. Persists for the
+// Set once an extended-MEM1 data BAT is installed and verified. Persists for the
 // module's lifetime (the CPU mapping survives stage teardown); only a full console
 // reset clears it, after which we re-install on the next session.
 static bool gExtendedMappingReady = false;
+static u32 gExtendedMappedEnd = 0; // exclusive end of the verified mapped window
 static RemoteActorSlot *gRemoteWaistSlot = nullptr;
 
 static u32 gRemotePerformDrawDiag = 0;
+
+static bool gReportedPerformGroupAllocFail = false;
 
 static JDrama::TViewObjPtrListT<JDrama::TViewObj> *ensureRemotePerformGroup() {
     if (gRemotePerformGroup)
         return gRemotePerformGroup;
 
-    if (!JKRHeap::sRootHeap)
-        return nullptr;
+    // Prefer the root heap (persists across stage teardown), but fall back to the
+    // remote actor heap and the current heap so a null/exhausted root heap on a
+    // given boot path does not silently disable every remote body for the stage.
+    const size_t size = sizeof(JDrama::TViewObjPtrListT<JDrama::TViewObj>);
+    JKRHeap *candidates[3] = {
+        JKRHeap::sRootHeap,
+        gRemoteActorHeap,
+        JKRHeap::sCurrentHeap,
+    };
 
-    void *mem = JKRHeap::sRootHeap->alloc(sizeof(JDrama::TViewObjPtrListT<JDrama::TViewObj>), 0x20);
-    if (!mem)
+    void *mem = nullptr;
+    for (JKRHeap *heap : candidates) {
+        if (!heap)
+            continue;
+        mem = heap->alloc(size, 0x20);
+        if (mem)
+            break;
+    }
+
+    if (!mem) {
+        if (!gReportedPerformGroupAllocFail) {
+            gReportedPerformGroupAllocFail = true;
+            OSReport("[SMSO] Remote perform group alloc FAILED (root=%p remote=%p current=%p)\n",
+                     JKRHeap::sRootHeap, gRemoteActorHeap, JKRHeap::sCurrentHeap);
+        }
         return nullptr;
+    }
 
     gRemotePerformGroup =
         new (mem) JDrama::TViewObjPtrListT<JDrama::TViewObj>("SMSO_RemotePuppets");
+    gReportedPerformGroupAllocFail = false;
     return gRemotePerformGroup;
 }
 
@@ -460,11 +561,24 @@ static void mirrorRemotePerformGroup(u32 flags, JDrama::TGraphics *graphics) {
 }
 
 static void registerRemotePerformGroup(TMarDirector *director) {
-    if (gRemotePerformGroupRegistered || !director || !gPlayerGroup)
+    if (!director || !gPlayerGroup)
         return;
 
-    if (!ensureRemotePerformGroup())
+    // Recover from a stale "registered" flag left over from a previous stage whose
+    // perform group was never (re)created. Without this, a null pointer paired with
+    // a true flag would keep updateRemoteActors bailing out for the whole stage.
+    if (gRemotePerformGroupRegistered && gRemotePerformGroup)
         return;
+
+    if (gRemotePerformGroupRegistered && !gRemotePerformGroup) {
+        OSReport("[SMSO] Remote perform group flag set but pointer null, recreating\n");
+        gRemotePerformGroupRegistered = false;
+    }
+
+    if (!ensureRemotePerformGroup()) {
+        // ensureRemotePerformGroup already emits a one-shot alloc-fail report.
+        return;
+    }
 
     gRemotePerformGroupRegistered = true;
     OSReport("[SMSO] Remote perform group ready (mirror dispatch via local Mario perform)\n");
@@ -522,10 +636,10 @@ static bool snapshotPacksWaistPitchForState(u16 vfxFlags, u16 animId, u32 state)
 static bool isRemoteBody(const TMario *mario) {
     if (!mario)
         return false;
-    // Every pooled puppet is a remote body, whether or not it is currently
-    // assigned to an active network slot. Parked (idle) pool bodies must still
-    // be treated as remote so the gameplay-safety patches never run on them.
-    for (u32 i = 0; i < gBodyPoolCount; ++i) {
+    // Pool is indexed by network slot (local slot left null). Scan every slot
+    // index — do NOT use gBodyPoolCount as a contiguous length, or high-index
+    // puppets (e.g. slot 9 when local is not 9) are misclassified as local.
+    for (u32 i = 0; i < MAX_REMOTE_SLOTS; ++i) {
         if (gBodyPool[i] == mario)
             return true;
     }
@@ -563,16 +677,23 @@ static bool isRemoteProxiedLocalDamage(TMario *mario, THitActor *hit) {
     return false;
 }
 
-static void disableRemotePickupInteraction(TMario *body, u8 rosterSlot) {
+static void configureRemoteMarioCollision(TMario *body, u8 rosterSlot) {
     if (!body)
         return;
 
-    body->mAttackRadius = 0.0f;
-    body->mAttackHeight = 0.0f;
+    auto *hitBody = reinterpret_cast<THitActor *>(body);
+
+    // Never mirror attack/receive radii onto puppets — that breaks stage load and routes
+    // map-object hits to the wrong body.
+    (void)rosterSlot;
     body->mReceiveRadius = 0.0f;
     body->mReceiveHeight = 0.0f;
-    body->mEntryRadius = 0.0f;
-    body->mHeldObject = nullptr;
+    hitBody->mEntryRadius = 0.0f;
+    body->mAttackRadius = 0.0f;
+    body->mAttackHeight = 0.0f;
+
+    // Preserve synced fruit carry — cleared again when the remote drops/throws.
+    body->mHeldObject = smso::getRemoteCarriedFruitActor(rosterSlot);
     body->mHolder = nullptr;
 
     if (!smso::isRemoteShineCollectActive(rosterSlot))
@@ -1158,6 +1279,7 @@ static u8 resolveWarpOutKind(u16 animId) {
 }
 
 static void setBodyVisible(TMario *body, bool visible);
+static u8 networkSlotOf(const RemoteActorSlot *slot);
 static void beginRemoteAppearHide(RemoteActorSlot &slot, u16 frames);
 static void tickRemoteAppearReveal(RemoteActorSlot *slot);
 
@@ -1206,7 +1328,8 @@ static void bindModelToJoint(J3DModel *model, Mtx *jointMtx) {
 }
 
 // Tail of doldecomp TMario::calcAnim: hands + cap after the body model perform.
-static void remoteBindHandsAndCap(TMario *mario, JDrama::TGraphics *graphics, bool showSeekerGlasses) {
+static void remoteBindHandsAndCap(TMario *mario, JDrama::TGraphics *graphics, bool showSeekerGlasses,
+                                  bool hideCaps) {
     J3DModel *body = mario->mModelData ? mario->mModelData->mModel : nullptr;
     if (!body || !body->mJointArray)
         return;
@@ -1229,15 +1352,25 @@ static void remoteBindHandsAndCap(TMario *mario, JDrama::TGraphics *graphics, bo
 
     if (mario->mCap) {
         ensureCapOnHead(mario);
-        if (mario->mCap->mCap1)
-            bindModelToJoint(mario->mCap->mCap1, mheadMtx);
-        if (mario->mCap->mCap3)
-            bindModelToJoint(mario->mCap->mCap3, mheadMtx);
+        // Capless skins: keep TMarioCap (glasses/helm still bind) but never leave
+        // retail hat meshes unbound — entryModels → mCap->perform(0x200) would
+        // draw them at stale/mtx-effect transforms (floating orphan caps).
+        if (hideCaps) {
+            smso::squashHiddenCapDrawInstance(mario);
+        } else {
+            if (mario->mCap->mCap1)
+                bindModelToJoint(mario->mCap->mCap1, mheadMtx);
+            if (mario->mCap->mCap3)
+                bindModelToJoint(mario->mCap->mCap3, mheadMtx);
+        }
         if (kEnableRemoteYCamHelmet && mario->mCap->mDiverHelm)
             bindModelToJoint(mario->mCap->mDiverHelm, headMtx);
         if (showSeekerGlasses && mario->mCap->maGlass1)
             bindModelToJoint(mario->mCap->maGlass1, mheadMtx);
         mario->mCap->perform(2, graphics);
+        // perform(2) recalcs active hat meshes — re-squash so entryModels is empty.
+        if (hideCaps)
+            smso::squashHiddenCapDrawInstance(mario);
     }
 }
 
@@ -1378,8 +1511,21 @@ static void remoteCalcAnim(TMario *mario, RemoteActorSlot *slot, JDrama::TGraphi
 
     mario->setPositions();
 
-    if (mario->mCap)
-        mario->mCap->mtxEffectShow();
+    bool hideCaps = false;
+    if (slot) {
+        const u32 idx = static_cast<u32>(slot - gActors);
+        if (idx < MAX_REMOTE_SLOTS)
+            hideCaps = gBodyPoolHideCaps[idx];
+    }
+
+    // Capless packs: never enable TMultiMtxEffect — lag ghosts float in the stage
+    // when hat meshes are not bound to the head.
+    if (mario->mCap) {
+        if (hideCaps)
+            mario->mCap->mtxEffectHide();
+        else
+            mario->mCap->mtxEffectShow();
+    }
 
     mario->addUpper();
     mario->considerWaist();
@@ -1401,7 +1547,7 @@ static void remoteCalcAnim(TMario *mario, RemoteActorSlot *slot, JDrama::TGraphi
         applyRemoteShirtVisibility(mario);
 
     applyRemoteRunHandBlend(mario);
-    remoteBindHandsAndCap(mario, graphics, slot && slot->hideSeekSeekerLook);
+    remoteBindHandsAndCap(mario, graphics, slot && slot->hideSeekSeekerLook, hideCaps);
 
     if (slot && (slot->vfxFlags & VFX_DEAD) == 0)
         smso::updateRemoteBlooperSurfFrame(mario, &slot->surf, graphics);
@@ -1661,6 +1807,12 @@ static void playRemoteFluddActorSound(u32 soundId, TMario *body) {
     if (!gpMSound || !body || !gpMSound->gateCheck(soundId))
         return;
 
+    for (u32 i = 0; i < MAX_REMOTE_SLOTS; ++i) {
+        if (gActors[i].spawned && gActors[i].body == body &&
+            shouldSuppressRemoteHiderFromSeekerGrace(static_cast<u8>(i)))
+            return;
+    }
+
     if (!isRemoteMarioSoundAudible(body->mTranslation))
         return;
 
@@ -1708,6 +1860,29 @@ static void updateRemoteFluddSounds(TMario *body, TWaterGun *fludd, RemoteActorS
     }
 
     slot.lastSoundVfx = vfx;
+}
+
+// Positional Mario movement SE on remotes. Mirrors playRemoteFluddActorSound /
+// soundMovement() one-shots without setPlayerInfo / MSRandPlay registration.
+static void playRemoteMarioActorSound(u32 soundId, TMario *body) {
+    if (!gpMSound || !body || !gpMSound->gateCheck(soundId))
+        return;
+
+    for (u32 i = 0; i < MAX_REMOTE_SLOTS; ++i) {
+        if (gActors[i].spawned && gActors[i].body == body &&
+            shouldSuppressRemoteHiderFromSeekerGrace(static_cast<u8>(i)))
+            return;
+    }
+
+    if (!isRemoteMarioSoundAudible(body->mTranslation))
+        return;
+
+    auto *actor = reinterpret_cast<JAIActor *>(body);
+    if (MSoundSESystem::MSoundSE::checkMonoSound(soundId, actor))
+        return;
+
+    const Vec *pos = reinterpret_cast<const Vec *>(&body->mTranslation);
+    MSoundSESystem::MSoundSE::startSoundActor(soundId, pos, 0, nullptr, 0, 4);
 }
 
 // doldecomp MarioStatus.hpp status type+id mask (low 9 bits of mState).
@@ -1762,6 +1937,171 @@ static bool isHeavyLanding(u32 state, u32 prevState) {
     if (state == TMario::STATE_HVY_LAND)
         return true;
     return isAirSpinJump(prevState);
+}
+
+// Ground dive-slide roll (speed sliding) — retail MSRandPlay drive;
+// Phase A approximates with one-shot + rate-limited ROLL SE.
+static bool isRolloutState(u32 state) {
+    return remoteStatusId(state) == 0x04Cu; // MARIO_STATUS_SPEED_SLIDING
+}
+
+static bool isSwimPaddleActive(u32 state) {
+    if ((state & TMario::STATE_WATERBORN) == 0)
+        return false;
+    const u32 id = remoteStatusId(state);
+    // MARIO_STATUS_SWIM_WAIT_TO_PADDLE .. SWIM_PADDLE_END_TO_WAIT (0xD3..0xD7)
+    return id >= 0x0D3u && id <= 0x0D7u;
+}
+
+static bool isWallKnockState(u32 state) {
+    return state == TMario::STATE_F_KNCK_H || state == TMario::STATE_KNCK_GND ||
+           state == TMario::STATE_KNCK_LND;
+}
+
+static f32 remoteHorizontalSpeed(const TMario *body) {
+    if (!body)
+        return 0.0f;
+    return sqrtf(body->mSpeed.x * body->mSpeed.x + body->mSpeed.z * body->mSpeed.z);
+}
+
+static u32 remoteFootstepSoundId(u8 phase) {
+    switch (phase & 3u) {
+    case 0:
+        return MSD_SE_MA_WALK_STONE_L_HEEL;
+    case 1:
+        return MSD_SE_MA_WALK_STONE_L_TIP;
+    case 2:
+        return MSD_SE_MA_WALK_STONE_R_HEEL;
+    default:
+        return MSD_SE_MA_WALK_STONE_R_TIP;
+    }
+}
+
+// One-shot movement SE edges — same window as syncRemoteParticleEdges.
+static void updateRemoteMovementSoundEdges(TMario *body, RemoteActorSlot &slot, u32 prevState,
+                                           u32 state, u16 vfxFlags) {
+    if (!body || !gpMSound)
+        return;
+    if ((vfxFlags & VFX_DEAD) != 0)
+        return;
+    if (prevState == kInvalidTrackState || prevState == state)
+        return;
+
+    // Slide type uses current vfx (CATCH wet bit). Status ids for other slips
+    // don't need vfx; misclassifying CATCH the frame wet flips is acceptable.
+    const bool prevDry = isDrySlideState(prevState, vfxFlags);
+    const bool prevWet = isWetSlideState(prevState, vfxFlags);
+    const bool nowDry = isDrySlideState(state, vfxFlags);
+    const bool nowWet = isWetSlideState(state, vfxFlags);
+
+    if ((!prevDry && !prevWet) && (nowDry || nowWet)) {
+        // Speed-sliding uses ROLL; other slip/slide statuses use SLIP.
+        if (remoteStatusId(state) == 0x04Cu)
+            playRemoteMarioActorSound(MSD_SE_MA_ROLL, body);
+        else if (nowWet || remoteStatusId(state) == 0x05Du)
+            playRemoteMarioActorSound(MSD_SE_MA_SLIP_POLLUT, body);
+        else
+            playRemoteMarioActorSound(MSD_SE_MA_SLIP, body);
+    } else if (!isRolloutState(prevState) && isRolloutState(state)) {
+        playRemoteMarioActorSound(MSD_SE_MA_ROLL, body);
+    }
+
+    if (isGroundPoundFallState(prevState) && state == TMario::STATE_SLAM)
+        playRemoteMarioActorSound(MSD_SE_MA_HIP_ATTACK, body);
+
+    const bool enteringLand = !isLandSlipState(prevState) && isLandSlipState(state);
+    if (slot.wasAirborne && enteringLand) {
+        if (isHeavyLanding(state, prevState)) {
+            playRemoteMarioActorSound(MSD_SE_MA_BOUND, body);
+            playRemoteMarioActorSound(MSD_SE_MA_TIMP_HI, body);
+        } else {
+            playRemoteMarioActorSound(MSD_SE_MA_TIMP_LOW, body);
+        }
+    }
+
+    if (prevState != TMario::STATE_SLIP_JUMP && state == TMario::STATE_SLIP_JUMP)
+        playRemoteMarioActorSound(MSD_SE_MA_STALL_JUMP, body);
+
+    if (!isWallKnockState(prevState) && isWallKnockState(state))
+        playRemoteMarioActorSound(MSD_SE_MA_WALL_COL_SOFT, body);
+
+    if (isAirSpinJump(state) && !isAirSpinJump(prevState))
+        playRemoteMarioActorSound(MSD_SE_MA_ROLL_JUMP, body);
+}
+
+// Continuous / rate-limited movement SE — called each remote perform tick
+// BEFORE wasInWater is advanced so water enter/exit edges are visible.
+static void updateRemoteMovementSoundLoops(TMario *body, RemoteActorSlot *slot) {
+    if (!body || !slot || !gpMSound)
+        return;
+
+    const u16 vfxFlags = slot->vfxFlags;
+    if ((vfxFlags & VFX_DEAD) != 0) {
+        slot->wasSurfRide = false;
+        slot->wasSurfJump = false;
+        return;
+    }
+
+    const u32 state = body->mState;
+    const u16 animId = body->mAnimationID;
+    ++slot->moveSeTick;
+
+    // Water enter / exit (reads wasInWater before continuous-VFX updates it).
+    const bool swimming = isRemoteSwimming(body);
+    if (swimming && !slot->wasInWater) {
+        if (isDiveSwimAnim(animId))
+            playRemoteMarioActorSound(MSD_SE_MA_FALL_IN_WATER_DEP, body);
+        else
+            playRemoteMarioActorSound(MSD_SE_MA_FALL_IN_WATER_SLW, body);
+    } else if (!swimming && slot->wasInWater) {
+        if ((state & TMario::STATE_AIRBORN) != 0)
+            playRemoteMarioActorSound(MSD_SE_MA_JUMP_FR_WATER_SLW, body);
+    }
+
+    const bool surfRide = smso::isBlooperSurfRideState(state);
+    const bool surfJump = smso::isBlooperSurfState(state) && !surfRide;
+    if (surfJump && slot->wasSurfRide && !slot->wasSurfJump)
+        playRemoteMarioActorSound(MSD_SE_MA_SURF_JUMP, body);
+    if (surfRide && slot->wasSurfJump)
+        playRemoteMarioActorSound(MSD_SE_MA_SURF_GND_ON_WATER, body);
+    if (surfRide && !slot->wasSurfRide)
+        playRemoteMarioActorSound(MSD_SE_MA_SURF_START_ACCEL, body);
+    slot->wasSurfRide = surfRide;
+    slot->wasSurfJump = surfJump;
+
+    const bool drySlide = isDrySlideState(state, vfxFlags);
+    const bool wetSlide = isWetSlideState(state, vfxFlags);
+    const bool speedSlide = isRolloutState(state);
+    if ((drySlide || wetSlide) && !speedSlide &&
+        (slot->moveSeTick % kMoveSeSlipInterval) == 0) {
+        if (wetSlide || remoteStatusId(state) == 0x05Du)
+            playRemoteMarioActorSound(MSD_SE_MA_SLIP_POLLUT, body);
+        else
+            playRemoteMarioActorSound(MSD_SE_MA_SLIP, body);
+    }
+
+    if (speedSlide && remoteHorizontalSpeed(body) >= kMoveSeRollSpeedMin &&
+        (slot->moveSeTick % kMoveSeRollInterval) == 0) {
+        playRemoteMarioActorSound(MSD_SE_MA_ROLL, body);
+    }
+
+    if (swimming && isSwimPaddleActive(state) &&
+        (slot->moveSeTick % kMoveSeSwimInterval) == 0) {
+        playRemoteMarioActorSound(MSD_SE_MA_SWIM_MOVE, body);
+    }
+
+    if (surfRide && (slot->moveSeTick % kMoveSeSurfInterval) == 0)
+        playRemoteMarioActorSound(MSD_SE_MA_SURF_WATER, body);
+
+    // Generic stone footsteps — no setPlayerInfo / MSRandPlay, no surface codes.
+    const bool grounded = (state & TMario::STATE_AIRBORN) == 0 && !swimming && !surfRide &&
+                          !drySlide && !wetSlide;
+    if (grounded && isRunningAnim(body) &&
+        remoteHorizontalSpeed(body) >= kMoveSeFootstepSpeedMin &&
+        (slot->moveSeTick % kMoveSeFootstepInterval) == 0) {
+        playRemoteMarioActorSound(remoteFootstepSoundId(slot->footstepPhase), body);
+        ++slot->footstepPhase;
+    }
 }
 
 static void emitRemoteWetSlideVfx(TMario *body) {
@@ -1846,10 +2186,17 @@ static void syncRemoteContinuousParticles(TMario *body, RemoteActorSlot *slot) {
     const u16 animId = body->mAnimationID;
     const u16 vfxFlags = slot ? slot->vfxFlags : static_cast<u16>(0);
     if ((vfxFlags & VFX_DEAD) != 0) {
-        if (slot)
+        if (slot) {
             slot->wasInWater = false;
+            slot->wasSurfRide = false;
+            slot->wasSurfJump = false;
+        }
         return;
     }
+
+    // Movement SE before wasInWater advances (water enter/exit edges).
+    if (slot)
+        updateRemoteMovementSoundLoops(body, slot);
 
     const bool turboDashActive =
         slot && (vfxFlags & VFX_TURBO) != 0 && (vfxFlags & VFX_WATER_SPRAY) != 0 && body->mFludd &&
@@ -1904,6 +2251,8 @@ static void syncRemoteContinuousParticles(TMario *body, RemoteActorSlot *slot) {
 static void syncRemoteParticleEdges(TMario *body, RemoteActorSlot &slot, const PlayerSnapshot &snap) {
     if (!body || !gpMarioParticleManager)
         return;
+    if (shouldSuppressRemoteHiderFromSeekerGrace(networkSlotOf(&slot)))
+        return;
 
     const u32 state = body->mState;
     const u32 prevState = slot.lastState;
@@ -1935,6 +2284,8 @@ static void syncRemoteParticleEdges(TMario *body, RemoteActorSlot &slot, const P
             body->emitParticle(particles::kHipDropC);
         }
     }
+
+    updateRemoteMovementSoundEdges(body, slot, prevState, state, snap.vfxFlags);
 
     slot.lastState = state;
     slot.lastAnimId = snap.animId;
@@ -2323,15 +2674,9 @@ static void emitRemoteFluddVfx(TMario *body, TWaterGun *fludd, RemoteActorSlot *
     }
 
     emitRemoteSprayVfx(fludd, vfxFlags, body, slot);
+
     if (slot) {
         // Droplets must be emitted every frame (60 Hz) to match local Mario's FLUDD.
-        // Each water particle that lands calls gpPollution->clean() (doldecomp
-        // ModelWaterManager splashGround/splashWall), so the graffiti clean rate is
-        // directly proportional to droplet count. The previous 30 Hz throttle made
-        // remote graffiti clean at ~half the local rate, so the host finished cleaning
-        // (and revealed the blue coin) before remote screens caught up. Cosmetic spray
-        // particles above still run at 30 Hz via emitThisFrame; only the cleaning
-        // droplets are promoted to per-frame.
         emitRemoteWaterDroplets(fludd, *slot, /*emitThisFrame=*/true);
     }
 
@@ -2574,8 +2919,35 @@ static void setBodyVisible(TMario *body, bool visible) {
         *attr &= ~kAttr114VisibleBit;
 }
 
+static u8 networkSlotOf(const RemoteActorSlot *slot) {
+    if (!slot)
+        return 0xFF;
+    for (u32 i = 0; i < MAX_REMOTE_SLOTS; ++i) {
+        if (&gActors[i] == slot)
+            return static_cast<u8>(i);
+    }
+    return 0xFF;
+}
+
+// Remote perform bypasses retail Mario draw gating — it must honor appear-hide,
+// attr 0x114 (setBodyVisible), AND Start Tag seeker-vs-hider grace suppress.
+// Prior grace fix only cleared attr 0x114; draw still ran because this helper
+// previously only checked appearRevealFrames.
 static bool isRemoteBodyDrawVisible(const RemoteActorSlot *slot) {
-    return !slot || slot->appearRevealFrames == 0;
+    if (!slot || slot->appearRevealFrames != 0)
+        return false;
+
+    const u8 netSlot = networkSlotOf(slot);
+    if (netSlot != 0xFF && shouldSuppressRemoteHiderFromSeekerGrace(netSlot))
+        return false;
+
+    if (slot->body) {
+        const u32 attr114 =
+            *reinterpret_cast<const u32 *>(reinterpret_cast<const u8 *>(slot->body) + 0x114);
+        if ((attr114 & kAttr114VisibleBit) == 0)
+            return false;
+    }
+    return true;
 }
 
 static void resetRemoteRuntimeState(RemoteActorSlot &slot, bool stageAppear) {
@@ -2617,6 +2989,10 @@ static void resetRemoteRuntimeState(RemoteActorSlot &slot, bool stageAppear) {
     slot.fluddSprayTick = 0;
     slot.swimVfxTick = 0;
     slot.wasInWater = false;
+    slot.moveSeTick = 0;
+    slot.footstepPhase = 0;
+    slot.wasSurfRide = false;
+    slot.wasSurfJump = false;
     slot.syncedSprayPressure = 0;
     slot.invalidSnapshotStreak = 0;
     slot.remoteSprayPressure = 0.0f;
@@ -2625,6 +3001,13 @@ static void resetRemoteRuntimeState(RemoteActorSlot &slot, bool stageAppear) {
     slot.hideSeekSeekerLookWas = false;
     slot.inWarpTransition = false;
     slot.displayMotionInit = false;
+    slot.lastAppliedState = kInvalidTrackState;
+    slot.lastAppliedAnimId = 0xFFFF;
+    slot.lastAppliedVfx = 0xFFFF;
+    slot.lastAppliedNozzle = 0xFF;
+    slot.lastAppliedHealth = 0xFF;
+    slot.lastAppliedWater = 0xFF;
+    slot.lastAppliedMovement = 0xFF;
     slot.yoshi = {};
 }
 
@@ -2639,8 +3022,14 @@ static void beginRemoteAppearHide(RemoteActorSlot &slot, u16 frames) {
 static void tickRemoteAppearReveal(RemoteActorSlot *slot) {
     if (!slot || slot->appearRevealFrames == 0)
         return;
-    if (--slot->appearRevealFrames == 0 && slot->body)
-        setBodyVisible(slot->body, true);
+    if (--slot->appearRevealFrames != 0 || !slot->body)
+        return;
+    // Do not re-show mid-perform if Start Tag grace still suppresses this hider.
+    if (shouldSuppressRemoteHiderFromSeekerGrace(networkSlotOf(slot))) {
+        setBodyVisible(slot->body, false);
+        return;
+    }
+    setBodyVisible(slot->body, true);
 }
 
 static bool isStageReady(TMarDirector *director) {
@@ -2678,6 +3067,17 @@ static bool isReasonableWorldPos(f32 x, f32 y, f32 z) {
 static bool isValidSnapshot(const PlayerSnapshot &snap) {
     return snap.connected != 0 && isFiniteVec(snap.position.x, snap.position.y, snap.position.z) &&
            isReasonableWorldPos(snap.position.x, snap.position.y, snap.position.z);
+}
+
+static bool snapshotHeavyDirty(const RemoteActorSlot &slot, const PlayerSnapshot &snap) {
+    const u32 rawState = static_cast<u32>(snap.actionId) |
+                         (static_cast<u32>(snap.actionIdHi) << 16);
+    return slot.lastAppliedState != rawState || slot.lastAppliedAnimId != snap.animId ||
+           slot.lastAppliedVfx != snap.vfxFlags || slot.lastAppliedNozzle != snap.nozzleId ||
+           slot.lastAppliedHealth != snap.health || slot.lastAppliedWater != snap.water ||
+           slot.lastAppliedMovement != snap.movementState ||
+           slot.fluddSwitchLatched || slot.hideSeekSeekerLook !=
+               (isHideSeekActive() && isHideSeekSeekerSlot(snap.slot));
 }
 
 static bool listContains(JDrama::TViewObjPtrListT<JDrama::TViewObj> *group, const void *obj) {
@@ -2728,23 +3128,24 @@ static JKRHeap *resolveRemoteHeapParent() {
     return nullptr;
 }
 
-static bool tryCreateDedicatedRemoteHeap();
+static bool tryCreateExpandedMem1RemoteHeap();
 
 // ---- Extended MEM1 (Dolphin 48 MiB) CPU mapping ------------------------------
 //
 // Retail SMS only configures CPU BATs for the stock 24 MiB, so guest addresses at
 // 0x81800000+ fault even though Dolphin backs 48 MiB of host RAM (JKRHeap::
 // mMemorySize reports it). Writing a JKRExpHeap header there with no mapping
-// instantly resets the console (proven in dolphin.log). The fix is to add ONE
-// data BAT (0x81800000 -> physical 0x01800000, 8 MiB, cached, R/W) into an
-// otherwise-unused DBAT. Physical = EA - 0x80000000 keeps OSCachedToPhysical
-// consistent, so GX DMA reads the same bytes the CPU writes.
+// instantly resets the console (proven in dolphin.log).
 //
-// Block encoding verified against the GameCube kexec setup: 0x810000FF == an
-// 8 MiB block at 0x81000000 (BL 0x3F << 2 | Vs | Vp). All BAT reads are harmless;
-// we only WRITE an application-usable DBAT (2 or 3) when it is currently invalid,
-// then sentinel-probe before trusting the region. Any failure path falls back to
-// the stage heap rather than crashing. SPRs: DBATnU/L = 536+2n / 537+2n.
+// Fix: map a pack+puppet arena at 0x81810000 (ABOVE retail arenaHi / mailbox)
+// with TWO non-overlapping BATs when possible:
+//   DBAT0 32 MiB (0x80000000..0x82000000) + DBAT2 16 MiB (0x82000000..0x83000000)
+// covering ~23.9 MiB through 0x82FF0000. A 30 MiB heap at 0x81000000 dual-BAT
+// mapped and probed OK but froze stage load — it overlapped the live root heap.
+// Proven fallback: widen DBAT2 8→16 MiB and use 7.5 MiB @ 0x81810000.
+// Physical = EA - 0x80000000. Sentinel-probe before trusting. NEVER carve a
+// tiny stage-child heap that then OOMs during pack/prewarm — soft-fail instead.
+// SPRs: DBATnU/L = 536+2n / 537+2n.
 
 static u32 readDBATU(int idx) {
     u32 v = 0;
@@ -2770,12 +3171,23 @@ static u32 readDBATL(int idx) {
     return v;
 }
 
-// Only DBAT2/DBAT3 are application-usable (Dolphin-OS reserves DBAT0/DBAT1).
-static void writeDBAT23(int idx, u32 upper, u32 lower) {
-    if (idx == 2)
+// DBAT2/DBAT3 are the usual application-writable slots. DBAT0 is the main RAM
+// BAT (0x80000000); we only enlarge it (never retarget) so the extra Dolphin
+// MEM1 above 24 MiB becomes CPU-reachable for the pack+puppet arena.
+static void writeDBAT(int idx, u32 upper, u32 lower) {
+    switch (idx) {
+    case 0:
+        asm volatile("mtspr 537, %0; mtspr 536, %1; isync" : : "r"(lower), "r"(upper) : "memory");
+        break;
+    case 2:
         asm volatile("mtspr 541, %0; mtspr 540, %1; isync" : : "r"(lower), "r"(upper) : "memory");
-    else if (idx == 3)
+        break;
+    case 3:
         asm volatile("mtspr 543, %0; mtspr 542, %1; isync" : : "r"(lower), "r"(upper) : "memory");
+        break;
+    default:
+        break;
+    }
 }
 
 static bool dbatCovers(u32 upper, u32 base, u32 end) {
@@ -2788,106 +3200,235 @@ static bool dbatCovers(u32 upper, u32 base, u32 end) {
     return base >= blockStart && end <= blockEnd;
 }
 
-// Preferred mapping route on retail SMS: DBAT2 maps the second RAM block
-// (0x81000000 -> phys 0x01000000, 8 MiB) and ends exactly at 0x81800000, right
-// where the puppet arena begins. Doubling its block size to 16 MiB is fully
-// transparent to the existing 0x81000000-0x817FFFFF data (phys = BRPN + (EA-BEPI)
-// is independent of BL) and newly exposes 0x81800000-0x81FFFFFF -> phys
-// 0x01800000, which Dolphin already backs (48 MiB). Far safer than claiming a new
-// BAT because it never introduces an overlapping/aliased mapping.
-static bool tryWidenAdjacentDbat(u32 regionStart, u32 regionEnd) {
-    for (int i = 2; i <= 3; ++i) { // only DBAT2/DBAT3 are application-writable
-        const u32 upper = readDBATU(i);
-        const u32 lower = readDBATL(i);
-        if ((upper & 0x3u) == 0)
-            continue;
+// Grow an existing cached-RAM DBAT by repeatedly doubling until it covers
+// [regionStart, regionEnd), or until the next double would break alignment /
+// exceed Dolphin's 48 MiB MEM1. Returns true only when the region is covered.
+// When widening DBAT0 past 0x81000000, invalidate DBAT2 first — overlapping
+// BATs on Gekko are undefined and crash Dolphin.
+static bool tryWidenDbatToCover(int idx, u32 regionStart, u32 regionEnd) {
+    if (idx != 0 && idx != 2 && idx != 3)
+        return false;
 
-        const u32 bl = (upper >> 2) & 0x7FFu;
-        const u32 blockSize = (bl + 1u) << 17;
-        const u32 bepi = upper & 0xFFFE0000u;
-        const u32 brpn = lower & 0xFFFE0000u;
+    u32 upper = readDBATU(idx);
+    const u32 lower = readDBATL(idx);
+    if ((upper & 0x3u) == 0)
+        return false;
 
-        // Must be a RAM-cached mapping with phys = EA - 0x80000000 so GX DMA and
-        // OSCachedToPhysical stay consistent over the widened range.
-        if (brpn != bepi - 0x80000000u)
-            continue;
-        if ((lower & 0x10u) != 0) // I (cache-inhibit) set -> not cached RAM
-            continue;
-        // The block must sit strictly below the region and double to cover it,
-        // staying naturally aligned.
-        if (bepi + blockSize > regionStart)
-            continue;
+    const u32 bepi = upper & 0xFFFE0000u;
+    const u32 brpn = lower & 0xFFFE0000u;
+    if (brpn != bepi - 0x80000000u)
+        return false;
+    if ((lower & 0x10u) != 0) // I (cache-inhibit) set -> not cached RAM
+        return false;
+    // Block must start at or below the arena.
+    if (bepi > regionStart)
+        return false;
+
+    u32 bl = (upper >> 2) & 0x7FFu;
+    u32 blockSize = (bl + 1u) << 17;
+    if (dbatCovers(upper, regionStart, regionEnd))
+        return true;
+
+    const u32 origUpper = upper;
+    const u32 origSize = blockSize;
+    bool widened = false;
+    while (bepi + blockSize < regionEnd) {
         const u32 newBlockSize = blockSize << 1;
         const u32 newBl = (newBlockSize >> 17) - 1u;
         if (newBl > 0x7FFu)
-            continue;
+            break;
         if (bepi & (newBlockSize - 1u))
-            continue;
-        if (bepi + newBlockSize < regionEnd)
-            continue;
+            break; // next size not naturally aligned (e.g. DBAT2 @ 0x81000000 → 32 MiB)
+        // Refuse to map past Dolphin's 48 MiB MEM1 ceiling (0x83000000).
+        // 64 MiB from 0x80000000 would end at 0x84000000 — blocked here.
+        if (bepi + newBlockSize > kMem1CachedEnd)
+            break;
 
-        const u32 newUpper = bepi | (newBl << 2) | 0x3u;
-        writeDBAT23(i, newUpper, lower);
-        OSReport("[SMSO] Widened DBAT%d %08X->%08X (%u->%u MiB) covering 0x%08X\n", i, upper,
-                 readDBATU(i), blockSize >> 20, newBlockSize >> 20, regionStart);
-        return true;
+        // Before DBAT0 swallows the DBAT2 window, clear DBAT2 so the ranges
+        // never overlap (Gekko undefined behavior / Dolphin crash).
+        if (idx == 0) {
+            const u32 newEnd = bepi + newBlockSize;
+            for (int other = 2; other <= 3; ++other) {
+                const u32 ou = readDBATU(other);
+                if ((ou & 0x3u) == 0)
+                    continue;
+                const u32 obl = (ou >> 2) & 0x7FFu;
+                const u32 oSize = (obl + 1u) << 17;
+                const u32 oStart = ou & 0xFFFE0000u;
+                const u32 oEnd = oStart + oSize;
+                // Only invalidate cached-RAM BATs that would overlap the new range.
+                const u32 ol = readDBATL(other);
+                if ((ol & 0x10u) != 0)
+                    continue;
+                if (oStart < newEnd && oEnd > bepi) {
+                    writeDBAT(other, ou & ~0x3u, ol); // clear Vs/Vp
+                    OSReport("[SMSO] Invalidated overlapping DBAT%d before widening DBAT0\n",
+                             other);
+                }
+            }
+        }
+
+        upper = bepi | (newBl << 2) | 0x3u;
+        writeDBAT(idx, upper, lower);
+        blockSize = newBlockSize;
+        widened = true;
     }
+
+    if (widened) {
+        OSReport("[SMSO] Widened DBAT%d %08X->%08X (%u->%u MiB) toward 0x%08X..0x%08X\n", idx,
+                 origUpper, readDBATU(idx), origSize >> 20, blockSize >> 20, regionStart, regionEnd);
+    }
+    return dbatCovers(readDBATU(idx), regionStart, regionEnd);
+}
+
+// True when every byte of [base, end) is covered by at least one live DBAT
+// (union of ranges). Needed because the 30 MiB arena spans DBAT0 (32 MiB) and
+// DBAT2 (16 MiB) — no single BAT can cover it under the 48 MiB MEM1 ceiling.
+static bool dbatsCoverRegion(u32 base, u32 end) {
+    if (end <= base)
+        return true;
+    u32 cursor = base;
+    while (cursor < end) {
+        bool advanced = false;
+        for (int i = 0; i < 4; ++i) {
+            const u32 upper = readDBATU(i);
+            if ((upper & 0x3u) == 0)
+                continue;
+            const u32 bl = (upper >> 2) & 0x7FFu;
+            const u32 blockSize = (bl + 1u) << 17;
+            const u32 blockStart = (upper & 0xFFFE0000u) & ~(blockSize - 1u);
+            const u32 blockEnd = blockStart + blockSize;
+            if (cursor >= blockStart && cursor < blockEnd) {
+                cursor = blockEnd;
+                advanced = true;
+                break;
+            }
+        }
+        if (!advanced)
+            return false;
+    }
+    return true;
+}
+
+// Install a free application BAT (DBAT2/3) as a 16 MiB cached-RAM window at
+// 0x82000000 so the upper half of the dual-BAT arena is reachable after DBAT0
+// has been widened to 32 MiB (0x80000000..0x82000000).
+static bool tryInstallUpperMem1Bat() {
+    int slot = -1;
+    if ((readDBATU(2) & 0x3u) == 0)
+        slot = 2;
+    else if ((readDBATU(3) & 0x3u) == 0)
+        slot = 3;
+    else {
+        // Prefer reclaiming DBAT2 if it still holds the retail 8 MiB window
+        // that we invalidated (or a stale partial widen). Overwriting a free
+        // or already-invalidated slot is safest.
+        const u32 ou = readDBATU(2);
+        const u32 ol = readDBATL(2);
+        if ((ol & 0x10u) == 0) {
+            writeDBAT(2, ou & ~0x3u, ol);
+            slot = 2;
+            OSReport("[SMSO] Cleared DBAT2 to reclaim for upper MEM1 window\n");
+        }
+    }
+    if (slot < 0) {
+        OSReport("[SMSO] Upper MEM1 BAT unavailable (DBAT2/3 busy)\n");
+        return false;
+    }
+
+    // 16 MiB @ 0x82000000 → phys 0x02000000. BL for 16 MiB = (16MiB/128KiB)-1 = 0x7F.
+    const u32 upper = 0x820001FFu; // 0x82000000 | BL(16 MiB) | Vs | Vp
+    const u32 lower = 0x02000002u; // phys 0x02000000 | WIMG cached | PP r/w
+    writeDBAT(slot, upper, lower);
+    OSReport("[SMSO] Installed DBAT%d = %08X %08X (16 MiB 0x82000000 -> phys 0x02000000)\n", slot,
+             readDBATU(slot), readDBATL(slot));
+    return dbatCovers(readDBATU(slot), kMem1DualBatSplit, kMem1CachedEnd);
+}
+
+// Probe [start, end) at start / mid / end-4. Mid uses the dual-BAT seam when
+// the region crosses 0x82000000 so both BATs are exercised.
+static bool probeMappedRegion(u32 regionStart, u32 regionEnd) {
+    if (regionEnd <= regionStart + 8)
+        return false;
+
+    volatile u32 *p0 = reinterpret_cast<volatile u32 *>(regionStart);
+    volatile u32 *p1 = reinterpret_cast<volatile u32 *>(regionEnd - 4);
+    u32 midAddr = regionStart + ((regionEnd - regionStart) / 2u);
+    if (regionStart < kMem1DualBatSplit && regionEnd > kMem1DualBatSplit)
+        midAddr = kMem1DualBatSplit;
+    volatile u32 *pMid = reinterpret_cast<volatile u32 *>(midAddr);
+
+    *p0 = 0x5A5AA5A5u;
+    *pMid = 0x3C3CC3C3u;
+    *p1 = 0xA5A55A5Au;
+    const bool ok = (*p0 == 0x5A5AA5A5u) && (*pMid == 0x3C3CC3C3u) && (*p1 == 0xA5A55A5Au);
+    OSReport("[SMSO] Extended MEM1 probe 0x%08X/0x%08X/0x%08X -> %s\n", regionStart, midAddr,
+             regionEnd - 4, ok ? "OK" : "FAIL");
+    return ok;
+}
+
+// Preferred mapping for the ~24 MiB arena above arenaHi:
+//   1) Widen DBAT0 16→32 MiB (covers 0x80000000..0x82000000, invalidates DBAT2)
+//   2) Install DBAT2 as 16 MiB at 0x82000000 (covers 0x82000000..0x83000000)
+// Arena 0x81810000..0x82FF0000 is then covered by the union of both BATs.
+// Fallback: widen DBAT2 8→16 MiB for the proven 7.5 MiB window only.
+static bool tryMapExpandedArena(u32 regionStart, u32 regionEnd) {
+    // Step 1: get DBAT0 to cover at least through 0x82000000 (lower half).
+    if (tryWidenDbatToCover(0, regionStart, kMem1DualBatSplit)) {
+        // DBAT0 alone covers any arena that ends at/before 0x82000000 (7.5 MiB
+        // fallback). Larger arenas need the upper BAT.
+        if (dbatsCoverRegion(regionStart, regionEnd))
+            return true;
+        if (tryInstallUpperMem1Bat() && dbatsCoverRegion(regionStart, regionEnd))
+            return true;
+        OSReport("[SMSO] Dual-BAT upper window failed; trying DBAT2-only fallback\n");
+    } else {
+        OSReport("[SMSO] DBAT0 could not cover 0x%08X..0x%08X for expanded arena\n", regionStart,
+                 kMem1DualBatSplit);
+    }
+
+    // Step 2: proven DBAT2-only path for the smaller fallback window.
+    // If DBAT0 widen invalidated DBAT2, restore the retail 8 MiB cached window
+    // at 0x81000000 so we can widen it 8→16 MiB again.
+    if ((readDBATU(2) & 0x3u) == 0) {
+        writeDBAT(2, 0x810000FFu, 0x01000002u); // retail-like 8 MiB @ 0x81000000
+        OSReport("[SMSO] Restored retail DBAT2 8 MiB window for fallback widen\n");
+    }
+    if (tryWidenDbatToCover(2, regionStart, regionEnd))
+        return true;
+    if (tryWidenDbatToCover(3, regionStart, regionEnd))
+        return true;
     return false;
 }
 
-static bool ensureExtendedMem1Mapping() {
-    if (gExtendedMappingReady)
+static bool ensureExtendedMem1Mapping(u32 regionStart, u32 regionEnd) {
+    if (gExtendedMappingReady && gExtendedMappedEnd >= regionEnd &&
+        dbatsCoverRegion(regionStart, regionEnd))
         return true;
-
-    const u32 regionStart = kRemoteActorExpandedHeapAddress;
-    const u32 regionEnd = regionStart + static_cast<u32>(kRemoteActorExpandedHeapSize);
 
     for (int i = 0; i < 4; ++i)
         OSReport("[SMSO] DBAT%d = %08X %08X\n", i, readDBATU(i), readDBATL(i));
 
-    // If a live BAT already covers the region, an earlier write-crash proves the
-    // physical RAM behind it is not actually backed -> bail without probing.
-    for (int i = 0; i < 4; ++i) {
-        if (dbatCovers(readDBATU(i), regionStart, regionEnd)) {
-            OSReport("[SMSO] Extended MEM1 already mapped by DBAT%d but unbacked; staying on stage heap\n", i);
-            return false;
-        }
-    }
+    bool alreadyCovered = dbatsCoverRegion(regionStart, regionEnd);
+    if (alreadyCovered)
+        OSReport("[SMSO] Extended MEM1 already covered by DBAT union — probing\n");
 
-    // Preferred: widen the adjacent RAM BAT (DBAT2 8->16 MiB on retail SMS).
-    bool mapped = tryWidenAdjacentDbat(regionStart, regionEnd);
-
-    // Fallback: claim a free application BAT if one exists (non-retail configs).
+    bool mapped = alreadyCovered || tryMapExpandedArena(regionStart, regionEnd);
     if (!mapped) {
-        int slot = -1;
-        if ((readDBATU(2) & 0x3u) == 0)
-            slot = 2;
-        else if ((readDBATU(3) & 0x3u) == 0)
-            slot = 3;
-        if (slot < 0) {
-            OSReport("[SMSO] Extended MEM1 mapping skipped: no widenable/free DBAT\n");
-            return false;
-        }
-        const u32 upper = 0x818000FFu; // 0x81800000 | BL(8 MiB) | Vs | Vp
-        const u32 lower = 0x01800002u; // phys 0x01800000 | WIMG 0000 (cached) | PP r/w
-        writeDBAT23(slot, upper, lower);
-        OSReport("[SMSO] Installed DBAT%d = %08X %08X (8 MiB 0x81800000 -> phys 0x01800000)\n", slot,
-                 readDBATU(slot), readDBATL(slot));
+        OSReport("[SMSO] Extended MEM1 mapping failed for arena 0x%08X..0x%08X\n", regionStart,
+                 regionEnd);
+        return false;
     }
 
-    // Region is now CPU-mapped to backed host RAM, so this cannot fault. Verify
-    // Dolphin honored the BAT and the RAM is present before building a heap here.
-    volatile u32 *p0 = reinterpret_cast<volatile u32 *>(regionStart);
-    volatile u32 *p1 = reinterpret_cast<volatile u32 *>(regionEnd - 4);
-    *p0 = 0x5A5AA5A5u;
-    *p1 = 0xA5A55A5Au;
-    const bool ok = (*p0 == 0x5A5AA5A5u) && (*p1 == 0xA5A55A5Au);
-    OSReport("[SMSO] Extended MEM1 probe 0x%08X/0x%08X -> %s\n", regionStart, regionEnd - 4,
-             ok ? "OK" : "FAIL");
-    if (!ok)
+    OSReport("[SMSO] Extended MEM1 arena mapped 0x%08X..0x%08X (%u KiB)\n", regionStart, regionEnd,
+             (regionEnd - regionStart) >> 10);
+
+    if (!probeMappedRegion(regionStart, regionEnd))
         return false;
 
     gExtendedMappingReady = true;
+    if (regionEnd > gExtendedMappedEnd)
+        gExtendedMappedEnd = regionEnd;
     return true;
 }
 
@@ -2905,75 +3446,53 @@ static bool tryCreateExpandedMem1RemoteHeap() {
         return false;
     }
 
-    if (!ensureExtendedMem1Mapping()) {
+    // Refuse to place the arena inside the live retail root heap / mailbox.
+    // arenaHi is typically ~0x817fe4c0; mailbox is 0x817FC000.
+    const u32 userRamEnd = reinterpret_cast<u32>(JKRHeap::mUserRamEnd);
+    if (kRemoteActorExpandedHeapAddress < 0x81800000u ||
+        (userRamEnd != 0 && kRemoteActorExpandedHeapAddress < userRamEnd)) {
         gExpandedHeapFailed = true;
-        OSReport("[SMSO] Expanded MEM1 heap unavailable; using stage heap (memSize=%u)\n",
-                 memorySize);
+        OSReport("[SMSO] Expanded MEM1 arena 0x%08X overlaps retail RAM end 0x%08X — refused\n",
+                 kRemoteActorExpandedHeapAddress, userRamEnd);
         return false;
     }
 
-    JKRHeap *parent = resolveRemoteHeapParent();
-    void *heapStart = reinterpret_cast<void *>(kRemoteActorExpandedHeapAddress);
-    JKRHeap *heap = JKRExpHeap::create(heapStart, kRemoteActorExpandedHeapSize, parent, false);
-    if (!heap) {
-        gExpandedHeapFailed = true;
-        OSReport("[SMSO] Expanded MEM1 heap create FAILED @ 0x%08X size=%u parent=%p\n",
-                 kRemoteActorExpandedHeapAddress, static_cast<u32>(kRemoteActorExpandedHeapSize),
-                 parent);
-        return false;
-    }
-
-    gRemoteActorHeap = heap;
-    gRemoteActorHeapOwned = true;
-    OSReport("[SMSO] Remote actor EXPANDED MEM1 heap created @ %p size=%u heapFree=%u memSize=%u\n",
-             gRemoteActorHeap, static_cast<u32>(kRemoteActorExpandedHeapSize),
-             static_cast<u32>(gRemoteActorHeap->getTotalFreeSize()), memorySize);
-    return true;
-}
-
-static bool tryCreateStageChildRemoteHeap(JKRHeap *parent) {
-    if (!parent)
-        return false;
-
-    const u32 parentFree = static_cast<u32>(parent->getTotalFreeSize());
-    static const size_t kStageChildSizes[] = {0x001C0000u, 0x001B0000u, 0x00190000u, 0x00180000u,
-                                              0x00160000u, 0x00140000u, 0x00120000u};
-
-    for (size_t i = 0; i < sizeof(kStageChildSizes) / sizeof(kStageChildSizes[0]); ++i) {
-        const size_t size = kStageChildSizes[i];
-        if (parentFree < size + kStageHeapReserveMargin)
+    static const size_t kSizes[] = {kRemoteActorExpandedHeapSize, kRemoteActorExpandedHeapSizeFallback};
+    for (size_t i = 0; i < sizeof(kSizes) / sizeof(kSizes[0]); ++i) {
+        const size_t size = kSizes[i];
+        const u32 regionStart = kRemoteActorExpandedHeapAddress;
+        const u32 regionEnd = regionStart + static_cast<u32>(size);
+        if (regionEnd > kMem1CachedEnd)
             continue;
 
-        JKRHeap *child = JKRExpHeap::create(size, parent, false);
-        if (!child)
+        if (!ensureExtendedMem1Mapping(regionStart, regionEnd)) {
+            OSReport("[SMSO] Expanded MEM1 map/probe failed for size=%u — trying smaller\n",
+                     static_cast<u32>(size));
             continue;
+        }
 
-        gRemoteActorHeap = child;
+        JKRHeap *parent = resolveRemoteHeapParent();
+        void *heapStart = reinterpret_cast<void *>(regionStart);
+        JKRHeap *heap = JKRExpHeap::create(heapStart, size, parent, false);
+        if (!heap) {
+            OSReport("[SMSO] Expanded MEM1 heap create FAILED @ 0x%08X size=%u parent=%p\n",
+                     regionStart, static_cast<u32>(size), parent);
+            continue;
+        }
+
+        gRemoteActorHeap = heap;
         gRemoteActorHeapOwned = true;
-        OSReport("[SMSO] Remote actor stage-child heap created @ %p size=%u parent=%p parentFree=%u heapFree=%u\n",
-                 gRemoteActorHeap, static_cast<u32>(size), parent, parentFree,
-                 static_cast<u32>(gRemoteActorHeap->getTotalFreeSize()));
+        OSReport("[SMSO] Remote actor EXPANDED MEM1 heap created @ %p size=%u heapFree=%u "
+                 "memSize=%u\n",
+                 gRemoteActorHeap, static_cast<u32>(size),
+                 static_cast<u32>(gRemoteActorHeap->getTotalFreeSize()), memorySize);
         return true;
     }
 
-    if (parentFree > kStageHeapReserveMarginTight + 0x000A0000u) {
-        size_t adaptiveSize = parentFree - kStageHeapReserveMarginTight;
-        adaptiveSize &= ~0x7FFFu;
-        if (adaptiveSize >= 0x000A0000u) {
-            JKRHeap *child = JKRExpHeap::create(adaptiveSize, parent, false);
-            if (child) {
-                gRemoteActorHeap = child;
-                gRemoteActorHeapOwned = true;
-                OSReport("[SMSO] Remote actor adaptive stage-child heap @ %p size=%u parent=%p parentFree=%u heapFree=%u\n",
-                         gRemoteActorHeap, static_cast<u32>(adaptiveSize), parent, parentFree,
-                         static_cast<u32>(gRemoteActorHeap->getTotalFreeSize()));
-                return true;
-            }
-        }
-    }
-
-    OSReport("[SMSO] Remote stage-child heap skipped: parent=%p parentFree=%u\n", parent,
-             parentFree);
+    gExpandedHeapFailed = true;
+    OSReport("[SMSO] Expanded MEM1 heap unavailable; soft-fail (no stage-child carve) "
+             "memSize=%u\n",
+             memorySize);
     return false;
 }
 
@@ -2981,42 +3500,10 @@ static bool tryUpgradeToOwnedRemoteHeap() {
     if (gRemoteActorHeapOwned)
         return gRemoteActorHeap != nullptr;
 
-    if (tryCreateExpandedMem1RemoteHeap())
-        return true;
-    if (tryCreateDedicatedRemoteHeap())
-        return true;
-
-    JKRHeap *parent = JKRHeap::sCurrentHeap ? JKRHeap::sCurrentHeap : resolveRemoteHeapParent();
-    return tryCreateStageChildRemoteHeap(parent);
-}
-
-static bool tryCreateDedicatedRemoteHeap() {
-    JKRHeap *parent = resolveRemoteHeapParent();
-    if (!parent)
-        return false;
-
-    const u32 parentFree = static_cast<u32>(parent->getTotalFreeSize());
-    static const size_t kDedicatedHeapSizes[] = {0x00280000u, 0x00200000u, 0x00180000u,
-                                                 0x00140000u, 0x00100000u};
-
-    for (size_t i = 0; i < sizeof(kDedicatedHeapSizes) / sizeof(kDedicatedHeapSizes[0]); ++i) {
-        const size_t size = kDedicatedHeapSizes[i];
-        if (parentFree < size)
-            continue;
-
-        gRemoteActorHeap = JKRExpHeap::create(size, parent, false);
-        if (!gRemoteActorHeap)
-            continue;
-
-        gRemoteActorHeapOwned = true;
-        OSReport("[SMSO] Remote actor dedicated heap created @ %p size=%u parent=%p parentFree=%u heapFree=%u\n",
-                 gRemoteActorHeap, static_cast<u32>(size), parent, parentFree,
-                 static_cast<u32>(gRemoteActorHeap->getTotalFreeSize()));
-        return true;
-    }
-
-    OSReport("[SMSO] Remote dedicated heap skipped: parent=%p parentFree=%u\n", parent, parentFree);
-    return false;
+    // Only the expanded-MEM1 arena is safe for packs + body prewarm. Carving a
+    // dedicated/stage-child heap from the live stage parent has aborted stage
+    // load (JKRHeap.cpp:694) after leaving ~1.8 MiB — never do that.
+    return tryCreateExpandedMem1RemoteHeap();
 }
 
 static bool ensureRemoteActorHeap() {
@@ -3025,25 +3512,12 @@ static bool ensureRemoteActorHeap() {
 
     if (tryCreateExpandedMem1RemoteHeap())
         return true;
-    if (tryCreateDedicatedRemoteHeap())
-        return true;
 
-    JKRHeap *parent = JKRHeap::sCurrentHeap ? JKRHeap::sCurrentHeap : resolveRemoteHeapParent();
-    if (parent && tryCreateStageChildRemoteHeap(parent))
-        return true;
-
-    if (!parent) {
-        OSReport("[SMSO] Remote heap unavailable: no parent heap\n");
-        return false;
-    }
-
-    gRemoteActorHeap = parent;
-    gRemoteActorHeapOwned = false;
-    OSReport("[SMSO] Remote actor heap borrowing active heap @ %p free=%u totalFree=%u memSize=%u userRamEnd=%p\n",
-             gRemoteActorHeap, static_cast<u32>(gRemoteActorHeap->getFreeSize()),
-             static_cast<u32>(gRemoteActorHeap->getTotalFreeSize()),
-             static_cast<u32>(JKRHeap::mMemorySize), JKRHeap::mUserRamEnd);
-    return true;
+    // Soft-fail path: no remote heap. Packs fall back to retail; body prewarm
+    // skips. Stage load must survive — do NOT borrow/carve the stage heap.
+    OSReport("[SMSO] Remote actor heap unavailable — soft-fail (packs=retail, "
+             "bodies=deferred/limited)\n");
+    return false;
 }
 
 static void destroyRemoteActorHeap() {
@@ -3063,7 +3537,18 @@ static void destroyRemoteActorHeap() {
     gExpandedHeapFailed = false;
 }
 
-static TMario *spawnRemoteBody() {
+static bool modelIdsMatch(const char a[8], const char b[8]) {
+    return memcmp(a, b, 8) == 0;
+}
+
+static void formatModelIdStr(char out[9], const char id[8]) {
+    u32 n = 0;
+    for (; n < 8 && id[n]; ++n)
+        out[n] = id[n];
+    out[n] = '\0';
+}
+
+static TMario *spawnRemoteBody(u32 archiveSlot, bool bindPack) {
     if (!ensureRemoteActorHeap())
         return nullptr;
 
@@ -3094,6 +3579,14 @@ static TMario *spawnRemoteBody() {
         return nullptr;
     }
 
+    // Bind / remount this slot's pack BEFORE constructing the body so initValues
+    // resolves BMD/BTK from the correct archive. Prefer pack-cache remount;
+    // SMSLoadArchive only on cache miss (see syncRemoteMarioArchiveSlot).
+    // Prewarm passes bindPack=false so unique lobby packs cannot starve later
+    // body slots — first-residency applies custom models once bodies exist.
+    if (bindPack && archiveSlot < MAX_REMOTE_SLOTS)
+        smso::syncRemoteMarioArchiveSlot(archiveSlot);
+
     JKRHeap *previousHeap = JKRHeap::sCurrentHeap;
     gRemoteActorHeap->becomeCurrentHeap();
 
@@ -3104,12 +3597,63 @@ static TMario *spawnRemoteBody() {
         return nullptr;
     }
 
+    // SMSCoop pattern: mount this network slot's character archive before
+    // initValues so BMD/BTK resolve from the correct pack, then restore local.
+    // Soft-fail: if remount fails, keep retail mounted and still spawn a body.
+    if (bindPack) {
+        if (!smso::setActiveMarioArchive(archiveSlot)) {
+            OSReport("[SMSO] Remote body slot=%u archive remount failed — spawning with retail\n",
+                     archiveSlot);
+        }
+    } else {
+        // Force retail for pool prewarm so body count is deterministic and pack
+        // loads cannot starve later slots. First-residency applies custom packs.
+        // Skip remount when already on retail — avoids custom↔retail thrash when
+        // the local player is also on a custom Shadow pack.
+        if (!smso::mountRetailMarioArchive()) {
+            OSReport("[SMSO] Remote body slot=%u retail mount failed during prewarm\n",
+                     archiveSlot);
+        }
+    }
+
     // TMario::initValues fully builds the puppet: it internally calls
     // initModel() and creates the cap, FLUDD, Yoshi, effects, and shadow
     // body (see decomp MarioInit.cpp). Do NOT call initModel separately.
     // initMirrorModel() duplicates a reflection rig and can leave a second FLUDD
     // pack visible on network puppets — skip it for remotes.
     body->initValues();
+
+    // Bind custom BTKs while this slot's pack is still mounted — getGlbResource
+    // resolves /mario/btk/* from the active volume. Remounting local first would
+    // miss Shadow Mario/Luigi BTKs that only exist in the remote pack.
+    // Allocate AnmData/MActors on the remote heap (same lifetime as pool bodies)
+    // or system heap — NEVER the stage heap. Stage teardown frees stage allocs
+    // while keep-alive pool bodies retain J3D MaterialAnm pointers → UAF crash
+    // when more remotes draw after the next stage enter.
+    JKRHeap *texHeap = gRemoteActorHeap;
+    if (!texHeap || texHeap->getTotalFreeSize() < 0x10000u)
+        texHeap = JKRHeap::sSystemHeap;
+    if (texHeap)
+        texHeap->becomeCurrentHeap();
+    else if (previousHeap)
+        previousHeap->becomeCurrentHeap();
+    else if (JKRHeap::sSystemHeap)
+        JKRHeap::sSystemHeap->becomeCurrentHeap();
+
+    smso::rebindMarioTexAnimsForSlot(body, static_cast<u8>(archiveSlot));
+
+    if (!smso::restoreLocalMarioArchiveGuarded()) {
+        OSReport("[SMSO] Remote body slot=%u post-spawn local restore failed\n", archiveSlot);
+    }
+    // Do NOT call rebindLocalMarioPlayerInfo / setPlayerInfo here. Archive
+    // remount only swaps the mario RARC for getGlbResource — it does not
+    // invalidate MSound's stored &mTranslation / &mSpeed / anmMtx(1) pointers
+    // (those are TMario members + the live local J3DModel). setPlayerInfo
+    // recreates MSRandPlay cry / exert-cont / water-wait entries; calling it
+    // once per pool spawn (9x on stage prewarm, again on first-residency
+    // rebuild) resets those timers and produces a spurious Mario SE on stage
+    // load / when remotes spawn nearby. Rebind only after local initModel
+    // rebuild (new joint matrices) — see rebuildLocalMarioVisuals.
 
     if (previousHeap)
         previousHeap->becomeCurrentHeap();
@@ -3123,7 +3667,7 @@ static TMario *spawnRemoteBody() {
     body->mHolder = nullptr;
     body->mSurfGesso = nullptr;
     body->mSurfGessoID = 0;
-    disableRemotePickupInteraction(body, 0xFF);
+    configureRemoteMarioCollision(body, 0xFF);
     body->mAttributes.mIsInvisible = false;
     body->mAttributes.mIsGameOver = false;
     body->mAttributes.mHasFludd = true;
@@ -3132,11 +3676,41 @@ static TMario *spawnRemoteBody() {
         applyRemoteShirtVisibility(body);
     setBodyVisible(body, false);
 
-    OSReport("[SMSO] Remote Mario body spawned @ %p remoteHeapFree=%u totalFree=%u\n", body,
-             static_cast<u32>(gRemoteActorHeap->getFreeSize()),
+    bool hideCaps = false;
+    if (bindPack && archiveSlot < MAX_REMOTE_SLOTS) {
+        char modelId[MARIO_MODEL_ID_SIZE] = {};
+        smso::readMarioModelIdForSlot(archiveSlot, modelId);
+        hideCaps = smso::marioModelIdWantsHiddenCaps(modelId);
+    }
+
+    if (archiveSlot < MAX_REMOTE_SLOTS) {
+        if (bindPack) {
+            smso::readMarioModelIdForSlot(archiveSlot, gBodyPoolModelIds[archiveSlot]);
+            gBodyPoolIsCustom[archiveSlot] = smso::marioSlotHasCustomPack(archiveSlot);
+            // Soft-fail mounts retail but CommBuffer still has the custom id — stamp
+            // empty so first-residency keeps retrying instead of "model ok" forever.
+            if (!gBodyPoolIsCustom[archiveSlot]) {
+                memset(gBodyPoolModelIds[archiveSlot], 0, sizeof(gBodyPoolModelIds[archiveSlot]));
+                hideCaps = false;
+            }
+            gBodyPoolHideCaps[archiveSlot] = hideCaps;
+        } else {
+            memset(gBodyPoolModelIds[archiveSlot], 0, sizeof(gBodyPoolModelIds[archiveSlot]));
+            gBodyPoolIsCustom[archiveSlot] = false;
+            gBodyPoolHideCaps[archiveSlot] = false;
+        }
+    }
+
+    char idStr[9] = {};
+    if (archiveSlot < MAX_REMOTE_SLOTS)
+        formatModelIdStr(idStr, gBodyPoolModelIds[archiveSlot]);
+    OSReport("[SMSO] Remote Mario body spawned @ %p slot=%u model='%s' remoteHeapFree=%u totalFree=%u\n",
+             body, archiveSlot, idStr, static_cast<u32>(gRemoteActorHeap->getFreeSize()),
              static_cast<u32>(gRemoteActorHeap->getTotalFreeSize()));
     return body;
 }
+
+static TMario *spawnRemoteBody(u32 archiveSlot) { return spawnRemoteBody(archiveSlot, true); }
 
 // Park an idle pool body well outside any playfield and hide it, so a reused
 // body can never flash at a stale position for a frame before its first
@@ -3165,53 +3739,360 @@ static bool isPoolBodyAssigned(const TMario *body) {
     return false;
 }
 
-// Hand out the first pool body that is not currently bound to an active slot.
-// All bodies already exist (see prewarmRemoteBodyPool), so this never allocates.
-static TMario *acquirePoolBody() {
-    for (u32 i = 0; i < gBodyPoolCount; ++i) {
-        TMario *body = gBodyPool[i];
-        if (body && !isPoolBodyAssigned(body))
-            return body;
-    }
+// Pool bodies are indexed by network slot so each can be initValues()'d under
+// that slot's character archive (custom models differ per player).
+static TMario *acquirePoolBodyForSlot(u32 slotId) {
+    if (slotId >= MAX_REMOTE_SLOTS)
+        return nullptr;
+    TMario *body = gBodyPool[slotId];
+    if (body && !isPoolBodyAssigned(body))
+        return body;
     return nullptr;
 }
 
-// Allocate the entire remote puppet set in one shot on the first eligible
-// gameplay frame. This is the SMSO 2 makeMarios() principle: front-load every
-// puppet while the heap is freshest instead of spawning during play. Runs under
-// the same gates as the old lazy spawn (stage normal, gpMarioAddress valid,
-// player group found, connected) so TMario::initValues() is equally safe here.
-static void prewarmRemoteBodyPool() {
-    if (gBodyPoolPrewarmAttempted)
+// Allocate at most one remote puppet body per call. Prefer spawning under an
+// already-cached custom pack for that slot so first-residency skips rebuild.
+// If the pack is not ready yet, spawn retail and let first-residency upgrade later.
+static void prewarmRemoteBodyPoolStep() {
+    if (gBodyPoolPrewarmComplete)
         return;
-    gBodyPoolPrewarmAttempted = true;
+    if (!ensureRemoteActorHeap())
+        return;
 
-    for (u32 i = 0; i < kSessionMaxRemotes; ++i) {
-        TMario *body = spawnRemoteBody();
-        if (!body) {
-            OSReport("[SMSO] Remote body pool prewarm stopped at %u/%u (heap limited)\n",
-                     gBodyPoolCount, kSessionMaxRemotes);
-            break;
+    CommBuffer *buf = getCommBuffer();
+    const u8 localSlot = buf ? buf->localSlot : 0xFF;
+
+    // Scan forward until we spawn one body or exhaust the slot range.
+    while (gBodyPoolPrewarmIndex < MAX_REMOTE_SLOTS) {
+        const u32 i = gBodyPoolPrewarmIndex;
+
+        if (i == localSlot) {
+            gBodyPool[i] = nullptr;
+            ++gBodyPoolPrewarmIndex;
+            continue;
         }
+
+        if (gBodyPool[i]) {
+            ++gBodyPoolPrewarmIndex;
+            continue;
+        }
+
+        if (gBodyPoolCount >= kSessionMaxRemotes) {
+            gBodyPoolPrewarmComplete = true;
+            OSReport("[SMSO] Remote body pool prewarm complete: %u/%u bodies heapFree=%u owned=%d\n",
+                     gBodyPoolCount, kSessionMaxRemotes,
+                     gRemoteActorHeap ? static_cast<u32>(gRemoteActorHeap->getTotalFreeSize()) : 0,
+                     gRemoteActorHeapOwned ? 1 : 0);
+            return;
+        }
+
+        // Prefer custom pack when already cached — avoids retail-prewarm → rebuild.
+        bool bindPack = false;
+        char desired[8] = {};
+        smso::readMarioModelIdForSlot(i, desired);
+        if (!marioModelIdIsEmpty(desired) && smso::isMarioModelPackCached(desired))
+            bindPack = true;
+
+        TMario *body = spawnRemoteBody(i, bindPack);
+        if (!body) {
+            // Retry this slot next frame (heap may free up / mapping may finish).
+            OSReport("[SMSO] Remote body pool prewarm miss at slot %u (%u ready) — retry next frame\n",
+                     i, gBodyPoolCount);
+            return;
+        }
+
         parkRemoteBody(body);
-        gBodyPool[gBodyPoolCount++] = body;
+        gBodyPool[i] = body;
+        ++gBodyPoolCount;
+        ++gBodyPoolPrewarmIndex;
+
+        OSReport("[SMSO] Remote body pool prewarm step: slot=%u bindPack=%d pool=%u/%u "
+                 "heapFree=%u\n",
+                 i, bindPack ? 1 : 0, gBodyPoolCount, kSessionMaxRemotes,
+                 gRemoteActorHeap ? static_cast<u32>(gRemoteActorHeap->getTotalFreeSize()) : 0);
+
+        if (gBodyPoolCount >= kSessionMaxRemotes || gBodyPoolPrewarmIndex >= MAX_REMOTE_SLOTS) {
+            gBodyPoolPrewarmComplete = true;
+            OSReport("[SMSO] Remote body pool prewarm complete: %u/%u bodies heapFree=%u owned=%d\n",
+                     gBodyPoolCount, kSessionMaxRemotes,
+                     gRemoteActorHeap ? static_cast<u32>(gRemoteActorHeap->getTotalFreeSize()) : 0,
+                     gRemoteActorHeapOwned ? 1 : 0);
+        }
+        // One spawn per frame — return even if more slots remain.
+        return;
     }
 
-    OSReport("[SMSO] Remote body pool prewarmed: %u/%u bodies heapFree=%u owned=%d\n",
+    gBodyPoolPrewarmComplete = true;
+    OSReport("[SMSO] Remote body pool prewarm complete: %u/%u bodies heapFree=%u owned=%d\n",
              gBodyPoolCount, kSessionMaxRemotes,
              gRemoteActorHeap ? static_cast<u32>(gRemoteActorHeap->getTotalFreeSize()) : 0,
              gRemoteActorHeapOwned ? 1 : 0);
 }
 
-static bool ensureRemoteBody(RemoteActorSlot &slot, u32 slotId) {
-    if (slot.spawned && slot.body)
+static void resetBodyPoolForFreshHeap() {
+    gBodyPoolCount = 0;
+    gBodyPoolPrewarmIndex = 0;
+    gBodyPoolPrewarmComplete = false;
+    for (u32 i = 0; i < MAX_REMOTE_SLOTS; ++i) {
+        gBodyPool[i] = nullptr;
+        memset(gBodyPoolModelIds[i], 0, sizeof(gBodyPoolModelIds[i]));
+        gBodyPoolIsCustom[i] = false;
+        gBodyPoolHideCaps[i] = false;
+        gBodyModelApplied[i] = false;
+        gBodyRetailGraceFrames[i] = 0;
+        gBodyModelRetryCooldown[i] = 0;
+    }
+}
+
+// After a keep-alive stage transition, park surviving bodies and clear residency
+// flags so first-residency can re-validate (usually a no-rebuild cache hit).
+static void prepareSurvivingBodyPoolForNewStage() {
+    CommBuffer *buf = getCommBuffer();
+    const u8 localSlot = buf ? buf->localSlot : 0xFF;
+
+    for (u32 i = 0; i < MAX_REMOTE_SLOTS; ++i) {
+        if (i == localSlot) {
+            // Local slot must not keep a remote pool body.
+            if (gBodyPool[i]) {
+                parkRemoteBody(gBodyPool[i]);
+                // Body stays allocated (abandoned) until heap destroy — rare localSlot change.
+                gBodyPool[i] = nullptr;
+                if (gBodyPoolCount > 0)
+                    --gBodyPoolCount;
+            }
+            memset(gBodyPoolModelIds[i], 0, sizeof(gBodyPoolModelIds[i]));
+            gBodyPoolIsCustom[i] = false;
+            gBodyPoolHideCaps[i] = false;
+        } else if (gBodyPool[i]) {
+            parkRemoteBody(gBodyPool[i]);
+        }
+        gBodyModelApplied[i] = false;
+        gBodyRetailGraceFrames[i] = 0;
+        gBodyModelRetryCooldown[i] = 0;
+    }
+
+    // Resume staggered prewarm if the pool still has holes.
+    if (gBodyPoolCount >= kSessionMaxRemotes) {
+        gBodyPoolPrewarmComplete = true;
+        gBodyPoolPrewarmIndex = MAX_REMOTE_SLOTS;
+    } else {
+        gBodyPoolPrewarmComplete = false;
+        gBodyPoolPrewarmIndex = 0;
+    }
+
+    OSReport("[SMSO] Remote body pool kept across stage (%u bodies, prewarmComplete=%d)\n",
+             gBodyPoolCount, gBodyPoolPrewarmComplete ? 1 : 0);
+}
+
+// First stage residency for a remote: ensure the pool body matches the live
+// CommBuffer model id. Prewarm often builds under retail (empty id); late join
+// with a custom pack must rebuild THAT slot once before the body appears.
+// After a definitive apply, gBodyModelApplied freezes the visual until dismiss,
+// stage exit, or requestRemoteMarioModelReapply. Soft-fail (pack missing / heap
+// low / spawn fail) keeps the current visible body and retries with cooldown —
+// never leave a remote invisible, and never permanently stick on retail when the
+// pack later becomes available.
+// Empty (retail) ids get a short grace window so a late CommBuffer write can still
+// upgrade once; after grace, retail freezes like any other applied id.
+static bool applyRemoteBodyModelOnFirstResidency(u32 slotId, TMario *&body) {
+    if (slotId >= MAX_REMOTE_SLOTS || !body)
+        return false;
+    if (gBodyModelApplied[slotId])
         return true;
 
-    TMario *body = acquirePoolBody();
+    if (gBodyModelRetryCooldown[slotId] > 0) {
+        --gBodyModelRetryCooldown[slotId];
+        return true;
+    }
+
+    char desired[8] = {};
+    smso::readMarioModelIdForSlot(slotId, desired);
+
+    char haveStr[9] = {};
+    char wantStr[9] = {};
+    formatModelIdStr(haveStr, gBodyPoolModelIds[slotId]);
+    formatModelIdStr(wantStr, desired);
+
+    if (modelIdsMatch(gBodyPoolModelIds[slotId], desired)) {
+        if (!marioModelIdIsEmpty(desired)) {
+            // Never SMSLoadArchive on the visibility path — wait for prefetch.
+            if (!smso::isMarioModelPackCached(desired)) {
+                OSReport("[SMSO] Remote body slot=%u first-residency id='%s' pack not cached — "
+                         "keep retail, prefetch will load (retry in %u frames)\n",
+                         slotId, wantStr, kRemoteModelRetryCooldownFrames);
+                gBodyModelRetryCooldown[slotId] = kRemoteModelRetryCooldownFrames;
+                return true;
+            }
+            smso::syncRemoteMarioArchiveSlot(slotId);
+            const bool packReady = smso::marioSlotHasCustomPack(slotId);
+            if (packReady && gBodyPoolIsCustom[slotId]) {
+                gBodyModelApplied[slotId] = true;
+                gBodyRetailGraceFrames[slotId] = 0;
+                gBodyModelRetryCooldown[slotId] = 0;
+                // Keep-alive stage exit used to wipe TexAnim while bodies survived.
+                // Safety net: rebind if this body lost its Shadow/BTK binding.
+                if (!smso::marioHasTexAnimBinding(body)) {
+                    smso::setActiveMarioArchive(slotId);
+                    smso::rebindMarioTexAnimsForSlot(body, static_cast<u8>(slotId));
+                    smso::restoreLocalMarioArchiveGuarded();
+                }
+                OSReport("[SMSO] Remote body slot=%u first-residency model ok id='%s' (no rebuild)\n",
+                         slotId, wantStr);
+                return true;
+            }
+            if (!packReady) {
+                OSReport("[SMSO] Remote body slot=%u first-residency id='%s' pack still "
+                         "unavailable — keep retail, retry in %u frames\n",
+                         slotId, wantStr, kRemoteModelRetryCooldownFrames);
+                gBodyModelRetryCooldown[slotId] = kRemoteModelRetryCooldownFrames;
+                return true;
+            }
+            // Pack is ready but the live body was built under retail — fall through
+            // to rebuild under the custom archive.
+            OSReport("[SMSO] Remote body slot=%u first-residency pack ready for '%s' — "
+                     "rebuilding retail body\n",
+                     slotId, wantStr);
+        } else {
+            // Retail match: wait briefly for a late-arriving custom id, then freeze.
+            if (gBodyRetailGraceFrames[slotId] < 255)
+                ++gBodyRetailGraceFrames[slotId];
+            if (gBodyRetailGraceFrames[slotId] >= kRemoteModelRetailGraceFrames) {
+                gBodyModelApplied[slotId] = true;
+                OSReport("[SMSO] Remote body slot=%u first-residency retail frozen "
+                         "(grace=%u, no custom id)\n",
+                         slotId, gBodyRetailGraceFrames[slotId]);
+            }
+            return true;
+        }
+    }
+
+    OSReport("[SMSO] Remote body slot=%u first-residency rebuild '%s' -> '%s'\n", slotId, haveStr,
+             wantStr);
+
+    // Need headroom for a fresh body. Keep the existing visible body and retry
+    // when free space returns (e.g. after another slot dismisses).
+    if (!gRemoteActorHeap ||
+        gRemoteActorHeap->getTotalFreeSize() < kRemoteBodySpawnMinFree) {
+        OSReport("[SMSO] Remote body slot=%u first-residency rebuild deferred "
+                 "(heap free=%u < %u) — keeping visible id='%s', retry in %u frames\n",
+                 slotId,
+                 gRemoteActorHeap ? static_cast<u32>(gRemoteActorHeap->getTotalFreeSize()) : 0u,
+                 static_cast<u32>(kRemoteBodySpawnMinFree), haveStr,
+                 kRemoteModelRetryCooldownFrames);
+        gBodyModelRetryCooldown[slotId] = kRemoteModelRetryCooldownFrames;
+        return true;
+    }
+
+    // Pack must already be cached — never SMSLoadArchive + initValues same frame.
+    if (!marioModelIdIsEmpty(desired) && !smso::isMarioModelPackCached(desired)) {
+        OSReport("[SMSO] Remote body slot=%u first-residency rebuild deferred "
+                 "(pack '%s' not cached yet) — keeping visible id='%s'\n",
+                 slotId, wantStr, haveStr);
+        gBodyModelRetryCooldown[slotId] = kRemoteModelRetryCooldownFrames;
+        return true;
+    }
+
+    // Remount the joiner's pack (cache hit), then construct a fresh body under it.
+    // The retail-prewarmed body is abandoned in the remote heap until heap destroy
+    // (freed on disconnect) — re-initValues on a live TMario is unsafe.
+    smso::syncRemoteMarioArchiveSlot(slotId);
+    if (!marioModelIdIsEmpty(desired) && !smso::marioSlotHasCustomPack(slotId)) {
+        OSReport("[SMSO] Remote body slot=%u first-residency pack unavailable for '%s' — "
+                 "keeping visible retail, retry in %u frames\n",
+                 slotId, wantStr, kRemoteModelRetryCooldownFrames);
+        gBodyModelRetryCooldown[slotId] = kRemoteModelRetryCooldownFrames;
+        return true;
+    }
+
+    // Desired retail (empty): only rebuild if the pool body is currently custom.
+    // spawnRemoteBody with empty id mounts retail.
+    TMario *fresh = spawnRemoteBody(slotId);
+    if (!fresh) {
+        OSReport("[SMSO] Remote body slot=%u first-residency rebuild failed — keeping "
+                 "visible id='%s', retry in %u frames\n",
+                 slotId, haveStr, kRemoteModelRetryCooldownFrames);
+        gBodyModelRetryCooldown[slotId] = kRemoteModelRetryCooldownFrames;
+        return true;
+    }
+
+    parkRemoteBody(fresh);
+    // Old retail/wrong-id body stays allocated until remote-heap destroy.
+    // Drop its TexAnim binding so rebuilds cannot fill the table with orphans
+    // (Shadow MActors tied to the abandoned TMario* would never draw again).
+    smso::releaseMarioTexAnims(body);
+    if (!gBodyPool[slotId])
+        ++gBodyPoolCount;
+    gBodyPool[slotId] = fresh;
+    body = fresh;
+    gBodyModelApplied[slotId] = true;
+    gBodyRetailGraceFrames[slotId] = 0;
+    gBodyModelRetryCooldown[slotId] = 0;
+    OSReport("[SMSO] Remote body slot=%u first-residency applied id='%s' @ %p\n", slotId, wantStr,
+             body);
+    return true;
+}
+
+static bool ensureRemoteBody(RemoteActorSlot &slot, u32 slotId) {
+    if (slot.spawned && slot.body) {
+        // Still within first-residency grace (retail pending custom id) — recheck.
+        if (slotId < MAX_REMOTE_SLOTS && !gBodyModelApplied[slotId]) {
+            TMario *prev = slot.body;
+            TMario *body = prev;
+            applyRemoteBodyModelOnFirstResidency(slotId, body);
+            if (body != prev) {
+                // Swap the live view-list entry so the rebuilt body is drawn.
+                if (slot.inViewList && gRemotePerformGroup) {
+                    removeBodyFromViewList(prev);
+                    gRemotePerformGroup->mViewObjList.push_back(body);
+                }
+                parkRemoteBody(prev);
+                smso::releaseMarioTexAnims(prev);
+                slot.body = body;
+                resetRemoteRuntimeState(slot, true);
+                OSReport("[SMSO] Remote Mario body slot %u swapped to rebuilt @ %p\n", slotId,
+                         body);
+            }
+        }
+        return true;
+    }
+
+    TMario *body = acquirePoolBodyForSlot(slotId);
+    if (!body) {
+        // Lazy spawn path (prewarm missed this slot). Prefer cache-only bind —
+        // if the custom pack is not cached yet, spawn retail and let prefetch +
+        // first-residency upgrade on a later frame (never load+init same frame).
+        char desired[8] = {};
+        smso::readMarioModelIdForSlot(slotId, desired);
+        const bool packCached =
+            marioModelIdIsEmpty(desired) || smso::isMarioModelPackCached(desired);
+        if (packCached && !marioModelIdIsEmpty(desired))
+            smso::syncRemoteMarioArchiveSlot(slotId);
+        body = spawnRemoteBody(slotId, packCached && !marioModelIdIsEmpty(desired));
+        if (body) {
+            parkRemoteBody(body);
+            if (slotId < MAX_REMOTE_SLOTS && !gBodyPool[slotId]) {
+                gBodyPool[slotId] = body;
+                ++gBodyPoolCount;
+            }
+            if (slotId < MAX_REMOTE_SLOTS) {
+                // Freeze immediately when we spawned under a known custom pack;
+                // empty / retail-pending stays in grace so a late write can rebuild.
+                if (!marioModelIdIsEmpty(desired) && gBodyPoolIsCustom[slotId]) {
+                    gBodyModelApplied[slotId] = true;
+                    gBodyRetailGraceFrames[slotId] = 0;
+                } else {
+                    gBodyModelApplied[slotId] = false;
+                    gBodyRetailGraceFrames[slotId] = 0;
+                }
+            }
+        }
+    } else if (slotId < MAX_REMOTE_SLOTS) {
+        applyRemoteBodyModelOnFirstResidency(slotId, body);
+    }
+
     if (!body) {
         if (!gReportedBodyCap) {
-            OSReport("[SMSO] Remote body pool exhausted (%u bodies), slot %u hidden\n",
-                     gBodyPoolCount, slotId);
+            OSReport("[SMSO] Remote body unavailable for slot %u (pool=%u)\n", slotId, gBodyPoolCount);
             gReportedBodyCap = true;
         }
         return false;
@@ -3255,14 +4136,26 @@ static void dismissRemoteBody(u8 slotIndex, RemoteActorSlot &slot) {
 
     // The body stays allocated in the pool; just unbind it from this slot and
     // park it so acquirePoolBody() can hand it to the next player who needs one.
+    // Clear the apply-once freeze so a later first residency (rejoin / late join
+    // after leave) can rebuild if the CommBuffer id differs from the pool body.
+    // Keep TexAnim bindings on parked Shadow bodies — MActors live on the remote
+    // heap with the body, and updateAllMarioTexAnims skips unassigned remotes so
+    // they will not remount packs while parked. releaseMarioTexAnims only on
+    // rebuild abandon (body never drawn again).
     if (slot.body) {
         parkRemoteBody(slot.body);
         if (wasActive)
             OSReport("[SMSO] Remote Mario body released to pool @ %p\n", slot.body);
     }
+    if (slotIndex < MAX_REMOTE_SLOTS) {
+        gBodyModelApplied[slotIndex] = false;
+        gBodyRetailGraceFrames[slotIndex] = 0;
+        gBodyModelRetryCooldown[slotIndex] = 0;
+    }
 
     slot.spawned = false;
     slot.body = nullptr;
+    smso::clearRemoteCarriedFruit(slotIndex);
     resetRemoteRuntimeState(slot, false);
     resetRemoteMarioVoiceSlot(slotIndex);
 }
@@ -3290,6 +4183,7 @@ static void applySnapshotToBody(RemoteActorSlot &slot, const PlayerSnapshot &sna
     const bool hostOnYoshi = snapshotHostOnYoshi(snap.nozzleId, snap.vfxFlags);
     const bool tongueTipOffset =
         hostOnYoshi && yoshiTongueIsActive(unpackYoshiTongueState(snap.health));
+    const bool heavyDirty = snapshotHeavyDirty(slot, snap);
 
     if (!incomingWarp) {
         slot.targetPos = snap.position;
@@ -3307,8 +4201,15 @@ static void applySnapshotToBody(RemoteActorSlot &slot, const PlayerSnapshot &sna
                                         snap.rotationY);
 
         slot.inWarpTransition = false;
-        if (slot.appearRevealFrames == 0 && isRemoteBodyDrawVisible(&slot))
+        // Defer final visibility to updateRemoteActors (grace / appear / warp).
+        // Forcing visible here raced grace suppress and was overwritten later —
+        // but perform can still run between apply and that final write on some
+        // orderings, so never enable during seeker grace.
+        if (slot.appearRevealFrames == 0 &&
+            !shouldSuppressRemoteHiderFromSeekerGrace(networkSlotOf(&slot)))
             setBodyVisible(body, true);
+        else
+            setBodyVisible(body, false);
     } else {
         slot.inWarpTransition = true;
         setBodyVisible(body, false);
@@ -3329,10 +4230,11 @@ static void applySnapshotToBody(RemoteActorSlot &slot, const PlayerSnapshot &sna
 
     const bool showFluddOnMarioBack = (snap.vfxFlags & VFX_NO_FLUDD) == 0;
 
-    // Mount puppet TYoshi before animation sync — host riding anims (0xB6..0xC6) only
-    // work through TMario::setAnimation when onYoshi() is true (doldecomp MarioDraw.cpp).
-    syncRemoteYoshiFromSnapshot(body, slot.yoshi, snap);
-    applyRemoteFluddPresence(body, showFluddOnMarioBack, hostOnYoshi);
+    // Heavy systems: only when snapshot meaningfully changed (or first frames).
+    if (heavyDirty || hostOnYoshi) {
+        syncRemoteYoshiFromSnapshot(body, slot.yoshi, snap);
+        applyRemoteFluddPresence(body, showFluddOnMarioBack, hostOnYoshi);
+    }
 
     if (!smso::isRemoteShineCollectActive(snap.slot))
         syncRemoteAnimation(body, &slot, snap, netUpper);
@@ -3340,16 +4242,19 @@ static void applySnapshotToBody(RemoteActorSlot &slot, const PlayerSnapshot &sna
     syncRemoteAnimAux(body, body->mFludd, snap.health, showFluddOnMarioBack);
     applyRemoteFacing(body, slot.yaw, snap.animId, body->mState, &slot);
 
-    const bool isDead = (snap.vfxFlags & VFX_DEAD) != 0;
-    smso::applyRemoteBlooperSurfSnapshot(body, slot.surf, snap);
-    const bool surfing = !isDead && smso::snapshotIsBlooperSurfing(snap);
+    if (heavyDirty) {
+        const bool isDead = (snap.vfxFlags & VFX_DEAD) != 0;
+        smso::applyRemoteBlooperSurfSnapshot(body, slot.surf, snap);
+        (void)isDead;
 
-    applyRemoteCosmetics(body, snap.slot);
-    if (!isHideSeekActive())
-        applyRemoteShirtVisibility(body);
-    applyRemoteYCamHelmet(body, snap.vfxFlags, slot.wasYCam);
+        applyRemoteCosmetics(body, snap.slot);
+        if (!isHideSeekActive())
+            applyRemoteShirtVisibility(body);
+        applyRemoteYCamHelmet(body, snap.vfxFlags, slot.wasYCam);
+        configureRemoteMarioCollision(body, snap.slot);
+    }
 
-    disableRemotePickupInteraction(body, snap.slot);
+    const bool surfing = !(snap.vfxFlags & VFX_DEAD) && smso::snapshotIsBlooperSurfing(snap);
 
     if (showFluddOnMarioBack && body->mFludd) {
         slot.lastHealth = snap.health;
@@ -3358,7 +4263,7 @@ static void applySnapshotToBody(RemoteActorSlot &slot, const PlayerSnapshot &sna
         const bool nozzleMismatch =
             !hostSwitching && !slot.fluddSwitchLatched &&
             body->mFludd->mCurrentNozzle != targetNozzle;
-        const bool needFluddSync = snapshotAnimChanged(slot, snap) || hostSwitching ||
+        const bool needFluddSync = heavyDirty || snapshotAnimChanged(slot, snap) || hostSwitching ||
                                    slot.fluddSwitchLatched || nozzleMismatch;
         if (needFluddSync) {
             if (!hostSwitching && slot.lastMovementState != 0xFF) {
@@ -3401,7 +4306,16 @@ static void applySnapshotToBody(RemoteActorSlot &slot, const PlayerSnapshot &sna
         }
     }
 
-    syncRemoteParticleEdges(body, slot, snap);
+    if (heavyDirty)
+        syncRemoteParticleEdges(body, slot, snap);
+
+    slot.lastAppliedState = rawState;
+    slot.lastAppliedAnimId = snap.animId;
+    slot.lastAppliedVfx = snap.vfxFlags;
+    slot.lastAppliedNozzle = snap.nozzleId;
+    slot.lastAppliedHealth = snap.health;
+    slot.lastAppliedWater = snap.water;
+    slot.lastAppliedMovement = snap.movementState;
 }
 
 // Replaces BSE's checkExecWaterGun patch with a remote-safe version. Remote
@@ -3505,11 +4419,18 @@ static TMarioPerformFn sOrigMarioPerform =
 
 static int TMario_perform_remote(TMario *mario, u32 flags, JDrama::TGraphics *graphics) {
     if (!isRemoteBody(mario)) {
-        const int result = sOrigMarioPerform(mario, flags, graphics);
+        // Before draw/entryModels: zero hats so retail cannot submit them this pass.
         if (mario == gpMarioAddress)
+            smso::maintainLocalHiddenCaps(mario, flags);
+        const int result = sOrigMarioPerform(mario, flags, graphics);
+        if (mario == gpMarioAddress) {
             mirrorRemotePerformGroup(flags, graphics);
-        if ((flags & 0x205) != 0 && mario == gpMarioAddress)
-            maintainLocalHideSeekSeekerDraw(mario, graphics);
+            if ((flags & 0x205) != 0)
+                maintainLocalHideSeekSeekerDraw(mario, graphics);
+            // After retail calcAnim / seeker rebind: keep hats squashed for the
+            // next entryModels and kill mtx-effect ghosts retail re-enabled.
+            smso::maintainLocalHiddenCaps(mario, flags | 0x2u);
+        }
         return result;
     }
 
@@ -3519,7 +4440,19 @@ static int TMario_perform_remote(TMario *mario, u32 flags, JDrama::TGraphics *gr
     if (!slot || !slot->visible)
         return 0;
 
-    disableRemotePickupInteraction(mario, slot ? slot->rosterSlot : 0xFF);
+    // Start Tag grace: seekers must not calc/draw/hear remote hiders at all
+    // (body, Yoshi, FLUDD, shadow, particles). setBodyVisible alone is insufficient
+    // because this path does not use retail attr-gated draw.
+    const u8 netSlot = networkSlotOf(slot);
+    if (netSlot != 0xFF && shouldSuppressRemoteHiderFromSeekerGrace(netSlot)) {
+        setBodyVisible(mario, false);
+        static u32 sGraceSuppressDiag = 0;
+        if ((++sGraceSuppressDiag % 180) == 1)
+            OSReport("[SMSO] Grace suppress remote perform slot=%u (seeker POV)\n", netSlot);
+        return 0;
+    }
+
+    configureRemoteMarioCollision(mario, slot ? slot->rosterSlot : 0xFF);
 
     const bool showFluddOnMarioBack = slot && (slot->vfxFlags & VFX_NO_FLUDD) == 0;
 
@@ -3564,18 +4497,34 @@ static int TMario_perform_remote(TMario *mario, u32 flags, JDrama::TGraphics *gr
 
     if (flags & 0x200) {
         if (drawBody) {
-            if (++gRemotePerformDrawDiag <= 3)
+            if (kRemoteHotPathOsReport && ++gRemotePerformDrawDiag <= 3)
                 OSReport("[SMSO] Remote body draw perform slot=%p flags=0x200\n", mario);
             // Remote perform group is not on Player Group's calcView pass in every pipeline
             // ordering; ensure view matrices exist before entryModels (doldecomp preEntry 0x4).
             if ((flags & 0x4) == 0)
                 mario->calcView(graphics);
+            // Capless remotes: re-assert zero-scale hats immediately before
+            // entryModels → mCap->perform(0x200) submits them.
+            {
+                const u32 idx = static_cast<u32>(slot - gActors);
+                if (idx < MAX_REMOTE_SLOTS && gBodyPoolHideCaps[idx])
+                    smso::squashHiddenCapDrawInstance(mario);
+            }
             mario->addDirty();
             if (showFluddOnMarioBack && remoteFluddPerformSafe(mario, mario->mFludd)) {
                 mario->mFludd->mIsEmitWater = false;
                 mario->mFludd->perform(0x200, graphics);
             }
+            const bool shadowMActors = smso::marioHasShadowMActors(mario);
+            if (shadowMActors && mario->mModelData && mario->mModelData->mModel)
+                mario->mModelData->mModel->unlock();
+            if (shadowMActors)
+                smso::entryInMarioShadowMActors(mario);
             mario->entryModels(graphics);
+            if (shadowMActors)
+                smso::entryOutMarioShadowMActors(mario);
+            if (shadowMActors && mario->mModelData && mario->mModelData->mModel)
+                mario->mModelData->mModel->lock();
             performRemoteYoshiDraw(mario, flags, graphics, drawBody);
             const u16 vfx = slot ? slot->vfxFlags : static_cast<u16>(0);
             drawRemoteMarioShadow(mario, vfx);
@@ -3663,31 +4612,58 @@ void initRemoteActors() {
     gRemotePerformGroupRegistered = false;
     gRemotePerformDrawDiag = 0;
     clearRemotePerformGroupMembers();
+    gRemotePerformGroup = nullptr;
+    gReportedPerformGroupAllocFail = false;
     gReportedMissingPlayerGroup = false;
     gReportedBodyCap = false;
     gReportedHeapShortage = false;
-    gRemoteHeapReserved = false;
-    // Pool bodies live in the remote heap, which is destroyed on stage exit, so
-    // every stage starts with an empty pool to be prewarmed on the first frame.
-    gBodyPoolCount = 0;
-    gBodyPoolPrewarmAttempted = false;
-    for (auto &body : gBodyPool)
-        body = nullptr;
+
     for (auto &slot : gActors)
         slot = {};
 
-    // Reserve remote heap at stage init while the stage heap is still mostly empty.
-    // Waiting until the first connected update often leaves too little free memory for 3 bodies.
     CommBuffer *buf = getCommBuffer();
-    if (buf && (buf->bridgeFlags & BF_CONNECTED) != 0) {
-        ensureRemoteActorHeap();
-        gRemoteHeapReserved = gRemoteActorHeap != nullptr;
-        if (gRemoteHeapReserved) {
-            OSReport("[SMSO] Remote actor heap reserved at stage init @ %p owned=%d free=%u\n",
-                     gRemoteActorHeap, gRemoteActorHeapOwned ? 1 : 0,
-                     static_cast<u32>(gRemoteActorHeap->getTotalFreeSize()));
+    const bool connected = buf && (buf->bridgeFlags & BF_CONNECTED) != 0;
+
+    // Keep-alive path: heap + pool survived the previous stage exit while connected.
+    if (gRemoteActorHeap && gBodyPoolCount > 0) {
+        gRemoteHeapReserved = true;
+        prepareSurvivingBodyPoolForNewStage();
+        OSReport("[SMSO] Remote actor heap reused at stage init @ %p owned=%d free=%u pool=%u\n",
+                 gRemoteActorHeap, gRemoteActorHeapOwned ? 1 : 0,
+                 static_cast<u32>(gRemoteActorHeap->getTotalFreeSize()), gBodyPoolCount);
+    } else {
+        gRemoteHeapReserved = false;
+        resetBodyPoolForFreshHeap();
+        if (connected) {
+            ensureRemoteActorHeap();
+            gRemoteHeapReserved = gRemoteActorHeap != nullptr;
+            if (gRemoteHeapReserved) {
+                OSReport("[SMSO] Remote actor heap reserved at stage init @ %p owned=%d free=%u\n",
+                         gRemoteActorHeap, gRemoteActorHeapOwned ? 1 : 0,
+                         static_cast<u32>(gRemoteActorHeap->getTotalFreeSize()));
+            }
         }
     }
+}
+
+void updateRemoteModelPreload(TMarDirector *director) {
+    (void)director;
+    CommBuffer *buf = getCommBuffer();
+    if (!buf || buf->magic != COMM_MAGIC)
+        return;
+    if ((buf->bridgeFlags & BF_CONNECTED) == 0)
+        return;
+
+    if (!gRemoteHeapReserved) {
+        gRemoteHeapReserved = true;
+        ensureRemoteActorHeap();
+    }
+    if (!gRemoteActorHeap)
+        return;
+
+    // Budget: at most one SMSLoadArchive, then at most one body initValues.
+    smso::prefetchRemoteMarioPacks();
+    prewarmRemoteBodyPoolStep();
 }
 
 void updateRemoteActors(TMarDirector *director) {
@@ -3726,10 +4702,8 @@ void updateRemoteActors(TMarDirector *director) {
         ensureRemoteActorHeap();
     }
 
-    // Front-load the whole puppet pool the first time we reach a connected,
-    // stage-ready frame. After this, no remote body is ever allocated during
-    // gameplay — joins/leaves only assign or release an existing pool body.
-    prewarmRemoteBodyPool();
+    // Pack prefetch + staggered body prewarm run from updateRemoteModelPreload
+    // (hub / loading / stageUpdate) so this path stays cache-hit / assign-only.
 
     for (u32 i = 0; i < MAX_REMOTE_SLOTS; ++i) {
         const PlayerSnapshot &snap = buf->remoteSnapshots[i];
@@ -3756,13 +4730,15 @@ void updateRemoteActors(TMarDirector *director) {
 
         if (!slot.visible && !slot.inViewList) {
             resetRemoteRuntimeState(slot, true);
-            OSReport("[SMSO] Remote Mario body slot %u activated @ %p\n", i, slot.body);
+            if (kRemoteHotPathOsReport)
+                OSReport("[SMSO] Remote Mario body slot %u activated @ %p\n", i, slot.body);
         }
 
         if (!slot.inViewList) {
             gRemotePerformGroup->mViewObjList.push_back(slot.body);
             slot.inViewList = true;
-            OSReport("[SMSO] Remote Mario body slot %u registered in remote perform group\n", i);
+            if (kRemoteHotPathOsReport)
+                OSReport("[SMSO] Remote Mario body slot %u registered in remote perform group\n", i);
         }
 
         if (!slot.visible)
@@ -3773,13 +4749,33 @@ void updateRemoteActors(TMarDirector *director) {
         if (!slot.inWarpTransition)
             advanceRemoteDisplayMotion(slot, slot.body);
 
-        if (slot.appearRevealFrames == 0 && !slot.pendingStageAppear && !slot.pendingWarpInVfx)
+        if (slot.appearRevealFrames == 0 && !slot.pendingStageAppear && !slot.pendingWarpInVfx &&
+            !shouldSuppressRemoteHiderFromSeekerGrace(static_cast<u8>(i)))
             setBodyVisible(slot.body, true);
         else
             setBodyVisible(slot.body, false);
     }
 
-    if (++gVisibilityDiagFrame % 300 == 0) {
+    updateRemoteCarriedFruit();
+
+    if (isHideSeekGraceActive()) {
+        static u32 sGraceVisDiag = 0;
+        if ((++sGraceVisDiag % 180) == 1) {
+            const CommBuffer *gmBuf = getCommBuffer();
+            u32 suppressed = 0;
+            for (u32 i = 0; i < MAX_REMOTE_SLOTS; ++i) {
+                if (i == localSlot)
+                    continue;
+                if (shouldSuppressRemoteHiderFromSeekerGrace(static_cast<u8>(i)))
+                    ++suppressed;
+            }
+            OSReport("[SMSO] Grace vis localRole=%u flags=0x%02x suppressed=%u\n",
+                     gmBuf ? gmBuf->gameModeState.localRole : 0xFFu,
+                     gmBuf ? gmBuf->gameModeState.flags : 0u, suppressed);
+        }
+    }
+
+    if (kRemoteHotPathOsReport && ++gVisibilityDiagFrame % kVisibilityDiagInterval == 0) {
         u32 connected = 0;
         u32 spawned = 0;
         u32 visible = 0;
@@ -3801,32 +4797,67 @@ void updateRemoteActors(TMarDirector *director) {
 
         const u32 heapFree =
             gRemoteActorHeap ? static_cast<u32>(gRemoteActorHeap->getTotalFreeSize()) : 0;
-        OSReport("[SMSO] Remote visibility diag localSlot=%u connected=%u spawned=%u visible=%u inView=%u pool=%u/%u heapFree=%u owned=%d\n",
-                 localSlot, connected, spawned, visible, inView, gBodyPoolCount, kSessionMaxRemotes,
-                 heapFree, gRemoteActorHeapOwned ? 1 : 0);
+        OSReport("[SMSO] Remote visibility diag localSlot=%u connected=%u spawned=%u visible=%u "
+                 "inView=%u pool=%u/%u heapFree=%u owned=%d\n",
+                 localSlot, connected, spawned, visible, inView,
+                 gBodyPoolCount, kSessionMaxRemotes, heapFree, gRemoteActorHeapOwned ? 1 : 0);
     }
 }
 
-void clearRemoteActors() {
+void clearRemoteActors(bool keepHeapAndPool) {
     gPlayerGroup = nullptr;
     gRemotePerformGroupRegistered = false;
     gRemotePerformDrawDiag = 0;
     clearRemotePerformGroupMembers();
+    // The perform group may have been allocated from a heap that is torn down with
+    // the stage (remote actor heap / current stage heap). Drop the reference so the
+    // next stage recreates it cleanly instead of dereferencing a dangling pointer.
+    gRemotePerformGroup = nullptr;
+    gReportedPerformGroupAllocFail = false;
     gReportedMissingPlayerGroup = false;
-    gRemoteHeapReserved = false;
     for (auto &slot : gActors)
         slot = {};
-    // Pool bodies are owned by the remote heap; destroying it frees them all.
-    gBodyPoolCount = 0;
-    gBodyPoolPrewarmAttempted = false;
-    for (auto &body : gBodyPool)
-        body = nullptr;
+
+    if (keepHeapAndPool && gRemoteActorHeap) {
+        // Connected stage exit: park pool bodies, keep heap + pack buffers + pool.
+        for (u32 i = 0; i < MAX_REMOTE_SLOTS; ++i) {
+            if (gBodyPool[i])
+                parkRemoteBody(gBodyPool[i]);
+            gBodyModelApplied[i] = false;
+            gBodyRetailGraceFrames[i] = 0;
+            gBodyModelRetryCooldown[i] = 0;
+        }
+        gRemoteHeapReserved = true;
+        OSReport("[SMSO] Remote actors cleared (heap+pool kept: %u bodies @ %p free=%u)\n",
+                 gBodyPoolCount, gRemoteActorHeap,
+                 static_cast<u32>(gRemoteActorHeap->getTotalFreeSize()));
+        return;
+    }
+
+    gRemoteHeapReserved = false;
+    resetBodyPoolForFreshHeap();
     destroyRemoteActorHeap();
+}
+
+bool isRemoteMarioModelFrozen(u8 slot) {
+    return slot < MAX_REMOTE_SLOTS && gBodyModelApplied[slot];
+}
+
+void requestRemoteMarioModelReapply(u8 slot) {
+    if (slot >= MAX_REMOTE_SLOTS)
+        return;
+    gBodyModelApplied[slot] = false;
+    gBodyRetailGraceFrames[slot] = 0;
+    gBodyModelRetryCooldown[slot] = 0;
 }
 
 bool hasRemoteBodyForSlot(u8 slot) {
     return slot < MAX_REMOTE_SLOTS && gActors[slot].spawned && gActors[slot].body != nullptr &&
            gActors[slot].inViewList;
+}
+
+bool hasRemoteBodyForSlotLoose(u8 slot) {
+    return slot < MAX_REMOTE_SLOTS && gActors[slot].spawned && gActors[slot].body != nullptr;
 }
 
 TMario *getRemoteBodyForSlot(u8 slot) {
@@ -3835,8 +4866,15 @@ TMario *getRemoteBodyForSlot(u8 slot) {
     return gActors[slot].body;
 }
 
+TMario *getRemoteBodyForSlotLoose(u8 slot) {
+    if (!hasRemoteBodyForSlotLoose(slot))
+        return nullptr;
+    return gActors[slot].body;
+}
+
 bool getRemoteBodyPosition(u8 slot, f32 &x, f32 &y, f32 &z) {
-    if (!hasRemoteBodyForSlot(slot))
+    // Loose: Far-culled remotes stay spawned with live translation for nametags / pop-in.
+    if (!hasRemoteBodyForSlotLoose(slot))
         return false;
 
     const TMario *body = gActors[slot].body;
@@ -3850,11 +4888,12 @@ static constexpr f32 kHeadCrownWorldOffset = 18.0f;
 static constexpr f32 kHeadFallbackWorldOffset = 232.0f;
 
 bool getRemoteHeadAnchorPosition(u8 slot, f32 &x, f32 &y, f32 &z) {
-    if (!hasRemoteBodyForSlot(slot))
+    if (!hasRemoteBodyForSlotLoose(slot))
         return false;
 
     const TMario *body = gActors[slot].body;
-    if (body->mModelData && body->mModelData->mModel && body->mModelData->mModel->mJointArray) {
+    if (body->mModelData && body->mModelData->mModel &&
+        body->mModelData->mModel->mJointArray) {
         const u8 headJoint = body->mBindBoneIDArray[10];
         const Mtx &headMtx = body->mModelData->mModel->mJointArray[headJoint];
         const Vec localCrown = {0.0f, kHeadCrownWorldOffset, 0.0f};
@@ -3880,6 +4919,10 @@ JKRHeap *borrowRemoteActorHeap() {
     return gRemoteActorHeap;
 }
 
+bool isRemoteMarioBody(const TMario *mario) {
+    return isRemoteBody(mario);
+}
+
 } // namespace smso
 
 #else
@@ -3888,14 +4931,25 @@ namespace smso {
 
 void initRemoteActors() {}
 void updateRemoteActors(TMarDirector *) {}
-void clearRemoteActors() {}
+void clearRemoteActors(bool) {}
+void updateRemoteModelPreload(TMarDirector *) {}
 
 bool hasRemoteBodyForSlot(u8 slot) {
     (void)slot;
     return false;
 }
 
+bool hasRemoteBodyForSlotLoose(u8 slot) {
+    (void)slot;
+    return false;
+}
+
 TMario *getRemoteBodyForSlot(u8 slot) {
+    (void)slot;
+    return nullptr;
+}
+
+TMario *getRemoteBodyForSlotLoose(u8 slot) {
     (void)slot;
     return nullptr;
 }
@@ -3918,6 +4972,11 @@ bool getRemoteHeadAnchorPosition(u8 slot, f32 &x, f32 &y, f32 &z) {
 
 JKRHeap *borrowRemoteActorHeap() {
     return nullptr;
+}
+
+bool isRemoteMarioBody(const TMario *mario) {
+    (void)mario;
+    return false;
 }
 
 } // namespace smso

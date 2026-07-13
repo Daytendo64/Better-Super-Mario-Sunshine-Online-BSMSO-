@@ -79,6 +79,8 @@ struct SlotRuntime {
     f32 anchorWorldX;
     f32 anchorWorldY;
     f32 anchorWorldZ;
+    f32 screenX;
+    f32 screenY;
 
     f32 smoothedFontSize;
     f32 smoothedAlpha;
@@ -93,6 +95,17 @@ struct SlotRuntime {
 
 static SlotRuntime gSlots[MAX_REMOTE_SLOTS];
 static bool gDebugOverlay = false;
+
+struct ProjectionCache {
+    f32 fovy;
+    f32 aspect;
+    f32 tanHalf;
+    f32 screenWidth;
+    f32 adjustX;
+    bool valid;
+};
+
+static ProjectionCache gProjectionCache = {};
 
 static f32 clampf(f32 value, f32 minValue, f32 maxValue) {
     if (value < minValue)
@@ -264,14 +277,24 @@ static bool projectWorldToScreen(f32 wx, f32 wy, f32 wz, f32 &outX, f32 &outY) {
     if (aspect < 0.5f || aspect > 4.0f)
         aspect = 4.0f / 3.0f;
 
-    const f32 halfFov = fovy * 0.5f * 0.017453293f;
-    const f32 tanHalf = sinf(halfFov) / cosf(halfFov);
+    const f32 screenWidth = static_cast<f32>(BetterSMS::getScreenRenderWidth());
+    const f32 adjustX = BetterSMS::getScreenRatioAdjustX();
+    if (!gProjectionCache.valid || gProjectionCache.fovy != fovy ||
+        gProjectionCache.aspect != aspect || gProjectionCache.screenWidth != screenWidth ||
+        gProjectionCache.adjustX != adjustX) {
+        const f32 halfFov = fovy * 0.5f * 0.017453293f;
+        gProjectionCache.fovy = fovy;
+        gProjectionCache.aspect = aspect;
+        gProjectionCache.tanHalf = sinf(halfFov) / cosf(halfFov);
+        gProjectionCache.screenWidth = screenWidth;
+        gProjectionCache.adjustX = adjustX;
+        gProjectionCache.valid = true;
+    }
+
+    const f32 tanHalf = gProjectionCache.tanHalf;
     const f32 invZ = -1.0f / view.z;
     const f32 ndcY = view.y * invZ / tanHalf;
     const f32 ndcX = view.x * invZ / (tanHalf * aspect);
-
-    const f32 screenWidth = static_cast<f32>(BetterSMS::getScreenRenderWidth());
-    const f32 adjustX = BetterSMS::getScreenRatioAdjustX();
 
     outX = (ndcX + 1.0f) * 0.5f * screenWidth - adjustX;
     outY = (1.0f - ndcY) * 0.5f * kGameScreenHeight;
@@ -281,11 +304,8 @@ static bool projectWorldToScreen(f32 wx, f32 wy, f32 wz, f32 &outX, f32 &outY) {
            outY >= -margin && outY <= kGameScreenHeight + margin;
 }
 
-static f32 measurePerspectiveFontSize(f32 anchorX, f32 anchorY, f32 anchorZ) {
-    f32 baseScreenX, baseScreenY;
+static f32 measurePerspectiveFontSize(f32 anchorX, f32 anchorY, f32 anchorZ, f32 baseScreenY) {
     f32 topScreenX, topScreenY;
-    if (!projectWorldToScreen(anchorX, anchorY, anchorZ, baseScreenX, baseScreenY))
-        return kMinFontSize;
     if (!projectWorldToScreen(anchorX, anchorY + kPerspectiveMeasureWorldHeight, anchorZ, topScreenX,
                               topScreenY))
         return kMinFontSize;
@@ -314,19 +334,22 @@ static f32 evaluateDistanceCurveSize(f32 cameraDistance) {
     return kMaxFontSize + (kMinFontSize - kMaxFontSize) * eased;
 }
 
-static f32 evaluateTargetFontSize(f32 cameraDistance, f32 anchorX, f32 anchorY, f32 anchorZ) {
+static f32 evaluateTargetFontSize(f32 cameraDistance, f32 anchorX, f32 anchorY, f32 anchorZ,
+                                  f32 baseScreenY) {
     const f32 curveSize = evaluateDistanceCurveSize(cameraDistance);
     if (curveSize <= 0.0f)
         return 0.0f;
 
-    const f32 perspectiveSize = measurePerspectiveFontSize(anchorX, anchorY, anchorZ);
+    const f32 perspectiveSize =
+        measurePerspectiveFontSize(anchorX, anchorY, anchorZ, baseScreenY);
     // Blend curve readability with true perspective so scaling tracks camera FOV/aspect.
     const f32 blended = curveSize * 0.4f + perspectiveSize * 0.6f;
     return clampf(blended, kMinFontSize, kMaxFontSize);
 }
 
-static f32 evaluateHideSeekFontSize(f32 cameraDistance, f32 anchorX, f32 anchorY, f32 anchorZ) {
-    f32 size = evaluateTargetFontSize(cameraDistance, anchorX, anchorY, anchorZ);
+static f32 evaluateHideSeekFontSize(f32 cameraDistance, f32 anchorX, f32 anchorY, f32 anchorZ,
+                                    f32 baseScreenY) {
+    f32 size = evaluateTargetFontSize(cameraDistance, anchorX, anchorY, anchorZ, baseScreenY);
     if (size <= 0.0f)
         return kMinFontSize;
     return clampf(size - kHideSeekFontSizeReduce, kMinFontSize, kMaxFontSize);
@@ -413,26 +436,22 @@ static JUtility::TColor applyAlpha(JUtility::TColor color, f32 alpha) {
     return JUtility::TColor(color.r, color.g, color.b, static_cast<u8>(alphaByte));
 }
 
-static void printLayer(int x, int y, int fontSize, const char *text, JUtility::TColor topColor,
-                       JUtility::TColor bottomColor, bool useGradient) {
-    if (!gpSystemFont || !text || text[0] == '\0')
-        return;
-
-    J2DPrint printer(gpSystemFont, 1);
+static void configurePrinter(J2DPrint &printer, int fontSize, JUtility::TColor topColor,
+                             JUtility::TColor bottomColor, bool useGradient) {
     const JUtility::TColor bottom = useGradient ? bottomColor : topColor;
     printer.private_initiate(gpSystemFont, 1, kJ2DPrintDefaultLeading, topColor, bottom);
     printer.initiate();
     printer.setFontSize(fontSize, fontSize);
     printer.syncCharMetrics();
-    printer.print(x, y, "%s", text);
 }
 
-static void drawOutline(int x, int y, int fontSize, const OutlineMetrics &metrics, const char *text,
-                        JUtility::TColor outlineColor) {
+static void drawOutline(J2DPrint &printer, int x, int y, const OutlineMetrics &metrics,
+                        const char *text) {
     if (metrics.offsetPx <= 0)
         return;
 
-    // Filled Chebyshev disk — solid halo at every distance, not just the outer ring.
+    // Outer Chebyshev ring only — filled disks were O(r^2) J2DPrint calls per tag/frame
+    // and spiked low-end CPU with multiple remotes on screen.
     for (int dy = -metrics.offsetPx; dy <= metrics.offsetPx; ++dy) {
         for (int dx = -metrics.offsetPx; dx <= metrics.offsetPx; ++dx) {
             if (dx == 0 && dy == 0)
@@ -441,10 +460,10 @@ static void drawOutline(int x, int y, int fontSize, const OutlineMetrics &metric
             const int adx = dx < 0 ? -dx : dx;
             const int ady = dy < 0 ? -dy : dy;
             const int cheb = adx > ady ? adx : ady;
-            if (cheb < 1 || cheb > metrics.offsetPx)
+            if (cheb != metrics.offsetPx)
                 continue;
 
-            printLayer(x + dx, y + dy, fontSize, text, outlineColor, outlineColor, false);
+            printer.print(x + dx, y + dy, "%s", text);
         }
     }
 }
@@ -457,11 +476,15 @@ static void drawNameTag(int x, int y, int fontSize, const OutlineMetrics &outlin
     const JUtility::TColor top = applyAlpha(appearance.textTopColor, alpha);
     const JUtility::TColor bottom = applyAlpha(appearance.textBottomColor, alpha);
     const JUtility::TColor outline = applyAlpha(appearance.outlineColor, alpha);
+    J2DPrint printer(gpSystemFont, 1);
 
-    if (outlineMetrics.offsetPx > 0)
-        drawOutline(x, y, fontSize, outlineMetrics, text, outline);
+    if (outlineMetrics.offsetPx > 0) {
+        configurePrinter(printer, fontSize, outline, outline, false);
+        drawOutline(printer, x, y, outlineMetrics, text);
+    }
 
-    printLayer(x, y, fontSize, text, top, bottom, appearance.gradientEnabled);
+    configurePrinter(printer, fontSize, top, bottom, appearance.gradientEnabled);
+    printer.print(x, y, "%s", text);
 }
 
 static void resetSlotRuntime(SlotRuntime &slot) {
@@ -471,6 +494,8 @@ static void resetSlotRuntime(SlotRuntime &slot) {
     slot.anchorWorldX = 0.0f;
     slot.anchorWorldY = 0.0f;
     slot.anchorWorldZ = 0.0f;
+    slot.screenX = 0.0f;
+    slot.screenY = 0.0f;
     slot.smoothedAlpha = 0.0f;
     slot.cameraDistance = 0.0f;
     slot.targetFontSize = 0.0f;
@@ -504,6 +529,7 @@ void initSystem() {
     memset(gSlots, 0, sizeof(gSlots));
     for (auto &slot : gSlots)
         resetSlotRuntime(slot);
+    gProjectionCache = {};
     gDebugOverlay = false;
 }
 
@@ -544,15 +570,20 @@ void updateSlot(u8 slot, bool active, f32 anchorX, f32 anchorY, f32 anchorZ, f32
     const f32 distance = measureCameraDistance(anchorX, anchorY, anchorZ);
 
     state.cameraDistance = distance;
+    state.screenX = rawScreenX;
+    state.screenY = rawScreenY;
     if (isHideSeekNameTagMode()) {
         state.targetFontSize =
-            onScreen ? evaluateHideSeekFontSize(distance, anchorX, anchorY, anchorZ) : 0.0f;
-        state.targetAlpha = onScreen ? 1.0f : 0.0f;
+            onScreen ? evaluateHideSeekFontSize(distance, anchorX, anchorY, anchorZ, rawScreenY)
+                     : 0.0f;
+        state.targetAlpha = onScreen ? evaluateTargetAlpha(distance) : 0.0f;
         state.targetOcclusion =
             onScreen && isNameTagAnchorOccluded(anchorX, anchorY, anchorZ) ? 0.0f : 1.0f;
         state.drawVisible = onScreen && state.targetFontSize >= kMinFontSize;
     } else {
-        state.targetFontSize = onScreen ? evaluateTargetFontSize(distance, anchorX, anchorY, anchorZ) : 0.0f;
+        state.targetFontSize =
+            onScreen ? evaluateTargetFontSize(distance, anchorX, anchorY, anchorZ, rawScreenY)
+                     : 0.0f;
         state.targetAlpha = onScreen ? evaluateTargetAlpha(distance) : 0.0f;
         state.targetOcclusion = 1.0f;
         state.drawVisible = onScreen && state.targetAlpha > 0.02f && state.targetFontSize > 0.5f;
@@ -583,7 +614,8 @@ void updateSlot(u8 slot, bool active, f32 anchorX, f32 anchorY, f32 anchorZ, f32
     }
 
     if (isHideSeekNameTagMode())
-        state.drawVisible = onScreen && state.targetFontSize >= kMinFontSize && state.smoothedAlpha > 0.03f;
+        state.drawVisible =
+            onScreen && state.targetFontSize >= kMinFontSize && state.smoothedAlpha > 0.03f;
 
     state.lastBodyX = bodyX;
     state.lastBodyY = bodyY;
@@ -608,14 +640,8 @@ void drawAll(const J2DOrthoGraph *graph) {
 
         const OutlineMetrics outlineMetrics = calcOutlineMetrics(state.smoothedFontSize);
 
-        f32 screenX = 0.0f;
-        f32 screenY = 0.0f;
-        if (!projectWorldToScreen(state.anchorWorldX, state.anchorWorldY, state.anchorWorldZ, screenX,
-                                  screenY))
-            continue;
-
-        const f32 centerX = screenX;
-        const f32 centerY = screenAnchorCenterY(screenY, state.smoothedFontSize);
+        const f32 centerX = state.screenX;
+        const f32 centerY = screenAnchorCenterY(state.screenY, state.smoothedFontSize);
 
         const f32 textWidth =
             measureTextWidth(state.name, fontSize, state.appearance.textTopColor);

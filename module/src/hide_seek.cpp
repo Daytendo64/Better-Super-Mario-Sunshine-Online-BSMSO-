@@ -2,20 +2,31 @@
 #include "stage_guard.hpp"
 
 #include "comm_buffer.hpp"
+#include "mario_model_system.hpp"
 #include "puppets.hpp"
 
 #include <BetterSMS/area.hxx>
+#include <BetterSMS/game.hxx>
 #include <BetterSMS/module.hxx>
 #include <BetterSMS/player.hxx>
+#include <Dolphin/GX.h>
 #include <Dolphin/MTX.h>
-#include <JSystem/J3D/J3DModel.hxx>
-#include <SMS/Player/MarioCap.hxx>
 #include <Dolphin/OS.h>
+#include <Dolphin/printf.h>
+#include <Dolphin/string.h>
+#include <JSystem/J2D/J2DOrthoGraph.hxx>
+#include <JSystem/J2D/J2DPane.hxx>
+#include <JSystem/J2D/J2DPrint.hxx>
+#include <JSystem/J3D/J3DModel.hxx>
 #include <JSystem/J3D/J3DShape.hxx>
+#include <JSystem/JUtility/JUTColor.hxx>
 #include <SMS/GC2D/GCConsole2.hxx>
+#include <SMS/MarioUtil/gd-reinit-gx.hxx>
 #include <SMS/MSound/MSound.hxx>
 #include <SMS/MSound/MSoundSESystem.hxx>
 #include <SMS/Player/Mario.hxx>
+#include <SMS/Player/MarioCap.hxx>
+#include <SMS/Player/MarioGamePad.hxx>
 #include <SMS/System/Application.hxx>
 #include <SMS/System/MarDirector.hxx>
 #include <SMS/raw_fn.hxx>
@@ -35,15 +46,16 @@ using StartDisappearTimerFn = void (*)(TGCConsole2 *);
 using StartMoveTimerFn = void (*)(TGCConsole2 *, int);
 using StopMoveTimerFn = void (*)(TGCConsole2 *);
 using SetTimerFn = void (*)(TGCConsole2 *, s32);
-using FloorDamageFn = void (*)(TMario *, int, int, int, int);
 using CountShineFn = void (*)(TGCConsole2 *);
 using StartBgmFn = void (*)(u32);
 
 // gc-forever asset list / OST track 42: demo BGM index 0x26 = Race Fanfare (Il Piantissimo).
 constexpr u32 kRaceFanfareBgm = 0x80010026u;
 
-constexpr u16 kTaggedDeathTimeoutFrames = 420u;
-constexpr u16 kMinTaggedDeathFrames = 90u;
+// Base durations are authored for 30 Hz. Scale with BetterSMS::getFrameRate() so
+// 60/120 fps do not finish death recovery (setMario) while Mario is still dying.
+constexpr u16 kTaggedDeathTimeoutFrames30 = 420u;
+constexpr u16 kMinTaggedDeathFrames30 = 90u;
 constexpr u8 kSeekerPromotionVfxDelayFrames = 12u;
 constexpr u8 kShirtShapeIndex = 10u;
 constexpr u32 kModelDataShapeNumOffset = 0x2Cu;
@@ -75,12 +87,19 @@ static u8 s_deathEpisodeId = 0;
 static bool s_deathStageCaptured = false;
 static u16 s_taggedDeathElapsed = 0;
 static u16 s_taggedDeathTimeout = 0;
+static u16 s_minTaggedDeathFrames = kMinTaggedDeathFrames30;
 static s32 s_frozenTimerCentiseconds = 0;
 static bool s_resumeDeathRecoveryAfterReload = false;
 static bool s_envDeathRecovery = false;
 static bool s_envDeathPromotionPending = false;
 static u8 s_seekerLookRetryFrames = 0;
 static u8 s_pendingSeekerPromotionVfxFrames = 0;
+// Defer lethal state changes off stageUpdate (pre-direct) onto the next local
+// Mario playerUpdate — changePlayerDropping mid-tree / before playerControl is
+// the frame-safe window. Coalesce duplicate tag/death edges into one apply.
+static bool s_pendingForceDeathAnim = false;
+static bool s_pendingDeathStageReload = false;
+static bool s_deathFinishBusy = false;
 static bool s_hideSeekHooksInstalled = false;
 static bool s_allowDeathStageTransition = false;
 static bool s_allowLauncherStageTransition = false;
@@ -90,8 +109,22 @@ static u8 s_tagPlayStageArea = 0;
 static u8 s_tagPlayStageEpisode = 0;
 static u16 s_tagDeathGraceFrames = 0;
 static u32 s_lastNetworkRoundStartMs = 0;
+static bool s_graceWasActive = false;
+static bool s_seekerGraceInputLocked = false;
+static bool s_seekerGracePosPinned = false;
+static f32 s_seekerGracePinX = 0.0f;
+static f32 s_seekerGracePinY = 0.0f;
+static f32 s_seekerGracePinZ = 0.0f;
+static u8 s_graceEndFlashFrames = 0;
 
 constexpr u16 kTagDeathGraceFrames = 360u;
+constexpr u8 kGraceEndFlashFrames = 18u;
+// Match retail SMS HUD digit size (same nominal as nametag / coin counters).
+constexpr int kGraceHudFontSize = 22;
+constexpr int kJ2DPrintDefaultLeading = static_cast<int>(0x80000000);
+
+static bool isLocalMarioInDeathState(const TMario *mario);
+static void applyForcedTaggedDeathAnim(TMario *mario);
 
 static void pinTagPlayStage(TMarDirector *director) {
     if (!director)
@@ -134,10 +167,6 @@ static SetTimerFn setTimerFn() {
     return reinterpret_cast<SetTimerFn>(SMS_PORT_REGION(0x8014836C, 0x8013CFF0, 0, 0));
 }
 
-static FloorDamageFn floorDamageExecFn() {
-    return reinterpret_cast<FloorDamageFn>(SMS_PORT_REGION(0x8024303C, 0x8023ADC8, 0, 0));
-}
-
 static CountShineFn countShineFn() {
     return reinterpret_cast<CountShineFn>(SMS_PORT_REGION(0x80147A0C, 0x8013C690, 0, 0));
 }
@@ -148,6 +177,38 @@ static StartBgmFn startBgmFn() {
 
 static TGCConsole2 *getConsole(TMarDirector *director) {
     return director && director->mGCConsole ? director->mGCConsole : nullptr;
+}
+
+static u16 scaleFramesFrom30(u16 frames30) {
+    f32 rate = BetterSMS::getFrameRate();
+    if (rate < 1.0f)
+        rate = 30.0f;
+    const u32 scaled = static_cast<u32>(static_cast<f32>(frames30) * (rate / 30.0f) + 0.5f);
+    if (scaled == 0)
+        return 1;
+    if (scaled > 0xFFFFu)
+        return 0xFFFFu;
+    return static_cast<u16>(scaled);
+}
+
+static void armTaggedDeathTimers() {
+    s_taggedDeathElapsed = 0;
+    s_taggedDeathTimeout = scaleFramesFrom30(kTaggedDeathTimeoutFrames30);
+    s_minTaggedDeathFrames = scaleFramesFrom30(kMinTaggedDeathFrames30);
+}
+
+static void applyForcedTaggedDeathAnim(TMario *mario) {
+    if (!mario)
+        return;
+
+    // Avoid floorDamageExec here: it assumes collision/playerControl context and can
+    // start overlapping death/game-over side-effects. Force the death drop once.
+    mario->mInvincibilityFrames = 0;
+    mario->mAttributes.mIsGameOver = false;
+    if (mario->mHealth > 0)
+        mario->mHealth = 0;
+    if (mario->mState != TMario::STATE_DEATH)
+        mario->changePlayerDropping(TMario::STATE_DEATH, 0);
 }
 
 static OSStopwatch *getDirectorEventStopwatch(TMarDirector *director) {
@@ -221,6 +282,143 @@ static void playTagStartSound(TMario *mario) {
 
     const Vec pos = {mario->mTranslation.x, mario->mTranslation.y, mario->mTranslation.z};
     MSoundSESystem::MSoundSE::startSoundActor(soundId, &pos, 0, nullptr, 0, 4);
+}
+
+static void playGraceEndSound(TMario *mario) {
+    if (!gpMSound || !mario)
+        return;
+
+    // Soft "go" cue when seekers are released.
+    const u32 soundId = MSD_SE_SY_RACE_FIRE;
+    if (!gpMSound->gateCheck(soundId))
+        return;
+
+    const Vec pos = {mario->mTranslation.x, mario->mTranslation.y, mario->mTranslation.z};
+    MSoundSESystem::MSoundSE::startSoundActor(soundId, &pos, 0, nullptr, 0, 4);
+}
+
+static bool isHideSeekGraceActive(const GameModeState &gm) {
+    return (gm.flags & GMF_GRACE_ACTIVE) != 0;
+}
+
+static void releaseSeekerGraceInputLock(TMario *mario) {
+    if (!s_seekerGraceInputLocked)
+        return;
+
+    if (mario && mario->mController) {
+        mario->mController->mState.mReadInput = true;
+        mario->mController->mState.mDisable = false;
+    }
+    s_seekerGraceInputLocked = false;
+    s_seekerGracePosPinned = false;
+}
+
+static void applySeekerGraceFreeze(TMario *mario) {
+    if (!mario || !mario->mController)
+        return;
+
+    mario->mController->mState.mReadInput = false;
+    mario->mController->mState.mDisable = true;
+    mario->mController->mStickX = 0.0f;
+    mario->mController->mStickY = 0.0f;
+    mario->mController->mMeaning = 0;
+    mario->mController->mFrameMeaning = 0;
+
+    // Hard pin: zero all velocity and restore the grace-start position every frame so
+    // residual physics / slope slide cannot creep the seeker.
+    if (!s_seekerGracePosPinned) {
+        s_seekerGracePinX = mario->mTranslation.x;
+        s_seekerGracePinY = mario->mTranslation.y;
+        s_seekerGracePinZ = mario->mTranslation.z;
+        s_seekerGracePosPinned = true;
+    } else {
+        mario->mTranslation.x = s_seekerGracePinX;
+        mario->mTranslation.y = s_seekerGracePinY;
+        mario->mTranslation.z = s_seekerGracePinZ;
+    }
+    mario->mSpeed.x = 0.0f;
+    mario->mSpeed.y = 0.0f;
+    mario->mSpeed.z = 0.0f;
+    mario->mForwardSpeed = 0.0f;
+    s_seekerGraceInputLocked = true;
+}
+
+static void updateHideSeekGrace(TMario *mario, const GameModeState &gm, bool localIsSeeker,
+                                bool tagActive) {
+    const bool graceActive = tagActive && isHideSeekGraceActive(gm);
+    // Never hard-pin / zero velocity while a tagged (or env) death recovery is live —
+    // fighting STATE_DEATH physics at 60fps corrupts Mario mid-perform.
+    const bool freezeSeeker =
+        graceActive && localIsSeeker && !s_taggedDeathActive && !isLocalMarioInDeathState(mario);
+
+    if (freezeSeeker)
+        applySeekerGraceFreeze(mario);
+    else
+        releaseSeekerGraceInputLock(mario);
+
+    if (s_graceWasActive && !graceActive && tagActive) {
+        playGraceEndSound(mario);
+        s_graceEndFlashFrames = kGraceEndFlashFrames;
+    }
+
+    if (!graceActive && !tagActive)
+        s_graceEndFlashFrames = 0;
+    else if (s_graceEndFlashFrames > 0)
+        --s_graceEndFlashFrames;
+
+    s_graceWasActive = graceActive;
+}
+
+static void drawGraceCountdownText(int secondsLeft, bool localIsSeeker) {
+    if (!gpSystemFont)
+        return;
+
+    char line[32];
+    if (localIsSeeker)
+        snprintf(line, sizeof(line), "HIDE %d", secondsLeft);
+    else
+        snprintf(line, sizeof(line), "HIDE TIME %d", secondsLeft);
+
+    const int centerX = 200;
+    // Bottom of the 480p ortho, above the FLUDD meter / TIME HUD cluster.
+    const int y = 400;
+
+    // Match retail HUD: white→yellow fill with thick black outline.
+    f32 outlineOffsetF = static_cast<f32>(kGraceHudFontSize) * 0.11f + 0.35f;
+    if (outlineOffsetF < 1.0f)
+        outlineOffsetF = 1.0f;
+    if (outlineOffsetF > 3.0f)
+        outlineOffsetF = 3.0f;
+    const int outlinePx = static_cast<int>(outlineOffsetF + 0.5f);
+
+    const JUtility::TColor fillTop(255, 255, 220, 255);
+    const JUtility::TColor fillBottom(255, 200, 0, 255);
+    const JUtility::TColor outline(0, 0, 0, 255);
+
+    J2DPrint printer(gpSystemFont, 1);
+    printer.private_initiate(gpSystemFont, 1, kJ2DPrintDefaultLeading, outline, outline);
+    printer.initiate();
+    printer.setFontSize(kGraceHudFontSize, kGraceHudFontSize);
+    printer.syncCharMetrics();
+
+    for (int dy = -outlinePx; dy <= outlinePx; ++dy) {
+        for (int dx = -outlinePx; dx <= outlinePx; ++dx) {
+            if (dx == 0 && dy == 0)
+                continue;
+            const int adx = dx < 0 ? -dx : dx;
+            const int ady = dy < 0 ? -dy : dy;
+            const int cheb = adx > ady ? adx : ady;
+            if (cheb < 1 || cheb > outlinePx)
+                continue;
+            printer.print(centerX + dx, y + dy, "%s", line);
+        }
+    }
+
+    printer.private_initiate(gpSystemFont, 1, kJ2DPrintDefaultLeading, fillTop, fillBottom);
+    printer.initiate();
+    printer.setFontSize(kGraceHudFontSize, kGraceHudFontSize);
+    printer.syncCharMetrics();
+    printer.print(centerX, y, "%s", line);
 }
 
 static bool tryGetHideSeekSlotWorldPos(const CommBuffer *buf, u8 slot, Vec &out) {
@@ -551,7 +749,7 @@ static bool isLocalMarioInDeathState(const TMario *mario) {
 }
 
 static void beginHideSeekDeathRecovery(TMarDirector *director, TMario *mario, bool forceDeathAnim) {
-    if (!mario || s_taggedDeathActive)
+    if (!mario || s_taggedDeathActive || s_deathFinishBusy)
         return;
 
     captureHideSeekDeathStage(director);
@@ -559,16 +757,14 @@ static void beginHideSeekDeathRecovery(TMarDirector *director, TMario *mario, bo
     if (!forceDeathAnim)
         s_envDeathPromotionPending = true;
 
-    if (forceDeathAnim) {
-        mario->mInvincibilityFrames = 0;
-        floorDamageExecFn()(mario, 8, 0, 0, 0);
-        if (mario->mState != TMario::STATE_DEATH)
-            mario->changePlayerDropping(TMario::STATE_DEATH, 0);
-    }
+    // Queue the lethal drop for the local Mario playerUpdate callback (runs inside
+    // perform, before playerControl). Applying floorDamageExec/changePlayerDropping
+    // from stageUpdate (pre-direct) races draw/half-frames at 60fps.
+    if (forceDeathAnim)
+        s_pendingForceDeathAnim = true;
 
     s_taggedDeathActive = true;
-    s_taggedDeathElapsed = 0;
-    s_taggedDeathTimeout = kTaggedDeathTimeoutFrames;
+    armTaggedDeathTimers();
     clampGameOverToDeathStage();
 }
 
@@ -618,8 +814,7 @@ static void forceTagRoundDeathStageRecovery(TMarDirector *director) {
     s_envDeathRecovery = true;
     s_envDeathPromotionPending = true;
     s_taggedDeathActive = true;
-    s_taggedDeathElapsed = 0;
-    s_taggedDeathTimeout = kTaggedDeathTimeoutFrames;
+    armTaggedDeathTimers();
     clampGameOverToDeathStage();
 
     if (gpMarioAddress)
@@ -659,14 +854,24 @@ static void bindLocalSeekerCapAttachments(TMario *mario, JDrama::TGraphics *grap
     const u8 mhead = mario->mBindBoneIDArray[11];
     Mtx *mheadMtx = &body->mJointArray[mhead];
 
-    if (mario->mCap->mCap1)
-        bindModelToHeadBone(mario->mCap->mCap1, mheadMtx);
-    if (mario->mCap->mCap3)
-        bindModelToHeadBone(mario->mCap->mCap3, mheadMtx);
+    CommBuffer *buf = getCommBuffer();
+    const bool hideHats = buf && buf->magic == COMM_MAGIC &&
+                          smso::marioModelIdWantsHiddenCaps(buf->localMarioModelId);
+
+    if (hideHats) {
+        smso::squashHiddenCapDrawInstance(mario);
+    } else {
+        if (mario->mCap->mCap1)
+            bindModelToHeadBone(mario->mCap->mCap1, mheadMtx);
+        if (mario->mCap->mCap3)
+            bindModelToHeadBone(mario->mCap->mCap3, mheadMtx);
+    }
     if (mario->mCap->maGlass1)
         bindModelToHeadBone(mario->mCap->maGlass1, mheadMtx);
 
     mario->mCap->perform(2, graphics);
+    if (hideHats)
+        smso::squashHiddenCapDrawInstance(mario);
 }
 
 static void queueLocalSeekerPromotionVfx() {
@@ -723,7 +928,7 @@ static void handleLocalSeekerPromotion(TMarDirector *director, TGCConsole2 *cons
 }
 
 static void finishHideSeekDeathRecovery(TMarDirector *director, TMario *mario) {
-    if (!director || !mario)
+    if (!director || !mario || !s_taggedDeathActive || s_deathFinishBusy)
         return;
 
     CommBuffer *buf = getCommBuffer();
@@ -737,6 +942,11 @@ static void finishHideSeekDeathRecovery(TMarDirector *director, TMario *mario) {
         return;
     }
 
+    // setMario() rebuilds live Mario graph state — never re-enter.
+    s_deathFinishBusy = true;
+    s_pendingForceDeathAnim = false;
+    s_pendingDeathStageReload = false;
+
     respawnLocalMarioAtStageSpawn(director, mario);
     while (mario->mHealth < 8)
         mario->incHP(1);
@@ -749,13 +959,17 @@ static void finishHideSeekDeathRecovery(TMarDirector *director, TMario *mario) {
     s_localWasHider = !localIsSeeker;
     s_envDeathRecovery = false;
 
-    if (localIsSeeker)
-        handleLocalSeekerPromotion(director, console, mario, buf->gameModeState);
-
+    // Clear before promotion so seeker cosmetics/VFX are allowed this frame.
     s_taggedDeathActive = false;
     s_taggedDeathElapsed = 0;
     s_taggedDeathTimeout = 0;
     s_deathStageCaptured = false;
+    s_resumeDeathRecoveryAfterReload = false;
+
+    if (localIsSeeker)
+        handleLocalSeekerPromotion(director, console, mario, buf->gameModeState);
+
+    s_deathFinishBusy = false;
 }
 
 static void finishTaggedDeath(TMarDirector *director, TMario *mario) {
@@ -772,6 +986,14 @@ static void installHideSeekDeathHooks() {
             if (!isLocal || !gpMarDirector || !player)
                 return;
 
+            // Apply deferred tag-kill inside Mario perform, before playerControl.
+            // Gated on s_taggedDeathActive so a Stop Tag / clear cannot fire a stale kill.
+            if (s_pendingForceDeathAnim) {
+                s_pendingForceDeathAnim = false;
+                if (s_taggedDeathActive)
+                    applyForcedTaggedDeathAnim(player);
+            }
+
             CommBuffer *buf = getCommBuffer();
             if (!isHideSeekTagRoundActive(buf))
                 return;
@@ -780,10 +1002,11 @@ static void installHideSeekDeathHooks() {
                 player->mAttributes.mIsGameOver = false;
                 clampGameOverToDeathStage();
                 noteTagRoundDeathGrace(player);
+                // Never setNextStage mid-perform — queue for stageUpdate.
                 if (s_deathStageCaptured &&
                     (gpMarDirector->mAreaID != s_deathAreaId ||
                      gpMarDirector->mEpisodeID != s_deathEpisodeId))
-                    ensureHideSeekDeathStage(gpMarDirector);
+                    s_pendingDeathStageReload = true;
                 return;
             }
 
@@ -837,9 +1060,14 @@ static void resetHideSeekDeathState() {
     s_taggedDeathActive = false;
     s_taggedDeathElapsed = 0;
     s_taggedDeathTimeout = 0;
+    s_minTaggedDeathFrames = kMinTaggedDeathFrames30;
     s_deathAreaId = 0;
     s_deathEpisodeId = 0;
     s_deathStageCaptured = false;
+    s_pendingForceDeathAnim = false;
+    s_pendingDeathStageReload = false;
+    s_deathFinishBusy = false;
+    s_resumeDeathRecoveryAfterReload = false;
 }
 
 static void resetHideSeekTransientState() {
@@ -963,6 +1191,10 @@ void maintainLocalHideSeekSeekerDraw(TMario *mario, JDrama::TGraphics *graphics)
     if (!isHideSeekActive() || !isLocalSlotSeeker(buf))
         return;
 
+    // Cap/glass bind + mCap->perform during STATE_DEATH races joint teardown at 60fps.
+    if (s_taggedDeathActive || isLocalMarioInDeathState(mario) || s_deathFinishBusy)
+        return;
+
     // Remote puppets reapply in remoteCalcAnim every frame; retail thinkAloha/calcAnim
     // overwrites local shirt + cap state if we only set it once from updateHideSeek.
     applyHideSeekPlayerCosmetics(mario, true, false);
@@ -1082,6 +1314,7 @@ void clearHideSeek() {
     s_lastTagSoundEventId = 0;
     s_taggedDeathElapsed = 0;
     s_taggedDeathTimeout = 0;
+    s_minTaggedDeathFrames = kMinTaggedDeathFrames30;
     s_frozenTimerCentiseconds = 0;
     s_lastNetworkRoundStartMs = 0;
     s_deathAreaId = 0;
@@ -1091,9 +1324,16 @@ void clearHideSeek() {
     s_envDeathPromotionPending = false;
     s_seekerLookRetryFrames = 0;
     s_pendingSeekerPromotionVfxFrames = 0;
+    s_pendingForceDeathAnim = false;
+    s_pendingDeathStageReload = false;
+    s_deathFinishBusy = false;
+    s_resumeDeathRecoveryAfterReload = false;
     s_tagPlayStageValid = false;
     s_authorizedStageExitPending = false;
     s_tagDeathGraceFrames = 0;
+    releaseSeekerGraceInputLock(gpMarioAddress);
+    s_graceWasActive = false;
+    s_graceEndFlashFrames = 0;
 }
 
 void setHideSeekAllowStageTransition(bool allow) {
@@ -1144,9 +1384,7 @@ bool shouldDrawHideSeekNameTag(u8 remoteSlot) {
     if (remoteSlot >= MAX_PLAYERS)
         return true;
 
-    if (buf->gameModeState.localRole == HSR_HIDER)
-        return true;
-
+    // Hide-and-seek: only seekers keep nametags. Hider tags stay fully hidden for everyone.
     return buf->gameModeState.roleBySlot[remoteSlot] == HSR_SEEKER;
 }
 
@@ -1155,6 +1393,32 @@ bool isHideSeekSeekerSlot(u8 slot) {
     if (buf->gameModeState.mode != GM_HIDE_SEEK || slot >= MAX_PLAYERS)
         return false;
     return buf->gameModeState.roleBySlot[slot] == HSR_SEEKER;
+}
+
+bool isHideSeekGraceActive() {
+    const CommBuffer *buf = getCommBuffer();
+    if (!buf || buf->magic != COMM_MAGIC)
+        return false;
+    const GameModeState &gm = buf->gameModeState;
+    return gm.mode == GM_HIDE_SEEK && (gm.flags & GMF_TAG_ACTIVE) != 0 &&
+           isHideSeekGraceActive(gm);
+}
+
+bool shouldSuppressRemoteHiderFromSeekerGrace(u8 remoteSlot) {
+    if (!isHideSeekGraceActive())
+        return false;
+
+    const CommBuffer *buf = getCommBuffer();
+    if (!buf || remoteSlot >= MAX_PLAYERS)
+        return false;
+
+    const GameModeState &gm = buf->gameModeState;
+    // Prefer localRole (same as blue wash); fall back to roleBySlot[localSlot].
+    if (!isLocalSlotSeeker(buf))
+        return false;
+    if (gm.roleBySlot[remoteSlot] == HSR_SEEKER)
+        return false;
+    return true;
 }
 
 void updateHideSeek(TMarDirector *director) {
@@ -1184,6 +1448,8 @@ void updateHideSeek(TMarDirector *director) {
     }
 
     s_hideSeekModeActive = true;
+
+    updateHideSeekGrace(gpMarioAddress, gm, localIsSeeker, tagActive);
 
     tryCaptureLocalTagTimerOnNewEvent(director, console, buf, gm);
 
@@ -1220,6 +1486,7 @@ void updateHideSeek(TMarDirector *director) {
     if (s_taggedDeathActive) {
         gpMarioAddress->mAttributes.mIsGameOver = false;
         clampGameOverToDeathStage();
+        s_pendingDeathStageReload = false;
         ensureHideSeekDeathStage(director);
         noteTagRoundDeathGrace(gpMarioAddress);
 
@@ -1230,10 +1497,11 @@ void updateHideSeek(TMarDirector *director) {
             s_envDeathPromotionPending = false;
         }
 
+        bool shouldFinish = false;
         if (s_resumeDeathRecoveryAfterReload) {
             s_resumeDeathRecoveryAfterReload = false;
             if (director->mCurState >= TMarDirector::STATE_NORMAL)
-                finishTaggedDeath(director, gpMarioAddress);
+                shouldFinish = true;
         }
 
         ++s_taggedDeathElapsed;
@@ -1241,9 +1509,11 @@ void updateHideSeek(TMarDirector *director) {
             --s_taggedDeathTimeout;
 
         const bool leftDeathState = gpMarioAddress->mState != TMario::STATE_DEATH;
-        const bool deathFinished = s_taggedDeathTimeout == 0 ||
-                                   (s_taggedDeathElapsed >= kMinTaggedDeathFrames && leftDeathState);
-        if (deathFinished)
+        if (s_taggedDeathTimeout == 0 ||
+            (s_taggedDeathElapsed >= s_minTaggedDeathFrames && leftDeathState))
+            shouldFinish = true;
+
+        if (shouldFinish)
             finishTaggedDeath(director, gpMarioAddress);
 
         s_tagActive = tagActive;
@@ -1362,6 +1632,64 @@ void updateHideSeek(TMarDirector *director) {
     s_timerResetWas = timerReset;
     if (hideSeekMode)
         s_lastNetworkRoundStartMs = gm.roundStartMs;
+}
+
+void drawHideSeekGrace(const J2DOrthoGraph *graph) {
+    if (!graph)
+        return;
+
+    const CommBuffer *buf = getCommBuffer();
+    if (!buf || buf->magic != COMM_MAGIC)
+        return;
+
+    const GameModeState &gm = buf->gameModeState;
+    const bool hideSeekMode = gm.mode == GM_HIDE_SEEK;
+    const bool tagActive = hideSeekMode && (gm.flags & GMF_TAG_ACTIVE) != 0;
+    const bool graceActive = tagActive && isHideSeekGraceActive(gm);
+    const bool flashActive = s_graceEndFlashFrames > 0;
+
+    if (!graceActive && !flashActive)
+        return;
+
+    ReInitializeGX();
+    const_cast<J2DOrthoGraph *>(graph)->setup2D();
+
+    // Cover the full J2D ortho (widescreen-safe). Stacked strips avoid rare large-fill clipping.
+    const f32 adjust = BetterSMS::getScreenRatioAdjustX();
+    const int left = static_cast<int>(-adjust);
+    const int width = BetterSMS::getScreenRenderWidth() > 0
+                          ? BetterSMS::getScreenRenderWidth()
+                          : static_cast<int>(600.0f + adjust * 2.0f);
+    const int screenH = 480;
+    const int stripH = 48;
+
+    if (graceActive) {
+        const bool localIsSeeker = gm.localRole == HSR_SEEKER;
+        // Blue wash is seeker-only so hiders keep a clear view while hiding.
+        if (localIsSeeker) {
+            const JUtility::TColor wash(24, 72, 190, 110);
+            for (int y = 0; y < screenH; y += stripH) {
+                const int h = (y + stripH > screenH) ? (screenH - y) : stripH;
+                J2DFillBox(left, y, width, h, wash);
+            }
+        }
+
+        const int secondsLeft =
+            static_cast<int>((gm.graceRemainingMs + 999u) / 1000u);
+        const int clamped = secondsLeft < 1 ? 1 : secondsLeft;
+        drawGraceCountdownText(clamped, localIsSeeker);
+    }
+
+    if (flashActive) {
+        const f32 t = static_cast<f32>(s_graceEndFlashFrames) /
+                      static_cast<f32>(kGraceEndFlashFrames);
+        const u8 flashAlpha = static_cast<u8>(t * 140.0f);
+        const JUtility::TColor flash(180, 220, 255, flashAlpha);
+        for (int y = 0; y < screenH; y += stripH) {
+            const int h = (y + stripH > screenH) ? (screenH - y) : stripH;
+            J2DFillBox(left, y, width, h, flash);
+        }
+    }
 }
 
 } // namespace smso

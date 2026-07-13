@@ -26,6 +26,7 @@ if ([string]::IsNullOrWhiteSpace($ServerDir)) {
 }
 $ModulePath = Join-Path $DistDir "_BSMSO.kxe"
 $ReleaseBseCache = Join-Path $DistDir "BetterSunshineEngine.release.kxe"
+$MovesetPath = Join-Path $DistDir "BetterSunshineMoveset.kxe"
 $BseReleaseZipUrl = "https://github.com/DotKuribo/BetterSunshineEngine/releases/download/v4.0.0/BetterSunshineEngine_RELEASE.zip"
 
 function Ensure-ReleaseBseKxe {
@@ -69,6 +70,9 @@ if (-not (Test-Path $ModulePath)) {
 if (-not (Test-Path $BseKxePath)) {
     Write-Error "Missing release BetterSunshineEngine.kxe at $BseKxePath"
 }
+if (-not (Test-Path $MovesetPath)) {
+    Write-Error "Missing dist\BetterSunshineMoveset.kxe. Place BetterSunshineMoveset.kxe in dist\."
+}
 if (-not (Test-Path (Join-Path $LauncherDir "BSMSO.Launcher.exe"))) {
     Write-Error "Missing published launcher. Run .\tools\publish.ps1 first."
 }
@@ -89,17 +93,27 @@ Better Super Mario Sunshine (BSMSO) is online multiplayer for Super Mario Sunshi
 via Dolphin Emulator and Better Sunshine Engine (BSE).
 
 Quick start:
-1. Copy BetterSunshineEngine.kxe and _BSMSO.kxe into your extracted ISO folder at files\Kuribo!\Mods\.
-   BetterSunshineEngine.kxe must load before _BSMSO.kxe.
-2. Run $LauncherExeName.
-3. In Settings, set your username, Dolphin path, and game ISO path.
+1. Run $LauncherExeName.
+2. In Settings, set your username, Dolphin path, and game ISO path (extracted folder or .iso/.gcm).
+3. Settings → Game modules → Install / patch modules.
+   Requires an original Super Mario Sunshine copy with nothing installed on it.
+   This installs the full Better Sunshine Engine / Kuribo runtime:
+   Kuribo!\System\ (KuriboKernel.bin), BSE-patched sys\main.dol and sys\boot.bin,
+   BetterSunshineEngine.kxe, BetterSunshineMoveset.kxe, and _BSMSO.kxe. (.gcz is not supported.)
 4. Launch Dolphin, enter a stage, then Host Server or Connect.
+
+Custom models:
+- CustomModels\ ships with this zip. The launcher copies them into your AppData
+  library on first run and into the game folder when modules are installed /
+  when a game path is set, so the Mario model dropdown works out of the box.
 
 Important files:
 - $LauncherExeName - main BSMSO launcher app
 - $ServerExeName - optional dedicated server host (in server\)
-- BetterSunshineEngine.kxe - official BSE release module (required parent)
+- BetterSunshineEngine.kxe - official BSE release module (required parent; also installed by the launcher)
+- BetterSunshineMoveset.kxe - Better Sunshine Moveset module (installed with the other .kxe files)
 - _BSMSO.kxe - BSMSO game module (loads after BSE)
+- CustomModels\ - bundled character packs (Shadow Mario, Luigi, Needle, etc.)
 - assets\ - level data used by the launcher and server
 - server\ - headless dedicated server host
 - docs\ - setup, networking, and troubleshooting guides
@@ -110,12 +124,41 @@ Do not run SMSCoop alongside BSMSO.
 
 Set-Content -Path (Join-Path $PackageDir "README_FIRST.txt") -Value $readme -Encoding UTF8
 Copy-Item $BseKxePath (Join-Path $PackageDir "BetterSunshineEngine.kxe") -Force
+Copy-Item $MovesetPath (Join-Path $PackageDir "BetterSunshineMoveset.kxe") -Force
 Copy-Item $ModulePath (Join-Path $PackageDir "_BSMSO.kxe") -Force
 Copy-Item (Join-Path $LauncherDir "BSMSO.Launcher.exe") (Join-Path $PackageDir $LauncherExeName) -Force
 Get-ChildItem $LauncherDir -File |
     Where-Object { $_.Name -ne "BSMSO.Launcher.exe" -and $_.Extension -ne ".pdb" } |
     ForEach-Object { Copy-Item $_.FullName (Join-Path $PackageDir $_.Name) -Force }
 Copy-Item (Join-Path $LauncherDir "assets") (Join-Path $PackageDir "assets") -Recurse -Force
+
+# Bundle custom Mario packs so recipients get the same model list without
+# re-importing SZS files. Prefer AppData library (authoritative labels + arcs);
+# fall back to a CustomModels folder already published next to the launcher.
+$CustomModelsSrc = Join-Path $env:APPDATA "SMSO\CustomModels"
+$PublishedModels = Join-Path $LauncherDir "CustomModels"
+if (-not (Test-Path $CustomModelsSrc)) {
+    $CustomModelsSrc = $PublishedModels
+}
+if (Test-Path $CustomModelsSrc) {
+    $modelsDest = Join-Path $PackageDir "CustomModels"
+    New-Item -ItemType Directory -Force -Path $modelsDest | Out-Null
+    $libraryJson = Join-Path $CustomModelsSrc "library.json"
+    if (Test-Path $libraryJson) {
+        Copy-Item $libraryJson (Join-Path $modelsDest "library.json") -Force
+    }
+    Get-ChildItem $CustomModelsSrc -File -Filter "*.arc" | ForEach-Object {
+        Copy-Item $_.FullName (Join-Path $modelsDest $_.Name) -Force
+    }
+    # Optional SZS copies for re-merge; skip if missing.
+    Get-ChildItem $CustomModelsSrc -File -Filter "*.szs" | ForEach-Object {
+        Copy-Item $_.FullName (Join-Path $modelsDest $_.Name) -Force
+    }
+    $arcCount = @(Get-ChildItem $modelsDest -File -Filter "*.arc").Count
+    Write-Host "Bundled $arcCount custom model pack(s) from $CustomModelsSrc"
+} else {
+    Write-Warning "No CustomModels library found - zip will not include custom Mario packs."
+}
 
 if (Test-Path $ServerDir) {
     $serverPackageDir = Join-Path $PackageDir "server"
@@ -144,7 +187,7 @@ if (Test-Path (Join-Path $Root "README.md")) {
 $bsmsoReadme = @"
 # $ProductName ($ProductShort)
 
-Online multiplayer for Super Mario Sunshine — built on Better Sunshine Engine.
+Online multiplayer for Super Mario Sunshine - built on Better Sunshine Engine.
 
 See README_FIRST.txt for install steps. Full docs are in docs\.
 "@
@@ -199,14 +242,16 @@ try {
         Add-ZipFile $archive (Join-Path $PackageDir "README_FIRST.txt") ($ZipRoot + "README_FIRST.txt")
         Add-ZipFile $archive (Join-Path $PackageDir $LauncherExeName) ($ZipRoot + $LauncherExeName)
         Add-ZipFile $archive (Join-Path $PackageDir "BetterSunshineEngine.kxe") ($ZipRoot + "BetterSunshineEngine.kxe")
+        Add-ZipFile $archive (Join-Path $PackageDir "BetterSunshineMoveset.kxe") ($ZipRoot + "BetterSunshineMoveset.kxe")
         Add-ZipFile $archive (Join-Path $PackageDir "_BSMSO.kxe") ($ZipRoot + "_BSMSO.kxe")
         Add-ZipFile $archive (Join-Path $PackageDir "BSMSO_README.md") ($ZipRoot + "BSMSO_README.md")
         Add-ZipFile $archive (Join-Path $PackageDir "PROJECT_README.md") ($ZipRoot + "PROJECT_README.md")
         Get-ChildItem $PackageDir -File |
-            Where-Object { $_.Name -notin @("README_FIRST.txt", $LauncherExeName, "BetterSunshineEngine.kxe", "_BSMSO.kxe", "PROJECT_README.md") } |
+            Where-Object { $_.Name -notin @("README_FIRST.txt", $LauncherExeName, "BetterSunshineEngine.kxe", "BetterSunshineMoveset.kxe", "_BSMSO.kxe", "PROJECT_README.md") } |
             Sort-Object Name |
             ForEach-Object { Add-ZipFile $archive $_.FullName ($ZipRoot + $_.Name) }
         Add-ZipDirectory $archive (Join-Path $PackageDir "assets") ($ZipRoot + "assets")
+        Add-ZipDirectory $archive (Join-Path $PackageDir "CustomModels") ($ZipRoot + "CustomModels")
         Add-ZipDirectory $archive (Join-Path $PackageDir "server") ($ZipRoot + "server")
         Add-ZipDirectory $archive (Join-Path $PackageDir "docs") ($ZipRoot + "docs")
     } finally {

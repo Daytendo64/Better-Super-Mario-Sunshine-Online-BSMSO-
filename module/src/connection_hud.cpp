@@ -2,6 +2,8 @@
 
 #include <BetterSMS/game.hxx>
 #include <BetterSMS/module.hxx>
+#include <Dolphin/GX.h>
+#include <Dolphin/MTX.h>
 #include <Dolphin/mem.h>
 #include <Dolphin/string.h>
 #include <JSystem/J2D/J2DOrthoGraph.hxx>
@@ -16,29 +18,24 @@ namespace smso::connection_hud {
 
 namespace {
 
-struct JUTPoint {
-    s32 x;
-    s32 y;
-};
-
-static JUTPoint *getCoinMidPoint() {
-    return reinterpret_cast<JUTPoint *>(SMS_PORT_REGION(0x8040DDC8, 0x80405448, 0, 0));
-}
-
 static constexpr f32 kToastDurationSec = 4.0f;
 static constexpr f32 kToastFadeSec = 0.6f;
 static constexpr int kMaxToasts = 5;
 static constexpr int kStatusFontSize = 15;
 static constexpr int kToastFontSize = 14;
-static constexpr int kToastMinFontSize = 10;
+static constexpr int kToastMinFontSize = 8;
 static constexpr int kToastLineGap = 4;
 static constexpr int kJ2DPrintDefaultLeading = static_cast<int>(0x80000000);
 
-static constexpr int kFallbackToastX = 498;
 static constexpr int kOrthoTopY = 16;
 static constexpr int kStatusMarginX = 20;
 static constexpr int kStatusTopPad = 4;
 static constexpr int kScreenEdgePad = 8;
+static constexpr int kMeasureWidthPadPx = 8;
+static constexpr f32 kMeasureWidthFudge = 1.12f;
+
+// SMS HUD projection spans [-adjustX, 600 + adjustX] (see game.cpp / globals.cpp).
+static constexpr int kHudLogicalWidth = 600;
 
 enum class ToastKind : u8 {
     Connected = 0,
@@ -49,7 +46,7 @@ struct ToastState {
     bool active;
     ToastKind kind;
     f32 remainingSec;
-    char text[48];
+    char playerName[MAX_PLAYER_NAME];
 };
 
 struct OutlineMetrics {
@@ -57,9 +54,12 @@ struct OutlineMetrics {
 };
 
 struct ToastLayout {
-    int drawX;
+    int drawXName;
+    int drawXStatus;
     int drawY;
     int fontSize;
+    char nameText[MAX_PLAYER_NAME];
+    char statusText[16];
 };
 
 static bool gHasSessionBaseline = false;
@@ -95,24 +95,66 @@ static int getStatusDrawY(int fontSize) {
     return kOrthoTopY + outline.offsetPx + fontSize + kStatusTopPad;
 }
 
-static void getScreenHorizontalBounds(int fontSize, int &outLeft, int &outRight) {
+static int getHudAdjustX() {
+    return static_cast<int>(BetterSMS::getScreenRatioAdjustX());
+}
+
+static int getHudLeftEdgeX() { return -getHudAdjustX(); }
+
+static int getHudRightEdgeX() { return kHudLogicalWidth + getHudAdjustX(); }
+
+// drawSystem calls ReInitializeGX() + setup2D(), which resets GX projection and J2D
+// scissor to the retail 0-600 span. Widen graf-context bounds/scissor and re-apply the
+// BSE widescreen HUD projection before drawing text.
+static void applyHudOrthoProjection() {
+    Mtx44 mtx;
+    C_MTXOrtho(mtx, 16, 496, -BetterSMS::getScreenRatioAdjustX(),
+               600.0f + BetterSMS::getScreenRatioAdjustX(), -1, 1);
+    GXSetProjection(mtx, GX_ORTHOGRAPHIC);
+}
+
+static void setupHudWidescreenDraw(J2DOrthoGraph *ctx) {
+    if (!ctx)
+        return;
+
+    const int hudTop = ctx->_8.mY1;
+    const int hudBottom = ctx->_8.mY2;
+
+    ctx->setup2D();
+
+    const int left = getHudLeftEdgeX();
+    const int right = getHudRightEdgeX();
+    const JUTRect hudBounds(left, hudTop, right, hudBottom);
+
+    ctx->_8 = hudBounds;
+    ctx->_18 = hudBounds;
+    ctx->setPort();
+    ctx->setScissor();
+
+    GXSetViewport(0.0f, 0.0f, 640.0f, 480.0f, 0.0f, 1.0f);
+    applyHudOrthoProjection();
+}
+
+static int getStatusBlockHeight(int fontSize) {
     const OutlineMetrics outline = calcOutlineMetrics(fontSize);
-    const int screenAdjustX = static_cast<int>(BetterSMS::getScreenRatioAdjustX());
-    const int orthoWidth = static_cast<int>(BetterSMS::getScreenOrthoWidth());
-    outLeft = kScreenEdgePad - screenAdjustX + outline.offsetPx;
-    outRight = orthoWidth - kScreenEdgePad - screenAdjustX - outline.offsetPx;
+    return outline.offsetPx * 2 + fontSize;
+}
+
+static int getToastBlockHeight(int fontSize) {
+    return getStatusBlockHeight(fontSize) * 2 + kToastLineGap;
+}
+
+static void getToastHorizontalBounds(int fontSize, int &outLeft, int &outRight) {
+    (void)fontSize;
+    outLeft = getHudLeftEdgeX() + kStatusMarginX;
+    outRight = getHudRightEdgeX() - kStatusMarginX;
     if (outRight < outLeft)
         outRight = outLeft;
 }
 
-static int getToastAnchorX() {
-    const int screenAdjustX = static_cast<int>(BetterSMS::getScreenRatioAdjustX());
-    const JUTPoint *mid = getCoinMidPoint();
-
-    if (mid && mid->x > 0)
-        return mid->x + screenAdjustX;
-
-    return kFallbackToastX + screenAdjustX;
+static int getStatusDrawX(int fontSize) {
+    const OutlineMetrics outline = calcOutlineMetrics(fontSize);
+    return getHudLeftEdgeX() + kStatusMarginX + outline.offsetPx;
 }
 
 static bool isSessionStableForDetection(const CommBuffer *buf) {
@@ -183,10 +225,11 @@ static void pushToast(ToastKind kind, const char *playerName) {
     toast.active = true;
     toast.kind = kind;
     toast.remainingSec = kToastDurationSec;
-    if (kind == ToastKind::Connected)
-        snprintf(toast.text, sizeof(toast.text), "%s connected", playerName);
-    else
-        snprintf(toast.text, sizeof(toast.text), "%s disconnected", playerName);
+    formatPlayerLabel(toast.playerName, playerName, 0);
+}
+
+static const char *getToastStatusText(ToastKind kind) {
+    return kind == ToastKind::Connected ? "connected" : "disconnected";
 }
 
 static void updateToastTimers() {
@@ -222,22 +265,17 @@ static JUtility::TColor applyAlpha(JUtility::TColor color, f32 alpha) {
     return JUtility::TColor(color.r, color.g, color.b, static_cast<u8>(alphaByte));
 }
 
-static void printLayer(int x, int y, int fontSize, const char *text, JUtility::TColor topColor,
-                       JUtility::TColor bottomColor, bool useGradient) {
-    if (!gpSystemFont || !text || text[0] == '\0')
-        return;
-
-    J2DPrint printer(gpSystemFont, 1);
+static void configurePrinter(J2DPrint &printer, int fontSize, JUtility::TColor topColor,
+                             JUtility::TColor bottomColor, bool useGradient) {
     const JUtility::TColor bottom = useGradient ? bottomColor : topColor;
     printer.private_initiate(gpSystemFont, 1, kJ2DPrintDefaultLeading, topColor, bottom);
     printer.initiate();
     printer.setFontSize(fontSize, fontSize);
     printer.syncCharMetrics();
-    printer.print(x, y, "%s", text);
 }
 
-static void drawOutline(int x, int y, int fontSize, const OutlineMetrics &metrics, const char *text,
-                        JUtility::TColor outlineColor) {
+static void drawOutline(J2DPrint &printer, int x, int y, const OutlineMetrics &metrics,
+                        const char *text) {
     if (metrics.offsetPx <= 0)
         return;
 
@@ -252,7 +290,7 @@ static void drawOutline(int x, int y, int fontSize, const OutlineMetrics &metric
             if (cheb < 1 || cheb > metrics.offsetPx)
                 continue;
 
-            printLayer(x + dx, y + dy, fontSize, text, outlineColor, outlineColor, false);
+            printer.print(x + dx, y + dy, "%s", text);
         }
     }
 }
@@ -267,11 +305,15 @@ static void drawOutlinedText(int x, int y, int fontSize, const char *text, JUtil
     const JUtility::TColor top = applyAlpha(topColor, alpha);
     const JUtility::TColor bottom = applyAlpha(bottomColor, alpha);
     const JUtility::TColor outline = applyAlpha(outlineColor, alpha);
+    J2DPrint printer(gpSystemFont, 1);
 
-    if (outlineMetrics.offsetPx > 0)
-        drawOutline(x, y, fontSize, outlineMetrics, text, outline);
+    if (outlineMetrics.offsetPx > 0) {
+        configurePrinter(printer, fontSize, outline, outline, false);
+        drawOutline(printer, x, y, outlineMetrics, text);
+    }
 
-    printLayer(x, y, fontSize, text, top, bottom, useGradient);
+    configurePrinter(printer, fontSize, top, bottom, useGradient);
+    printer.print(x, y, "%s", text);
 }
 
 static int measureTextWidth(int fontSize, const char *text) {
@@ -289,36 +331,116 @@ static int measureTextWidth(int fontSize, const char *text) {
     const int baseFontWidth = gpSystemFont->getWidth();
     if (baseFontWidth > 0)
         width *= static_cast<f32>(fontSize) / static_cast<f32>(baseFontWidth);
-    return static_cast<int>(width + 0.5f);
+    width *= kMeasureWidthFudge;
+    return static_cast<int>(width + 0.5f) + kMeasureWidthPadPx;
 }
 
-static ToastLayout fitToastLayout(int anchorX, int drawY, const char *text) {
+static int getTextBlockWidth(int fontSize, const char *text) {
+    const OutlineMetrics outline = calcOutlineMetrics(fontSize);
+    return measureTextWidth(fontSize, text) + outline.offsetPx * 2;
+}
+
+static int computeRightAlignedDrawX(int rightOuterEdge, int fontSize, const char *text) {
+    const OutlineMetrics outline = calcOutlineMetrics(fontSize);
+    const int textWidth = measureTextWidth(fontSize, text);
+    return rightOuterEdge - outline.offsetPx - textWidth;
+}
+
+static void clampTextBlockPosition(int &drawX, int fontSize, const char *text, int leftBound,
+                                   int rightBound) {
+    const OutlineMetrics outline = calcOutlineMetrics(fontSize);
+    const int blockWidth = getTextBlockWidth(fontSize, text);
+
+    int blockLeft = drawX - outline.offsetPx;
+    if (blockLeft < leftBound)
+        drawX += leftBound - blockLeft;
+
+    int blockRight = drawX - outline.offsetPx + blockWidth;
+    if (blockRight > rightBound)
+        drawX -= blockRight - rightBound;
+
+    blockLeft = drawX - outline.offsetPx;
+    if (blockLeft < leftBound)
+        drawX = leftBound + outline.offsetPx;
+}
+
+static void buildToastNameText(char *out, size_t outCap, const char *playerName, int fontSize,
+                               int maxBlockWidth) {
+    if (!out || outCap == 0 || !playerName || fontSize <= 0 || maxBlockWidth <= 0) {
+        if (out && outCap > 0)
+            out[0] = '\0';
+        return;
+    }
+
+    char name[MAX_PLAYER_NAME];
+    strncpy(name, playerName, sizeof(name) - 1);
+    name[sizeof(name) - 1] = '\0';
+
+    snprintf(out, outCap, "%s", name);
+    if (getTextBlockWidth(fontSize, out) <= maxBlockWidth)
+        return;
+
+    static const char kEllipsis[] = "...";
+
+    size_t nameLen = strlen(name);
+    while (nameLen > 0) {
+        if (nameLen == strlen(name)) {
+            snprintf(out, outCap, "%s", name);
+        } else if (nameLen <= 1) {
+            snprintf(out, outCap, "%s", kEllipsis);
+        } else {
+            snprintf(out, outCap, "%.*s%s", static_cast<int>(nameLen), name, kEllipsis);
+        }
+
+        if (getTextBlockWidth(fontSize, out) <= maxBlockWidth)
+            return;
+
+        if (nameLen == 0)
+            break;
+
+        --nameLen;
+    }
+
+    out[0] = '\0';
+}
+
+static ToastLayout fitToastLayout(int drawY, const char *playerName, ToastKind kind) {
     ToastLayout layout{};
     layout.drawY = drawY;
-    layout.fontSize = kToastFontSize;
+    layout.fontSize = kToastMinFontSize;
+    if (!playerName || playerName[0] == '\0')
+        return layout;
 
+    const char *statusText = getToastStatusText(kind);
     int leftBound = 0;
     int rightBound = 0;
+
     for (int fontSize = kToastFontSize; fontSize >= kToastMinFontSize; --fontSize) {
-        getScreenHorizontalBounds(fontSize, leftBound, rightBound);
-        const int maxWidth = rightBound - leftBound;
-        if (maxWidth <= 0)
-            break;
+        getToastHorizontalBounds(fontSize, leftBound, rightBound);
+        const int maxBlockWidth = rightBound - leftBound;
+        if (maxBlockWidth <= 0)
+            continue;
 
-        const int textWidth = measureTextWidth(fontSize, text);
+        buildToastNameText(layout.nameText, sizeof(layout.nameText), playerName, fontSize,
+                           maxBlockWidth);
+        if (layout.nameText[0] == '\0')
+            continue;
+
+        strncpy(layout.statusText, statusText, sizeof(layout.statusText) - 1);
+        layout.statusText[sizeof(layout.statusText) - 1] = '\0';
+
+        const int nameBlockWidth = getTextBlockWidth(fontSize, layout.nameText);
+        const int statusBlockWidth = getTextBlockWidth(fontSize, layout.statusText);
+        if (nameBlockWidth > maxBlockWidth || statusBlockWidth > maxBlockWidth)
+            continue;
+
         layout.fontSize = fontSize;
-
-        int drawX = anchorX - textWidth / 2;
-        if (drawX < leftBound)
-            drawX = leftBound;
-        if (drawX + textWidth > rightBound)
-            drawX = rightBound - textWidth;
-        if (drawX < leftBound)
-            drawX = leftBound;
-
-        layout.drawX = drawX;
-        if (textWidth <= maxWidth)
-            break;
+        layout.drawXName = computeRightAlignedDrawX(rightBound, fontSize, layout.nameText);
+        layout.drawXStatus = computeRightAlignedDrawX(rightBound, fontSize, layout.statusText);
+        clampTextBlockPosition(layout.drawXName, fontSize, layout.nameText, leftBound, rightBound);
+        clampTextBlockPosition(layout.drawXStatus, fontSize, layout.statusText, leftBound,
+                               rightBound);
+        break;
     }
 
     return layout;
@@ -438,10 +560,9 @@ void drawSystem(TApplication *app, const J2DOrthoGraph *ortho) {
         buf && buf->magic == COMM_MAGIC && (buf->bridgeFlags & BF_CONNECTED) != 0;
 
     ReInitializeGX();
-    const_cast<J2DOrthoGraph *>(ortho)->setup2D();
+    setupHudWidescreenDraw(const_cast<J2DOrthoGraph *>(ortho));
 
-    const int screenAdjustX = static_cast<int>(BetterSMS::getScreenRatioAdjustX());
-    const int statusX = kStatusMarginX - screenAdjustX;
+    const int statusX = getStatusDrawX(kStatusFontSize);
     const int statusY = getStatusDrawY(kStatusFontSize);
     const JUtility::TColor outlineColor(0, 0, 0, 255);
 
@@ -460,8 +581,7 @@ void drawSystem(TApplication *app, const J2DOrthoGraph *ortho) {
     if (gToastCount <= 0)
         return;
 
-    const int anchorX = getToastAnchorX();
-    const int lineStep = kToastFontSize + kToastLineGap;
+    int toastY = statusY;
     for (int i = 0; i < gToastCount; ++i) {
         const ToastState &toast = gToasts[i];
         const f32 alpha = toastAlpha(toast);
@@ -472,9 +592,15 @@ void drawSystem(TApplication *app, const J2DOrthoGraph *ortho) {
         JUtility::TColor bottom;
         getToastColors(toast.kind, top, bottom);
 
-        const ToastLayout layout = fitToastLayout(anchorX, statusY + i * lineStep, toast.text);
-        drawOutlinedText(layout.drawX, layout.drawY, layout.fontSize, toast.text, top, bottom,
-                         outlineColor, alpha, true);
+        const ToastLayout layout = fitToastLayout(toastY, toast.playerName, toast.kind);
+        const int lineHeight = getStatusBlockHeight(layout.fontSize);
+        const int statusLineY = layout.drawY + lineHeight + kToastLineGap;
+
+        drawOutlinedText(layout.drawXName, layout.drawY, layout.fontSize, layout.nameText, top,
+                         bottom, outlineColor, alpha, true);
+        drawOutlinedText(layout.drawXStatus, statusLineY, layout.fontSize, layout.statusText, top,
+                         bottom, outlineColor, alpha, true);
+        toastY += getToastBlockHeight(layout.fontSize) + kToastLineGap;
     }
 }
 

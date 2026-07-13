@@ -33,7 +33,13 @@ set(SMSO_SOURCES
     src/coin_collect_fx.cpp
     src/world_sync.cpp
     src/red_coin_sync.cpp
+    src/story_flag_sync.cpp
     src/yoshi_sync.cpp
+    src/fruit_sync.cpp
+    src/npc_sync.cpp
+    src/monte_clean_sync.cpp
+    src/mario_model_system.cpp
+    src/mario_tex_anim.cpp
 )
 
 add_executable(_SMSO ${SMSO_SOURCES})

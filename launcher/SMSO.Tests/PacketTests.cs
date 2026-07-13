@@ -1,4 +1,6 @@
+using System.Buffers.Binary;
 using SMSO.Net;
+using SMSO.Net.MarioPack;
 
 namespace SMSO.Tests;
 
@@ -68,6 +70,26 @@ public class PacketTests
         Assert.Equal(12, appearance.TextTopR);
         Assert.Equal(NameTagColorCodec.ExtendedMarker, restored.Name[15]);
         Assert.Equal(snap.ActionIdHi, restored.ActionIdHi);
+    }
+
+    [Fact]
+    public void SnapshotFromBytes_ReusesProvidedNameBufferWithoutPerPacketAllocation()
+    {
+        var snap = new PlayerSnapshot { Name = new byte[16], Connected = 1, Slot = 3 };
+        snap.SetName("Mario");
+        var payload = PacketSerializer.SnapshotToBytes(snap);
+        var nameBuffer = new byte[16];
+
+        _ = PacketSerializer.SnapshotFromBytes(payload, nameBuffer);
+        var allocatedBefore = GC.GetAllocatedBytesForCurrentThread();
+        PlayerSnapshot restored = default;
+        for (int i = 0; i < 1_000; i++)
+            restored = PacketSerializer.SnapshotFromBytes(payload, nameBuffer);
+        var allocated = GC.GetAllocatedBytesForCurrentThread() - allocatedBefore;
+
+        Assert.Same(nameBuffer, restored.Name);
+        Assert.Equal("Mario", restored.GetName());
+        Assert.True(allocated <= 128, $"Reusable snapshot decode allocated {allocated} bytes.");
     }
 
     [Fact]
@@ -166,6 +188,60 @@ public class PacketTests
     }
 
     [Fact]
+    public void WorldEventBroadcast_NpcReact_RoundTrip()
+    {
+        // payload0 = reaction kind (1=wet), reserved = actor slot, payload1 = packed NPC pos,
+        // payload2 = retail message id (HIT_MESSAGE_SPRAYED_BY_WATER = 0xF).
+        var react = new WorldEventPacket(16, WorldEventType.NpcReact, 1, 0, 1, 3, 0xABCDEF, 0xF);
+
+        var frame = PacketSerializer.BuildWorldEventBroadcast(react);
+        Assert.True(PacketSerializer.TryUnwrapTcp(frame, out _, out var payload));
+        Assert.True(PacketSerializer.TryReadWorldEventBroadcast(payload, out var restored));
+
+        Assert.Equal(WorldEventType.NpcReact, restored.Type);
+        Assert.Equal((byte)1, restored.CourseId);
+        Assert.Equal((byte)0, restored.EpisodeId);
+        Assert.Equal((byte)1, restored.Payload0);
+        Assert.Equal((byte)3, restored.Reserved);
+        Assert.Equal(0xABCDEFu, restored.Payload1);
+        Assert.Equal(0xFu, restored.Payload2);
+    }
+
+    [Fact]
+    public void WorldEventRequest_NpcReact_PreservesActingSlot()
+    {
+        // reserved = acting slot must survive request encode/decode so server dedup can key on it.
+        var request = new WorldEventRequest(22, WorldEventType.NpcReact, 1, 0, 1, 0, 0x112233u, 0xFu);
+        var frame = PacketSerializer.BuildWorldEventRequest(request);
+        Assert.True(PacketSerializer.TryUnwrapTcp(frame, out _, out var payload));
+        Assert.True(PacketSerializer.TryReadWorldEventRequest(payload, out var restored));
+
+        Assert.Equal(WorldEventType.NpcReact, restored.Type);
+        Assert.Equal((byte)1, restored.Payload0);
+        Assert.Equal((byte)0, restored.Reserved);
+        Assert.Equal(0x112233u, restored.Payload1);
+        Assert.Equal(0xFu, restored.Payload2);
+    }
+
+    [Fact]
+    public void WorldEventBroadcast_MarioFruitActions_RoundTrip()
+    {
+        var kicked = new WorldEventPacket(8, WorldEventType.MarioFruitKicked, 3, 2, 4, 1, 0xABCDEF);
+        var kickedFrame = PacketSerializer.BuildWorldEventBroadcast(kicked);
+        Assert.True(PacketSerializer.TryUnwrapTcp(kickedFrame, out _, out var kickedPayload));
+        Assert.True(PacketSerializer.TryReadWorldEventBroadcast(kickedPayload, out var restoredKick));
+        Assert.Equal(WorldEventType.MarioFruitKicked, restoredKick.Type);
+        Assert.Equal((byte)4, restoredKick.Payload0);
+        Assert.Equal((byte)1, restoredKick.Reserved);
+
+        var thrown = new WorldEventPacket(9, WorldEventType.MarioFruitThrown, 3, 2, 2, 1, 0x123456);
+        var thrownFrame = PacketSerializer.BuildWorldEventBroadcast(thrown);
+        Assert.True(PacketSerializer.TryUnwrapTcp(thrownFrame, out _, out var thrownPayload));
+        Assert.True(PacketSerializer.TryReadWorldEventBroadcast(thrownPayload, out var restoredThrow));
+        Assert.Equal(WorldEventType.MarioFruitThrown, restoredThrow.Type);
+    }
+
+    [Fact]
     public void WorldStateReplay_RoundTrip_PreservesEvents()
     {
         var events = new[]
@@ -230,5 +306,48 @@ public class PacketTests
         Assert.True(NameTagColorCodec.TryDecodeAppearance(snap.Name, out var appearance));
         Assert.Equal(1, appearance.OutlineR);
         Assert.True(appearance.GradientEnabled);
+    }
+
+    [Fact]
+    public void JoinRequest_RoundTrip_PreservesMarioModelId()
+    {
+        var frame = PacketSerializer.BuildJoinRequest("Player1", "4ef21b6e");
+        Assert.True(PacketSerializer.TryUnwrapTcp(frame, out var id, out var payload));
+        Assert.Equal(TcpPacketId.JoinRequest, id);
+        Assert.True(PacketSerializer.TryReadJoinRequest(payload, out var name, out var modelId));
+        Assert.Equal("Player1", name);
+        Assert.Equal("4ef21b6e", modelId);
+    }
+
+    [Fact]
+    public void HeartbeatPayload_WithModelId_IsDecodable()
+    {
+        var payload = new byte[10 + ProtocolConstants.MarioModelIdSize];
+        BinaryPrimitives.WriteInt64LittleEndian(payload.AsSpan(0, 8), 123456789L);
+        BinaryPrimitives.WriteUInt16LittleEndian(payload.AsSpan(8, 2), 42);
+        CharacterPack.EncodeModelId("4ef21b6e").CopyTo(payload, 10);
+
+        var frame = PacketSerializer.BuildHeartbeat(payload);
+        Assert.True(PacketSerializer.TryUnwrapTcp(frame, out var id, out var restored));
+        Assert.Equal(TcpPacketId.Heartbeat, id);
+        Assert.Equal(10 + ProtocolConstants.MarioModelIdSize, restored.Length);
+        Assert.Equal("4ef21b6e",
+            CharacterPack.DecodeModelId(restored.AsSpan(10, ProtocolConstants.MarioModelIdSize)));
+    }
+
+    [Fact]
+    public void CommBufferEndian_RoundTrip_PreservesMarioModelIds()
+    {
+        var buf = CommBuffer.CreateDefault();
+        CharacterPack.EncodeModelId("4ef21b6e").CopyTo(buf.LocalMarioModelId, 0);
+        CharacterPack.EncodeModelId("aabbccdd")
+            .CopyTo(buf.RemoteMarioModelIds, 1 * ProtocolConstants.MarioModelIdSize);
+
+        var restored = CommBufferEndian.FromDolphinBytes(CommBufferEndian.ToDolphinBytes(buf));
+        Assert.Equal("4ef21b6e", CharacterPack.DecodeModelId(restored.LocalMarioModelId));
+        Assert.Equal("aabbccdd",
+            CharacterPack.DecodeModelId(
+                restored.RemoteMarioModelIds.AsSpan(1 * ProtocolConstants.MarioModelIdSize,
+                    ProtocolConstants.MarioModelIdSize)));
     }
 }

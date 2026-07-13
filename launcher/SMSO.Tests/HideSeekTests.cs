@@ -1,3 +1,4 @@
+using SMSO.Bridge;
 using SMSO.Net;
 using SMSO.Server;
 using Xunit;
@@ -11,26 +12,29 @@ public sealed class GameModeStatePacketTests
     {
         var state = GameModeStatePacket.CreateDefault();
         state.GameMode = GameMode.HideSeek;
-        state.Flags = GameModeFlags.TagActive;
+        state.Flags = GameModeFlags.TagActive | GameModeFlags.GraceActive;
         state.Seq = 42;
         state.RoundStartMs = 123456;
         state.SetRole(0, HideSeekRole.Seeker);
         state.SetRole(1, HideSeekRole.Hider);
         state.LastTaggedSlot = 1;
         state.TagEventId = 3;
+        state.GraceRemainingMs = 25000;
 
         var frame = PacketSerializer.BuildGameModeState(state);
         Assert.True(PacketSerializer.TryUnwrapTcp(frame, out var id, out var payload));
         Assert.Equal(TcpPacketId.GameModeState, id);
         Assert.True(PacketSerializer.TryReadGameModeState(payload, out var decoded));
         Assert.Equal(GameMode.HideSeek, decoded.GameMode);
-        Assert.Equal(GameModeFlags.TagActive, decoded.Flags);
+        Assert.Equal(GameModeFlags.TagActive | GameModeFlags.GraceActive, decoded.Flags);
         Assert.Equal((ushort)42, decoded.Seq);
         Assert.Equal(123456u, decoded.RoundStartMs);
         Assert.Equal(HideSeekRole.Seeker, decoded.Roles[0]);
         Assert.Equal(HideSeekRole.Hider, decoded.Roles[1]);
         Assert.Equal((byte)1, decoded.LastTaggedSlot);
         Assert.Equal((byte)3, decoded.TagEventId);
+        Assert.Equal((ushort)25000, decoded.GraceRemainingMs);
+        Assert.True(decoded.GraceActive);
     }
 }
 
@@ -93,7 +97,7 @@ public sealed class HideSeekServiceTests
     }
 
     [Fact]
-    public void TagDetection_TagsImmediatelyOnStart()
+    public void TagDetection_IgnoresProximityDuringStartImmunity()
     {
         var levels = new LevelCatalog();
         var server = new GameServer(levels);
@@ -109,6 +113,61 @@ public sealed class HideSeekServiceTests
                 [2] = HideSeekRole.Hider,
             });
             Assert.True(service.TryStartTag(out _));
+            Assert.True(service.IsProximityTagImmunityActive);
+
+            var seeker = new PlayerSnapshot
+            {
+                Connected = 1,
+                StageId = 2,
+                EpisodeId = 0,
+                Position = new Vec3 { X = 0f, Y = 0f, Z = 0f },
+            };
+            var hider = new PlayerSnapshot
+            {
+                Connected = 1,
+                StageId = 2,
+                EpisodeId = 0,
+                Position = new Vec3 { X = 20f, Y = 0f, Z = 0f },
+            };
+            var clustered = new PlayerSnapshot
+            {
+                Connected = 1,
+                StageId = 2,
+                EpisodeId = 0,
+                Position = new Vec3 { X = 40f, Y = 0f, Z = 0f },
+            };
+
+            // Clustered lobby/spawn positions must not mass-promote at Start Tag.
+            service.ProcessSnapshot(0, seeker, 1, hider);
+            service.ProcessSnapshot(0, seeker, 2, clustered);
+            Assert.Equal(HideSeekRole.Hider, service.CurrentState.Roles[1]);
+            Assert.Equal(HideSeekRole.Hider, service.CurrentState.Roles[2]);
+            Assert.True(service.CurrentState.TagActive);
+        }
+        finally
+        {
+            server.Stop();
+        }
+    }
+
+    [Fact]
+    public void TagDetection_TagsAfterStartImmunityExpires()
+    {
+        var levels = new LevelCatalog();
+        var server = new GameServer(levels);
+        server.Start(27115);
+        try
+        {
+            var service = server.HideSeek;
+            service.SetGameMode(GameMode.HideSeek);
+            service.SetRoles(new Dictionary<byte, HideSeekRole>
+            {
+                [0] = HideSeekRole.Seeker,
+                [1] = HideSeekRole.Hider,
+                [2] = HideSeekRole.Hider,
+            });
+            Assert.True(service.TryStartTag(out _));
+            service.ExpireProximityTagImmunityForTests();
 
             var seeker = new PlayerSnapshot
             {
@@ -153,6 +212,7 @@ public sealed class HideSeekServiceTests
             };
             service.SetRoles(roles);
             Assert.True(service.TryStartTag(out _));
+            service.ExpireProximityTagImmunityForTests();
 
             var seeker = new PlayerSnapshot
             {
@@ -201,6 +261,7 @@ public sealed class HideSeekServiceTests
                 [2] = HideSeekRole.Hider,
             });
             Assert.True(service.TryStartTag(out _));
+            service.ExpireProximityTagImmunityForTests();
 
             var seeker = new PlayerSnapshot
             {
@@ -327,6 +388,7 @@ public sealed class HideSeekServiceTests
                 [2] = HideSeekRole.Hider,
             });
             Assert.True(service.TryStartTag(out _));
+            service.ExpireProximityTagImmunityForTests();
 
             var seeker = new PlayerSnapshot
             {
@@ -498,6 +560,7 @@ public sealed class HideSeekServiceTests
                 [1] = HideSeekRole.Hider,
             });
             Assert.True(service.TryStartTag(out _));
+            service.ExpireProximityTagImmunityForTests();
 
             var seeker = new PlayerSnapshot
             {
@@ -516,6 +579,250 @@ public sealed class HideSeekServiceTests
 
             service.ProcessSnapshot(0, seeker, 1, hider);
             Assert.Equal(HideSeekRole.Hider, service.CurrentState.Roles[1]);
+        }
+        finally
+        {
+            server.Stop();
+        }
+    }
+
+    [Fact]
+    public void HiderDeath_StillPromotesDuringStartImmunity()
+    {
+        var levels = new LevelCatalog();
+        var server = new GameServer(levels);
+        server.Start(27116);
+        try
+        {
+            var service = server.HideSeek;
+            service.SetGameMode(GameMode.HideSeek);
+            service.SetRoles(new Dictionary<byte, HideSeekRole>
+            {
+                [0] = HideSeekRole.Seeker,
+                [1] = HideSeekRole.Hider,
+                [2] = HideSeekRole.Hider,
+            });
+            Assert.True(service.TryStartTag(out _));
+            Assert.True(service.IsProximityTagImmunityActive);
+
+            var dead = new PlayerSnapshot
+            {
+                Connected = 1,
+                StageId = 2,
+                EpisodeId = 0,
+                VfxFlags = (ushort)VfxFlags.Dead,
+            };
+
+            service.ProcessHiderDeath(1, dead);
+            Assert.Equal(HideSeekRole.Seeker, service.CurrentState.Roles[1]);
+            Assert.Equal(HideSeekRole.Hider, service.CurrentState.Roles[2]);
+            Assert.True(service.CurrentState.TagActive);
+            Assert.True(service.IsProximityTagImmunityActive);
+        }
+        finally
+        {
+            server.Stop();
+        }
+    }
+
+    [Fact]
+    public void NotifyPlayersWarped_RearmsProximityImmunityWhileTagActive()
+    {
+        var levels = new LevelCatalog();
+        var server = new GameServer(levels);
+        server.Start(27117);
+        try
+        {
+            var service = server.HideSeek;
+            service.SetGameMode(GameMode.HideSeek);
+            service.SetRoles(new Dictionary<byte, HideSeekRole>
+            {
+                [0] = HideSeekRole.Seeker,
+                [1] = HideSeekRole.Hider,
+                [2] = HideSeekRole.Hider,
+            });
+            Assert.True(service.TryStartTag(out _));
+            service.ExpireProximityTagImmunityForTests();
+            Assert.False(service.IsProximityTagImmunityActive);
+
+            service.NotifyPlayersWarped();
+            Assert.True(service.IsProximityTagImmunityActive);
+
+            var seeker = new PlayerSnapshot
+            {
+                Connected = 1,
+                StageId = 2,
+                EpisodeId = 0,
+                Position = new Vec3 { X = 0f, Y = 0f, Z = 0f },
+            };
+            var hider = new PlayerSnapshot
+            {
+                Connected = 1,
+                StageId = 2,
+                EpisodeId = 0,
+                Position = new Vec3 { X = 20f, Y = 0f, Z = 0f },
+            };
+
+            service.ProcessSnapshot(0, seeker, 1, hider);
+            Assert.Equal(HideSeekRole.Hider, service.CurrentState.Roles[1]);
+
+            service.ExpireProximityTagImmunityForTests();
+            service.ProcessSnapshot(0, seeker, 1, hider);
+            Assert.Equal(HideSeekRole.Seeker, service.CurrentState.Roles[1]);
+        }
+        finally
+        {
+            server.Stop();
+        }
+    }
+
+    [Fact]
+    public void TryStartTag_Arms30SecondGraceAndBlocksProximity()
+    {
+        var levels = new LevelCatalog();
+        var server = new GameServer(levels);
+        server.Start(27140);
+        try
+        {
+            var service = server.HideSeek;
+            service.SetGameMode(GameMode.HideSeek);
+            service.SetRoles(new Dictionary<byte, HideSeekRole>
+            {
+                [0] = HideSeekRole.Seeker,
+                [1] = HideSeekRole.Hider,
+                [2] = HideSeekRole.Hider,
+            });
+            Assert.True(service.TryStartTag(out _));
+
+            var state = service.CurrentState;
+            Assert.True(state.TagActive);
+            Assert.True(state.GraceActive);
+            Assert.True(state.GraceRemainingMs > 29000);
+            Assert.True(state.GraceRemainingMs <= HideSeekService.StartTagGraceMs);
+            Assert.True(service.IsStartTagGraceActive);
+            Assert.True(service.IsProximityTagImmunityActive);
+
+            var seeker = new PlayerSnapshot
+            {
+                Connected = 1,
+                StageId = 2,
+                EpisodeId = 0,
+                Position = new Vec3 { X = 0f, Y = 0f, Z = 0f },
+            };
+            var hider = new PlayerSnapshot
+            {
+                Connected = 1,
+                StageId = 2,
+                EpisodeId = 0,
+                Position = new Vec3 { X = 20f, Y = 0f, Z = 0f },
+            };
+
+            service.ProcessSnapshot(0, seeker, 1, hider);
+            Assert.Equal(HideSeekRole.Hider, service.CurrentState.Roles[1]);
+
+            service.ExpireProximityTagImmunityForTests();
+            Assert.False(service.IsStartTagGraceActive);
+            Assert.False(service.IsProximityTagImmunityActive);
+            Assert.False(service.CurrentState.GraceActive);
+            Assert.Equal((ushort)0, service.CurrentState.GraceRemainingMs);
+            Assert.True(service.CurrentState.TagActive);
+
+            service.ProcessSnapshot(0, seeker, 1, hider);
+            Assert.Equal(HideSeekRole.Seeker, service.CurrentState.Roles[1]);
+            Assert.Equal(HideSeekRole.Hider, service.CurrentState.Roles[2]);
+            Assert.True(service.CurrentState.TagActive);
+        }
+        finally
+        {
+            server.Stop();
+        }
+    }
+
+    [Fact]
+    public void NotifyPlayersWarped_DoesNotRearmFullStartTagGrace()
+    {
+        var levels = new LevelCatalog();
+        var server = new GameServer(levels);
+        server.Start(27141);
+        try
+        {
+            var service = server.HideSeek;
+            service.SetGameMode(GameMode.HideSeek);
+            service.SetRoles(new Dictionary<byte, HideSeekRole>
+            {
+                [0] = HideSeekRole.Seeker,
+                [1] = HideSeekRole.Hider,
+            });
+            Assert.True(service.TryStartTag(out _));
+            service.ExpireProximityTagImmunityForTests();
+            Assert.False(service.IsStartTagGraceActive);
+
+            service.NotifyPlayersWarped();
+            Assert.True(service.IsProximityTagImmunityActive);
+            Assert.False(service.IsStartTagGraceActive);
+            Assert.False(service.CurrentState.GraceActive);
+        }
+        finally
+        {
+            server.Stop();
+        }
+    }
+
+    [Fact]
+    public void StopTag_ClearsGraceImmediately()
+    {
+        var levels = new LevelCatalog();
+        var server = new GameServer(levels);
+        server.Start(27142);
+        try
+        {
+            var service = server.HideSeek;
+            service.SetGameMode(GameMode.HideSeek);
+            service.SetRoles(new Dictionary<byte, HideSeekRole>
+            {
+                [0] = HideSeekRole.Seeker,
+                [1] = HideSeekRole.Hider,
+            });
+            Assert.True(service.TryStartTag(out _));
+            Assert.True(service.CurrentState.GraceActive);
+
+            service.StopTag();
+            Assert.False(service.CurrentState.TagActive);
+            Assert.False(service.CurrentState.GraceActive);
+            Assert.Equal((ushort)0, service.CurrentState.GraceRemainingMs);
+            Assert.False(service.IsStartTagGraceActive);
+        }
+        finally
+        {
+            server.Stop();
+        }
+    }
+
+    [Fact]
+    public void TryStartTag_DoesNotConvertRolesToSeekers()
+    {
+        var levels = new LevelCatalog();
+        var server = new GameServer(levels);
+        server.Start(27118);
+        try
+        {
+            var service = server.HideSeek;
+            service.SetGameMode(GameMode.HideSeek);
+            service.SetRoles(new Dictionary<byte, HideSeekRole>
+            {
+                [0] = HideSeekRole.Seeker,
+                [1] = HideSeekRole.Hider,
+                [2] = HideSeekRole.Hider,
+                [3] = HideSeekRole.Hider,
+            });
+            Assert.True(service.TryStartTag(out _));
+
+            var state = service.CurrentState;
+            Assert.Equal(HideSeekRole.Seeker, state.Roles[0]);
+            Assert.Equal(HideSeekRole.Hider, state.Roles[1]);
+            Assert.Equal(HideSeekRole.Hider, state.Roles[2]);
+            Assert.Equal(HideSeekRole.Hider, state.Roles[3]);
+            Assert.True(state.TagActive);
         }
         finally
         {
@@ -555,7 +862,7 @@ public sealed class HideSeekServiceTests
     }
 
     [Fact]
-    public void OnPlayerDisconnected_EndsRoundWhenLastHiderLeaves()
+    public void OnPlayerDisconnected_KeepsTagActiveWhenLastHiderLeaves()
     {
         var levels = new LevelCatalog();
         var server = new GameServer(levels);
@@ -575,8 +882,8 @@ public sealed class HideSeekServiceTests
 
             var state = service.CurrentState;
             Assert.Equal(GameMode.HideSeek, state.GameMode);
-            Assert.False(state.TagActive);
-            Assert.Equal(HideSeekRole.Hider, state.Roles[0]);
+            Assert.True(state.TagActive);
+            Assert.Equal(HideSeekRole.Seeker, state.Roles[0]);
             Assert.Equal(HideSeekRole.Hider, state.Roles[1]);
         }
         finally
@@ -677,6 +984,152 @@ public sealed class HideSeekServiceTests
             var resumed = service.CurrentState;
             Assert.True(resumed.TagActive);
             Assert.Equal(paused.RoundStartMs, resumed.RoundStartMs);
+            // Resume must not re-arm Start Tag grace (wash / seeker freeze).
+            Assert.False(resumed.GraceActive);
+            Assert.Equal((ushort)0, resumed.GraceRemainingMs);
+            Assert.False(service.IsStartTagGraceActive);
+            Assert.False(service.IsProximityTagImmunityActive);
+        }
+        finally
+        {
+            server.Stop();
+        }
+    }
+
+    [Fact]
+    public void TryStartTag_ResumeAfterStop_DoesNotRearmGrace()
+    {
+        var levels = new LevelCatalog();
+        var server = new GameServer(levels);
+        server.Start(27143);
+        try
+        {
+            var service = server.HideSeek;
+            service.SetGameMode(GameMode.HideSeek);
+            service.SetRoles(new Dictionary<byte, HideSeekRole>
+            {
+                [0] = HideSeekRole.Seeker,
+                [1] = HideSeekRole.Hider,
+                [2] = HideSeekRole.Hider,
+            });
+            Assert.True(service.TryStartTag(out _));
+            Assert.True(service.CurrentState.GraceActive);
+
+            // Let the round accumulate elapsed time, then clear grace so we are
+            // mid-round (same state as after grace naturally expires).
+            Thread.Sleep(50);
+            service.ExpireProximityTagImmunityForTests();
+            Assert.False(service.IsStartTagGraceActive);
+            Assert.True(service.CurrentState.TagActive);
+
+            service.StopTag();
+            Assert.False(service.CurrentState.TagActive);
+            Assert.True(service.CurrentState.RoundStartMs > 0);
+
+            Assert.True(service.TryStartTag(out _));
+            var resumed = service.CurrentState;
+            Assert.True(resumed.TagActive);
+            Assert.False(resumed.GraceActive);
+            Assert.Equal((ushort)0, resumed.GraceRemainingMs);
+            Assert.False(service.IsStartTagGraceActive);
+            Assert.False(service.IsProximityTagImmunityActive);
+
+            // Proximity tags must work immediately on resume (no grace / warp immunity).
+            var seeker = new PlayerSnapshot
+            {
+                Connected = 1,
+                StageId = 2,
+                EpisodeId = 0,
+                Position = new Vec3 { X = 0f, Y = 0f, Z = 0f },
+            };
+            var hider = new PlayerSnapshot
+            {
+                Connected = 1,
+                StageId = 2,
+                EpisodeId = 0,
+                Position = new Vec3 { X = 20f, Y = 0f, Z = 0f },
+            };
+            service.ProcessSnapshot(0, seeker, 1, hider);
+            Assert.Equal(HideSeekRole.Seeker, service.CurrentState.Roles[1]);
+            Assert.Equal(HideSeekRole.Hider, service.CurrentState.Roles[2]);
+        }
+        finally
+        {
+            server.Stop();
+        }
+    }
+
+    [Fact]
+    public void TryStartTag_ResumeAfterStopDuringGrace_DoesNotRearmGrace()
+    {
+        // Bugbot: Stop on the same tick as Start leaves elapsed at 0; resume must
+        // still skip grace (do not treat as a fresh Start Tag).
+        var levels = new LevelCatalog();
+        var server = new GameServer(levels);
+        server.Start(27145);
+        try
+        {
+            var service = server.HideSeek;
+            service.SetGameMode(GameMode.HideSeek);
+            service.SetRoles(new Dictionary<byte, HideSeekRole>
+            {
+                [0] = HideSeekRole.Seeker,
+                [1] = HideSeekRole.Hider,
+            });
+            Assert.True(service.TryStartTag(out _));
+            Assert.True(service.CurrentState.GraceActive);
+
+            service.StopTag();
+            Assert.False(service.CurrentState.TagActive);
+            Assert.Equal(0u, service.CurrentState.RoundStartMs);
+
+            Assert.True(service.TryStartTag(out _));
+            var resumed = service.CurrentState;
+            Assert.True(resumed.TagActive);
+            Assert.False(resumed.GraceActive);
+            Assert.Equal((ushort)0, resumed.GraceRemainingMs);
+            Assert.False(service.IsStartTagGraceActive);
+        }
+        finally
+        {
+            server.Stop();
+        }
+    }
+
+    [Fact]
+    public void TryStartTag_AfterReset_ArmsGraceAgain()
+    {
+        var levels = new LevelCatalog();
+        var server = new GameServer(levels);
+        server.Start(27144);
+        try
+        {
+            var service = server.HideSeek;
+            service.SetGameMode(GameMode.HideSeek);
+            service.SetRoles(new Dictionary<byte, HideSeekRole>
+            {
+                [0] = HideSeekRole.Seeker,
+                [1] = HideSeekRole.Hider,
+            });
+            Assert.True(service.TryStartTag(out _));
+            Thread.Sleep(50);
+            service.StopTag();
+            Assert.True(service.CurrentState.RoundStartMs > 0);
+
+            service.ResetTag();
+            Assert.Equal(0u, service.CurrentState.RoundStartMs);
+
+            service.SetRoles(new Dictionary<byte, HideSeekRole>
+            {
+                [0] = HideSeekRole.Seeker,
+                [1] = HideSeekRole.Hider,
+            });
+            Assert.True(service.TryStartTag(out _));
+            var fresh = service.CurrentState;
+            Assert.True(fresh.TagActive);
+            Assert.True(fresh.GraceActive);
+            Assert.True(fresh.GraceRemainingMs > 29000);
+            Assert.True(service.IsStartTagGraceActive);
         }
         finally
         {
@@ -723,24 +1176,138 @@ public sealed class HideSeekServiceTests
     }
 }
 
+public sealed class BridgeWorkerGameModeTests
+{
+    [Fact]
+    public void ForceReset_AfterHighSeqNormal_AllowsLowSeqHideSeek()
+    {
+        // Reproduces host disconnect/rehost: Apply HideSeek@50 → Normal@51 (seq gate stores 51),
+        // then ForceReset (session teardown). New session HideSeek@1 must apply immediately.
+        using var worker = new BridgeWorker(new DolphinBridge());
+
+        var hideSeek = GameModeStatePacket.CreateDefault();
+        hideSeek.GameMode = GameMode.HideSeek;
+        hideSeek.Seq = 50;
+        worker.ApplyGameModeState(0, hideSeek);
+        Assert.Equal(GameMode.HideSeek, worker.CurrentGameModeState.GameMode);
+
+        var normal = GameModeStatePacket.CreateDefault();
+        normal.GameMode = GameMode.Normal;
+        normal.Seq = 51;
+        worker.ApplyGameModeState(0, normal);
+        Assert.Equal(GameMode.Normal, worker.CurrentGameModeState.GameMode);
+
+        // Previously ForceGameModeToNormalLocally skipped ForceReset when already Normal,
+        // leaving _lastGameModeSeq=51 so Seq=1 was rejected.
+        worker.ForceResetGameModeToNormal(0);
+        Assert.Equal(GameMode.Normal, worker.CurrentGameModeState.GameMode);
+        Assert.Equal((ushort)0, worker.CurrentGameModeState.Seq);
+
+        var hideSeekAgain = GameModeStatePacket.CreateDefault();
+        hideSeekAgain.GameMode = GameMode.HideSeek;
+        hideSeekAgain.Seq = 1;
+        worker.ApplyGameModeState(0, hideSeekAgain);
+        Assert.Equal(GameMode.HideSeek, worker.CurrentGameModeState.GameMode);
+        Assert.Equal((ushort)1, worker.CurrentGameModeState.Seq);
+    }
+
+    [Fact]
+    public void ApplyGameModeState_RejectsStaleOrEqualSeq()
+    {
+        using var worker = new BridgeWorker(new DolphinBridge());
+
+        var hideSeek = GameModeStatePacket.CreateDefault();
+        hideSeek.GameMode = GameMode.HideSeek;
+        hideSeek.Seq = 10;
+        worker.ApplyGameModeState(0, hideSeek);
+
+        var stale = GameModeStatePacket.CreateDefault();
+        stale.GameMode = GameMode.Normal;
+        stale.Seq = 10;
+        worker.ApplyGameModeState(0, stale);
+        Assert.Equal(GameMode.HideSeek, worker.CurrentGameModeState.GameMode);
+
+        var older = GameModeStatePacket.CreateDefault();
+        older.GameMode = GameMode.Normal;
+        older.Seq = 5;
+        worker.ApplyGameModeState(0, older);
+        Assert.Equal(GameMode.HideSeek, worker.CurrentGameModeState.GameMode);
+    }
+
+    [Fact]
+    public void SetConnected_False_ResetsGameModeSeqSoLowSeqApplies()
+    {
+        using var worker = new BridgeWorker(new DolphinBridge());
+
+        var hideSeek = GameModeStatePacket.CreateDefault();
+        hideSeek.GameMode = GameMode.HideSeek;
+        hideSeek.Seq = 40;
+        worker.ApplyGameModeState(0, hideSeek);
+
+        var normal = GameModeStatePacket.CreateDefault();
+        normal.GameMode = GameMode.Normal;
+        normal.Seq = 41;
+        worker.ApplyGameModeState(0, normal);
+
+        // Disconnect path (ResetClientSessionState) must clear seq even without ForceReset.
+        worker.SetConnected(false, 0, "", false);
+
+        var hideSeekAgain = GameModeStatePacket.CreateDefault();
+        hideSeekAgain.GameMode = GameMode.HideSeek;
+        hideSeekAgain.Seq = 1;
+        worker.ApplyGameModeState(0, hideSeekAgain);
+        Assert.Equal(GameMode.HideSeek, worker.CurrentGameModeState.GameMode);
+        Assert.Equal((ushort)1, worker.CurrentGameModeState.Seq);
+    }
+
+    [Fact]
+    public void SetConnected_True_DoesNotWipeWorldSyncWhenAlreadyConnected()
+    {
+        using var worker = new BridgeWorker(new DolphinBridge());
+        worker.SetConnected(true, 1, "Host", true);
+        worker.DebugSeedWorldSync(lastAppliedEventId: 99, incomingEventId: 100);
+
+        // JoinAccepted already connected; FlushSnapshotsAfterConnect must not clear mid-replay.
+        worker.SetConnected(true, 1, "Host", true);
+
+        var (lastApplied, incoming) = worker.DebugGetWorldSync();
+        Assert.Equal(99u, lastApplied);
+        Assert.Equal(100u, incoming);
+    }
+
+    [Fact]
+    public void SetConnected_True_ClearsWorldSyncOnFreshConnect()
+    {
+        using var worker = new BridgeWorker(new DolphinBridge());
+        worker.SetConnected(true, 1, "Host", true);
+        worker.DebugSeedWorldSync(lastAppliedEventId: 99, incomingEventId: 100);
+        worker.SetConnected(false, 0, "", false);
+
+        worker.SetConnected(true, 1, "Host", true);
+        var (lastApplied, incoming) = worker.DebugGetWorldSync();
+        Assert.Equal(0u, lastApplied);
+        Assert.Equal(0u, incoming);
+    }
+}
+
 public sealed class HideSeekRandomTagExemptionTests
 {
     [Theory]
-    [InlineData(2, 1)]
-    [InlineData(4, 1)]
-    [InlineData(5, 2)]
-    [InlineData(6, 2)]
-    [InlineData(7, 3)]
-    [InlineData(8, 3)]
-    [InlineData(9, 4)]
-    [InlineData(10, 4)]
+    [InlineData(2, 2)]
+    [InlineData(4, 2)]
+    [InlineData(5, 3)]
+    [InlineData(6, 3)]
+    [InlineData(7, 4)]
+    [InlineData(8, 4)]
+    [InlineData(9, 5)]
+    [InlineData(10, 5)]
     public void GetExemptRounds_ScalesWithPlayerCount(int playerCount, int expectedRounds)
     {
         Assert.Equal(expectedRounds, HideSeekRandomTagExemption.GetExemptRounds(playerCount));
     }
 
     [Fact]
-    public void RegisterPick_ExemptsPreviousSeekerForOneRoundWithFourPlayers()
+    public void RegisterPick_ExemptsPreviousSeekerForTwoRoundsWithFourPlayers()
     {
         var rounds = new Dictionary<byte, int>();
 
@@ -748,12 +1315,17 @@ public sealed class HideSeekRandomTagExemptionTests
         Assert.Contains((byte)0, HideSeekRandomTagExemption.GetExemptSlots(rounds));
 
         HideSeekRandomTagExemption.RegisterPick(rounds, 1, 4);
+        Assert.Contains((byte)0, HideSeekRandomTagExemption.GetExemptSlots(rounds));
+        Assert.Contains((byte)1, HideSeekRandomTagExemption.GetExemptSlots(rounds));
+
+        HideSeekRandomTagExemption.RegisterPick(rounds, 2, 4);
         Assert.DoesNotContain((byte)0, HideSeekRandomTagExemption.GetExemptSlots(rounds));
         Assert.Contains((byte)1, HideSeekRandomTagExemption.GetExemptSlots(rounds));
+        Assert.Contains((byte)2, HideSeekRandomTagExemption.GetExemptSlots(rounds));
     }
 
     [Fact]
-    public void RegisterPick_ExemptsPreviousSeekerForTwoRoundsWithSixPlayers()
+    public void RegisterPick_ExemptsPreviousSeekerForThreeRoundsWithSixPlayers()
     {
         var rounds = new Dictionary<byte, int>();
 
@@ -765,9 +1337,15 @@ public sealed class HideSeekRandomTagExemptionTests
         Assert.Contains((byte)1, HideSeekRandomTagExemption.GetExemptSlots(rounds));
 
         HideSeekRandomTagExemption.RegisterPick(rounds, 2, 6);
+        Assert.Contains((byte)0, HideSeekRandomTagExemption.GetExemptSlots(rounds));
+        Assert.Contains((byte)1, HideSeekRandomTagExemption.GetExemptSlots(rounds));
+        Assert.Contains((byte)2, HideSeekRandomTagExemption.GetExemptSlots(rounds));
+
+        HideSeekRandomTagExemption.RegisterPick(rounds, 3, 6);
         Assert.DoesNotContain((byte)0, HideSeekRandomTagExemption.GetExemptSlots(rounds));
         Assert.Contains((byte)1, HideSeekRandomTagExemption.GetExemptSlots(rounds));
         Assert.Contains((byte)2, HideSeekRandomTagExemption.GetExemptSlots(rounds));
+        Assert.Contains((byte)3, HideSeekRandomTagExemption.GetExemptSlots(rounds));
     }
 
     [Fact]

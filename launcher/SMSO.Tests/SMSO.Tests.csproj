@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net7.0</TargetFramework>
+    <TargetFramework>net8.0-windows</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
 
@@ -26,6 +26,7 @@
     <ProjectReference Include="..\SMSO.Net\SMSO.Net.csproj" />
     <ProjectReference Include="..\SMSO.Server\SMSO.Server.csproj" />
     <ProjectReference Include="..\SMSO.Bridge\SMSO.Bridge.csproj" />
+    <ProjectReference Include="..\SMSO.Launcher\SMSO.Launcher.csproj" />
   </ItemGroup>
 
   <ItemGroup>

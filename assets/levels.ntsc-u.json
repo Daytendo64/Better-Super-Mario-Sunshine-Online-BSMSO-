@@ -155,14 +155,19 @@
       "courseId": 13,
       "displayName": "Pinna Park \u2014 Park Area",
       "warpable": true,
-      "episodes": [{ "episodeId": 0, "displayName": "Episode 1 \u2014 Mecha-Bowser Appears!" }]
+      "episodes": [
+        { "episodeId": 0, "displayName": "Episode 1 \u2014 Mecha-Bowser Appears!" },
+        { "episodeId": 7, "displayName": "Episode 8 \u2014 Roller Coaster Balloons" }
+      ]
     },
     {
       "courseId": 7,
       "displayName": "Sirena Beach \u2014 Hotel Interior",
       "warpable": true,
       "episodes": [
+        { "episodeId": 0, "displayName": "Hotel Lobby" },
         { "episodeId": 2, "displayName": "Episode 3 \u2014 Mysterious Hotel Delfino" },
+        { "episodeId": 6, "displayName": "Episode 7 \u2014 Shadow Mario Checks In" },
         { "episodeId": 7, "displayName": "Episode 8 \u2014 Red Coins in the Hotel" }
       ]
     },

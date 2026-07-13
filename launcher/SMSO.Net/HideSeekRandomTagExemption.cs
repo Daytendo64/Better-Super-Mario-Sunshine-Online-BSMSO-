@@ -8,10 +8,10 @@ public static class HideSeekRandomTagExemption
 {
     public static int GetExemptRounds(int connectedPlayerCount) => connectedPlayerCount switch
     {
-        <= 4 => 1,
-        <= 6 => 2,
-        <= 8 => 3,
-        _ => 4,
+        <= 4 => 2,
+        <= 6 => 3,
+        <= 8 => 4,
+        _ => 5,
     };
 
     public static IReadOnlyCollection<byte> GetExemptSlots(IReadOnlyDictionary<byte, int> roundsRemainingBySlot)

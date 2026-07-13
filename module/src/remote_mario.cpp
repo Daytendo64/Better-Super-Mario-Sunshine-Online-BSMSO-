@@ -111,7 +111,8 @@ void updateRemoteMarioVisuals(TMarDirector *director) {
         const u8 playerId = snap.connected != 0 ? snap.slot : static_cast<u8>(slot);
 
         if (!isSameStage(buf, snap) || !isValidSnapshot(snap) ||
-            !hasRemoteBodyForSlot(playerId) || !shouldDrawHideSeekNameTag(playerId)) {
+            !hasRemoteBodyForSlotLoose(playerId) || !shouldDrawHideSeekNameTag(playerId) ||
+            shouldSuppressRemoteHiderFromSeekerGrace(playerId)) {
             r.active = false;
             nametag::updateSlot(playerId, false, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, {}, nullptr);
             continue;

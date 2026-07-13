@@ -42,6 +42,12 @@ static u8 sLastEpisodeId = 0xFF;
 static u16 sStageSettleFrames = 0;
 static bool sStageSnapshotReady = false;
 static u8 sCollectedMask = 0;
+// Set by stageInit so same course/episode reloads still reset trackers.
+static bool sForceStageTrackerReset = false;
+// Remote collections recorded while the local switch mission was idle; flush HUD
+// once the local player presses the switch (or live coins appear on pre-placed maps).
+static bool sPendingHudCatchUp = false;
+static u8 sHudAppliedMask = 0;
 
 static TCoin *sPrevLiveCoins[kMaxStageRedCoins] = {};
 static u8 sPrevLiveCoinCount = 0;
@@ -64,13 +70,15 @@ static TVec3f sCollectedPositions[kMaxStageRedCoins] = {};
 static u8 sCollectedPositionCount = 0;
 
 using ProcessDownCoinFn = void (*)(TGCConsole2 *, int);
-using StartAppearRedCoinFn = void (*)(TGCConsole2 *);
 
 static ProcessDownCoinFn gProcessDownCoin = nullptr;
-static StartAppearRedCoinFn gStartAppearRedCoin = nullptr;
 static u32 gCoinRedVtable = 0;
 static u32 gCoinEmptyVtable = 0;
-static u32 gRedCoinSwitchVtable = 0;
+
+struct SortedCoinCtx;
+static u8 popCountMask(u8 mask);
+static void reconcileCollectedRedCoinActors();
+static void gatherSortedLiveRedCoins(SortedCoinCtx *sorted);
 
 static u8 currentCourseId() {
     return gpMarDirector ? gpMarDirector->mAreaID : 0;
@@ -185,19 +193,6 @@ static void sortStageRedCoinSnapshot() {
         sStageRedCoins[i].stableIndex = i;
 }
 
-static bool visitAppearCoinEmpty(TMapObjBase *obj, void *) {
-    if (*reinterpret_cast<const u32 *>(obj) != gCoinEmptyVtable)
-        return false;
-    const auto *live = reinterpret_cast<const TLiveActor *>(obj);
-    if (live->mStateFlags.asFlags.mIsObjDead)
-        obj->makeObjAppeared();
-    return false;
-}
-
-static void appearAllRedCoinEmptySlots() {
-    forEachManagedMapObj(visitAppearCoinEmpty, nullptr);
-}
-
 static void buildSnapshotFromSorted(const SortedCoinCtx &sorted) {
     sStageRedCoinCount = sorted.count;
     for (u8 i = 0; i < sorted.count; ++i) {
@@ -238,6 +233,8 @@ static void resetRedCoinTrackersForStage(u8 courseId, u8 episodeId) {
     sCollectedMask = 0;
     sCollectedPositionCount = 0;
     sPrevLiveCoinCount = 0;
+    sPendingHudCatchUp = false;
+    sHudAppliedMask = 0;
     for (u32 i = 0; i < kMaxStageRedCoins; ++i) {
         sStageRedCoins[i] = {};
         sPrevLiveCoins[i] = nullptr;
@@ -248,7 +245,73 @@ static void resetRedCoinTrackersForStage(u8 courseId, u8 episodeId) {
     if (!fm)
         return;
 
+    // After a fresh stage enter vanilla clears the red-coin session; prefer 0 over a
+    // stale Type6 value if anything raced before resetStage finished.
     sLastRedCoinCount = static_cast<u32>(fm->Type6Flag.mRedCoinCount);
+}
+
+/// True when this client has already started the red-coin mission locally.
+/// Switch missions: hip-drop sets mRedCoinSwitchPressed and spawns TCoinRed.
+/// Pre-placed missions: live TCoinRed exist at settle without the switch bit.
+/// Never treat durable collection replay alone as "armed" — that reopens the HUD.
+static bool isLocalRedCoinMissionLive(const TFlagManager *fm) {
+    if (fm && fm->Type5Flag.mRedCoinSwitchPressed)
+        return true;
+
+    TGCConsole2 *console = gpMarDirector ? gpMarDirector->mGCConsole : nullptr;
+    if (console && console->mIsRedCoinCard)
+        return true;
+
+    SortedCoinCtx sorted = {};
+    gatherSortedLiveRedCoins(&sorted);
+    return sorted.count > 0;
+}
+
+static void applyHudSlotForCollection(TGCConsole2 *console, u8 hudSlot, u8 stableIndex) {
+    if (!console || !gProcessDownCoin)
+        return;
+
+    u8 slot = hudSlot;
+    if (slot >= kMaxStageRedCoins)
+        slot = stableIndex;
+    if (slot >= kMaxStageRedCoins)
+        slot = 0;
+
+    if ((sHudAppliedMask & static_cast<u8>(1u << slot)) != 0)
+        return;
+
+    gProcessDownCoin(console, static_cast<int>(slot));
+    sHudAppliedMask |= static_cast<u8>(1u << slot);
+}
+
+static void catchUpRedCoinHudIfArmed(TFlagManager *fm) {
+    if (!fm || !sPendingHudCatchUp)
+        return;
+    if (!isLocalRedCoinMissionLive(fm))
+        return;
+
+    TGCConsole2 *console = gpMarDirector ? gpMarDirector->mGCConsole : nullptr;
+    const u32 resolvedCount = static_cast<u32>(popCountMask(sCollectedMask));
+    if (resolvedCount == 0) {
+        sPendingHudCatchUp = false;
+        return;
+    }
+
+    fm->Type6Flag.mRedCoinCount = static_cast<s32>(resolvedCount);
+    sLastRedCoinCount = resolvedCount;
+
+    if (console && gProcessDownCoin) {
+        for (u8 i = 0; i < kMaxStageRedCoins; ++i) {
+            if ((sCollectedMask & static_cast<u8>(1u << i)) == 0)
+                continue;
+            const u8 hudSlot =
+                (i < sStageRedCoinCount) ? sStageRedCoins[i].hudSlot : i;
+            applyHudSlotForCollection(console, hudSlot, i);
+        }
+    }
+
+    sPendingHudCatchUp = false;
+    reconcileCollectedRedCoinActors();
 }
 
 static void publishLocalRedCoinEvent(smso::WorldEventType type, u8 courseId, u8 episodeId, u8 payload0,
@@ -489,22 +552,32 @@ static void applySingleRedCoinCollected(TFlagManager *fm, TGCConsole2 *console, 
     if (!fm || stableIndex >= kMaxStageRedCoins)
         return;
 
+    // Red-coin switch arming is local-only. Collection sync may remember/hide coins, but must
+    // not write mRedCoinCount or call processDownCoin until this client has armed the mission
+    // (local switch press or live pre-placed coins). Otherwise durable replay / periodic
+    // resync after a stage reload reopens the red-coin HUD with no switch press.
     const u8 publishHudSlot = payload0 & 0xF;
     const u32 targetCount = (payload0 >> 4) & 0xF;
+    const bool missionLive = isLocalRedCoinMissionLive(fm);
     TVec3f collectedPos{};
     const bool havePos = resolveCollectedCoinWorldPos(stableIndex, payload1, &collectedPos);
 
     if ((sCollectedMask & (1u << stableIndex)) != 0) {
-        if (targetCount > 0 && static_cast<u32>(fm->Type6Flag.mRedCoinCount) != targetCount) {
+        if (missionLive && targetCount > 0 &&
+            static_cast<u32>(fm->Type6Flag.mRedCoinCount) != targetCount) {
             fm->Type6Flag.mRedCoinCount = static_cast<s32>(targetCount);
             sLastRedCoinCount = targetCount;
         }
         if (havePos) {
             recordAuthoritativeRedCoinPosition(stableIndex, publishHudSlot, collectedPos);
             rememberCollectedPosition(collectedPos);
-            hideRedCoinAtNetworkPosition(collectedPos);
-            hideRedCoinByStableIndex(stableIndex);
+            if (missionLive) {
+                hideRedCoinAtNetworkPosition(collectedPos);
+                hideRedCoinByStableIndex(stableIndex);
+            }
         }
+        if (!missionLive)
+            sPendingHudCatchUp = true;
         return;
     }
 
@@ -518,30 +591,41 @@ static void applySingleRedCoinCollected(TFlagManager *fm, TGCConsole2 *console, 
     if (havePos) {
         recordAuthoritativeRedCoinPosition(stableIndex, publishHudSlot, collectedPos);
         rememberCollectedPosition(collectedPos);
-        hideRedCoinAtNetworkPosition(collectedPos);
-        hideRedCoinByStableIndex(stableIndex);
-        rememberCollectedRedCoinPosition(stableIndex, publishHudSlot,
-                                         coinNearestNetworkPosition(collectedPos));
+        if (missionLive) {
+            hideRedCoinAtNetworkPosition(collectedPos);
+            hideRedCoinByStableIndex(stableIndex);
+            rememberCollectedRedCoinPosition(stableIndex, publishHudSlot,
+                                             coinNearestNetworkPosition(collectedPos));
+        } else {
+            rememberCollectedRedCoinPosition(stableIndex, publishHudSlot, nullptr);
+        }
     } else if (stableIndex < sStageRedCoinCount) {
         rememberCollectedPosition(sStageRedCoins[stableIndex].initialPos);
-        hideRedCoinAtNetworkPosition(sStageRedCoins[stableIndex].initialPos);
-        hideRedCoinByStableIndex(stableIndex);
-        rememberCollectedRedCoinPosition(stableIndex, publishHudSlot,
-                                         coinAtStableIndex(stableIndex));
+        if (missionLive) {
+            hideRedCoinAtNetworkPosition(sStageRedCoins[stableIndex].initialPos);
+            hideRedCoinByStableIndex(stableIndex);
+            rememberCollectedRedCoinPosition(stableIndex, publishHudSlot,
+                                             coinAtStableIndex(stableIndex));
+        } else {
+            rememberCollectedRedCoinPosition(stableIndex, publishHudSlot, nullptr);
+        }
     }
 
     sCollectedMask |= static_cast<u8>(1u << stableIndex);
     const u32 resolvedCount =
         targetCount > 0 ? targetCount : static_cast<u32>(popCountMask(sCollectedMask));
+
+    if (!missionLive) {
+        // Bookkeeping only — wait for local arm before touching Type6 count / HUD.
+        sPendingHudCatchUp = true;
+        return;
+    }
+
     fm->Type6Flag.mRedCoinCount = static_cast<s32>(resolvedCount);
     sLastRedCoinCount = resolvedCount;
 
-    if (console && gProcessDownCoin && resolvedCount > 0) {
-        u8 slot = publishHudSlot;
-        if (slot >= kMaxStageRedCoins)
-            slot = stableIndex;
-        gProcessDownCoin(console, static_cast<int>(slot));
-    }
+    if (resolvedCount > 0)
+        applyHudSlotForCollection(console, publishHudSlot, stableIndex);
 
     if (havePos)
         smso::playRemoteCoinCollectParticles(collectedPos, false);
@@ -685,42 +769,15 @@ void flushDeferredRedCoinEvents();
 void initRedCoinSync() {
     gProcessDownCoin =
         reinterpret_cast<ProcessDownCoinFn>(SMS_PORT_REGION(0x801466F0, 0x8013B32C, 0, 0));
-    gStartAppearRedCoin = reinterpret_cast<StartAppearRedCoinFn>(
-        SMS_PORT_REGION(0x8014A9BC, 0x8013F64C, 0, 0));
     gCoinRedVtable = SMS_PORT_REGION(0x803C9BB4, 0x803C13A4, 0, 0);
     gCoinEmptyVtable = SMS_PORT_REGION(0x803C9D98, 0x803C1588, 0, 0);
-    gRedCoinSwitchVtable = SMS_PORT_REGION(0x803CA6CC, 0x803C1EBC, 0, 0);
     sLastCourseId = 0xFF;
     sLastEpisodeId = 0xFF;
+    sForceStageTrackerReset = false;
 }
 
-u32 redCoinSwitchVtable() {
-    return gRedCoinSwitchVtable;
-}
-
-void applyRemoteRedCoinSwitchHit(TMapObjBase *switchObj) {
-    TFlagManager *fm = TFlagManager::smInstance;
-    if (!fm || fm->Type5Flag.mRedCoinSwitchPressed)
-        return;
-
-    TMario *mario = gpMarioAddress;
-    if (switchObj && mario) {
-        const u32 savedState = mario->mState;
-        mario->mState = TMario::STATE_G_POUND;
-        switchObj->receiveMessage(reinterpret_cast<THitActor *>(mario), 1);
-        mario->mState = savedState;
-    }
-
-    if (!fm->Type5Flag.mRedCoinSwitchPressed) {
-        fm->Type5Flag.mRedCoinSwitchPressed = true;
-        TGCConsole2 *console = gpMarDirector ? gpMarDirector->mGCConsole : nullptr;
-        if (gStartAppearRedCoin && console)
-            gStartAppearRedCoin(console);
-        appearAllRedCoinEmptySlots();
-    }
-
-    sStageSettleFrames = kStageSettleFrames;
-    sStageSnapshotReady = false;
+void notifyRedCoinStageEnter() {
+    sForceStageTrackerReset = true;
 }
 
 void captureLocalRedCoinProgress() {
@@ -735,8 +792,13 @@ void captureLocalRedCoinProgress() {
     if (isHubArea(courseId))
         return;
 
-    if (courseId != sLastCourseId || episodeId != sLastEpisodeId)
+    if (sForceStageTrackerReset || courseId != sLastCourseId || episodeId != sLastEpisodeId) {
+        sForceStageTrackerReset = false;
         resetRedCoinTrackersForStage(courseId, episodeId);
+        // Apply deferred replay events only after the per-stage reset so we do not flush
+        // collections and then immediately wipe sCollectedMask on the same frame (late join).
+        flushDeferredRedCoinEvents();
+    }
 
     if (sStageSettleFrames < kStageSettleFrames)
         ++sStageSettleFrames;
@@ -745,6 +807,9 @@ void captureLocalRedCoinProgress() {
         captureStageRedCoinSnapshot();
 
     TFlagManager *fm = TFlagManager::smInstance;
+    if (fm)
+        catchUpRedCoinHudIfArmed(fm);
+
     if (publishEnabled && fm)
         detectLocalRedCoinProgress(fm, courseId, episodeId);
 

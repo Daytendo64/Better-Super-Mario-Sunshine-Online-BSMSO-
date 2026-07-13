@@ -7,7 +7,7 @@
 namespace smso {
 
 constexpr u32 COMM_MAGIC = 0x534D534F; // "SMSO"
-constexpr u16 COMM_VERSION = 7;
+constexpr u16 COMM_VERSION = 11;
 // Legacy scan hint for the launcher; the live buffer lives in module BSS.
 constexpr u32 COMM_GUEST_ADDRESS = 0x817FC000;
 // Maximum connected players (slots 0..MAX_PLAYERS-1). roleBySlot and roster logic key off this.
@@ -15,6 +15,7 @@ constexpr u32 MAX_PLAYERS = 10;
 // Remote snapshot slots are indexed directly by network slot id, so the array must hold every
 // possible slot index (0..MAX_PLAYERS-1). Keep >= MAX_PLAYERS.
 constexpr u32 MAX_REMOTE_SLOTS = MAX_PLAYERS;
+constexpr u32 MARIO_MODEL_ID_SIZE = 8;
 constexpr u32 MARIO_VOICE_EVENT_SIZE = 12;
 constexpr u32 COMM_MARIO_VOICE_EVENTS_OFFSET = 862;
 constexpr u32 COMM_MARIO_VOICE_EVENTS_SIZE = MARIO_VOICE_EVENT_SIZE * (MAX_REMOTE_SLOTS + 1);
@@ -35,20 +36,24 @@ enum GameModeFlags : u8 {
     GMF_ROUND_COMPLETE = 1 << 1,
     GMF_TIMER_RESET = 1 << 2,
     GMF_ROUND_FANFARE = 1 << 3,
+    GMF_GRACE_ACTIVE = 1 << 4,
 };
 
 // GameModeState: mode(1)+flags(1)+localRole(1)+lastTaggedSlot(1)+tagEventId(1)+roundStartMs(4)
-// + roleBySlot[MAX_PLAYERS](10) = 19 bytes.
-constexpr u32 COMM_GAME_MODE_STATE_SIZE = 9 + MAX_PLAYERS;
+// + roleBySlot[MAX_PLAYERS](10)+graceRemainingMs(2) = 21 bytes.
+constexpr u32 COMM_GAME_MODE_STATE_SIZE = 11 + MAX_PLAYERS;
 constexpr u32 COMM_GAME_MODE_STATE_OFFSET = COMM_MARIO_VOICE_EVENTS_OFFSET + COMM_MARIO_VOICE_EVENTS_SIZE;
-constexpr u32 COMM_WORLD_EVENT_SIZE = 15;
+constexpr u32 COMM_WORLD_EVENT_SIZE = 19;
 constexpr u32 COMM_WORLD_SYNC_SIZE = COMM_WORLD_EVENT_SIZE * 2 + 4;
 constexpr u32 COMM_WORLD_SYNC_OFFSET = COMM_GAME_MODE_STATE_OFFSET + COMM_GAME_MODE_STATE_SIZE;
 constexpr u32 COMM_ROSTER_HUD_EVENT_SIZE = 20;
-constexpr u32 COMM_ROSTER_HUD_RING_SLOTS = 8;
+// One slot per player so a full-lobby connect/disconnect wave cannot overwrite unread HUD events.
+constexpr u32 COMM_ROSTER_HUD_RING_SLOTS = MAX_PLAYERS;
 constexpr u32 COMM_ROSTER_HUD_SYNC_SIZE = 2 + COMM_ROSTER_HUD_RING_SLOTS * COMM_ROSTER_HUD_EVENT_SIZE;
 constexpr u32 COMM_ROSTER_HUD_OFFSET = COMM_WORLD_SYNC_OFFSET + COMM_WORLD_SYNC_SIZE;
-constexpr u32 COMM_BUFFER_SIZE = COMM_ROSTER_HUD_OFFSET + COMM_ROSTER_HUD_SYNC_SIZE;
+constexpr u32 COMM_MARIO_MODEL_IDS_OFFSET = COMM_ROSTER_HUD_OFFSET + COMM_ROSTER_HUD_SYNC_SIZE;
+constexpr u32 COMM_MARIO_MODEL_IDS_SIZE = MARIO_MODEL_ID_SIZE * (MAX_REMOTE_SLOTS + 1);
+constexpr u32 COMM_BUFFER_SIZE = COMM_MARIO_MODEL_IDS_OFFSET + COMM_MARIO_MODEL_IDS_SIZE;
 // localNameTagAppearance starts right after remoteSnapshots[10] (48 + 64 + 64*10 = 752).
 constexpr u32 COMM_NAME_TAG_APPEARANCES_OFFSET = 752;
 // local(10) + remote[10](100) = 110.
@@ -536,6 +541,7 @@ struct GameModeState {
     u8 tagEventId;
     u32 roundStartMs;
     u8 roleBySlot[MAX_PLAYERS];
+    u16 graceRemainingMs;
 };
 
 static_assert(sizeof(GameModeState) == COMM_GAME_MODE_STATE_SIZE, "GameModeState size mismatch");
@@ -558,6 +564,32 @@ enum WorldEventType : u8 {
     // Host Yoshi ate a fruit with the tongue. payload0 = encoded fruit actor type,
     // payload1 = packed fruit world position (packCollectibleWorldPos), reserved = eater slot.
     WE_YOSHI_FRUIT_TAKEN = 10,
+    // Mario kicked a fruit (dive kick). payload0 = fruit actor encode (1..7, 0 = any),
+    // payload1 = packed fruit position, reserved = kicker slot.
+    WE_MARIO_FRUIT_KICKED = 11,
+    // Mario picked up / is carrying a fruit. Same payload layout as WE_MARIO_FRUIT_KICKED.
+    WE_MARIO_FRUIT_PICKED = 12,
+    // Mario threw a held fruit. payload0 = fruit actor encode (1..7, 0 = any),
+    // payload1 = packed release position (packCollectibleWorldPos), payload2 = packed throw
+    // velocity (bit 31 tag via fruit_sync; 0 when unavailable), reserved = thrower slot.
+    WE_MARIO_FRUIT_THROWN = 13,
+    // Mario released a held fruit without throwing. Same payload layout.
+    WE_MARIO_FRUIT_DROPPED = 14,
+    // Authoritative airborne fruit position/velocity snapshot. payload0 = fruit encode,
+    // payload1 = packed position, payload2 = packed velocity, reserved = last mover slot.
+    WE_MARIO_FRUIT_SYNC = 15,
+    // NPC reaction (Pianta / TBaseNPC wet, trample, or mad). payload0 = reaction kind
+    // (1=wet/spray, 2=trample/jump-on, 3=mad), reserved = acting player slot,
+    // payload1 = packed NPC world position (packCollectibleWorldPos),
+    // payload2 = optional retail hit-message id (0 = derive from kind).
+    // Gated by BF_SYNC_OBJECTS. Remotes replay via TBaseNPC::receiveMessage with gpMario spoof.
+    // Ephemeral — not in durable history (spray spam).
+    WE_NPC_REACT = 16,
+    // Pollution NPC fully rescued/cleaned (Pianta Village Ep. 6 etc.). Durable.
+    // reserved = stable index (0–15), payload0 = (authoritativeCount << 4) | index,
+    // payload1 = packed NPC world position. Gated by BF_SYNC_EVENT|BF_SYNC_MISSION.
+    // Apply forces clean+unsunk so checkMonteClear / mission HUD catch up on late join.
+    WE_NPC_CLEANED = 17,
 };
 
 struct CommWorldEvent {
@@ -569,6 +601,7 @@ struct CommWorldEvent {
     u8 payload0;
     u8 reserved;
     u32 payload1;
+    u32 payload2;
 };
 
 static_assert(sizeof(CommWorldEvent) == COMM_WORLD_EVENT_SIZE, "CommWorldEvent size mismatch");
@@ -626,6 +659,8 @@ struct CommBuffer {
     GameModeState gameModeState;
     WorldSyncState worldSync;
     RosterHudSync rosterHud;
+    char localMarioModelId[MARIO_MODEL_ID_SIZE];
+    char remoteMarioModelIds[MAX_REMOTE_SLOTS][MARIO_MODEL_ID_SIZE];
 };
 
 #pragma pack(pop)
@@ -641,6 +676,28 @@ static_assert(offsetof(CommBuffer, localMarioVoiceEvent) == COMM_MARIO_VOICE_EVE
               "mario voice events offset mismatch");
 static_assert(offsetof(CommBuffer, gameModeState) == COMM_GAME_MODE_STATE_OFFSET,
               "game mode state offset mismatch");
+static_assert(offsetof(CommBuffer, localMarioModelId) == COMM_MARIO_MODEL_IDS_OFFSET,
+              "mario model ids offset mismatch");
+
+inline bool marioModelIdIsEmpty(const char id[MARIO_MODEL_ID_SIZE]) {
+    if (!id)
+        return true;
+    for (u32 i = 0; i < MARIO_MODEL_ID_SIZE; ++i) {
+        if (id[i] != '\0')
+            return false;
+    }
+    return true;
+}
+
+inline void copyMarioModelId(char dest[MARIO_MODEL_ID_SIZE], const char src[MARIO_MODEL_ID_SIZE]) {
+    if (!dest)
+        return;
+    if (!src) {
+        memset(dest, 0, MARIO_MODEL_ID_SIZE);
+        return;
+    }
+    memcpy(dest, src, MARIO_MODEL_ID_SIZE);
+}
 
 CommBuffer *getCommBuffer();
 void publishMailboxAnchor();

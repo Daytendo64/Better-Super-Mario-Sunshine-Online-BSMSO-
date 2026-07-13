@@ -60,6 +60,21 @@ public class GameServerTests
         Assert.False(server.IsRunning);
     }
 
+    [Fact]
+    public void NpcReactDedup_IncludesActingSlot()
+    {
+        var server = new GameServer(new LevelCatalog());
+        var slot0 = new WorldEventRequest(1, WorldEventType.NpcReact, 1, 0, 1, 0, 0xABCDEF);
+        var slot1 = new WorldEventRequest(2, WorldEventType.NpcReact, 1, 0, 1, 1, 0xABCDEF);
+        var slot0Dup = new WorldEventRequest(3, WorldEventType.NpcReact, 1, 0, 1, 0, 0xABCDEF);
+
+        Assert.True(server.TryAcceptNpcReact(slot0));
+        // Different acting slot must not be collapsed with the first hit.
+        Assert.True(server.TryAcceptNpcReact(slot1));
+        // Same slot + same NPC pos within the window is still deduped.
+        Assert.False(server.TryAcceptNpcReact(slot0Dup));
+    }
+
     private static string FindLevels()
     {
         var p = Path.Combine(Directory.GetCurrentDirectory(), "..", "..", "..", "..", "assets", "levels.ntsc-u.json");

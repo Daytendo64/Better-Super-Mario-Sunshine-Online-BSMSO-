@@ -11,6 +11,17 @@ public sealed class HideSeekService
     // Half a UDP tick for the fresh snapshot; stale peers extrapolate by packet age up to the cap.
     private const float TagFreshExtrapolationSeconds = 1f / (ProtocolConstants.SnapshotRateHz * 2f);
     private const int TagCooldownMs = 500;
+    /// <summary>
+    /// Full Start Tag hide grace: blue wash + seeker freeze on clients, proximity tags blocked.
+    /// Server clock is authoritative via GraceActive / GraceRemainingMs.
+    /// </summary>
+    internal const int StartTagGraceMs = 30_000;
+    /// <summary>
+    /// After mid-round warp-all, ignore proximity tags briefly so clustered spawn positions
+    /// do not mass-promote hiders. Does NOT re-arm the full 30s freeze/tint (too long on warp).
+    /// Death promotions are unaffected.
+    /// </summary>
+    internal const int TagProximityImmunityMs = 4000;
 
     private readonly GameServer _server;
     private GameModeStatePacket _state = GameModeStatePacket.CreateDefault();
@@ -20,10 +31,26 @@ public sealed class HideSeekService
     private byte _tagEventId;
     private uint _tagElapsedMs;
     private long _tagSegmentStartTick;
+    /// <summary>
+    /// True after the first Start Tag until Reset Tag / full Reset. Distinguishes
+    /// Resume from a fresh Start even when Stop Tag lands on the same tick as
+    /// start (elapsed stays 0) or during opening grace.
+    /// </summary>
+    private bool _tagRoundStarted;
+    private long _startTagGraceUntilTick;
+    private long _proximityTagImmunityUntilTick;
+    private ushort _lastBroadcastGraceSec = ushort.MaxValue;
 
     public HideSeekService(GameServer server) => _server = server;
 
-    public GameModeStatePacket CurrentState => _state.Clone();
+    public GameModeStatePacket CurrentState
+    {
+        get
+        {
+            SyncGraceFieldsFromClock();
+            return _state.Clone();
+        }
+    }
 
     public void Reset()
     {
@@ -34,6 +61,10 @@ public sealed class HideSeekService
         _tagEventId = 0;
         _tagElapsedMs = 0;
         _tagSegmentStartTick = 0;
+        _tagRoundStarted = false;
+        _startTagGraceUntilTick = 0;
+        _proximityTagImmunityUntilTick = 0;
+        _lastBroadcastGraceSec = ushort.MaxValue;
     }
 
     private void AccumulateTagElapsed()
@@ -50,6 +81,115 @@ public sealed class HideSeekService
         _tagSegmentStartTick = Environment.TickCount64;
     }
 
+    private void ArmStartTagGrace()
+    {
+        _startTagGraceUntilTick = Environment.TickCount64 + StartTagGraceMs;
+        _state.Flags |= GameModeFlags.GraceActive;
+        _state.GraceRemainingMs = StartTagGraceMs;
+        _lastBroadcastGraceSec = (ushort)(StartTagGraceMs / 1000);
+    }
+
+    private void ClearStartTagGrace()
+    {
+        _startTagGraceUntilTick = 0;
+        _state.Flags &= ~GameModeFlags.GraceActive;
+        _state.GraceRemainingMs = 0;
+        _lastBroadcastGraceSec = ushort.MaxValue;
+    }
+
+    private void ArmProximityTagImmunity()
+    {
+        _proximityTagImmunityUntilTick = Environment.TickCount64 + TagProximityImmunityMs;
+    }
+
+    private void ClearProximityTagImmunity()
+    {
+        _proximityTagImmunityUntilTick = 0;
+    }
+
+    private void SyncGraceFieldsFromClock()
+    {
+        if (_startTagGraceUntilTick == 0)
+        {
+            _state.Flags &= ~GameModeFlags.GraceActive;
+            _state.GraceRemainingMs = 0;
+            return;
+        }
+
+        var now = Environment.TickCount64;
+        if (now >= _startTagGraceUntilTick)
+        {
+            // Keep the end tick until TickGrace broadcasts the clear.
+            _state.Flags |= GameModeFlags.GraceActive;
+            _state.GraceRemainingMs = 0;
+            return;
+        }
+
+        var remaining = (ushort)Math.Min(ushort.MaxValue, _startTagGraceUntilTick - now);
+        _state.Flags |= GameModeFlags.GraceActive;
+        _state.GraceRemainingMs = remaining;
+    }
+
+    /// <summary>
+    /// Advance Start Tag grace clock. Broadcasts when grace ends or whole seconds change
+    /// so clients keep a shared countdown.
+    /// </summary>
+    internal void TickGrace()
+    {
+        if (_startTagGraceUntilTick == 0)
+            return;
+
+        SyncGraceFieldsFromClock();
+
+        if (Environment.TickCount64 >= _startTagGraceUntilTick)
+        {
+            ClearStartTagGrace();
+            BumpAndBroadcast();
+            _server.LogMessage("Hide & Seek grace ended — seekers released.");
+            return;
+        }
+
+        var sec = (ushort)(_state.GraceRemainingMs / 1000);
+        if (sec == _lastBroadcastGraceSec)
+            return;
+
+        _lastBroadcastGraceSec = sec;
+        BumpAndBroadcast();
+    }
+
+    /// <summary>
+    /// True while Start Tag grace or warp proximity immunity is suppressing proximity tags.
+    /// </summary>
+    internal bool IsProximityTagImmunityActive
+        => IsStartTagGraceActive || IsWarpProximityImmunityActive;
+
+    internal bool IsStartTagGraceActive
+        => _startTagGraceUntilTick != 0 &&
+           Environment.TickCount64 < _startTagGraceUntilTick;
+
+    private bool IsWarpProximityImmunityActive
+        => _proximityTagImmunityUntilTick != 0 &&
+           Environment.TickCount64 < _proximityTagImmunityUntilTick;
+
+    /// <summary>Test helper: allow proximity tags immediately after Start Tag / warp.</summary>
+    internal void ExpireProximityTagImmunityForTests()
+    {
+        ClearStartTagGrace();
+        ClearProximityTagImmunity();
+    }
+
+    /// <summary>
+    /// Re-arm short proximity-only immunity while tag is running (e.g. host warp-all).
+    /// Does not re-arm the full 30s Start Tag freeze/tint.
+    /// </summary>
+    internal void NotifyPlayersWarped()
+    {
+        if (_state.GameMode != GameMode.HideSeek || !_state.TagActive)
+            return;
+
+        ArmProximityTagImmunity();
+    }
+
     public void SetGameMode(GameMode mode)
     {
         _state.GameMode = mode;
@@ -58,6 +198,7 @@ public sealed class HideSeekService
             _state.Flags = GameModeFlags.None;
             _state.RoundStartMs = 0;
             _state.LastTaggedSlot = 0xFF;
+            _state.GraceRemainingMs = 0;
             for (int i = 0; i < _state.Roles.Length; i++)
                 _state.Roles[i] = HideSeekRole.Hider;
             _tagCooldowns.Clear();
@@ -66,6 +207,8 @@ public sealed class HideSeekService
             _tagEventId = 0;
             _tagElapsedMs = 0;
             _tagSegmentStartTick = 0;
+            ClearStartTagGrace();
+            ClearProximityTagImmunity();
         }
 
         BumpAndBroadcast();
@@ -102,6 +245,8 @@ public sealed class HideSeekService
             AccumulateTagElapsed();
             _state.Flags &= ~GameModeFlags.TagActive;
             _state.RoundStartMs = _tagElapsedMs;
+            ClearStartTagGrace();
+            ClearProximityTagImmunity();
             _server.LogMessage("Hide & Seek tag stopped — roles changed.");
         }
 
@@ -136,11 +281,23 @@ public sealed class HideSeekService
         _tagEventId = 0;
         _tagCooldowns.Clear();
         _hiderDeathWasActive.Clear();
+        // Do not change roles here — only arm TagActive. Clustered spawn/lobby positions
+        // would otherwise mass-promote hiders on the first proximity checks.
+        ClearProximityTagImmunity();
+        // Fresh Start Tag (first start after Reset) gets hide grace.
+        // Resume after Stop Tag continues the same round — no re-arm of wash/freeze,
+        // even if Stop landed on the same tick as Start (elapsed still 0) or mid-grace.
+        var isResume = _tagRoundStarted;
+        _tagRoundStarted = true;
+        if (isResume)
+            ClearStartTagGrace();
+        else
+            ArmStartTagGrace();
         BeginTagSegment();
         BumpAndBroadcast();
-        _server.LogMessage(_tagElapsedMs > 0
-            ? "Hide & Seek tag resumed."
-            : "Hide & Seek tag started.");
+        _server.LogMessage(isResume
+            ? "Hide & Seek tag resumed (no hide grace)."
+            : "Hide & Seek tag started (30s hide grace).");
         return true;
     }
 
@@ -150,12 +307,16 @@ public sealed class HideSeekService
             return;
 
         AccumulateTagElapsed();
-        _state.Flags &= ~(GameModeFlags.TagActive | GameModeFlags.RoundComplete | GameModeFlags.RoundFanfare);
+        _state.Flags &= ~(GameModeFlags.TagActive | GameModeFlags.RoundComplete |
+                          GameModeFlags.RoundFanfare | GameModeFlags.GraceActive);
         _state.RoundStartMs = _tagElapsedMs;
         _state.LastTaggedSlot = 0xFF;
         _state.TagEventId = 0;
+        _state.GraceRemainingMs = 0;
         _tagCooldowns.Clear();
         _hiderDeathWasActive.Clear();
+        ClearStartTagGrace();
+        ClearProximityTagImmunity();
         BumpAndBroadcast();
         _server.LogMessage("Hide & Seek tag stopped.");
     }
@@ -171,13 +332,18 @@ public sealed class HideSeekService
         AccumulateTagElapsed();
         _tagElapsedMs = 0;
         _tagSegmentStartTick = 0;
-        _state.Flags &= ~(GameModeFlags.TagActive | GameModeFlags.RoundComplete | GameModeFlags.RoundFanfare);
+        _tagRoundStarted = false;
+        _state.Flags &= ~(GameModeFlags.TagActive | GameModeFlags.RoundComplete |
+                          GameModeFlags.RoundFanfare | GameModeFlags.GraceActive);
         _state.RoundStartMs = 0;
         _state.LastTaggedSlot = 0xFF;
         _state.TagEventId = 0;
+        _state.GraceRemainingMs = 0;
         _tagEventId = 0;
         _tagCooldowns.Clear();
         _hiderDeathWasActive.Clear();
+        ClearStartTagGrace();
+        ClearProximityTagImmunity();
         if (playRoundFanfare)
             _state.Flags |= GameModeFlags.RoundFanfare;
         _state.Flags |= GameModeFlags.TimerReset;
@@ -207,6 +373,12 @@ public sealed class HideSeekService
         if (!_state.TagActive || _state.GameMode != GameMode.HideSeek)
             return;
 
+        TickGrace();
+
+        // Proximity-only immunity / Start Tag grace: death promotions still apply.
+        if (IsProximityTagImmunityActive)
+            return;
+
         if (_state.GetRole(seekerSlot) != (byte)HideSeekRole.Seeker)
             return;
         if (_state.GetRole(hiderSlot) != (byte)HideSeekRole.Hider)
@@ -216,8 +388,10 @@ public sealed class HideSeekService
         if (seekerSnap.StageId != hiderSnap.StageId)
             return;
 
-        var seekerEpisode = LevelCatalog.NormalizeEpisodeFromGame(seekerSnap.StageId, seekerSnap.EpisodeId);
-        var hiderEpisode = LevelCatalog.NormalizeEpisodeFromGame(hiderSnap.StageId, hiderSnap.EpisodeId);
+        var seekerEpisode = LevelCatalog.NormalizeEpisodeFromGame(seekerSnap.StageId, seekerSnap.EpisodeId,
+            _server.Levels);
+        var hiderEpisode = LevelCatalog.NormalizeEpisodeFromGame(hiderSnap.StageId, hiderSnap.EpisodeId,
+            _server.Levels);
         if (seekerEpisode != hiderEpisode)
             return;
 
@@ -309,7 +483,9 @@ public sealed class HideSeekService
         var roundComplete = CountConnectedRole(HideSeekRole.Hider, GetActiveRoleSlots()) == 0;
         if (roundComplete)
         {
-            _state.Flags &= ~GameModeFlags.TagActive;
+            _state.Flags &= ~(GameModeFlags.TagActive | GameModeFlags.GraceActive);
+            _state.GraceRemainingMs = 0;
+            _startTagGraceUntilTick = 0;
             _state.Flags |= GameModeFlags.RoundComplete;
         }
 
@@ -346,20 +522,10 @@ public sealed class HideSeekService
         foreach (var key in staleCooldowns)
             _tagCooldowns.Remove(key);
 
-        if (_state.GameMode != GameMode.HideSeek)
-            return;
-
-        if (!_state.TagActive)
-            return;
-
-        if (CountConnectedRole(HideSeekRole.Hider, GetActiveRoleSlots()) == 0)
-        {
-            _server.LogMessage("Hide & Seek round complete — all hiders left.");
-            ResetTag(playRoundFanfare: true);
-            return;
-        }
-
-        _server.LogMessage($"Player slot {slot} left during Hide & Seek — tag continues.");
+        // Disconnect never ends an active tag round — even if the last hider/seeker
+        // leaves. The host stops or resets tag explicitly when they want the round over.
+        if (_state.GameMode == GameMode.HideSeek && _state.TagActive)
+            _server.LogMessage($"Player slot {slot} left during Hide & Seek — tag continues.");
     }
 
     private IReadOnlyList<byte> GetActiveRoleSlots()
@@ -385,6 +551,7 @@ public sealed class HideSeekService
 
     private void BumpAndBroadcast()
     {
+        SyncGraceFieldsFromClock();
         _state.Seq++;
         _server.BroadcastGameModeState(_state);
     }

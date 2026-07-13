@@ -2,15 +2,13 @@
 
 #include "comm_buffer.hpp"
 
-class TMapObjBase;
-
 namespace smso {
 
 void initRedCoinSync();
+/// Force per-stage tracker reset on every stage enter (including same course/episode reload).
+void notifyRedCoinStageEnter();
 void captureLocalRedCoinProgress();
 bool applyRedCoinWorldEvent(const CommWorldEvent &event);
 void flushDeferredRedCoinEvents();
-u32 redCoinSwitchVtable();
-void applyRemoteRedCoinSwitchHit(TMapObjBase *switchObj);
 
 } // namespace smso

@@ -4,6 +4,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Threading.Channels;
 using SMSO.Net;
+using SMSO.Net.MarioPack;
 
 namespace SMSO.Server;
 
@@ -24,12 +25,24 @@ public sealed class GameServer : IDisposable
     private bool _allowClientTeleport;
     private int _maxPlayers = ProtocolConstants.StableMaxPlayers;
     private DateTime _lastRosterBroadcastUtc = DateTime.MinValue;
+    private ulong? _lastRosterSignature;
+    private const int RosterKeepAliveIntervalMs = 1000;
+    private DateTime _lastProgressResyncUtc = DateTime.MinValue;
     private readonly HideSeekService _hideSeek;
     private readonly WorldEventRelay _worldEvents = new();
     private readonly RedCoinAuthority _redCoinAuthority = new();
+    private readonly NpcCleanAuthority _npcCleanAuthority = new();
     private readonly ShineAuthority _shineAuthority = new();
     private readonly BlueCoinAuthority _blueCoinAuthority = new();
+    private readonly StoryFlagAuthority _storyFlagAuthority = new();
+    // Include acting slot so two players hitting the same NPC are not collapsed forever.
+    private readonly Dictionary<(byte CourseId, byte EpisodeId, byte Kind, byte ActingSlot, uint PackedPos), DateTime>
+        _npcReactRecent = new();
+    private static readonly TimeSpan NpcReactDedupWindow = TimeSpan.FromMilliseconds(700);
     private readonly Dictionary<(byte CourseId, byte EpisodeId), int> _stageOccupancy = new();
+    // Reused across UDP relay / hide-seek tag checks so a full lobby does not allocate
+    // ClientSession[] on every snapshot (~600/sec at 10×60 Hz).
+    private ClientSession[] _peerScratch = new ClientSession[ProtocolConstants.StableMaxPlayers];
     private readonly byte[] _udpPongScratch =
         new byte[ProtocolConstants.UdpSnapshotPayloadOffset + ProtocolConstants.UdpPingPayloadSize];
 
@@ -37,6 +50,7 @@ public sealed class GameServer : IDisposable
     public event Action<PlayerRosterEntry[]>? RosterChanged;
 
     public HideSeekService HideSeek => _hideSeek;
+    public LevelCatalog Levels => _levels;
 
     public bool IsRunning { get; private set; }
     public int MaxPlayers
@@ -106,6 +120,10 @@ public sealed class GameServer : IDisposable
             _stageOccupancy.Clear();
         }
         _redCoinAuthority.Reset();
+        _npcCleanAuthority.Reset();
+        _shineAuthority.Reset();
+        _blueCoinAuthority.Reset();
+        _storyFlagAuthority.Reset();
         _hideSeek.Reset();
         Log?.Invoke("Server stopped");
     }
@@ -118,10 +136,15 @@ public sealed class GameServer : IDisposable
 
     public void SetSyncSettings(bool syncFlags, bool syncObjects, bool syncProgress)
     {
+        var wasSyncFlags = _syncFlags;
         _syncFlags = syncFlags;
         _syncObjects = syncObjects;
         _syncProgress = syncProgress;
         BroadcastTcp(PacketSerializer.BuildSyncSettings(syncFlags, syncObjects, syncProgress));
+        // Re-enabling flag sync: push authority snapshot so clients heal durable events
+        // missed while sync was off (SyncSettings alone does not replay history).
+        if (syncFlags && !wasSyncFlags)
+            MaybeBroadcastProgressResync(force: true);
     }
 
     public bool AllowClientTeleport => _allowClientTeleport;
@@ -148,6 +171,9 @@ public sealed class GameServer : IDisposable
         }
         return slots;
     }
+
+    /// <summary>Test/diagnostics: number of sessions currently holding a slot (including unnamed handshakes).</summary>
+    internal int SessionCount => _sessions.Count;
 
     public void BroadcastGameModeState(GameModeStatePacket state)
         => BroadcastTcp(PacketSerializer.BuildGameModeState(state));
@@ -197,6 +223,11 @@ public sealed class GameServer : IDisposable
         var payload = new byte[] { targetSlot, courseId, episodeId, requesterSlot };
         BroadcastTcp(PacketSerializer.WrapTcp(TcpPacketId.WarpCommand, payload));
         Log?.Invoke($"Warp command: target={targetSlot} course={courseId} ep={episodeId}");
+
+        // Warp-all (and single warps) often land players on the same spawn; suppress
+        // proximity tags briefly so a mid-round warp cannot mass-promote clustered hiders.
+        if (_hideSeek.CurrentState.TagActive)
+            _hideSeek.NotifyPlayersWarped();
     }
 
     public void UpdatePlayerState(byte slot, byte stageId, byte episodeId, DolphinState state, ushort pingMs)
@@ -217,7 +248,7 @@ public sealed class GameServer : IDisposable
 
     private bool ApplySessionLocation(ClientSession session, byte stageId, byte episodeId)
     {
-        var normalized = LevelCatalog.NormalizeEpisodeFromGame(stageId, episodeId);
+        var normalized = LevelCatalog.NormalizeEpisodeFromGame(stageId, episodeId, _levels);
         var changed = session.StageId != stageId || session.EpisodeId != normalized;
         if (!changed)
             return false;
@@ -271,7 +302,8 @@ public sealed class GameServer : IDisposable
         {
             _stageOccupancy.Remove(key);
             _redCoinAuthority.ResetStage(courseId, episodeId);
-            Log?.Invoke($"World sync: reset red coin state for course={courseId}/{episodeId} (stage empty)");
+            _npcCleanAuthority.ResetStage(courseId, episodeId);
+            Log?.Invoke($"World sync: reset red-coin/npc-clean state for course={courseId}/{episodeId} (stage empty)");
         }
         else
         {
@@ -333,7 +365,11 @@ public sealed class GameServer : IDisposable
 
                         case TcpPacketId.JoinRequest:
                             if (session == null) break;
-                            var name = System.Text.Encoding.UTF8.GetString(payload).TrimEnd('\0');
+                            if (!PacketSerializer.TryReadJoinRequest(payload, out var name, out var joinModelId))
+                            {
+                                name = System.Text.Encoding.UTF8.GetString(payload).TrimEnd('\0');
+                                joinModelId = string.Empty;
+                            }
                             if (!TryRegisterName(session, name, out var reason))
                             {
                                 EnqueueSend(session, PacketSerializer.WrapTcp(TcpPacketId.JoinRejected,
@@ -342,6 +378,7 @@ public sealed class GameServer : IDisposable
                                 session = null;
                                 return;
                             }
+                            session.MarioModelId = CharacterPack.NormalizeModelId(joinModelId);
                             var roster = BuildRoster();
                             var accepted = new byte[1 + roster.Length];
                             accepted[0] = session.Slot;
@@ -350,12 +387,8 @@ public sealed class GameServer : IDisposable
                             EnqueueSend(session, PacketSerializer.BuildSyncSettings(_syncFlags, _syncObjects, _syncProgress));
                             EnqueueSend(session, PacketSerializer.BuildClientTeleportSettings(_allowClientTeleport));
                             EnqueueSend(session, PacketSerializer.BuildGameModeState(_hideSeek.CurrentState));
-                            if (_syncFlags && _worldEvents.History.Count > 0)
-                            {
-                                EnqueueSend(session, _worldEvents.BuildWorldStateReplay());
-                                Log?.Invoke(
-                                    $"World sync: replayed {_worldEvents.History.Count} events to slot {session.Slot}");
-                            }
+                            if (_syncFlags)
+                                EnqueueProgressSnapshot(session, reason: "join");
                             MaybeBroadcastRoster(force: true);
                             break;
 
@@ -385,11 +418,26 @@ public sealed class GameServer : IDisposable
                             if (session != null)
                             {
                                 session.LastSeen = DateTime.UtcNow;
+                                var rosterDirty = false;
                                 if (payload.Length >= 10)
                                 {
                                     session.PingMs = BinaryPrimitives.ReadUInt16LittleEndian(payload.AsSpan(8, 2));
-                                    MaybeBroadcastRoster();
+                                    rosterDirty = true;
                                 }
+                                // Model id is always present on modern heartbeats. Empty means
+                                // intentional retail; do not treat a short legacy heartbeat as clear.
+                                if (payload.Length >= 10 + ProtocolConstants.MarioModelIdSize)
+                                {
+                                    var modelId = CharacterPack.DecodeModelId(
+                                        payload.AsSpan(10, ProtocolConstants.MarioModelIdSize));
+                                    if (!string.Equals(session.MarioModelId, modelId, StringComparison.Ordinal))
+                                    {
+                                        session.MarioModelId = modelId;
+                                        rosterDirty = true;
+                                    }
+                                }
+                                if (rosterDirty)
+                                    MaybeBroadcastRoster();
                                 EnqueueSend(session, PacketSerializer.WrapTcp(TcpPacketId.Heartbeat, payload));
                             }
                             break;
@@ -421,6 +469,12 @@ public sealed class GameServer : IDisposable
                             BroadcastTcp(PacketSerializer.BuildMarioVoiceEvent(session.Slot, voiceEvent));
                             break;
 
+                        case TcpPacketId.WorldProgressRequest:
+                            if (session == null || !_syncFlags)
+                                break;
+                            EnqueueProgressSnapshot(session, reason: "client-request");
+                            break;
+
                         case TcpPacketId.WorldEvent:
                             if (session == null || !_syncFlags)
                                 break;
@@ -449,6 +503,24 @@ public sealed class GameServer : IDisposable
                                         coinPayload1);
                                     break;
 
+                                case WorldEventType.NpcCleaned:
+                                    if (!_npcCleanAuthority.TryAcceptCleaned(worldRequest, out var cleanPayload0,
+                                            out var cleanReserved, out var cleanPayload1))
+                                    {
+                                        Log?.Invoke(
+                                            $"World sync: rejected duplicate npc-clean index course={worldRequest.CourseId}/{worldRequest.EpisodeId} slot={session.Slot} reserved={worldRequest.Reserved} payload1={worldRequest.Payload1}");
+                                        break;
+                                    }
+
+                                    broadcast = _worldEvents.CreateWorldEvent(
+                                        worldRequest.Type,
+                                        worldRequest.CourseId,
+                                        worldRequest.EpisodeId,
+                                        cleanPayload0,
+                                        cleanReserved,
+                                        cleanPayload1);
+                                    break;
+
                                 default:
                                 {
                                     switch (worldRequest.Type)
@@ -467,7 +539,8 @@ public sealed class GameServer : IDisposable
                                                 worldRequest.EpisodeId,
                                                 worldRequest.Payload0,
                                                 worldRequest.Reserved,
-                                                worldRequest.Payload1);
+                                                worldRequest.Payload1,
+                                                worldRequest.Payload2);
                                             break;
 
                                         case WorldEventType.BlueCoinCollected:
@@ -484,7 +557,84 @@ public sealed class GameServer : IDisposable
                                                 worldRequest.EpisodeId,
                                                 worldRequest.Payload0,
                                                 worldRequest.Reserved,
-                                                worldRequest.Payload1);
+                                                worldRequest.Payload1,
+                                                worldRequest.Payload2);
+                                            break;
+
+                                        case WorldEventType.StoryFlag:
+                                            if (!_storyFlagAuthority.TryAcceptStory(worldRequest.Payload1, worldRequest.Payload0))
+                                            {
+                                                Log?.Invoke(
+                                                    $"World sync: rejected duplicate story flag id=0x{worldRequest.Payload1:X8} val={worldRequest.Payload0} slot={session.Slot}");
+                                                break;
+                                            }
+
+                                            broadcast = _worldEvents.CreateWorldEvent(
+                                                worldRequest.Type,
+                                                worldRequest.CourseId,
+                                                worldRequest.EpisodeId,
+                                                worldRequest.Payload0,
+                                                worldRequest.Reserved,
+                                                worldRequest.Payload1,
+                                                worldRequest.Payload2);
+                                            break;
+
+                                        case WorldEventType.TriggerFlag:
+                                            if (!_storyFlagAuthority.TryAcceptTrigger(
+                                                    worldRequest.CourseId,
+                                                    worldRequest.EpisodeId,
+                                                    worldRequest.Payload1,
+                                                    worldRequest.Payload0))
+                                            {
+                                                Log?.Invoke(
+                                                    $"World sync: rejected duplicate trigger flag id=0x{worldRequest.Payload1:X8} val={worldRequest.Payload0} slot={session.Slot}");
+                                                break;
+                                            }
+
+                                            broadcast = _worldEvents.CreateWorldEvent(
+                                                worldRequest.Type,
+                                                worldRequest.CourseId,
+                                                worldRequest.EpisodeId,
+                                                worldRequest.Payload0,
+                                                worldRequest.Reserved,
+                                                worldRequest.Payload1,
+                                                worldRequest.Payload2);
+                                            break;
+
+                                        case WorldEventType.SecretComplete:
+                                            if (!_storyFlagAuthority.TryAcceptSecret(worldRequest.Payload1, worldRequest.Payload0))
+                                            {
+                                                Log?.Invoke(
+                                                    $"World sync: rejected duplicate secret flag id=0x{worldRequest.Payload1:X8} val={worldRequest.Payload0} slot={session.Slot}");
+                                                break;
+                                            }
+
+                                            broadcast = _worldEvents.CreateWorldEvent(
+                                                worldRequest.Type,
+                                                worldRequest.CourseId,
+                                                worldRequest.EpisodeId,
+                                                worldRequest.Payload0,
+                                                worldRequest.Reserved,
+                                                worldRequest.Payload1,
+                                                worldRequest.Payload2);
+                                            break;
+
+                                        case WorldEventType.NpcReact:
+                                            if (!TryAcceptNpcReact(worldRequest))
+                                            {
+                                                Log?.Invoke(
+                                                    $"World sync: rejected duplicate npc-react kind={worldRequest.Payload0} course={worldRequest.CourseId}/{worldRequest.EpisodeId} pos=0x{worldRequest.Payload1:X8} slot={session.Slot}");
+                                                break;
+                                            }
+
+                                            broadcast = _worldEvents.CreateWorldEvent(
+                                                worldRequest.Type,
+                                                worldRequest.CourseId,
+                                                worldRequest.EpisodeId,
+                                                worldRequest.Payload0,
+                                                worldRequest.Reserved,
+                                                worldRequest.Payload1,
+                                                worldRequest.Payload2);
                                             break;
 
                                         default:
@@ -495,7 +645,8 @@ public sealed class GameServer : IDisposable
                                                 worldRequest.EpisodeId,
                                                 worldRequest.Payload0,
                                                 worldRequest.Reserved,
-                                                worldRequest.Payload1);
+                                                worldRequest.Payload1,
+                                                worldRequest.Payload2);
                                             break;
                                         }
                                     }
@@ -524,19 +675,26 @@ public sealed class GameServer : IDisposable
 
     internal void ProcessHideSeekTagsForSnapshot(byte updatedSlot, in PlayerSnapshot snap)
     {
+        _hideSeek.TickGrace();
+
         if (!_hideSeek.CurrentState.TagActive)
             return;
 
-        ClientSession[] peers;
-        lock (_lock)
-            peers = _sessions.Values.ToArray();
+        // Cheap early-out during Start Tag grace / warp proximity immunity.
+        if (_hideSeek.IsProximityTagImmunityActive)
+            return;
 
+        var peers = CopyPeersToScratch(out var peerCount);
         var nowMs = Environment.TickCount64;
-        foreach (var other in peers)
+        for (var i = 0; i < peerCount; i++)
         {
+            var other = peers[i];
             if (other.Slot == updatedSlot)
                 continue;
             if (other.LastSnapshot.Connected == 0)
+                continue;
+            // Stale/loading positions are unreliable for proximity (often still at spawn).
+            if (other.State is DolphinState.Loading or DolphinState.Warping or DolphinState.Booting)
                 continue;
 
             var otherLagSeconds = other.LastSnapshotReceivedMs == 0
@@ -548,14 +706,41 @@ public sealed class GameServer : IDisposable
         }
     }
 
+    /// <summary>
+    /// Snapshot connected sessions into a reusable array under lock. Caller must finish
+    /// iterating before the next CopyPeersToScratch call on this instance.
+    /// </summary>
+    private ClientSession[] CopyPeersToScratch(out int count)
+    {
+        lock (_lock)
+        {
+            count = _sessions.Count;
+            if (_peerScratch.Length < count)
+                _peerScratch = new ClientSession[Math.Max(count, ProtocolConstants.StableMaxPlayers)];
+
+            var i = 0;
+            foreach (var s in _sessions.Values)
+                _peerScratch[i++] = s;
+            count = i;
+            return _peerScratch;
+        }
+    }
+
     private ClientSession? AssignSlot(TcpClient tcp, out byte slot)
     {
         slot = 0;
         lock (_lock)
         {
-            if (_sessions.Count >= _maxPlayers) return null;
-
             PruneExpiredReleases();
+
+            // At capacity, reclaim ghosts / abandoned handshakes / heartbeat timeouts before
+            // rejecting Full. Otherwise a half-open TCP or incomplete Handshake permanently
+            // blocks reconnects when the lobby is full or nearly full.
+            if (_sessions.Count >= _maxPlayers)
+                ReclaimStaleSessionsLocked();
+
+            if (_sessions.Count >= _maxPlayers)
+                return null;
 
             for (byte i = 0; i < _maxPlayers; i++)
             {
@@ -575,6 +760,39 @@ public sealed class GameServer : IDisposable
             }
         }
         return null;
+    }
+
+    /// <summary>
+    /// Evict sessions that are safe to free for a new Handshake. Must run under <see cref="_lock"/>.
+    /// </summary>
+    private void ReclaimStaleSessionsLocked()
+    {
+        var now = DateTime.UtcNow;
+        var reclaimed = false;
+        foreach (var s in _sessions.Values.ToArray())
+        {
+            if (!IsSessionReclaimable(s, now))
+                continue;
+            EvictSessionLocked(s);
+            reclaimed = true;
+        }
+
+        if (reclaimed)
+            BroadcastRoster();
+    }
+
+    private static bool IsSessionReclaimable(ClientSession session, DateTime now)
+    {
+        if (!IsSessionTcpAlive(session))
+            return true;
+        if ((now - session.LastSeen).TotalMilliseconds > ProtocolConstants.DisconnectTimeoutMs)
+            return true;
+        // Handshake assigned a slot but JoinRequest never arrived — free it after a short grace
+        // so connect-retry storms cannot pin every free slot until the 15s watchdog.
+        if (string.IsNullOrEmpty(session.Username) &&
+            (now - session.LastSeen).TotalMilliseconds > ProtocolConstants.AbandonedHandshakeGraceMs)
+            return true;
+        return false;
     }
 
     private void PruneExpiredReleases()
@@ -599,17 +817,29 @@ public sealed class GameServer : IDisposable
         {
             PruneExpiredReleases();
 
+            // Same-name policy: prefer reconnect success over false NameTaken.
+            // TcpClient.Connected is unreliable for half-closed sockets, so we do NOT require
+            // a dead TCP before replacing. Reject NameTaken only when the existing session is
+            // clearly a different live player (truly-alive TCP, recent heartbeats, different
+            // endpoint, and outside the reconnect window). Otherwise treat as reconnect and
+            // replace — critical when a ghost still occupies the name at high player counts.
             if (_usernames.TryGetValue(name, out var existingSlot) && existingSlot != session.Slot)
             {
                 if (_sessions.TryGetValue(existingSlot, out var existingSession))
                 {
-                    if (IsSessionTcpAlive(existingSession))
+                    if (IsClearlyDifferentLivePlayer(existingSession, session, name))
                     {
                         reason = JoinRejectReason.NameTaken;
                         return false;
                     }
 
-                    EvictSessionLocked(existingSession);
+                    var priorSlot = existingSession.Slot;
+                    // Keep hide-seek role on this slot — the reconnecting player is taking it over.
+                    EvictSessionLocked(existingSession, notifyHideSeek: false);
+                    // Take over the prior slot so roster / hide-seek identity stays stable and
+                    // the temporary Handshake slot is released immediately.
+                    if (priorSlot != session.Slot)
+                        MigrateSessionToSlotLocked(session, priorSlot);
                     BroadcastRoster();
                 }
                 else
@@ -637,9 +867,7 @@ public sealed class GameServer : IDisposable
                 release.Slot < _maxPlayers &&
                 !_sessions.ContainsKey(release.Slot))
             {
-                _sessions.TryRemove(session.Slot, out _);
-                session.Slot = release.Slot;
-                _sessions[release.Slot] = session;
+                MigrateSessionToSlotLocked(session, release.Slot);
                 _usernames[name] = release.Slot;
                 Log?.Invoke($"Reconnect: slot {release.Slot} restored for '{name}'");
             }
@@ -649,11 +877,83 @@ public sealed class GameServer : IDisposable
         return true;
     }
 
+    /// <summary>
+    /// True only when another connection with this name is almost certainly a distinct live
+    /// player — not a reconnect/ghost. Must run under <see cref="_lock"/>.
+    /// </summary>
+    private bool IsClearlyDifferentLivePlayer(ClientSession existing, ClientSession incoming, string name)
+    {
+        // Inside the reconnect window → always treat as the same player coming back.
+        if (_recentReleases.ContainsKey(name))
+            return false;
+
+        if (string.IsNullOrEmpty(existing.Username))
+            return false;
+
+        if (!IsSessionTcpAlive(existing))
+            return false;
+
+        if ((DateTime.UtcNow - existing.LastSeen).TotalMilliseconds > ProtocolConstants.StaleTimeoutMs)
+            return false;
+
+        if (!TryGetRemoteEndPoint(existing, out var existingEp) ||
+            !TryGetRemoteEndPoint(incoming, out var incomingEp))
+            return false;
+
+        // Same remote endpoint cannot be two distinct live players.
+        if (existingEp.Equals(incomingEp))
+            return false;
+
+        return true;
+    }
+
+    private static bool TryGetRemoteEndPoint(ClientSession session, out IPEndPoint endpoint)
+    {
+        endpoint = null!;
+        try
+        {
+            if (session.Tcp.Client.RemoteEndPoint is IPEndPoint ep)
+            {
+                endpoint = ep;
+                return true;
+            }
+        }
+        catch
+        {
+            // socket already disposed
+        }
+        return false;
+    }
+
+    private void MigrateSessionToSlotLocked(ClientSession session, byte targetSlot)
+    {
+        if (session.Slot == targetSlot)
+            return;
+
+        _sessions.TryRemove(session.Slot, out _);
+        session.Slot = targetSlot;
+        _sessions[targetSlot] = session;
+    }
+
+    /// <summary>
+    /// Detect half-closed TCP. <see cref="TcpClient.Connected"/> alone is insufficient — it
+    /// often stays true after the peer is gone, which previously caused false NameTaken and
+    /// capacity ghosts until the 15s watchdog.
+    /// </summary>
     private static bool IsSessionTcpAlive(ClientSession session)
     {
         try
         {
-            return session.Tcp.Connected;
+            var tcp = session.Tcp;
+            if (!tcp.Connected)
+                return false;
+
+            var socket = tcp.Client;
+            if (socket is not { Connected: true })
+                return false;
+
+            // Readable + zero bytes available ⇒ peer closed the connection (half-open/FIN).
+            return !(socket.Poll(0, SelectMode.SelectRead) && socket.Available == 0);
         }
         catch
         {
@@ -661,14 +961,23 @@ public sealed class GameServer : IDisposable
         }
     }
 
-    private void EvictSessionLocked(ClientSession session)
+    private void EvictSessionLocked(ClientSession session, bool notifyHideSeek = true)
     {
+        // Only remove if this object still owns the slot — prevents a racing HandleClient
+        // finally from wiping a replacement session that already took over the slot.
+        if (!_sessions.TryGetValue(session.Slot, out var current) || !ReferenceEquals(current, session))
+            return;
+
         _sessions.TryRemove(session.Slot, out _);
         if (!string.IsNullOrEmpty(session.Username))
         {
             _recentReleases[session.Username] = (session.Slot, DateTime.UtcNow);
-            _usernames.Remove(session.Username);
+            if (_usernames.TryGetValue(session.Username, out var mapped) && mapped == session.Slot)
+                _usernames.Remove(session.Username);
         }
+
+        if (IsTrackedStage(session.StageId, session.EpisodeId))
+            ReleaseStageOccupancyLocked(session.StageId, session.EpisodeId);
 
         // Enqueue the disconnect notice without waiting — eviction runs under _lock and the
         // connection is typically already dead. The send task drains what it can, then exits.
@@ -681,7 +990,40 @@ public sealed class GameServer : IDisposable
         session.LastSnapshotReceivedMs = 0;
         session.UdpEndPoint = null;
 
+        if (notifyHideSeek && _hideSeek.CurrentState.GameMode == GameMode.HideSeek)
+        {
+            if (session.IsHost)
+                _hideSeek.SetGameMode(GameMode.Normal);
+            else
+                _hideSeek.OnPlayerDisconnected(session.Slot);
+        }
+
         Log?.Invoke($"Evicted stale session for slot {session.Slot}");
+    }
+
+    internal bool TryAcceptNpcReact(WorldEventRequest request)
+    {
+        var key = (request.CourseId, request.EpisodeId, request.Payload0, request.Reserved,
+            request.Payload1);
+        var now = DateTime.UtcNow;
+        lock (_lock)
+        {
+            if (_npcReactRecent.Count > 64)
+            {
+                var stale = _npcReactRecent
+                    .Where(pair => now - pair.Value > NpcReactDedupWindow)
+                    .Select(pair => pair.Key)
+                    .ToArray();
+                foreach (var staleKey in stale)
+                    _npcReactRecent.Remove(staleKey);
+            }
+
+            if (_npcReactRecent.TryGetValue(key, out var last) && now - last < NpcReactDedupWindow)
+                return false;
+
+            _npcReactRecent[key] = now;
+            return true;
+        }
     }
 
     private void RemoveSession(ClientSession? session, DisconnectReason reason = DisconnectReason.Timeout)
@@ -691,13 +1033,17 @@ public sealed class GameServer : IDisposable
         var removed = false;
         lock (_lock)
         {
-            if (_sessions.TryRemove(session.Slot, out _))
+            // Reference check: after same-name replace, the old HandleClient finally must not
+            // remove the replacement session that now owns this slot.
+            if (_sessions.TryGetValue(session.Slot, out var current) && ReferenceEquals(current, session))
             {
+                _sessions.TryRemove(session.Slot, out _);
                 removed = true;
                 if (!string.IsNullOrEmpty(session.Username))
                 {
                     _recentReleases[session.Username] = (session.Slot, DateTime.UtcNow);
-                    _usernames.Remove(session.Username);
+                    if (_usernames.TryGetValue(session.Username, out var mapped) && mapped == session.Slot)
+                        _usernames.Remove(session.Username);
                 }
             }
         }
@@ -745,7 +1091,8 @@ public sealed class GameServer : IDisposable
     {
         // Iterate by slot index (0..maxPlayers-1) instead of OrderBy to keep roster builds
         // allocation-light and deterministic at up to 10 players.
-        var list = new List<byte>(1 + _maxPlayers * 22);
+        // Entry: slot(1)+name(16)+stage(1)+ep(1)+state(1)+ping(2)+modelId(8) = 30
+        var list = new List<byte>(1 + _maxPlayers * ProtocolConstants.RosterEntrySize);
         lock (_lock)
         {
             list.Add((byte)_sessions.Count);
@@ -763,6 +1110,7 @@ public sealed class GameServer : IDisposable
                 list.Add(s.EpisodeId);
                 list.Add((byte)s.State);
                 list.AddRange(BitConverter.GetBytes(s.PingMs));
+                list.AddRange(CharacterPack.EncodeModelId(s.MarioModelId));
             }
         }
         return list.ToArray();
@@ -770,15 +1118,107 @@ public sealed class GameServer : IDisposable
 
     private void MaybeBroadcastRoster(bool force = false)
     {
+        _hideSeek.TickGrace();
+
+        var signature = ComputeRosterSignature();
+        var now = DateTime.UtcNow;
+        var elapsed = (now - _lastRosterBroadcastUtc).TotalMilliseconds;
+        if (!force && _lastRosterSignature == signature && elapsed < RosterKeepAliveIntervalMs)
+            return;
+
+        if (!force && elapsed < ProtocolConstants.RosterBroadcastIntervalMs)
+            return;
+
+        _lastRosterSignature = signature;
+        _lastRosterBroadcastUtc = now;
+        BroadcastRoster();
+    }
+
+    private ulong ComputeRosterSignature()
+    {
+        var hash = 14695981039346656037ul;
+
+        lock (_lock)
+        {
+            HashRosterByte(ref hash, (byte)_sessions.Count);
+            for (byte slot = 0; slot < _maxPlayers; slot++)
+            {
+                if (!_sessions.TryGetValue(slot, out var session))
+                    continue;
+
+                HashRosterByte(ref hash, session.Slot);
+                HashRosterString(ref hash, session.Username);
+                HashRosterByte(ref hash, session.StageId);
+                HashRosterByte(ref hash, session.EpisodeId);
+                HashRosterByte(ref hash, (byte)session.State);
+                HashRosterByte(ref hash, (byte)session.PingMs);
+                HashRosterByte(ref hash, (byte)(session.PingMs >> 8));
+                HashRosterString(ref hash, session.MarioModelId);
+            }
+        }
+
+        return hash;
+    }
+
+    private static void HashRosterByte(ref ulong hash, byte value)
+    {
+        hash ^= value;
+        hash *= 1099511628211ul;
+    }
+
+    private static void HashRosterString(ref ulong hash, string value)
+    {
+        foreach (var ch in value)
+        {
+            HashRosterByte(ref hash, (byte)ch);
+            HashRosterByte(ref hash, (byte)(ch >> 8));
+        }
+        HashRosterByte(ref hash, 0xFF);
+    }
+
+    private void EnqueueProgressSnapshot(ClientSession session, string reason)
+    {
+        var frame = _worldEvents.BuildAuthoritySnapshotReplay(
+            _shineAuthority, _blueCoinAuthority, _redCoinAuthority, _npcCleanAuthority, _storyFlagAuthority);
+        // Empty snapshot (2-byte count) is still useful so clients clear "waiting for sync".
+        EnqueueSend(session, frame);
+        var shineCount = _shineAuthority.Collected.Count;
+        var blueCourses = _blueCoinAuthority.AllCourses.Count;
+        var redStages = _redCoinAuthority.AllStages.Count;
+        var npcCleanStages = _npcCleanAuthority.AllStages.Count;
+        var storyFlags = _storyFlagAuthority.TotalCount;
+        Log?.Invoke(
+            $"World sync: progress snapshot → slot {session.Slot} ({reason}) shines={shineCount} blueCourses={blueCourses} redStages={redStages} npcCleans={npcCleanStages} storyFlags={storyFlags} durableHistory={_worldEvents.History.Count}");
+    }
+
+    private void MaybeBroadcastProgressResync(bool force = false)
+    {
+        if (!_syncFlags)
+            return;
+
         if (!force)
         {
-            var elapsed = (DateTime.UtcNow - _lastRosterBroadcastUtc).TotalMilliseconds;
-            if (elapsed < ProtocolConstants.RosterBroadcastIntervalMs)
+            var elapsed = (DateTime.UtcNow - _lastProgressResyncUtc).TotalMilliseconds;
+            if (elapsed < ProtocolConstants.WorldProgressResyncIntervalMs)
                 return;
         }
 
-        _lastRosterBroadcastUtc = DateTime.UtcNow;
-        BroadcastRoster();
+        if (_shineAuthority.Collected.Count == 0 &&
+            _blueCoinAuthority.AllCourses.Count == 0 &&
+            _redCoinAuthority.AllStages.Count == 0 &&
+            _npcCleanAuthority.AllStages.Count == 0 &&
+            _storyFlagAuthority.TotalCount == 0)
+        {
+            _lastProgressResyncUtc = DateTime.UtcNow;
+            return;
+        }
+
+        _lastProgressResyncUtc = DateTime.UtcNow;
+        var frame = _worldEvents.BuildAuthoritySnapshotReplay(
+            _shineAuthority, _blueCoinAuthority, _redCoinAuthority, _npcCleanAuthority, _storyFlagAuthority);
+        BroadcastTcp(frame);
+        Log?.Invoke(
+            $"World sync: periodic progress resync shines={_shineAuthority.Collected.Count} blueCourses={_blueCoinAuthority.AllCourses.Count} redStages={_redCoinAuthority.AllStages.Count} npcCleans={_npcCleanAuthority.AllStages.Count} storyFlags={_storyFlagAuthority.TotalCount}");
     }
 
     private void BroadcastRoster()
@@ -803,6 +1243,7 @@ public sealed class GameServer : IDisposable
                     EpisodeId = s.EpisodeId,
                     State = s.State,
                     PingMs = s.PingMs,
+                    MarioModelId = s.MarioModelId,
                 };
             }
         }
@@ -902,15 +1343,13 @@ public sealed class GameServer : IDisposable
                 if (!applied)
                     continue;
 
-                ClientSession[] peers;
-                lock (_lock)
-                    peers = _sessions.Values.ToArray();
-
+                var peers = CopyPeersToScratch(out var peerCount);
                 var buffer = result.Buffer;
                 var length = buffer.Length;
                 var sender = result.RemoteEndPoint;
-                foreach (var s in peers)
+                for (var i = 0; i < peerCount; i++)
                 {
+                    var s = peers[i];
                     if (s.UdpEndPoint == null || s.UdpEndPoint.Equals(sender))
                         continue;
                     try
@@ -1079,7 +1518,8 @@ public sealed class GameServer : IDisposable
             return false;
 
         var snap = PacketSerializer.SnapshotFromBytes(
-            buffer.AsSpan(ProtocolConstants.UdpSnapshotPayloadOffset, ProtocolConstants.PlayerSnapshotSize));
+            buffer.AsSpan(ProtocolConstants.UdpSnapshotPayloadOffset, ProtocolConstants.PlayerSnapshotSize),
+            session.SnapshotNameBuffer);
         if (snap.StageId == 0 && session.StageId != 0 && snap.Connected != 0)
         {
             // Keep last known stage during boot flicker; allow valid area 0 (Airstrip) updates.
@@ -1107,12 +1547,11 @@ public sealed class GameServer : IDisposable
             var now = DateTime.UtcNow;
             foreach (var s in _sessions.Values.ToArray())
             {
-                if (!IsSessionTcpAlive(s) ||
-                    (now - s.LastSeen).TotalMilliseconds > ProtocolConstants.DisconnectTimeoutMs)
-                {
+                if (IsSessionReclaimable(s, now))
                     RemoveSession(s);
-                }
             }
+
+            MaybeBroadcastProgressResync();
         }
     }
 
@@ -1148,6 +1587,7 @@ public sealed class GameServer : IDisposable
     {
         public byte Slot { get; set; }
         public string Username { get; set; } = "";
+        public string MarioModelId { get; set; } = "";
         public TcpClient Tcp { get; set; } = null!;
         public bool IsHost { get; set; }
         public byte StageId { get; set; }
@@ -1156,6 +1596,7 @@ public sealed class GameServer : IDisposable
         public ushort PingMs { get; set; }
         public DateTime LastSeen { get; set; }
         public long LastSnapshotReceivedMs { get; set; }
+        public byte[] SnapshotNameBuffer { get; } = new byte[16];
         public PlayerSnapshot LastSnapshot { get; set; }
         public uint LastSnapshotSeq { get; set; }
         public IPEndPoint? UdpEndPoint { get; set; }

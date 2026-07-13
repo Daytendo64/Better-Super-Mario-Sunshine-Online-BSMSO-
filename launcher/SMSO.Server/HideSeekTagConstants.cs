@@ -21,8 +21,8 @@ public static class HideSeekTagConstants
     /// <summary>Extra vertical reach while jumping over a hider.</summary>
     public const float VerticalSlack = 35f;
 
-    /// <summary>Max horizontal pivot-to-pivot distance: touching bodies + slack.</summary>
-    public const float MaxHorizontalReach = MarioBodyRadius * 2f + TouchSlack;
+    /// <summary>Max horizontal pivot-to-pivot distance: ~1.25 body-widths of contact + slack.</summary>
+    public const float MaxHorizontalReach = MarioBodyRadius * 2.5f + TouchSlack;
 
     /// <summary>Max feet-to-feet vertical separation for a valid tag.</summary>
     public const float MaxVerticalSeparation = MarioStandingHeight + VerticalSlack;

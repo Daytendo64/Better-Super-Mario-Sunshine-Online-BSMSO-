@@ -1,55 +1,120 @@
-# Copy dist/_BSMSO.kxe into your extracted ISO Mods folder.
+# Install the full Better Sunshine Engine / Kuribo runtime + dist/_BSMSO.kxe
+# into an extracted SMS game folder (not .kxe-only).
 param(
     [string]$ModsDir = "",
-    [string]$IsoFolder = ""
+    [string]$IsoFolder = "",
+    [string]$GameRoot = ""
 )
 
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
 $Source = Join-Path $Root "dist\_BSMSO.kxe"
-$ReleaseBseCache = Join-Path $Root "dist\BetterSunshineEngine.release.kxe"
+$ReleaseZipCache = Join-Path $Root "dist\BetterSunshineEngine_RELEASE.zip"
+$AppDataZipCache = Join-Path $env:APPDATA "SMSO\BetterSunshineEngine_RELEASE.zip"
+$AppDataStaging = Join-Path $env:APPDATA "SMSO\bse-v4.0.0"
 $BseReleaseZipUrl = "https://github.com/DotKuribo/BetterSunshineEngine/releases/download/v4.0.0/BetterSunshineEngine_RELEASE.zip"
 $OfficialBseSize = 583744
 
-function Ensure-ReleaseBseKxe {
-    param([string]$DestinationPath)
+function Ensure-OfficialBsePayload {
+    $stagingKuribo = Join-Path $AppDataStaging "Kuribo!"
+    $stagingMain = Join-Path $AppDataStaging "main.dol"
+    $stagingBoot = Join-Path $AppDataStaging "boot.bin"
+    $stagingKxe = Join-Path $AppDataStaging "BetterSunshineEngine.kxe"
+    $stagingKernel = Join-Path $stagingKuribo "System\KuriboKernel.bin"
 
-    if (Test-Path $DestinationPath) {
+    if ((Test-Path $stagingKernel) -and (Test-Path $stagingMain) -and (Test-Path $stagingBoot) -and (Test-Path $stagingKxe)) {
+        Write-Host "Using cached BSE payload at $AppDataStaging"
         return
     }
 
-    $tempDir = Join-Path ([IO.Path]::GetTempPath()) ("smso-bse-release-" + [Guid]::NewGuid().ToString("N"))
-    $zipPath = Join-Path $tempDir "BetterSunshineEngine_RELEASE.zip"
-    New-Item -ItemType Directory -Force -Path $tempDir | Out-Null
+    $zipPath = $null
+    if (Test-Path $AppDataZipCache) {
+        $zipPath = $AppDataZipCache
+    } elseif (Test-Path $ReleaseZipCache) {
+        $zipPath = $ReleaseZipCache
+    } else {
+        $tempDir = Join-Path ([IO.Path]::GetTempPath()) ("smso-bse-release-" + [Guid]::NewGuid().ToString("N"))
+        New-Item -ItemType Directory -Force -Path $tempDir | Out-Null
+        $zipPath = Join-Path $tempDir "BetterSunshineEngine_RELEASE.zip"
+        try {
+            Write-Host "Downloading official BetterSunshineEngine RELEASE zip..."
+            Invoke-WebRequest -Uri $BseReleaseZipUrl -OutFile $zipPath
+            New-Item -ItemType Directory -Force -Path (Split-Path $AppDataZipCache -Parent) | Out-Null
+            Copy-Item $zipPath $AppDataZipCache -Force
+            Copy-Item $zipPath $ReleaseZipCache -Force -ErrorAction SilentlyContinue
+            $zipPath = $AppDataZipCache
+        } finally {
+            Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
 
+    $extractDir = Join-Path ([IO.Path]::GetTempPath()) ("smso-bse-extract-" + [Guid]::NewGuid().ToString("N"))
     try {
-        Write-Host "Downloading official BetterSunshineEngine RELEASE..."
-        Invoke-WebRequest -Uri $BseReleaseZipUrl -OutFile $zipPath
-        Expand-Archive -Path $zipPath -DestinationPath $tempDir -Force
+        if (Test-Path $AppDataStaging) {
+            Remove-Item $AppDataStaging -Recurse -Force
+        }
+        New-Item -ItemType Directory -Force -Path $AppDataStaging | Out-Null
+        New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
 
-        $releaseKxe = Get-ChildItem $tempDir -Recurse -Filter "BetterSunshineEngine.kxe" |
-            Select-Object -First 1
-        if (-not $releaseKxe) {
-            Write-Error "BetterSunshineEngine_RELEASE.zip did not contain BetterSunshineEngine.kxe"
+        Write-Host "Extracting official BSE payload from $zipPath..."
+        Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
+
+        $kuribo = Get-ChildItem $extractDir -Recurse -Directory -Filter "Kuribo!" | Select-Object -First 1
+        if (-not $kuribo) {
+            Write-Error "BetterSunshineEngine_RELEASE.zip did not contain a Kuribo! folder."
         }
 
-        Copy-Item $releaseKxe.FullName $DestinationPath -Force
-        $size = (Get-Item $DestinationPath).Length
-        Write-Host "Cached release BSE at $DestinationPath ($size bytes)"
+        $releaseRoot = $kuribo.FullName | Split-Path -Parent
+        $mainDol = Join-Path $releaseRoot "main.dol"
+        $bootBin = Join-Path $releaseRoot "boot.bin"
+        $kernel = Join-Path $kuribo.FullName "System\KuriboKernel.bin"
+        $bseKxe = Join-Path $kuribo.FullName "Mods\BetterSunshineEngine.kxe"
+        if (-not (Test-Path $bseKxe)) {
+            $bseKxe = (Get-ChildItem $extractDir -Recurse -Filter "BetterSunshineEngine.kxe" | Select-Object -First 1).FullName
+        }
+
+        if (-not ((Test-Path $mainDol) -and (Test-Path $bootBin) -and (Test-Path $kernel) -and (Test-Path $bseKxe))) {
+            Write-Error "BetterSunshineEngine_RELEASE.zip is missing KuriboKernel.bin, main.dol, boot.bin, or BetterSunshineEngine.kxe."
+        }
+
+        $stagedKuribo = Join-Path $AppDataStaging "Kuribo!"
+        New-Item -ItemType Directory -Force -Path $stagedKuribo | Out-Null
+        robocopy $kuribo.FullName $stagedKuribo /E /NFL /NDL /NJH /NJS /nc /ns /np | Out-Null
+        if ($LASTEXITCODE -ge 8) {
+            Write-Error "Failed to stage Kuribo! folder (robocopy exit $LASTEXITCODE)"
+        }
+        Copy-Item $mainDol $stagingMain -Force
+        Copy-Item $bootBin $stagingBoot -Force
+        Copy-Item $bseKxe $stagingKxe -Force
+
+        # Also keep legacy single-file cache for older tooling.
+        $legacyKxe = Join-Path $Root "dist\BetterSunshineEngine.release.kxe"
+        Copy-Item $bseKxe $legacyKxe -Force
+        Copy-Item $bseKxe (Join-Path $env:APPDATA "SMSO\BetterSunshineEngine.release.kxe") -Force
+
+        Write-Host "Staged official BSE payload at $AppDataStaging"
     } finally {
-        Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item $extractDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
-function Resolve-ModsDirectory {
-    param([string]$ExplicitModsDir, [string]$ExplicitIsoFolder)
+function Resolve-GameRoot {
+    param([string]$ExplicitGameRoot, [string]$ExplicitModsDir, [string]$ExplicitIsoFolder)
 
-    if (-not [string]::IsNullOrWhiteSpace($ExplicitModsDir)) {
-        return $ExplicitModsDir.Trim().Trim('"')
+    if (-not [string]::IsNullOrWhiteSpace($ExplicitGameRoot)) {
+        return $ExplicitGameRoot.Trim().Trim('"')
     }
 
     if (-not [string]::IsNullOrWhiteSpace($ExplicitIsoFolder)) {
-        return Join-Path $ExplicitIsoFolder.Trim().Trim('"') "files\Kuribo!\Mods"
+        return $ExplicitIsoFolder.Trim().Trim('"')
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($ExplicitModsDir)) {
+        $mods = $ExplicitModsDir.Trim().Trim('"')
+        # ...\files\Kuribo!\Mods → game root is three parents up
+        $kuribo = Split-Path $mods -Parent
+        $files = Split-Path $kuribo -Parent
+        return (Split-Path $files -Parent)
     }
 
     $modsPathFile = Join-Path $PSScriptRoot "mods-path.txt"
@@ -58,12 +123,18 @@ function Resolve-ModsDirectory {
             Where-Object { $_ -and -not $_.Trim().StartsWith("#") } |
             Select-Object -First 1)
         if (-not [string]::IsNullOrWhiteSpace($line)) {
-            return $line.Trim().Trim('"')
+            $mods = $line.Trim().Trim('"')
+            $kuribo = Split-Path $mods -Parent
+            $files = Split-Path $kuribo -Parent
+            return (Split-Path $files -Parent)
         }
     }
 
     if ($env:SMSO_MODS_DIR -and -not [string]::IsNullOrWhiteSpace($env:SMSO_MODS_DIR)) {
-        return $env:SMSO_MODS_DIR.Trim().Trim('"')
+        $mods = $env:SMSO_MODS_DIR.Trim().Trim('"')
+        $kuribo = Split-Path $mods -Parent
+        $files = Split-Path $kuribo -Parent
+        return (Split-Path $files -Parent)
     }
 
     $launcherConfig = Join-Path $env:APPDATA "SMSO\config.json"
@@ -71,7 +142,10 @@ function Resolve-ModsDirectory {
         try {
             $cfg = Get-Content $launcherConfig -Raw | ConvertFrom-Json
             if ($cfg.ModsDir -and -not [string]::IsNullOrWhiteSpace([string]$cfg.ModsDir)) {
-                return [string]$cfg.ModsDir
+                $mods = [string]$cfg.ModsDir
+                $kuribo = Split-Path $mods -Parent
+                $files = Split-Path $kuribo -Parent
+                return (Split-Path $files -Parent)
             }
 
             $isoPath = [string]$cfg.IsoPath
@@ -92,9 +166,8 @@ function Resolve-ModsDirectory {
 
                 foreach ($root in $candidates | Select-Object -Unique) {
                     if ([string]::IsNullOrWhiteSpace($root)) { continue }
-                    $mods = Join-Path $root "files\Kuribo!\Mods"
-                    if (Test-Path $mods) {
-                        return $mods
+                    if ((Test-Path (Join-Path $root "sys")) -or (Test-Path (Join-Path $root "files"))) {
+                        return $root
                     }
                 }
             }
@@ -104,48 +177,94 @@ function Resolve-ModsDirectory {
         }
     }
 
-    return "C:\Users\young\OneDrive\Desktop\sms online files\files\Kuribo!\Mods"
+    return "C:\Users\young\OneDrive\Desktop\sms online files"
 }
 
-$ModsDir = Resolve-ModsDirectory -ExplicitModsDir $ModsDir -ExplicitIsoFolder $IsoFolder
-$Dest = Join-Path $ModsDir "_BSMSO.kxe"
+function Install-BseRuntime {
+    param([string]$TargetGameRoot)
+
+    $stagingKuribo = Join-Path $AppDataStaging "Kuribo!"
+    $stagingMain = Join-Path $AppDataStaging "main.dol"
+    $stagingBoot = Join-Path $AppDataStaging "boot.bin"
+    $stagingKxe = Join-Path $AppDataStaging "BetterSunshineEngine.kxe"
+
+    $filesDir = Join-Path $TargetGameRoot "files"
+    $sysDir = Join-Path $TargetGameRoot "sys"
+    $kuriboDest = Join-Path $filesDir "Kuribo!"
+    $systemDest = Join-Path $kuriboDest "System"
+    $modsDest = Join-Path $kuriboDest "Mods"
+
+    New-Item -ItemType Directory -Force -Path $systemDest | Out-Null
+    New-Item -ItemType Directory -Force -Path $modsDest | Out-Null
+    New-Item -ItemType Directory -Force -Path $sysDir | Out-Null
+
+    Write-Host "Merging Kuribo! System → $systemDest"
+    robocopy (Join-Path $stagingKuribo "System") $systemDest /E /NFL /NDL /NJH /NJS /nc /ns /np | Out-Null
+    if ($LASTEXITCODE -ge 8) {
+        Write-Error "Failed to copy Kuribo! System (robocopy exit $LASTEXITCODE)"
+    }
+
+    # Copy any other Kuribo! top-level entries except Mods
+    Get-ChildItem $stagingKuribo -Force | Where-Object {
+        $_.Name -notin @("System", "Mods")
+    } | ForEach-Object {
+        $dest = Join-Path $kuriboDest $_.Name
+        if ($_.PSIsContainer) {
+            robocopy $_.FullName $dest /E /NFL /NDL /NJH /NJS /nc /ns /np | Out-Null
+        } else {
+            Copy-Item $_.FullName $dest -Force
+        }
+    }
+
+    $bseDest = Join-Path $modsDest "BetterSunshineEngine.kxe"
+    if (Test-Path $bseDest) {
+        $existingSize = (Get-Item $bseDest).Length
+        if ($existingSize -ne $OfficialBseSize) {
+            $backup = Join-Path $modsDest "BetterSunshineEngine.kxe.dev-backup"
+            Copy-Item $bseDest $backup -Force
+            Write-Warning "Replacing non-release BetterSunshineEngine.kxe ($existingSize bytes); backup: $backup"
+        }
+    }
+    Copy-Item $stagingKxe $bseDest -Force
+    $movesetSrc = Join-Path $Root "dist\BetterSunshineMoveset.kxe"
+    if (-not (Test-Path $movesetSrc)) {
+        Write-Error "Missing dist\BetterSunshineMoveset.kxe"
+    }
+    Copy-Item $movesetSrc (Join-Path $modsDest "BetterSunshineMoveset.kxe") -Force
+    Copy-Item $Source (Join-Path $modsDest "_BSMSO.kxe") -Force
+    Copy-Item $stagingMain (Join-Path $sysDir "main.dol") -Force
+    Copy-Item $stagingBoot (Join-Path $sysDir "boot.bin") -Force
+
+    # Patch GMSE90 into boot.bin (first 6 ASCII bytes), matching launcher GameIdentity.
+    $bootDest = Join-Path $sysDir "boot.bin"
+    $bytes = [System.IO.File]::ReadAllBytes($bootDest)
+    $id = [System.Text.Encoding]::ASCII.GetBytes("GMSE90")
+    for ($i = 0; $i -lt 6; $i++) { $bytes[$i] = $id[$i] }
+    [System.IO.File]::WriteAllBytes($bootDest, $bytes)
+
+    Write-Host "Installed KuriboKernel.bin → $(Join-Path $systemDest 'KuriboKernel.bin')"
+    Write-Host "Installed BSE main.dol / boot.bin (GMSE90) → $sysDir"
+    Write-Host "Installed BetterSunshineEngine.kxe → $bseDest ($((Get-Item $bseDest).Length) bytes)"
+    Write-Host "Installed BetterSunshineMoveset.kxe → $(Join-Path $modsDest 'BetterSunshineMoveset.kxe') ($((Get-Item (Join-Path $modsDest 'BetterSunshineMoveset.kxe')).Length) bytes)"
+    Write-Host "Installed _BSMSO.kxe → $(Join-Path $modsDest '_BSMSO.kxe') ($((Get-Item (Join-Path $modsDest '_BSMSO.kxe')).Length) bytes)"
+}
 
 if (-not (Test-Path $Source)) {
     Write-Error "Build first: .\tools\build.ps1"
 }
 
-if (-not (Test-Path $ModsDir)) {
-    Write-Error "Mods folder not found: $ModsDir`nSet tools\mods-path.txt, SMSO_MODS_DIR, or launcher config ModsDir."
+$resolvedRoot = Resolve-GameRoot -ExplicitGameRoot $GameRoot -ExplicitModsDir $ModsDir -ExplicitIsoFolder $IsoFolder
+if (-not (Test-Path $resolvedRoot -PathType Container)) {
+    Write-Error "Game root not found: $resolvedRoot`nPass -GameRoot / -IsoFolder, or set tools\mods-path.txt / launcher config."
 }
 
-Ensure-ReleaseBseKxe -DestinationPath $ReleaseBseCache
-
-$bseDest = Join-Path $ModsDir "BetterSunshineEngine.kxe"
-$installedDevBse = $false
-if (Test-Path $bseDest) {
-    $installedDevBse = (Get-Item $bseDest).Length -ne $OfficialBseSize
+if (-not ((Test-Path (Join-Path $resolvedRoot "sys")) -or (Test-Path (Join-Path $resolvedRoot "files")))) {
+    Write-Error "Not a valid extracted SMS root (need sys\ and/or files\): $resolvedRoot"
 }
 
-if ($installedDevBse) {
-    $backup = Join-Path $ModsDir "BetterSunshineEngine.kxe.dev-backup"
-    Copy-Item $bseDest $backup -Force
-    Write-Warning "Replacing non-release BetterSunshineEngine.kxe ($((Get-Item $bseDest).Length) bytes) with official v4.0.0 release."
-    Write-Warning "Dev build backed up to $backup"
-}
+Ensure-OfficialBsePayload
+Install-BseRuntime -TargetGameRoot $resolvedRoot
 
-Copy-Item $ReleaseBseCache $bseDest -Force
-$bseSize = (Get-Item $bseDest).Length
-
-$srcSize = (Get-Item $Source).Length
-Copy-Item $Source $Dest -Force
-$dstSize = (Get-Item $Dest).Length
-
-Write-Host "Installed BetterSunshineEngine.kxe"
-Write-Host "  From: $ReleaseBseCache - $bseSize bytes"
-Write-Host "  To:   $bseDest - $bseSize bytes"
 Write-Host ""
-Write-Host "Installed _BSMSO.kxe"
-Write-Host "  From: $Source - $srcSize bytes"
-Write-Host "  To:   $Dest - $dstSize bytes"
-Write-Host ""
-Write-Host "Restart Dolphin to load the latest BSMSO module."
+Write-Host "BSE / Kuribo runtime installed into: $resolvedRoot"
+Write-Host "Restart Dolphin to load the latest modules."

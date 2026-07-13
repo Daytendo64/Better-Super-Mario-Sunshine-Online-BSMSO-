@@ -4,6 +4,7 @@
 
 class TMarDirector;
 class TMario;
+class J2DOrthoGraph;
 
 namespace JDrama {
 class TGraphics;
@@ -17,11 +18,17 @@ void maintainLocalHideSeekSeekerDraw(TMario *mario, JDrama::TGraphics *graphics)
 
 bool isHideSeekSeekerSlot(u8 slot);
 
+// True while the server-authoritative Start Tag hide-grace is active.
+bool isHideSeekGraceActive();
+// Seekers must not see or hear remote hiders during grace.
+bool shouldSuppressRemoteHiderFromSeekerGrace(u8 remoteSlot);
+
 void initHideSeek();
 void bootHideSeek();
 void onHideSeekStageExit();
 void guardHideSeekDeathBeforeWarp(TMarDirector *director);
 void updateHideSeek(TMarDirector *director);
+void drawHideSeekGrace(const J2DOrthoGraph *graph);
 void clearHideSeek();
 
 bool isHideSeekActive();

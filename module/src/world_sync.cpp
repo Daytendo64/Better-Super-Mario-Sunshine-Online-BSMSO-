@@ -3,8 +3,12 @@
 #include "coin_collect_fx.hpp"
 #include "collectible_scan.hpp"
 #include "comm_buffer.hpp"
+#include "fruit_sync.hpp"
+#include "monte_clean_sync.hpp"
+#include "npc_sync.hpp"
 #include "red_coin_sync.hpp"
 #include "remote_actor.hpp"
+#include "story_flag_sync.hpp"
 #include "yoshi_sync.hpp"
 
 #include <SMS/GC2D/GCConsole2.hxx>
@@ -31,11 +35,16 @@ extern TMario *gpMarioAddress;
 struct TMapObjManager;
 extern TMapObjManager *gpMapObjManager;
 
+namespace smso {
+bool objectSyncGameplayReady();
+}
+
 namespace {
 
 constexpr u32 kStageSettleFrames = 180;
 constexpr u32 kCoinTakenFlagOffset = 0x152;
-constexpr u8 kMaxStageBlueCoins = 30;
+// Vanilla TFlagManager::get/setBlueCoinFlag accepts indices 0..49 per shine stage.
+constexpr u8 kMaxStageBlueCoins = 50;
 constexpr u8 kMaxStageShines = 48;
 constexpr f32 kPosMatchEpsilon = 4.0f;
 constexpr f32 kShinePosMatchEpsilon = 64.0f;
@@ -90,8 +99,10 @@ static u32 sLastGoldCoinCount = 0;
 static u8 sLastCourseId = 0xFF;
 static u8 sLastEpisodeId = 0xFF;
 static u8 sShineBits[16] = {};
-static u32 sBlueCoinBits = 0;
+static u64 sBlueCoinBits = 0;
 static u16 sStageSettleFrames = 0;
+static u16 sCollectibleFallbackCountdown = 0;
+constexpr u16 kCollectibleFallbackIntervalFrames = 120;
 
 static u32 gShineVtable = 0;
 static u32 gCoinBlueVtable = 0;
@@ -143,8 +154,6 @@ static const u32 kVtBrickBlock = SMS_PORT_REGION(0x803CB958, 0x803C3148, 0, 0);
 static const u32 kFnBrickBlockReceive =
     SMS_PORT_REGION(0x801C34B4, 0x801BB36C, 0, 0);
 static const u32 kVtRedCoinSwitch = SMS_PORT_REGION(0x803CA6CC, 0x803C1EBC, 0, 0);
-static const u32 kFnRedCoinSwitchReceive =
-    SMS_PORT_REGION(0x801C0A9C, 0x801B8954, 0, 0);
 static const u32 kVtBreakHideObj = SMS_PORT_REGION(0x803D7050, 0x803CE840, 0, 0);
 static const u32 kFnBreakHideReceive =
     SMS_PORT_REGION(0x801FED74, 0x801F6C58, 0, 0);
@@ -176,7 +185,7 @@ static CountShineFn gCountShine = nullptr;
 static CountBlueCoinFn gCountBlueCoin = nullptr;
 
 static void publishLocalWorldEvent(smso::WorldEventType type, u8 courseId, u8 episodeId, u8 payload0,
-                                   u8 reserved, u32 payload1);
+                                   u8 reserved, u32 payload1, u32 payload2 = 0);
 
 static bool worldSyncEnabled(const smso::CommBuffer *buf) {
     return buf && (buf->bridgeFlags & smso::BF_CONNECTED) != 0 &&
@@ -268,11 +277,15 @@ static void markShineSet(u8 shineId) {
 }
 
 static bool blueCoinWasSet(u8 coinIndex) {
-    return (sBlueCoinBits & (1u << coinIndex)) != 0;
+    if (coinIndex >= kMaxStageBlueCoins)
+        return false;
+    return (sBlueCoinBits & (1ull << coinIndex)) != 0;
 }
 
 static void markBlueCoinSet(u8 coinIndex) {
-    sBlueCoinBits |= 1u << coinIndex;
+    if (coinIndex >= kMaxStageBlueCoins)
+        return;
+    sBlueCoinBits |= 1ull << coinIndex;
 }
 
 static bool isLiveCollectible(const TMapObjBase *obj) {
@@ -545,7 +558,7 @@ static void initHipDropObjectHooks() {
     registerReceiveMessageHook(kVtWoodBarrel, kFnWoodBarrelReceive);
     registerReceiveMessageHook(kVtSuperHipDropBlock, kFnSuperHipDropReceive);
     registerReceiveMessageHook(kVtBrickBlock, kFnBrickBlockReceive);
-    registerReceiveMessageHook(kVtRedCoinSwitch, kFnRedCoinSwitchReceive);
+    // TRedCoinSwitch is intentionally not hooked — switch arming stays local-only.
     registerReceiveMessageHook(kVtBreakHideObj, kFnBreakHideReceive);
 
     gHipDropHideObjVtable = kVtHipDropHideObj;
@@ -590,10 +603,14 @@ static bool visitHideBlueCoinByFlagIndex(TMapObjBase *obj, void *rawCtx) {
     if (!isCollectibleBlueCoin(obj))
         return false;
 
-    auto *coin = reinterpret_cast<TCoin *>(obj);
-    const u8 coinIndex = static_cast<u8>(coin->_154);
-    const u8 mapObjId = static_cast<u8>(obj->mMapObjID);
-    if (coinIndex != hideCtx->flagIndex && mapObjId != hideCtx->flagIndex)
+    // Vanilla blue-coin identity is TMapObjBase::mMapObjID (0x134): TCoinBlue::loadBeforeInit
+    // writes the stream ID there, and fireGetBlueCoin / makeObjAppeared / graffiti
+    // TWaterHitPictureHideObj all gate on getBlueCoinFlag(area, mMapObjID).
+    // Never match TCoin::_154 — on TCoinBlue that field stays 0 (or becomes a particle
+    // pointer). Matching it treated every graffiti-spawned coin as index 0, so after any
+    // real index-0 collect, reconcileCollectibleActors immediately killed newly appeared
+    // graffiti coins ("spray cleans graffiti but no blue coin spawns").
+    if (static_cast<u8>(obj->mMapObjID) != hideCtx->flagIndex)
         return false;
 
     hideBlueCoinActor(obj);
@@ -619,10 +636,7 @@ static bool visitFindBlueCoinByFlagIndex(TMapObjBase *obj, void *rawCtx) {
     if (!isCollectibleBlueCoin(obj))
         return false;
 
-    auto *coin = reinterpret_cast<TCoin *>(obj);
-    const u8 coinIndex = static_cast<u8>(coin->_154);
-    const u8 mapObjId = static_cast<u8>(obj->mMapObjID);
-    if (coinIndex != findCtx->flagIndex && mapObjId != findCtx->flagIndex)
+    if (static_cast<u8>(obj->mMapObjID) != findCtx->flagIndex)
         return false;
 
     findCtx->coin = obj;
@@ -688,9 +702,24 @@ static bool visitCountLiveShine(TMapObjBase *obj, void *ctx) {
     return false;
 }
 
-static bool visitHideShineIfFlagged(TMapObjBase *obj, void *ctx) {
-    auto *fm = reinterpret_cast<TFlagManager *>(ctx);
-    if (*reinterpret_cast<const u32 *>(obj) != gShineVtable)
+struct ReconcileCollectiblesCtx {
+    TFlagManager *fm;
+    u8 courseId;
+};
+
+static bool visitReconcileCollectible(TMapObjBase *obj, void *rawCtx) {
+    auto *ctx = reinterpret_cast<ReconcileCollectiblesCtx *>(rawCtx);
+    const u32 vtable = *reinterpret_cast<const u32 *>(obj);
+
+    if (vtable == gCoinBlueVtable) {
+        const u8 coinIndex = static_cast<u8>(obj->mMapObjID);
+        if (coinIndex < kMaxStageBlueCoins && isCollectibleBlueCoin(obj) &&
+            ctx->fm->getBlueCoinFlag(ctx->courseId, coinIndex))
+            hideBlueCoinActor(obj);
+        return false;
+    }
+
+    if (vtable != gShineVtable)
         return false;
 
     auto *shine = reinterpret_cast<TShine *>(obj);
@@ -698,16 +727,18 @@ static bool visitHideShineIfFlagged(TMapObjBase *obj, void *ctx) {
         return false;
 
     const s32 globalId = shineGlobalIdForActor(shine);
-    if (globalId >= 0 && fm->getShineFlag(static_cast<u8>(globalId)) && shouldHideShineActor(shine))
+    if (globalId >= 0 && ctx->fm->getShineFlag(static_cast<u8>(globalId)) &&
+        shouldHideShineActor(shine))
         hideShineActor(shine);
     return false;
 }
 
-static void hideAllShinesWithSetFlags(TFlagManager *fm) {
-    if (!fm || gShineVtable == 0)
+static void reconcileVisibleCollectibles(TFlagManager *fm, u8 courseId) {
+    if (!fm || gShineVtable == 0 || gCoinBlueVtable == 0)
         return;
 
-    smso::forEachManagedMapObj(visitHideShineIfFlagged, fm);
+    ReconcileCollectiblesCtx ctx = {fm, courseId};
+    smso::forEachManagedMapObj(visitReconcileCollectible, &ctx);
 }
 
 struct HideShineCtx {
@@ -1162,7 +1193,15 @@ static void reconcileCollectibleActors(TFlagManager *fm, u8 courseId) {
     if (sStageSettleFrames < kStageSettleFrames)
         return;
 
-    hideAllShinesWithSetFlags(fm);
+    // The steady-state reconciliation is one manager traversal regardless of how many
+    // collectibles are set. Keep the expensive ID/position fallback at a low cadence for
+    // unusual or late-spawned shines whose global ID cannot be resolved from their actor.
+    reconcileVisibleCollectibles(fm, courseId);
+    if (sCollectibleFallbackCountdown > 0) {
+        --sCollectibleFallbackCountdown;
+        return;
+    }
+    sCollectibleFallbackCountdown = kCollectibleFallbackIntervalFrames;
 
     for (u8 shineId = 0; shineId < 128; ++shineId) {
         if (!fm->getShineFlag(shineId))
@@ -1187,12 +1226,15 @@ static void resetLocalTrackersForStage(u8 courseId, u8 episodeId) {
     sLastGoldCoinCount = 0;
     sBlueCoinBits = 0;
     sStageSettleFrames = 0;
+    sCollectibleFallbackCountdown = 0;
     sStageShineSnapshotReady = false;
     sStageShineCount = 0;
     sPendingShineCapture = {};
     clearRemoteShineCollect();
     clearKnownShinePositions();
     smso::resetLocalYoshiFruitSync();
+    smso::resetNpcSyncForStage();
+    smso::resetStoryFlagTrackers();
     sLocalHipDropFired = false;
     for (u32 i = 0; i < sizeof(sShineBits); ++i)
         sShineBits[i] = 0;
@@ -1206,14 +1248,14 @@ static void resetLocalTrackersForStage(u8 courseId, u8 episodeId) {
         if (fm->getShineFlag(shineId))
             markShineSet(shineId);
     }
-    for (u8 coinIndex = 0; coinIndex < 30; ++coinIndex) {
+    for (u8 coinIndex = 0; coinIndex < kMaxStageBlueCoins; ++coinIndex) {
         if (fm->getBlueCoinFlag(courseId, coinIndex))
             markBlueCoinSet(coinIndex);
     }
 }
 
 static void publishLocalWorldEvent(smso::WorldEventType type, u8 courseId, u8 episodeId, u8 payload0,
-                                   u8 reserved, u32 payload1) {
+                                   u8 reserved, u32 payload1, u32 payload2) {
     if (sApplyingRemoteEvent)
         return;
 
@@ -1238,12 +1280,42 @@ static void publishLocalWorldEvent(smso::WorldEventType type, u8 courseId, u8 ep
         if ((buf->bridgeFlags & (smso::BF_SYNC_EVENT | smso::BF_SYNC_MISSION)) == 0)
             return;
         break;
+    case smso::WE_NPC_CLEANED:
+        if ((buf->bridgeFlags & (smso::BF_SYNC_EVENT | smso::BF_SYNC_MISSION)) == 0)
+            return;
+        break;
     case smso::WE_HIP_DROP_OBJECT:
+        if (!objectSyncEnabled(buf))
+            return;
+        break;
+    case smso::WE_NPC_REACT:
         if (!objectSyncEnabled(buf))
             return;
         break;
     case smso::WE_YOSHI_FRUIT_TAKEN:
         if (!worldSyncEnabled(buf))
+            return;
+        break;
+    case smso::WE_STORY_FLAG:
+        if (!worldSyncEnabled(buf) || (buf->bridgeFlags & smso::BF_SYNC_STORY) == 0)
+            return;
+        break;
+    case smso::WE_TRIGGER_FLAG:
+        if (!worldSyncEnabled(buf) ||
+            (buf->bridgeFlags & (smso::BF_SYNC_STORY | smso::BF_SYNC_MISSION)) == 0)
+            return;
+        break;
+    case smso::WE_SECRET_COMPLETE:
+        if (!worldSyncEnabled(buf) ||
+            (buf->bridgeFlags & (smso::BF_SYNC_STORY | smso::BF_SYNC_SECRET)) == 0)
+            return;
+        break;
+    case smso::WE_MARIO_FRUIT_KICKED:
+    case smso::WE_MARIO_FRUIT_PICKED:
+    case smso::WE_MARIO_FRUIT_THROWN:
+    case smso::WE_MARIO_FRUIT_DROPPED:
+    case smso::WE_MARIO_FRUIT_SYNC:
+        if (!objectSyncEnabled(buf))
             return;
         break;
     default:
@@ -1252,8 +1324,11 @@ static void publishLocalWorldEvent(smso::WorldEventType type, u8 courseId, u8 ep
         break;
     }
 
-    if (sLocalWorldEventQueueCount >= kLocalWorldEventQueueCap)
+    if (sLocalWorldEventQueueCount >= kLocalWorldEventQueueCap) {
+        OSReport("[SMSOBB] world-event queue full (cap=%u) — dropping type=%u course=%u/%u\n",
+                 kLocalWorldEventQueueCap, static_cast<u32>(type), courseId, episodeId);
         return;
+    }
 
     const u8 writeIndex = static_cast<u8>(
         (sLocalWorldEventQueueHead + sLocalWorldEventQueueCount) % kLocalWorldEventQueueCap);
@@ -1266,6 +1341,7 @@ static void publishLocalWorldEvent(smso::WorldEventType type, u8 courseId, u8 ep
     event.payload0 = payload0;
     event.reserved = reserved;
     event.payload1 = payload1;
+    event.payload2 = payload2;
     ++sLocalWorldEventQueueCount;
 }
 
@@ -1347,6 +1423,9 @@ static bool applyWorldEvent(const smso::CommWorldEvent &event) {
 
     case smso::WE_BLUE_COIN_COLLECTED: {
         const u8 flagIndex = event.payload0;
+        if (flagIndex >= kMaxStageBlueCoins)
+            break;
+
         const bool alreadySet = fm->getBlueCoinFlag(event.courseId, flagIndex);
         const bool locallyTracked = blueCoinWasSet(flagIndex);
         const smso::CommBuffer *buf = smso::getCommBuffer();
@@ -1367,7 +1446,10 @@ static bool applyWorldEvent(const smso::CommWorldEvent &event) {
         if (event.courseId == currentCourseId() && (!alreadySet || !locallyTracked))
             hideBlueCoinAtIndex(flagIndex);
 
-        if (remoteCollector && !locallyTracked && haveCoinPos)
+        // Particles/SFX only for collectors on the same course — resolving a local blue-coin
+        // actor by index on a different stage would play the pickup jingle at the wrong place.
+        if (remoteCollector && !locallyTracked && haveCoinPos &&
+            event.courseId == currentCourseId())
             smso::playRemoteCoinCollectParticles(coinPos, true);
         break;
     }
@@ -1383,6 +1465,22 @@ static bool applyWorldEvent(const smso::CommWorldEvent &event) {
 
     case smso::WE_RED_COIN_COLLECTED:
         applied = applyRedCoinWorldEvent(event);
+        break;
+
+    case smso::WE_NPC_CLEANED:
+        applied = smso::applyMonteCleanWorldEvent(event);
+        break;
+
+    case smso::WE_STORY_FLAG:
+        applied = smso::applyStoryFlagWorldEvent(event);
+        break;
+
+    case smso::WE_TRIGGER_FLAG:
+        applied = smso::applyTriggerFlagWorldEvent(event);
+        break;
+
+    case smso::WE_SECRET_COMPLETE:
+        applied = smso::applySecretCompleteWorldEvent(event);
         break;
 
     case smso::WE_HIP_DROP_OBJECT: {
@@ -1410,10 +1508,37 @@ static bool applyWorldEvent(const smso::CommWorldEvent &event) {
                  *reinterpret_cast<const u32 *>(obj), event.payload0, event.reserved);
 
         const u32 objVt = *reinterpret_cast<const u32 *>(obj);
-        if (objVt == smso::redCoinSwitchVtable())
-            smso::applyRemoteRedCoinSwitchHit(obj);
-        else
-            replayRemoteHipDropHit(obj, hipDropPayloadIsSuper(event.payload1));
+        // Never remotely arm red-coin switches — each player presses their own.
+        if (objVt == kVtRedCoinSwitch) {
+            OSReport("[SMSOBB] hip-drop skip red-coin switch (local-only)\n");
+            break;
+        }
+        replayRemoteHipDropHit(obj, hipDropPayloadIsSuper(event.payload1));
+        break;
+    }
+
+    case smso::WE_NPC_REACT: {
+        if (!sameStage(event.courseId, event.episodeId)) {
+            smso::deferRemoteNpcReact(event.payload0, event.reserved, event.payload1,
+                                       event.payload2);
+            break;
+        }
+        smso::CommBuffer *buf = smso::getCommBuffer();
+        const u8 localSlot = buf ? buf->localSlot : 0;
+        if (event.reserved == localSlot)
+            break;
+        if (!buf || !objectSyncEnabled(buf))
+            break;
+        if (!smso::objectSyncGameplayReady()) {
+            smso::deferRemoteNpcReact(event.payload0, event.reserved, event.payload1,
+                                       event.payload2);
+            applied = false;
+            break;
+        }
+
+        if (!smso::applyRemoteNpcReact(event.payload0, event.reserved, event.payload1,
+                                       event.payload2))
+            applied = false;
         break;
     }
 
@@ -1430,6 +1555,60 @@ static bool applyWorldEvent(const smso::CommWorldEvent &event) {
             break;
 
         if (!smso::applyRemoteYoshiFruitWorldEvent(event.payload0, event.payload1))
+            applied = false;
+        break;
+    }
+
+    case smso::WE_MARIO_FRUIT_KICKED:
+    case smso::WE_MARIO_FRUIT_PICKED:
+    case smso::WE_MARIO_FRUIT_THROWN:
+    case smso::WE_MARIO_FRUIT_DROPPED: {
+        if (!sameStage(event.courseId, event.episodeId)) {
+            smso::deferRemoteMarioFruitWorldEvent(event.type, event.payload0, event.reserved,
+                                                    event.payload1, event.payload2);
+            break;
+        }
+        if (!smso::objectSyncGameplayReady()) {
+            smso::deferRemoteMarioFruitWorldEvent(event.type, event.payload0, event.reserved,
+                                                  event.payload1, event.payload2);
+            break;
+        }
+        smso::CommBuffer *buf = smso::getCommBuffer();
+        const u8 localSlot = buf ? buf->localSlot : 0;
+        if (event.reserved == localSlot)
+            break;
+        if (!buf || !objectSyncEnabled(buf))
+            break;
+
+        if (!smso::applyRemoteMarioFruitWorldEvent(event.type, event.payload0, event.reserved,
+                                                   event.payload1, event.payload2)) {
+            OSReport("[SMSOBB] mario-fruit apply miss type=%u enc=%u slot=%u packed=0x%08X\n",
+                     event.type, event.payload0, event.reserved, event.payload1);
+            applied = false;
+        }
+        break;
+    }
+
+    case smso::WE_MARIO_FRUIT_SYNC: {
+        if (!sameStage(event.courseId, event.episodeId)) {
+            smso::deferRemoteMarioFruitWorldEvent(event.type, event.payload0, event.reserved,
+                                                  event.payload1, event.payload2);
+            break;
+        }
+        if (!smso::objectSyncGameplayReady()) {
+            smso::deferRemoteMarioFruitWorldEvent(event.type, event.payload0, event.reserved,
+                                                  event.payload1, event.payload2);
+            break;
+        }
+        smso::CommBuffer *buf = smso::getCommBuffer();
+        const u8 localSlot = buf ? buf->localSlot : 0;
+        if (event.reserved == localSlot)
+            break;
+        if (!buf || !objectSyncEnabled(buf))
+            break;
+
+        if (!smso::applyRemoteMarioFruitSync(event.payload0, event.reserved, event.payload1,
+                                           event.payload2))
             applied = false;
         break;
     }
@@ -1468,7 +1647,6 @@ static void captureLocalWorldProgress() {
         captureStageShineSnapshot();
 
     trackLocalShineCollection();
-    smso::flushDeferredRedCoinEvents();
     resetLocalHipDropCaptureIfIdle();
 
     const u32 goldCoins = static_cast<u32>(fm->getFlag(0x40002u));
@@ -1495,7 +1673,7 @@ static void captureLocalWorldProgress() {
     }
 
     if ((buf->bridgeFlags & smso::BF_SYNC_BLUE_COIN) != 0) {
-        for (u8 coinIndex = 0; coinIndex < 30; ++coinIndex) {
+        for (u8 coinIndex = 0; coinIndex < kMaxStageBlueCoins; ++coinIndex) {
             if (!fm->getBlueCoinFlag(courseId, coinIndex) || blueCoinWasSet(coinIndex))
                 continue;
             markBlueCoinSet(coinIndex);
@@ -1507,6 +1685,8 @@ static void captureLocalWorldProgress() {
     tickRemoteShineCollect();
 
     smso::captureLocalRedCoinProgress();
+    smso::captureLocalStoryFlagProgress();
+    smso::updateMonteCleanSync();
     reconcileCollectibleActors(fm, courseId);
 }
 
@@ -1567,6 +1747,10 @@ bool looksLikePackedCollectibleWorldPos(u32 packed) {
 
 void initWorldSync() {
     initRedCoinSync();
+    initMonteCleanSync();
+    initStoryFlagSync();
+    initFruitSync();
+    initNpcSync();
     clearRemoteShineCollect();
     sPendingShineCapture = {};
     clearKnownShinePositions();
@@ -1588,7 +1772,14 @@ void initWorldSync() {
 
 void processWorldEvents() {
     CommBuffer *buf = getCommBuffer();
-    if (!buf || (buf->bridgeFlags & smso::BF_CONNECTED) == 0)
+    const bool connected =
+        buf && (buf->bridgeFlags & smso::BF_CONNECTED) != 0;
+    const bool storySync =
+        connected &&
+        (buf->bridgeFlags &
+         (smso::BF_SYNC_STORY | smso::BF_SYNC_MISSION | smso::BF_SYNC_SECRET)) != 0;
+    updateStoryFlagSyncConnectionState(connected, storySync);
+    if (!connected)
         return;
 
     const bool progressSync = worldSyncEnabled(buf);
@@ -1598,28 +1789,76 @@ void processWorldEvents() {
 
     if (progressSync)
         captureLocalWorldProgress();
-    else
+    else {
         resetLocalHipDropCaptureIfIdle();
+        if (objectsSync) {
+            const u8 courseId = currentCourseId();
+            const u8 episodeId = currentEpisodeId();
+            if (courseId != sLastCourseId || episodeId != sLastEpisodeId)
+                resetLocalTrackersForStage(courseId, episodeId);
+            if (sStageSettleFrames < kStageSettleFrames)
+                ++sStageSettleFrames;
+        }
+    }
+
+    const bool fruitGameplayReady = objectSyncGameplayReady();
+    if (objectsSync && fruitGameplayReady)
+        updateLocalMarioFruitCapture(gpMarioAddress);
+
+    if (objectsSync && fruitGameplayReady)
+        retryPendingRemoteFruitEvents();
+
+    if (objectsSync && fruitGameplayReady)
+        retryPendingRemoteNpcEvents();
+
+    if (objectsSync && fruitGameplayReady)
+        updateNpcReactSync();
 
     flushLocalWorldEventQueue();
 
     CommWorldEvent &incoming = buf->worldSync.incoming;
     if (incoming.eventId != 0 && incoming.type != 0) {
-        if (incoming.eventId > buf->worldSync.lastAppliedEventId) {
-            if (applyWorldEvent(incoming))
-                buf->worldSync.lastAppliedEventId = incoming.eventId;
+        const bool durableCollectible =
+            incoming.type == static_cast<u8>(smso::WE_SHINE_COLLECTED) ||
+            incoming.type == static_cast<u8>(smso::WE_BLUE_COIN_COLLECTED) ||
+            incoming.type == static_cast<u8>(smso::WE_RED_COIN_COLLECTED) ||
+            incoming.type == static_cast<u8>(smso::WE_NPC_CLEANED) ||
+            incoming.type == static_cast<u8>(smso::WE_STORY_FLAG) ||
+            incoming.type == static_cast<u8>(smso::WE_TRIGGER_FLAG) ||
+            incoming.type == static_cast<u8>(smso::WE_SECRET_COMPLETE);
+
+        // Durable collectibles / story flags are idempotent. Re-apply even when
+        // eventId <= lastApplied so periodic authority snapshots can heal mid-run loss.
+        const bool shouldAttempt =
+            durableCollectible || incoming.eventId > buf->worldSync.lastAppliedEventId;
+
+        if (shouldAttempt) {
+            if (applyWorldEvent(incoming)) {
+                if (incoming.eventId > buf->worldSync.lastAppliedEventId)
+                    buf->worldSync.lastAppliedEventId = incoming.eventId;
+            } else if (durableCollectible) {
+                // FlagManager / stage actors not ready yet — keep the slot and retry next frame
+                // instead of silently dropping a shine/blue/red/story flag that would desync.
+                return;
+            }
         }
-        // Always free the incoming slot once we have observed it so the bridge can deliver
-        // the next queued remote event. Without this, a duplicate or stale eventId would
-        // pin the slot and stall the incoming queue.
+
+        // Free the incoming slot once observed (or non-durable apply failed) so the bridge
+        // can deliver the next queued remote event.
         incoming = {};
     }
 }
 
 void enqueueLocalWorldEvent(u8 type, u8 courseId, u8 episodeId, u8 payload0, u8 reserved,
-                            u32 payload1) {
+                            u32 payload1, u32 payload2) {
     publishLocalWorldEvent(static_cast<smso::WorldEventType>(type), courseId, episodeId, payload0,
-                           reserved, payload1);
+                           reserved, payload1, payload2);
+}
+
+bool objectSyncGameplayReady() {
+    if (!gpMarDirector || gpMarDirector->mCurState != TMarDirector::STATE_NORMAL)
+        return false;
+    return sStageSettleFrames >= kStageSettleFrames;
 }
 
 } // namespace smso

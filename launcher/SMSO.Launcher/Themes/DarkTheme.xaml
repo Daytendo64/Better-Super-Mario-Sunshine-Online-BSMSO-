@@ -327,11 +327,11 @@
     </Style>
 
     <Style x:Key="SmsRedToggleButton" TargetType="ToggleButton">
-        <Setter Property="Background" Value="{StaticResource SmsPrimaryButtonGradient}"/>
-        <Setter Property="Foreground" Value="White"/>
-        <Setter Property="BorderBrush" Value="#7F1D1D"/>
+        <Setter Property="Background" Value="{StaticResource SmsSecondaryBtnSurface}"/>
+        <Setter Property="Foreground" Value="{StaticResource SmsForegroundDim}"/>
+        <Setter Property="BorderBrush" Value="{StaticResource SmsBorder}"/>
         <Setter Property="BorderThickness" Value="1"/>
-        <Setter Property="Padding" Value="12,6"/>
+        <Setter Property="Padding" Value="8,6,12,6"/>
         <Setter Property="Margin" Value="0"/>
         <Setter Property="FontWeight" Value="SemiBold"/>
         <Setter Property="Cursor" Value="Hand"/>
@@ -344,22 +344,62 @@
                             BorderThickness="{TemplateBinding BorderThickness}"
                             CornerRadius="8"
                             Padding="{TemplateBinding Padding}">
-                        <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                            <Border x:Name="stateChip"
+                                    Background="#3B1515"
+                                    BorderBrush="#F87171"
+                                    BorderThickness="1"
+                                    CornerRadius="6"
+                                    Padding="7,2"
+                                    Margin="0,0,8,0"
+                                    VerticalAlignment="Center"
+                                    MinWidth="36">
+                                <TextBlock x:Name="stateLabel"
+                                           Text="Off"
+                                           FontSize="11"
+                                           FontWeight="Bold"
+                                           Foreground="{StaticResource SmsStatusBad}"
+                                           HorizontalAlignment="Center"
+                                           VerticalAlignment="Center"/>
+                            </Border>
+                            <ContentPresenter VerticalAlignment="Center"
+                                              TextElement.Foreground="{TemplateBinding Foreground}"/>
+                        </StackPanel>
                     </Border>
                     <ControlTemplate.Triggers>
                         <Trigger Property="IsChecked" Value="True">
+                            <Setter TargetName="border" Property="Background" Value="{StaticResource SmsPrimaryButtonGradient}"/>
                             <Setter TargetName="border" Property="BorderBrush" Value="#FCA5A5"/>
                             <Setter TargetName="border" Property="BorderThickness" Value="2"/>
+                            <Setter Property="Foreground" Value="White"/>
+                            <Setter TargetName="stateChip" Property="Background" Value="#052E1C"/>
+                            <Setter TargetName="stateChip" Property="BorderBrush" Value="#34D399"/>
+                            <Setter TargetName="stateLabel" Property="Text" Value="On"/>
+                            <Setter TargetName="stateLabel" Property="Foreground" Value="{StaticResource SmsStatusOk}"/>
                         </Trigger>
-                        <Trigger Property="IsMouseOver" Value="True">
+                        <MultiTrigger>
+                            <MultiTrigger.Conditions>
+                                <Condition Property="IsMouseOver" Value="True"/>
+                                <Condition Property="IsChecked" Value="False"/>
+                            </MultiTrigger.Conditions>
+                            <Setter TargetName="border" Property="Background" Value="{StaticResource SmsSecondaryBtnSurfaceHover}"/>
+                            <Setter TargetName="border" Property="BorderBrush" Value="{StaticResource SmsBorderGlow}"/>
+                            <Setter Property="Foreground" Value="{StaticResource SmsForeground}"/>
+                        </MultiTrigger>
+                        <MultiTrigger>
+                            <MultiTrigger.Conditions>
+                                <Condition Property="IsMouseOver" Value="True"/>
+                                <Condition Property="IsChecked" Value="True"/>
+                            </MultiTrigger.Conditions>
                             <Setter TargetName="border" Property="Background" Value="{StaticResource SmsButtonHover}"/>
-                        </Trigger>
+                        </MultiTrigger>
                         <Trigger Property="IsPressed" Value="True">
-                            <Setter TargetName="border" Property="Background" Value="{StaticResource SmsButtonPressed}"/>
+                            <Setter TargetName="border" Property="Opacity" Value="0.92"/>
                         </Trigger>
                         <Trigger Property="IsEnabled" Value="False">
                             <Setter TargetName="border" Property="Background" Value="{StaticResource SmsButtonDisabled}"/>
                             <Setter Property="Foreground" Value="{StaticResource SmsButtonDisabledText}"/>
+                            <Setter TargetName="stateChip" Property="Opacity" Value="0.5"/>
                         </Trigger>
                     </ControlTemplate.Triggers>
                 </ControlTemplate>
@@ -523,7 +563,7 @@
                         <ContentPresenter x:Name="ContentSite"
                                           IsHitTestVisible="False"
                                           Content="{TemplateBinding SelectionBoxItem}"
-                                          ContentTemplate="{TemplateBinding SelectionBoxItemTemplate}"
+                                          ContentTemplate="{TemplateBinding ItemTemplate}"
                                           ContentTemplateSelector="{TemplateBinding ItemTemplateSelector}"
                                           ContentStringFormat="{TemplateBinding SelectionBoxItemStringFormat}"
                                           Margin="8,4,24,4"

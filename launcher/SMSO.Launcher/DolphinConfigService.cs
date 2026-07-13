@@ -12,18 +12,86 @@ internal static class DolphinConfigService
     private const string ConfigDirectoryName = "Config";
     private const string GameSettingsDirectoryName = "GameSettings";
     private const string DolphinIniName = "Dolphin.ini";
+    private const string GfxIniName = "GFX.ini";
     private const string CoreSection = "Core";
+    private const string VideoSettingsSection = "Video_Settings";
+    private const string VideoEnhancementsSection = "Video_Enhancements";
+    private const string VideoHacksSection = "Video_Hacks";
+    private const string GfxSettingsSection = "Settings";
+    private const string GfxEnhancementsSection = "Enhancements";
+    private const string GfxHacksSection = "Hacks";
     private const string RamOverrideEnableKey = "RAMOverrideEnable";
     private const string Mem1SizeKey = "MEM1Size";
     private const string Mem2SizeKey = "MEM2Size";
     private const string TargetMem1Size = "0x03000000"; // 48 MiB, conservative GDEV-size MEM1.
     private const string TargetMem2Size = "0x04000000";
+    private const string BackupRootFolderName = "dolphin-settings-backup";
+    private const string BackupMarkerName = ".backed-up";
 
-    private static readonly string[] LegacyGameSettingsIniNames =
-    {
-        "GMS.ini",
-        $"{GameIdentity.VanillaNtscUGameId}.ini",
-    };
+    // Always applied for GMSE90 (even when the recommended performance profile is off).
+    // FastDiscSpeed=False ⇒ Dolphin UI "Emulate Disc Speed" ON (INI key is inverted).
+    // Overclock=2.0 ⇒ Dolphin UI "Emulated CPU Clock Override" at 200%.
+    private static readonly (string Key, string Value)[] CoreRequiredKeys =
+    [
+        ("FastDiscSpeed", "False"),
+        ("OverclockEnable", "True"),
+        ("Overclock", "2.0"),
+        (RamOverrideEnableKey, "True"),
+        (Mem1SizeKey, TargetMem1Size),
+        (Mem2SizeKey, TargetMem2Size),
+    ];
+
+    // BSMSO GameINI / Dolphin.ini [Core] performance + stability profile.
+    // Does not force GFXBackend (GPU-dependent).
+    private static readonly (string Key, string Value)[] CorePerformanceKeys =
+    [
+        ("CPUThread", "True"),
+        ("DSPHLE", "True"),
+        ("OverclockEnable", "True"),
+        ("Overclock", "2.0"),
+        ("EmulationSpeed", "1.0"),
+        ("FastDiscSpeed", "False"), // Dolphin UI: Emulate Disc Speed ON
+        ("SyncGPU", "False"),
+        (RamOverrideEnableKey, "True"),
+        (Mem1SizeKey, TargetMem1Size),
+        (Mem2SizeKey, TargetMem2Size),
+    ];
+
+    // GameINI uses Video_* section names; GFX.ini uses Settings/Enhancements/Hacks.
+    private static readonly (string Key, string Value)[] VideoSettingsKeys =
+    [
+        ("InternalResolution", "1"),
+        ("MSAA", "0"),
+        ("SSAA", "False"),
+        ("MaxAnisotropy", "0"),
+        ("ShaderCompilationMode", "2"),
+        ("WaitForShadersBeforeStarting", "False"),
+        ("BackendMultithreading", "True"),
+        ("EnableGPUTextureDecoding", "True"),
+        ("VSync", "False"),
+    ];
+
+    private static readonly (string Key, string Value)[] VideoEnhancementsKeys =
+    [
+        ("ForceFiltering", "False"),
+        ("DisableCopyFilter", "True"),
+        ("ArbitraryMipmapDetection", "False"),
+    ];
+
+    private static readonly (string Key, string Value)[] VideoHacksKeys =
+    [
+        ("EFBAccessEnable", "False"),
+        ("EFBToTextureEnable", "False"),
+        ("XFBToTextureEnable", "True"),
+        ("ImmediateXFBEnable", "True"),
+        ("SkipDuplicateXFBs", "False"),
+        ("EFBEmulateFormatChanges", "False"),
+        ("DeferEFBCopies", "True"),
+        ("EFBScaledCopy", "True"),
+        ("FastDepthCalc", "True"),
+        ("VertexRounding", "False"),
+        ("BBoxEnable", "False"),
+    ];
 
     public static bool EnsureBsmsGameIdentity(
         string gamePath,
@@ -125,22 +193,72 @@ internal static class DolphinConfigService
                 return false;
             }
 
+            // Never write icon.png — Dolphin treats icon.png as a Homebrew-style banner for
+            // EVERY game file in that folder (shared ISO directories would all show BSMSO art).
+            RemoveSharedIconBannerIfOurs(sysDirectory, bannerAssetPath, log);
+            if (File.Exists(trimmed))
+            {
+                var isoDirectory = Path.GetDirectoryName(Path.GetFullPath(trimmed));
+                if (!string.IsNullOrEmpty(isoDirectory) &&
+                    !string.Equals(isoDirectory, sysDirectory, StringComparison.OrdinalIgnoreCase))
+                {
+                    RemoveSharedIconBannerIfOurs(isoDirectory, bannerAssetPath, log);
+                }
+            }
+
             var deployed = 0;
-            if (CopyBannerIfChanged(bannerAssetPath, Path.Combine(sysDirectory, $"{gameFileStem}.png")))
+            // Side-car named after this game file only (e.g. main.png / MySms.iso → MySms.png).
+            if (gameFileStem.Length > 0 &&
+                CopyBannerIfChanged(bannerAssetPath, Path.Combine(sysDirectory, $"{gameFileStem}.png")))
+            {
                 deployed++;
-            if (CopyBannerIfChanged(bannerAssetPath, Path.Combine(sysDirectory, "icon.png")))
-                deployed++;
+            }
 
             log?.Invoke(
                 deployed > 0
-                    ? $"Installed BSMSO Dolphin banner in {sysDirectory} ({gameFileStem}.png, icon.png)."
-                    : $"BSMSO Dolphin banner already installed in {sysDirectory}.");
+                    ? $"Installed BSMSO Dolphin banner in {sysDirectory} ({gameFileStem}.png)."
+                    : $"BSMSO Dolphin banner already installed in {sysDirectory} ({gameFileStem}.png).");
             return true;
         }
         catch (Exception ex)
         {
             error = $"Failed to install BSMSO Dolphin banner: {ex.Message}";
             return false;
+        }
+    }
+
+    /// <summary>
+    /// Deletes a leftover <c>icon.png</c> only when it matches the BSMSO banner asset, so other
+    /// games in the same folder stop incorrectly using it as their custom banner.
+    /// </summary>
+    private static void RemoveSharedIconBannerIfOurs(
+        string directory,
+        string bannerAssetPath,
+        Action<string>? log)
+    {
+        var iconPath = Path.Combine(directory, "icon.png");
+        if (!File.Exists(iconPath) || !File.Exists(bannerAssetPath))
+            return;
+
+        try
+        {
+            var iconInfo = new FileInfo(iconPath);
+            var bannerInfo = new FileInfo(bannerAssetPath);
+            if (iconInfo.Length != bannerInfo.Length)
+                return;
+
+            var iconBytes = File.ReadAllBytes(iconPath);
+            var bannerBytes = File.ReadAllBytes(bannerAssetPath);
+            if (!iconBytes.AsSpan().SequenceEqual(bannerBytes))
+                return;
+
+            File.Delete(iconPath);
+            log?.Invoke(
+                $"Removed shared icon.png from {directory} (it was overriding banners for every game in that folder).");
+        }
+        catch (Exception ex)
+        {
+            log?.Invoke($"Could not remove shared icon.png in {directory}: {ex.Message}");
         }
     }
 
@@ -182,6 +300,44 @@ internal static class DolphinConfigService
         }
     }
 
+    /// <summary>
+    /// Launch-time Dolphin settings: always keeps Emulate Disc Speed (FastDiscSpeed=False),
+    /// Emulated CPU Clock Override at 200%, and MEM1/MEM2. Optionally applies or restores the
+    /// recommended performance profile.
+    /// </summary>
+    public static bool ApplyLaunchDolphinSettings(
+        string dolphinPath,
+        bool applyRecommended,
+        Action<string>? log,
+        out string? error)
+    {
+        if (applyRecommended)
+        {
+            TryBackupOriginalSettings(dolphinPath, log);
+            // Performance profile already includes CPU 200% / disc / MEM; re-apply CoreRequired
+            // afterward so those always-forced keys win even if the profile list drifts.
+            if (!EnsurePerformanceStabilityConfig(dolphinPath, log, out error))
+                return false;
+            return EnsureMultiplayerMemoryConfig(dolphinPath, log, out error);
+        }
+
+        if (!TryRestoreOriginalSettings(dolphinPath, log, out var hadBackup, out error))
+            return false;
+
+        if (!hadBackup)
+        {
+            log?.Invoke(
+                "No backed-up Dolphin settings to restore — keeping current files " +
+                "(Emulate Disc Speed + CPU clock 200% + MEM1/MEM2 still applied).");
+        }
+
+        return EnsureMultiplayerMemoryConfig(dolphinPath, log, out error);
+    }
+
+    /// <summary>
+    /// Applies always-required GMSE90 Core keys: Emulate Disc Speed (FastDiscSpeed=False),
+    /// Emulated CPU Clock Override at 200%, and RAM.
+    /// </summary>
     public static bool EnsureMultiplayerMemoryConfig(
         string dolphinPath,
         Action<string>? log,
@@ -203,22 +359,27 @@ internal static class DolphinConfigService
             Directory.CreateDirectory(configDirectory);
 
             var dolphinIni = Path.Combine(configDirectory, DolphinIniName);
-            var dolphinChanged = EnsureRamOverrideIni(dolphinIni);
+            var changed = EnsureIniFile(dolphinIni, lines =>
+                UpsertIniValues(lines, CoreSection, CoreRequiredKeys));
 
-            var gameChanged = false;
             string? configuredIni = null;
+            // Always write root GameSettings first — that is what Dolphin loads for GMSE90.
             foreach (var gameSettingsDirectory in ResolveGameSettingsDirectories(userDirectory))
             {
                 Directory.CreateDirectory(gameSettingsDirectory);
                 var bsmsGameIni = Path.Combine(gameSettingsDirectory, $"{GameIdentity.BsmsGameId}.ini");
-                MigrateLegacyGameSettings(gameSettingsDirectory, bsmsGameIni);
-                gameChanged |= EnsureRamOverrideIni(bsmsGameIni);
+                changed |= EnsureIniFile(bsmsGameIni, lines =>
+                    UpsertIniValues(lines, CoreSection, CoreRequiredKeys));
                 configuredIni ??= bsmsGameIni;
             }
 
-            var verb = dolphinChanged || gameChanged ? "Configured" : "Dolphin RAM override already configured for";
-            log?.Invoke($"{verb} BSMSO: MEM1={TargetMem1Size}, MEM2={TargetMem2Size} ({dolphinIni}; {configuredIni})");
-
+            var verb = changed ? "Configured" : "Dolphin required Core already configured for";
+            log?.Invoke(
+                $"{verb} BSMSO: Emulate Disc Speed on (FastDiscSpeed=False), " +
+                $"CPU clock override 200% (Overclock=2.0), MEM1={TargetMem1Size}, MEM2={TargetMem2Size}");
+            log?.Invoke($"Dolphin User directory: {userDirectory}");
+            if (configuredIni is not null)
+                log?.Invoke($"BSMSO GameINI: {configuredIni}");
             return true;
         }
         catch (Exception ex)
@@ -228,21 +389,87 @@ internal static class DolphinConfigService
         }
     }
 
+    /// <summary>
+    /// Upserts GMSE90 GameINI + matching Dolphin.ini [Core] / GFX.ini keys for performance and
+    /// stability. Preserves unrelated sections (controls, [Gecko], EnableCheats, etc.).
+    /// Does not force GFXBackend. Also applies Emulate Disc Speed, CPU clock 200%, and MEM1/MEM2.
+    /// </summary>
+    public static bool EnsurePerformanceStabilityConfig(
+        string dolphinPath,
+        Action<string>? log,
+        out string? error)
+    {
+        error = null;
+
+        var exePath = dolphinPath.Trim().Trim('"');
+        if (string.IsNullOrWhiteSpace(exePath) || !File.Exists(exePath))
+        {
+            error = "Dolphin path not found.";
+            return false;
+        }
+
+        try
+        {
+            var userDirectory = ResolveUserDirectory(exePath);
+            var configDirectory = Path.Combine(userDirectory, ConfigDirectoryName);
+            Directory.CreateDirectory(configDirectory);
+
+            var dolphinIni = Path.Combine(configDirectory, DolphinIniName);
+            var gfxIni = Path.Combine(configDirectory, GfxIniName);
+            var changed = false;
+
+            changed |= EnsureIniFile(dolphinIni, ApplyCorePerformanceKeys);
+            changed |= EnsureIniFile(gfxIni, ApplyGfxPerformanceKeys);
+
+            string? configuredGameIni = null;
+            // Always write root GameSettings first — that is what Dolphin loads for GMSE90.
+            foreach (var gameSettingsDirectory in ResolveGameSettingsDirectories(userDirectory))
+            {
+                Directory.CreateDirectory(gameSettingsDirectory);
+                var bsmsGameIni = Path.Combine(gameSettingsDirectory, $"{GameIdentity.BsmsGameId}.ini");
+                // Do not seed from GMS.ini / GMSE01.ini — that would import vanilla GFX/controls into BSMSO.
+                changed |= EnsureIniFile(bsmsGameIni, ApplyGameIniPerformanceKeys);
+                configuredGameIni ??= bsmsGameIni;
+            }
+
+            log?.Invoke(
+                changed
+                    ? "Applied BSMSO Dolphin performance profile (1x IR, Dual Core, Hybrid shaders, CPU 200%, MEM1/MEM2…)"
+                    : "BSMSO Dolphin performance profile already applied " +
+                      $"(1x IR, Dual Core, Hybrid shaders, CPU 200%, MEM1={TargetMem1Size}, MEM2={TargetMem2Size})");
+            log?.Invoke($"Dolphin User directory: {userDirectory}");
+
+            if (configuredGameIni is not null)
+                log?.Invoke($"BSMSO GameINI: {configuredGameIni}");
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            error = $"Failed to configure Dolphin performance settings: {ex.Message}";
+            return false;
+        }
+    }
+
     internal static string ResolveUserDirectory(string dolphinExePath)
     {
         var exeDirectory = Path.GetDirectoryName(Path.GetFullPath(dolphinExePath))
             ?? Environment.CurrentDirectory;
 
-        if (Directory.Exists(Path.Combine(exeDirectory, "User")) ||
-            File.Exists(Path.Combine(exeDirectory, "portable.txt")) ||
+        // Match Dolphin: portable only with portable.txt or LocalUserConfig=1.
+        // A bare User/ folder next to Dolphin.exe is NOT enough — Dolphin still uses
+        // AppData / UserConfigPath in that case (writing to User/ silently does nothing).
+        if (File.Exists(Path.Combine(exeDirectory, "portable.txt")) ||
             IsRegistryLocalUserConfigEnabled())
         {
-            return Path.Combine(exeDirectory, "User");
+            var localUser = Path.Combine(exeDirectory, "User");
+            Directory.CreateDirectory(localUser);
+            return localUser;
         }
 
         var registryPath = ReadRegistryUserConfigPath();
         if (!string.IsNullOrWhiteSpace(registryPath))
-            return registryPath!;
+            return registryPath.TrimEnd('\\', '/');
 
         var roamingPath = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
@@ -256,23 +483,129 @@ internal static class DolphinConfigService
 
     internal static IEnumerable<string> ResolveGameSettingsDirectories(string userDirectory)
     {
-        var directories = new List<string>();
-        var rootSettings = Path.Combine(userDirectory, GameSettingsDirectoryName);
-        var configSettings = Path.Combine(userDirectory, ConfigDirectoryName, GameSettingsDirectoryName);
+        // Always write both. Dolphin loads User/GameSettings/<id>.ini for per-game overrides;
+        // Config/GameSettings is a secondary layout some installs also keep.
+        yield return Path.Combine(userDirectory, GameSettingsDirectoryName);
+        yield return Path.Combine(userDirectory, ConfigDirectoryName, GameSettingsDirectoryName);
+    }
 
-        if (Directory.Exists(rootSettings))
-            directories.Add(rootSettings);
-
-        if (Directory.Exists(configSettings) ||
-            Directory.Exists(Path.Combine(userDirectory, ConfigDirectoryName)))
+    /// <summary>
+    /// Copies Dolphin.ini / GFX.ini / GMSE90.ini once before the first recommended-profile apply.
+    /// </summary>
+    internal static void TryBackupOriginalSettings(string dolphinPath, Action<string>? log)
+    {
+        try
         {
-            directories.Add(configSettings);
+            var exePath = dolphinPath.Trim().Trim('"');
+            if (string.IsNullOrWhiteSpace(exePath) || !File.Exists(exePath))
+                return;
+
+            var userDirectory = ResolveUserDirectory(exePath);
+            var backupDirectory = ResolveBackupDirectory(userDirectory);
+            var markerPath = Path.Combine(backupDirectory, BackupMarkerName);
+            if (File.Exists(markerPath))
+                return;
+
+            Directory.CreateDirectory(backupDirectory);
+            var copied = 0;
+            foreach (var relativePath in EnumerateBackupRelativePaths())
+            {
+                var source = Path.Combine(userDirectory, relativePath);
+                if (!File.Exists(source))
+                    continue;
+
+                var destination = Path.Combine(backupDirectory, relativePath);
+                Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+                File.Copy(source, destination, overwrite: false);
+                copied++;
+            }
+
+            File.WriteAllText(markerPath, userDirectory);
+            log?.Invoke(
+                copied > 0
+                    ? $"Backed up original Dolphin settings ({copied} files) to {backupDirectory}"
+                    : $"No existing Dolphin settings to back up yet (marker created at {backupDirectory})");
         }
+        catch (Exception ex)
+        {
+            log?.Invoke($"Could not back up original Dolphin settings: {ex.Message}");
+        }
+    }
 
-        if (directories.Count == 0)
-            directories.Add(configSettings);
+    /// <summary>
+    /// Restores files from the one-time backup. Returns false with error on I/O failure.
+    /// </summary>
+    internal static bool TryRestoreOriginalSettings(
+        string dolphinPath,
+        Action<string>? log,
+        out bool hadBackup,
+        out string? error)
+    {
+        error = null;
+        hadBackup = false;
 
-        return directories;
+        try
+        {
+            var exePath = dolphinPath.Trim().Trim('"');
+            if (string.IsNullOrWhiteSpace(exePath) || !File.Exists(exePath))
+            {
+                error = "Dolphin path not found.";
+                return false;
+            }
+
+            var userDirectory = ResolveUserDirectory(exePath);
+            var backupDirectory = ResolveBackupDirectory(userDirectory);
+            var markerPath = Path.Combine(backupDirectory, BackupMarkerName);
+            if (!File.Exists(markerPath) || !Directory.Exists(backupDirectory))
+                return true;
+
+            hadBackup = true;
+            var restored = 0;
+            foreach (var relativePath in EnumerateBackupRelativePaths())
+            {
+                var source = Path.Combine(backupDirectory, relativePath);
+                if (!File.Exists(source))
+                    continue;
+
+                var destination = Path.Combine(userDirectory, relativePath);
+                Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+                File.Copy(source, destination, overwrite: true);
+                restored++;
+            }
+
+            log?.Invoke(
+                restored > 0
+                    ? $"Restored original Dolphin settings ({restored} files) from backup"
+                    : "Dolphin settings backup exists but contained no INI files to restore");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            error = $"Failed to restore original Dolphin settings: {ex.Message}";
+            return false;
+        }
+    }
+
+    internal static string ResolveBackupDirectory(string userDirectory)
+    {
+        var root = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "SMSO",
+            BackupRootFolderName);
+        var key = Convert.ToHexString(
+            System.Security.Cryptography.SHA256.HashData(
+                System.Text.Encoding.UTF8.GetBytes(userDirectory.TrimEnd('\\', '/').ToLowerInvariant())))
+            [..16];
+        return Path.Combine(root, key);
+    }
+
+    private static IEnumerable<string> EnumerateBackupRelativePaths()
+    {
+        yield return Path.Combine(ConfigDirectoryName, DolphinIniName);
+        yield return Path.Combine(ConfigDirectoryName, GfxIniName);
+        yield return Path.Combine(GameSettingsDirectoryName, $"{GameIdentity.BsmsGameId}.ini");
+        yield return Path.Combine(
+            ConfigDirectoryName, GameSettingsDirectoryName, $"{GameIdentity.BsmsGameId}.ini");
     }
 
     private static IEnumerable<string> ResolveCacheDirectories(string dolphinExePath)
@@ -355,36 +688,56 @@ internal static class DolphinConfigService
         return true;
     }
 
-    private static void MigrateLegacyGameSettings(string gameSettingsDirectory, string targetIniPath)
-    {
-        if (File.Exists(targetIniPath))
-            return;
+    // Exposed for unit tests — applies the GMSE90 GameINI performance profile in-memory.
+    internal static bool ApplyGameIniPerformanceProfile(List<string> lines) =>
+        ApplyGameIniPerformanceKeys(lines);
 
-        foreach (var legacyName in LegacyGameSettingsIniNames)
-        {
-            var legacyPath = Path.Combine(gameSettingsDirectory, legacyName);
-            if (!File.Exists(legacyPath))
-                continue;
+    internal static bool ApplyGfxIniPerformanceProfile(List<string> lines) =>
+        ApplyGfxPerformanceKeys(lines);
 
-            File.Copy(legacyPath, targetIniPath);
-            return;
-        }
-    }
-
-    private static bool EnsureRamOverrideIni(string path)
+    private static bool EnsureIniFile(string path, Func<List<string>, bool> apply)
     {
         var lines = File.Exists(path)
             ? new List<string>(File.ReadAllLines(path))
             : new List<string>();
 
-        var changed = false;
-        changed |= UpsertIniValue(lines, CoreSection, RamOverrideEnableKey, "True");
-        changed |= UpsertIniValue(lines, CoreSection, Mem1SizeKey, TargetMem1Size);
-        changed |= UpsertIniValue(lines, CoreSection, Mem2SizeKey, TargetMem2Size);
-
+        var changed = apply(lines);
         if (changed)
             File.WriteAllLines(path, lines);
 
+        return changed;
+    }
+
+    private static bool ApplyCorePerformanceKeys(List<string> lines) =>
+        UpsertIniValues(lines, CoreSection, CorePerformanceKeys);
+
+    private static bool ApplyGameIniPerformanceKeys(List<string> lines)
+    {
+        var changed = false;
+        changed |= UpsertIniValues(lines, CoreSection, CorePerformanceKeys);
+        changed |= UpsertIniValues(lines, VideoSettingsSection, VideoSettingsKeys);
+        changed |= UpsertIniValues(lines, VideoEnhancementsSection, VideoEnhancementsKeys);
+        changed |= UpsertIniValues(lines, VideoHacksSection, VideoHacksKeys);
+        return changed;
+    }
+
+    private static bool ApplyGfxPerformanceKeys(List<string> lines)
+    {
+        var changed = false;
+        changed |= UpsertIniValues(lines, GfxSettingsSection, VideoSettingsKeys);
+        changed |= UpsertIniValues(lines, GfxEnhancementsSection, VideoEnhancementsKeys);
+        changed |= UpsertIniValues(lines, GfxHacksSection, VideoHacksKeys);
+        return changed;
+    }
+
+    private static bool UpsertIniValues(
+        List<string> lines,
+        string section,
+        IReadOnlyList<(string Key, string Value)> values)
+    {
+        var changed = false;
+        foreach (var (key, value) in values)
+            changed |= UpsertIniValue(lines, section, key, value);
         return changed;
     }
 
@@ -420,7 +773,8 @@ internal static class DolphinConfigService
         }
     }
 
-    private static bool UpsertIniValue(List<string> lines, string section, string key, string value)
+    /// <summary>Upserts a key under [section], preserving other keys/sections. Exposed for tests.</summary>
+    internal static bool UpsertIniValue(List<string> lines, string section, string key, string value)
     {
         var (sectionStart, sectionEnd) = FindSection(lines, section);
         if (sectionStart < 0)

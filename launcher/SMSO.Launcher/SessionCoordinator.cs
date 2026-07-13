@@ -7,6 +7,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using SMSO.Bridge;
 using SMSO.Net;
+using SMSO.Net.MarioPack;
 using SMSO.Server;
 
 namespace SMSO.Launcher;
@@ -28,18 +29,25 @@ public sealed class SessionCoordinator : IDisposable
     private readonly object _sessionLock = new();
     private readonly SemaphoreSlim _networkOpLock = new(1, 1);
     private PlayerRosterEntry[] _roster = Array.Empty<PlayerRosterEntry>();
+    private readonly string?[] _rosterNamesBySlot =
+        new string?[ProtocolConstants.MaxRemoteSlots];
     private bool _sessionHasSeenRoster;
     private volatile bool _shuttingDown;
     private int _clientGeneration;
     private int _sessionEndHandling;
     private int _gameCloseCheckGeneration;
     private CancellationTokenSource? _gameCloseCts;
+    private CancellationTokenSource? _worldReplayCts;
     private DolphinLinkState _previousLinkState = DolphinLinkState.NotRunning;
     private const int GameCloseGraceMs = 1500;
     private PlayerSnapshot _lastLocalSnapshot;
     private bool _hasLastLocalSnapshot;
-    private CancellationTokenSource? _worldReplayCts;
     private readonly List<WorldEventPacket> _pendingEpisodeWorldEvents = new();
+    private readonly object _pendingEpisodeWorldEventsLock = new();
+    private volatile bool _acceptWorldEventApplies;
+    private readonly HashSet<string> _ensuredMarioPackIds = new(StringComparer.OrdinalIgnoreCase);
+    private readonly object _packEnsureLock = new();
+    private int _packEnsureRunning;
 
     public event Action<string>? StatusChanged;
     public event Action<string>? Log;
@@ -51,6 +59,8 @@ public sealed class SessionCoordinator : IDisposable
     public event Action<GameModeStatePacket>? GameModeStateChanged;
     public event Action<DolphinLinkState>? DolphinLinkStateChanged;
     public event Action<string>? DisconnectNotice;
+    /// <summary>Fired when the host warps everyone (or this client via warp-all) to a stage.</summary>
+    public event Action<byte, byte>? WarpEveryoneReceived;
 
     public bool IsHosting => _server?.IsRunning == true;
     public bool IsConnected => _client?.IsConnected == true;
@@ -105,7 +115,7 @@ public sealed class SessionCoordinator : IDisposable
         PlayerNameValidator.ValidateOrThrow(_config.Config.Username);
 
         StatusChanged?.Invoke("Starting server...");
-        await DisconnectAsync().ConfigureAwait(true);
+        await DisconnectAsync(endSession: true).ConfigureAwait(true);
 
         try
         {
@@ -184,6 +194,7 @@ public sealed class SessionCoordinator : IDisposable
                 try
                 {
                     _bridgeWorker.SetConnected(true, client.AssignedSlot, _config.Config.Username, isHost);
+                    _acceptWorldEventApplies = true;
                     if (isHost)
                         ApplyConfiguredSyncSettings();
                     RefreshPlayerAppearance();
@@ -231,7 +242,8 @@ public sealed class SessionCoordinator : IDisposable
             StatusChanged?.Invoke("Connecting");
             try
             {
-                await client.ConnectAsync(host, port, _config.Config.Username).ConfigureAwait(true);
+                await client.ConnectAsync(host, port, _config.Config.Username,
+                    marioModelId: _config.Config.SelectedMarioModelId).ConfigureAwait(true);
                 FlushSnapshotsAfterConnect();
             }
             catch (NetJoinRejectedException ex)
@@ -267,6 +279,7 @@ public sealed class SessionCoordinator : IDisposable
                 return;
 
             _bridgeWorker.SetConnected(true, client.AssignedSlot, _config.Config.Username, IsHosting);
+            _acceptWorldEventApplies = true;
 
             if (_hasLastLocalSnapshot)
             {
@@ -292,7 +305,7 @@ public sealed class SessionCoordinator : IDisposable
         }
     }
 
-    public async Task DisconnectAsync(DisconnectReason reason = DisconnectReason.UserRequest)
+    public async Task DisconnectAsync(DisconnectReason reason = DisconnectReason.UserRequest, bool endSession = false)
     {
         await _networkOpLock.WaitAsync().ConfigureAwait(true);
         try
@@ -304,7 +317,8 @@ public sealed class SessionCoordinator : IDisposable
         }
         finally
         {
-            StopServer();
+            if (endSession)
+                StopServer();
             _networkOpLock.Release();
         }
     }
@@ -348,6 +362,11 @@ public sealed class SessionCoordinator : IDisposable
 
     private void ResetClientSessionState()
     {
+        // Cancel any in-flight DrainWorldEventReplayAsync so disconnect mid-replay cannot
+        // keep pushing shine/red/blue events into Dolphin after SetConnected(false).
+        CancelWorldEventReplay("session reset");
+        _acceptWorldEventApplies = false;
+
         _bridgeWorker.SetConnected(false, 0, "", false);
         AllowClientTeleport = false;
         ClientTeleportPolicyKnown = false;
@@ -357,9 +376,10 @@ public sealed class SessionCoordinator : IDisposable
         _rosterMissStrikes.Clear();
         _sessionHasSeenRoster = false;
         _roster = Array.Empty<PlayerRosterEntry>();
-        _pendingEpisodeWorldEvents.Clear();
-        _worldReplayCts?.Cancel();
-        _worldReplayCts = null;
+        Array.Clear(_rosterNamesBySlot);
+        lock (_pendingEpisodeWorldEventsLock)
+            _pendingEpisodeWorldEvents.Clear();
+        _bridgeWorker.ClearPendingIncomingWorldEvents();
         _bridgeWorker.ClearRemoteSnapshots();
         try
         {
@@ -371,6 +391,34 @@ public sealed class SessionCoordinator : IDisposable
         }
 
         ClientTeleportPolicyChanged?.Invoke();
+    }
+
+    private void CancelWorldEventReplay(string reason)
+    {
+        var cts = Interlocked.Exchange(ref _worldReplayCts, null);
+        if (cts == null)
+            return;
+        try
+        {
+            cts.Cancel();
+            Log?.Invoke($"World sync: cancelled in-flight replay ({reason})");
+        }
+        catch (ObjectDisposedException)
+        {
+            // already disposed
+        }
+        finally
+        {
+            cts.Dispose();
+        }
+    }
+
+    private CancellationToken BeginWorldEventReplay()
+    {
+        CancelWorldEventReplay("new replay");
+        var cts = new CancellationTokenSource();
+        _worldReplayCts = cts;
+        return cts.Token;
     }
 
     private async Task HandleUnexpectedDisconnectAsync(bool stopServer, DisconnectReason reason)
@@ -444,6 +492,7 @@ public sealed class SessionCoordinator : IDisposable
         _bridge.SetTrackedProcessId(_monitor.TrackedProcessId);
         if (_bridge.ForceRelink())
         {
+            _bridgeWorker.InvalidateMailboxWriteCaches();
             Log?.Invoke("Reconnected to Dolphin memory");
             return true;
         }
@@ -477,8 +526,27 @@ public sealed class SessionCoordinator : IDisposable
 
         DolphinConfigService.ClearDolphinGameListCache(dolphinPath, m => Log?.Invoke(m));
 
-        if (!DolphinConfigService.EnsureMultiplayerMemoryConfig(dolphinPath, m => Log?.Invoke(m), out error))
+        if (!DolphinConfigService.ApplyLaunchDolphinSettings(
+                dolphinPath,
+                _config.Config.ApplyRecommendedDolphinSettings,
+                m => Log?.Invoke(m),
+                out error))
             return false;
+
+        if (!_config.Config.ApplyRecommendedDolphinSettings)
+            Log?.Invoke("Skipped recommended Dolphin performance profile (disabled in Connection).");
+
+        // Ensure custom packs are on the disc/folder before Dolphin opens the image.
+        try
+        {
+            MarioPackInstaller.EnsureAllLibraryPacksPresent(isoPath, m => Log?.Invoke(m));
+        }
+        catch (Exception ex)
+        {
+            Log?.Invoke($"Custom model install before launch skipped: {ex.Message}");
+        }
+
+        ApplySelectedMarioModelToBridge();
 
         if (!DolphinProcessMonitor.TryLaunchDolphin(dolphinPath, isoPath, out var processId, out error))
             return false;
@@ -486,6 +554,7 @@ public sealed class SessionCoordinator : IDisposable
         _monitor.RegisterLaunchedProcess(processId);
         _bridge.SetTrackedProcessId(processId);
         _bridge.PrepareForRelink();
+        _bridgeWorker.InvalidateMailboxWriteCaches();
         _bridgeWorker.NotifyDolphinRunning(true);
         _bridge.TryAttach();
 
@@ -721,9 +790,10 @@ public sealed class SessionCoordinator : IDisposable
 
     private void ForceGameModeToNormalLocally()
     {
-        if (_bridgeWorker.CurrentGameModeState.GameMode == GameMode.HideSeek)
-            _bridgeWorker.ForceResetGameModeToNormal(LocalSlot);
-
+        // Always reset — even when already Normal. ResetHideSeekIfActiveOnServer may have
+        // applied Normal at a high Seq first; skipping ForceReset left _lastGameModeSeq stale
+        // so the next session's Seq=1 HideSeek enable was rejected until Seq caught up.
+        _bridgeWorker.ForceResetGameModeToNormal(LocalSlot);
         GameModeStateChanged?.Invoke(_bridgeWorker.CurrentGameModeState);
     }
 
@@ -752,56 +822,71 @@ public sealed class SessionCoordinator : IDisposable
             }
 
             _roster = entries;
+            Array.Clear(_rosterNamesBySlot);
+            foreach (var entry in entries)
+            {
+                if (entry.Slot < _rosterNamesBySlot.Length)
+                    _rosterNamesBySlot[entry.Slot] = entry.Username;
+            }
             rosterCopy = entries;
 
-            if (!IsConnected)
-                return;
-
-            if (_sessionHasSeenRoster)
-            {
-                foreach (var entry in entries)
-                {
-                    if (entry.Slot == LocalSlot || _previousRosterSlots.Contains(entry.Slot))
-                        continue;
-
-                    joinedPlayers ??= new List<(byte, string)>();
-                    var name = string.IsNullOrWhiteSpace(entry.Username)
-                        ? $"Player {entry.Slot + 1}"
-                        : entry.Username;
-                    joinedPlayers.Add((entry.Slot, name));
-                    ResetRemotePlayerForSlot(entry.Slot);
-                }
-            }
-
-            _activeRosterSlots.Clear();
+            // Always push remote model ids into the CommBuffer, even during the brief
+            // JoinAccepted window before IsConnected is observed on this thread.
             foreach (var entry in entries)
-                _activeRosterSlots.Add(entry.Slot);
-
-            var activeSlots = _activeRosterSlots;
-            if (_sessionHasSeenRoster)
             {
-                foreach (var slot in _remoteSnapshots.Keys.ToArray())
+                if (entry.Slot == LocalSlot)
+                    continue;
+                _bridgeWorker.SetRemoteMarioModelId(entry.Slot, entry.MarioModelId);
+            }
+
+            if (IsConnected)
+            {
+                if (_sessionHasSeenRoster)
                 {
-                    if (activeSlots.Contains(slot))
+                    foreach (var entry in entries)
                     {
-                        _rosterMissStrikes.Remove(slot);
-                        continue;
+                        if (entry.Slot == LocalSlot || _previousRosterSlots.Contains(entry.Slot))
+                            continue;
+
+                        joinedPlayers ??= new List<(byte, string)>();
+                        var name = string.IsNullOrWhiteSpace(entry.Username)
+                            ? $"Player {entry.Slot + 1}"
+                            : entry.Username;
+                        joinedPlayers.Add((entry.Slot, name));
+                        ResetRemotePlayerForSlot(entry.Slot);
                     }
-
-                    _rosterMissStrikes.Remove(slot);
-                    EvictRemotePlayer(slot);
                 }
-            }
-            else
-            {
-                _rosterMissStrikes.Clear();
-            }
 
-            _previousRosterSlots.Clear();
-            foreach (var slot in incomingSlots)
-                _previousRosterSlots.Add(slot);
+                _activeRosterSlots.Clear();
+                foreach (var entry in entries)
+                    _activeRosterSlots.Add(entry.Slot);
 
-            _sessionHasSeenRoster = true;
+                var activeSlots = _activeRosterSlots;
+                if (_sessionHasSeenRoster)
+                {
+                    foreach (var slot in _remoteSnapshots.Keys.ToArray())
+                    {
+                        if (activeSlots.Contains(slot))
+                        {
+                            _rosterMissStrikes.Remove(slot);
+                            continue;
+                        }
+
+                        _rosterMissStrikes.Remove(slot);
+                        EvictRemotePlayer(slot);
+                    }
+                }
+                else
+                {
+                    _rosterMissStrikes.Clear();
+                }
+
+                _previousRosterSlots.Clear();
+                foreach (var slot in incomingSlots)
+                    _previousRosterSlots.Add(slot);
+
+                _sessionHasSeenRoster = true;
+            }
         }
 
         if (departedPlayers != null)
@@ -819,7 +904,77 @@ public sealed class SessionCoordinator : IDisposable
                 _bridgeWorker.EnqueueRosterHudEvent(RosterHudEventKind.Connected, slot, name);
         }
 
+        foreach (var entry in rosterCopy)
+        {
+            if (entry.Slot == LocalSlot)
+                continue;
+            // Re-apply after ResetRemotePlayerForSlot/Evict which clear bridge model ids.
+            _bridgeWorker.SetRemoteMarioModelId(entry.Slot, entry.MarioModelId);
+        }
+
+        // Never stall the roster/network callback with ISO extract/rebuild.
+        QueueEnsureRemotePacksBackground(rosterCopy);
+
         RosterUpdated?.Invoke(rosterCopy);
+    }
+
+    private void QueueEnsureRemotePacksBackground(PlayerRosterEntry[] roster)
+    {
+        var isoPath = _config.Config.IsoPath;
+        if (string.IsNullOrWhiteSpace(isoPath) || roster.Length == 0)
+            return;
+
+        List<string>? needed = null;
+        foreach (var entry in roster)
+        {
+            if (entry.Slot == LocalSlot)
+                continue;
+            var id = CharacterPack.NormalizeModelId(entry.MarioModelId);
+            if (id.Length == 0)
+                continue;
+
+            lock (_packEnsureLock)
+            {
+                if (_ensuredMarioPackIds.Contains(id))
+                    continue;
+            }
+
+            needed ??= new List<string>();
+            if (!needed.Contains(id, StringComparer.OrdinalIgnoreCase))
+                needed.Add(id);
+        }
+
+        if (needed == null || needed.Count == 0)
+            return;
+
+        if (Interlocked.CompareExchange(ref _packEnsureRunning, 1, 0) != 0)
+            return;
+
+        var path = isoPath;
+        var ids = needed;
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                foreach (var id in ids)
+                {
+                    try
+                    {
+                        MarioPackInstaller.EnsurePackPresent(path, id, m => Log?.Invoke(m));
+                        lock (_packEnsureLock)
+                            _ensuredMarioPackIds.Add(id);
+                    }
+                    catch (Exception ex)
+                    {
+                        Log?.Invoke($"Model pack ensure for {id} skipped: {ex.Message}");
+                    }
+                }
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _packEnsureRunning, 0);
+            }
+        });
     }
 
     private void ResetRemotePlayerForSlot(byte slot)
@@ -839,6 +994,10 @@ public sealed class SessionCoordinator : IDisposable
     {
         _ = requesterSlot;
         if (targetSlot != ProtocolConstants.WarpAllSlots && targetSlot != LocalSlot) return;
+
+        if (targetSlot == ProtocolConstants.WarpAllSlots)
+            WarpEveryoneReceived?.Invoke(courseId, episodeId);
+
         if (!_bridgeWorker.ApplyWarp(targetSlot, courseId, episodeId, IsHosting))
         {
             Log?.Invoke("Warp queued — waiting for Dolphin link");
@@ -846,6 +1005,7 @@ public sealed class SessionCoordinator : IDisposable
         }
 
         FlushPendingEpisodeWorldEvents(courseId, episodeId);
+        RequestWorldProgressResync($"warp {courseId}/{episodeId}");
     }
 
     private void OnSnapshotReceived(byte slot, PlayerSnapshot snap)
@@ -867,7 +1027,9 @@ public sealed class SessionCoordinator : IDisposable
                 if (NameTagColorCodec.TryDecodeAppearance(snap.Name, out var decoded))
                     appearance = decoded;
 
-                var rosterName = _roster.FirstOrDefault(r => r.Slot == slot)?.Username;
+                var rosterName = slot < _rosterNamesBySlot.Length
+                    ? _rosterNamesBySlot[slot]
+                    : null;
                 if (!string.IsNullOrWhiteSpace(rosterName))
                     snap.SetName(rosterName);
                 else if (string.IsNullOrWhiteSpace(snap.GetPureName()))
@@ -899,16 +1061,59 @@ public sealed class SessionCoordinator : IDisposable
 
     public void RefreshPlayerAppearance()
     {
+        ApplySelectedMarioModelToBridge();
         if (!_hasLastLocalSnapshot || !IsConnected)
             return;
 
         SendLocalSnapshot(_lastLocalSnapshot);
     }
 
+    public void ApplySelectedMarioModelToBridge()
+    {
+        var modelId = CharacterPack.NormalizeModelId(_config.Config.SelectedMarioModelId);
+        _bridgeWorker.ApplyLocalMarioModelId(modelId);
+        var isoPath = _config.Config.IsoPath;
+        if (string.IsNullOrWhiteSpace(isoPath) || modelId.Length == 0)
+            return;
+
+        lock (_packEnsureLock)
+        {
+            if (_ensuredMarioPackIds.Contains(modelId))
+                return;
+        }
+
+        // Disc rebuilds must not block UI / join paths.
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                MarioPackInstaller.EnsurePackPresent(isoPath, modelId, m => Log?.Invoke(m));
+                lock (_packEnsureLock)
+                    _ensuredMarioPackIds.Add(modelId);
+            }
+            catch (Exception ex)
+            {
+                Log?.Invoke($"Model pack install skipped: {ex.Message}");
+            }
+        });
+    }
+
+    public void NotifyLocalMarioModelChanged(string? modelId)
+    {
+        _config.Config.SelectedMarioModelId = CharacterPack.NormalizeModelId(modelId);
+        ApplySelectedMarioModelToBridge();
+        _client?.SetMarioModelId(_config.Config.SelectedMarioModelId);
+        // CommBuffer + heartbeat/roster carry the id; module remounts on next stage reload.
+        Log?.Invoke(string.IsNullOrEmpty(_config.Config.SelectedMarioModelId)
+            ? "Mario model set to Retail (applies after stage reload)."
+            : $"Mario model set to {_config.Config.SelectedMarioModelId} (applies after stage reload).");
+    }
+
     private void OnLocalSnapshot(PlayerSnapshot snap)
     {
         var logicalStage = YoshiSnapshotCodec.LogicalStageId(snap, snap.StageId);
         var logicalEpisode = YoshiSnapshotCodec.LogicalEpisodeId(snap, snap.EpisodeId);
+        var firstSnapshot = !_hasLastLocalSnapshot;
         var lastLogicalStage = _hasLastLocalSnapshot
             ? YoshiSnapshotCodec.LogicalStageId(_lastLocalSnapshot, _lastLocalSnapshot.StageId)
             : logicalStage;
@@ -920,10 +1125,22 @@ public sealed class SessionCoordinator : IDisposable
                            (logicalStage != lastLogicalStage || logicalEpisode != lastLogicalEpisode);
         _lastLocalSnapshot = snap;
         _hasLastLocalSnapshot = true;
-        if (stageChanged)
+        if (firstSnapshot || stageChanged)
+        {
             FlushPendingEpisodeWorldEvents(logicalStage, logicalEpisode);
+            RequestWorldProgressResync(
+                $"{(firstSnapshot ? "initial-stage" : "stage-enter")} {logicalStage}/{logicalEpisode}");
+        }
         SendLocalSnapshot(snap);
         _bridgeWorker.FlushRemoteSnapshotsToDolphin();
+    }
+
+    private void RequestWorldProgressResync(string reason)
+    {
+        if (_client?.IsConnected != true)
+            return;
+        Log?.Invoke($"World sync: requesting progress resync ({reason})");
+        _ = _client.SendWorldProgressRequestAsync();
     }
 
     private void OnLocalMarioVoice(MarioVoiceEvent voiceEvent)
@@ -946,7 +1163,16 @@ public sealed class SessionCoordinator : IDisposable
 
     private static bool IsEpisodeScopedWorldEvent(WorldEventType type) =>
         type is WorldEventType.GoldCoinCollected
-            or WorldEventType.RedCoinCollected;
+            or WorldEventType.RedCoinCollected
+            or WorldEventType.NpcCleaned
+            or WorldEventType.TriggerFlag
+            or WorldEventType.MarioFruitKicked
+            or WorldEventType.MarioFruitPicked
+            or WorldEventType.MarioFruitThrown
+            or WorldEventType.MarioFruitDropped
+            or WorldEventType.MarioFruitSync
+            or WorldEventType.HipDropObject
+            or WorldEventType.NpcReact;
 
     private void OnWorldEventReceived(WorldEventPacket worldEvent)
     {
@@ -955,14 +1181,31 @@ public sealed class SessionCoordinator : IDisposable
 
     private void OnWorldStateReplayReceived(WorldEventPacket[] events)
     {
-        Log?.Invoke($"World sync: received {events.Length} replayed events from server");
+        Log?.Invoke($"World sync: received {events.Length} replayed/resync events from server");
         if (events.Length == 0)
             return;
 
-        _worldReplayCts?.Cancel();
-        _worldReplayCts = new CancellationTokenSource();
-        var ct = _worldReplayCts.Token;
-        _ = DrainWorldEventReplayAsync(events, ct);
+        // Full authority replay replaces pending state — clear queues so duplicates
+        // do not pile up under load / overlapping resyncs (Bugbot medium).
+        _bridgeWorker.ClearPendingIncomingWorldEvents();
+        lock (_pendingEpisodeWorldEventsLock)
+            _pendingEpisodeWorldEvents.Clear();
+
+        // Queue episode-local events when not on that stage; apply immediately when we are.
+        // Avoid forceApply so FlushPendingEpisodeWorldEvents can re-deliver on stage entry
+        // after the module resets per-stage red-coin trackers (late join).
+        // Durable shine/blue events always apply (global / course-keyed flags).
+        foreach (var worldEvent in events)
+            ApplyWorldEventToBridge(worldEvent, forceApply: false);
+
+        // Also kick a drained apply for any events that match the current stage so red-coin
+        // switch recovery runs promptly after a mid-run resync.
+        if (_hasLastLocalSnapshot)
+        {
+            var stageId = YoshiSnapshotCodec.LogicalStageId(_lastLocalSnapshot, _lastLocalSnapshot.StageId);
+            var episodeId = YoshiSnapshotCodec.LogicalEpisodeId(_lastLocalSnapshot, _lastLocalSnapshot.EpisodeId);
+            FlushPendingEpisodeWorldEvents(stageId, episodeId);
+        }
     }
 
     private async Task DrainWorldEventReplayAsync(WorldEventPacket[] events, CancellationToken ct)
@@ -972,7 +1215,16 @@ public sealed class SessionCoordinator : IDisposable
             if (ct.IsCancellationRequested)
                 return;
 
+            // Session teardown rejects applies; leave events queued (reset clears the list).
+            if (!_acceptWorldEventApplies)
+                return;
+
             ApplyWorldEventToBridge(worldEvent, forceApply: true);
+
+            // Remove only after a successful push so a cancelled drain (resync /
+            // overlapping flush) can re-deliver undelivered episode events.
+            lock (_pendingEpisodeWorldEventsLock)
+                _pendingEpisodeWorldEvents.RemoveAll(pending => pending.EventId == worldEvent.EventId);
 
             var deadline = DateTime.UtcNow.AddSeconds(5);
             while (!ct.IsCancellationRequested && DateTime.UtcNow < deadline)
@@ -983,11 +1235,19 @@ public sealed class SessionCoordinator : IDisposable
                     break;
                 }
 
-                await Task.Delay(16, ct).ConfigureAwait(false);
+                try
+                {
+                    await Task.Delay(16, ct).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
             }
         }
 
-        Log?.Invoke($"World sync: replay drain finished ({events.Length} events)");
+        if (!ct.IsCancellationRequested)
+            Log?.Invoke($"World sync: replay drain finished ({events.Length} events)");
     }
 
     private void ApplyWorldEventToBridge(WorldEventPacket worldEvent, bool forceApply = false)
@@ -995,17 +1255,28 @@ public sealed class SessionCoordinator : IDisposable
         if (worldEvent.EventId == 0)
             return;
 
+        // Drop applies after disconnect so a cancelled drain / late TCP packet cannot
+        // resurrect collectible state into an offline session.
+        if (!_acceptWorldEventApplies)
+            return;
+
         if (!forceApply &&
             IsEpisodeScopedWorldEvent(worldEvent.Type) &&
-            _hasLastLocalSnapshot &&
-            (worldEvent.CourseId != YoshiSnapshotCodec.LogicalStageId(_lastLocalSnapshot, _lastLocalSnapshot.StageId) ||
+            (!_hasLastLocalSnapshot ||
+             worldEvent.CourseId != YoshiSnapshotCodec.LogicalStageId(_lastLocalSnapshot, _lastLocalSnapshot.StageId) ||
              worldEvent.EpisodeId != YoshiSnapshotCodec.LogicalEpisodeId(_lastLocalSnapshot,
                  _lastLocalSnapshot.EpisodeId)))
         {
-            if (_pendingEpisodeWorldEvents.All(pending => pending.EventId != worldEvent.EventId))
-                _pendingEpisodeWorldEvents.Add(worldEvent);
+            lock (_pendingEpisodeWorldEventsLock)
+            {
+                if (_pendingEpisodeWorldEvents.All(pending => pending.EventId != worldEvent.EventId))
+                    _pendingEpisodeWorldEvents.Add(worldEvent);
+            }
+            var localStage = _hasLastLocalSnapshot
+                ? $"{_lastLocalSnapshot.StageId}/{_lastLocalSnapshot.EpisodeId}"
+                : "not-ready";
             Log?.Invoke(
-                $"World sync: queued episode-local eventId={worldEvent.EventId} type={worldEvent.Type} — local stage {_lastLocalSnapshot.StageId}/{_lastLocalSnapshot.EpisodeId}, event {worldEvent.CourseId}/{worldEvent.EpisodeId}");
+                $"World sync: queued episode-local eventId={worldEvent.EventId} type={worldEvent.Type} — local stage {localStage}, event {worldEvent.CourseId}/{worldEvent.EpisodeId}");
             return;
         }
 
@@ -1016,23 +1287,28 @@ public sealed class SessionCoordinator : IDisposable
 
     private void FlushPendingEpisodeWorldEvents(byte stageId, byte episodeId)
     {
-        if (_pendingEpisodeWorldEvents.Count == 0)
-            return;
+        WorldEventPacket[] ready;
+        lock (_pendingEpisodeWorldEventsLock)
+        {
+            if (_pendingEpisodeWorldEvents.Count == 0)
+                return;
 
-        var ready = _pendingEpisodeWorldEvents
-            .Where(worldEvent => worldEvent.CourseId == stageId && worldEvent.EpisodeId == episodeId)
-            .OrderBy(worldEvent => worldEvent.EventId)
-            .ToArray();
+            // Snapshot matching events but leave them queued until DrainWorldEventReplayAsync
+            // pushes each one. Cancelling an in-flight drain (resync / new flush) must not
+            // permanently drop events that never reached the bridge.
+            ready = _pendingEpisodeWorldEvents
+                .Where(worldEvent => worldEvent.CourseId == stageId && worldEvent.EpisodeId == episodeId)
+                .OrderBy(worldEvent => worldEvent.EventId)
+                .ToArray();
 
-        if (ready.Length == 0)
-            return;
-
-        foreach (var worldEvent in ready)
-            _pendingEpisodeWorldEvents.Remove(worldEvent);
+            if (ready.Length == 0)
+                return;
+        }
 
         Log?.Invoke(
             $"World sync: flushing {ready.Length} queued episode events for stage {stageId}/{episodeId}");
-        _ = DrainWorldEventReplayAsync(ready, CancellationToken.None);
+        var ct = BeginWorldEventReplay();
+        _ = DrainWorldEventReplayAsync(ready, ct);
     }
 
     private void SendLocalSnapshot(PlayerSnapshot snap)
@@ -1063,6 +1339,7 @@ public sealed class SessionCoordinator : IDisposable
             }
 
             _bridgeWorker.ApplyLocalNameTagAppearance(_config.Config.Username, appearance);
+            // Model id is applied on join / combo change / launch — not every ~60 Hz snapshot.
             if (_client?.IsConnected == true)
                 _client.PublishSnapshot(snap);
 
@@ -1172,7 +1449,7 @@ public sealed class SessionCoordinator : IDisposable
             }
 
             Log?.Invoke(logMessage);
-            await DisconnectAsync(DisconnectReason.DolphinClosed).ConfigureAwait(false);
+            await DisconnectAsync(DisconnectReason.DolphinClosed, endSession: IsHosting).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -1192,9 +1469,13 @@ public sealed class SessionCoordinator : IDisposable
         _previousLinkState = DolphinLinkState.NotRunning;
         _bridgeWorker.NotifyDolphinRunning(true);
         _bridge.PrepareForRelink();
+        _bridgeWorker.InvalidateMailboxWriteCaches();
         _bridge.TryAttach();
         if (IsConnected || IsHosting)
+        {
             _bridgeWorker.SetConnected(true, LocalSlot, _config.Config.Username, IsHosting);
+            _acceptWorldEventApplies = true;
+        }
     }
 
     private void OnDolphinStopped() => HandleDolphinStopped();
@@ -1276,10 +1557,11 @@ public sealed class SessionCoordinator : IDisposable
         if (_shuttingDown) return;
         _shuttingDown = true;
         CancelPendingGameCloseCheck();
+        CancelWorldEventReplay("shutdown");
 
         try
         {
-            DisconnectAsync().Wait(TimeSpan.FromSeconds(2));
+            DisconnectAsync(DisconnectReason.UserRequest, endSession: true).Wait(TimeSpan.FromSeconds(2));
         }
         catch
         {

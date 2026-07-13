@@ -76,12 +76,27 @@ public static class PacketSerializer
 
     public static byte[] BuildHandshake(Guid clientId) => WrapTcp(TcpPacketId.Handshake, clientId.ToByteArray());
 
-    public static byte[] BuildJoinRequest(string username)
+    public static byte[] BuildJoinRequest(string username, string? marioModelId = null)
     {
-        var name = new byte[16];
-        var bytes = System.Text.Encoding.UTF8.GetBytes(username);
-        Array.Copy(bytes, name, Math.Min(bytes.Length, 15));
-        return WrapTcp(TcpPacketId.JoinRequest, name);
+        var payload = new byte[ProtocolConstants.JoinRequestSize];
+        var bytes = System.Text.Encoding.UTF8.GetBytes(username ?? string.Empty);
+        Array.Copy(bytes, payload, Math.Min(bytes.Length, 15));
+        var model = MarioPack.CharacterPack.EncodeModelId(marioModelId);
+        model.CopyTo(payload, 16);
+        return WrapTcp(TcpPacketId.JoinRequest, payload);
+    }
+
+    public static bool TryReadJoinRequest(ReadOnlySpan<byte> payload, out string username, out string marioModelId)
+    {
+        username = string.Empty;
+        marioModelId = string.Empty;
+        if (payload.Length < 16)
+            return false;
+
+        username = System.Text.Encoding.UTF8.GetString(payload.Slice(0, 16)).TrimEnd('\0');
+        if (payload.Length >= ProtocolConstants.JoinRequestSize)
+            marioModelId = MarioPack.CharacterPack.DecodeModelId(payload.Slice(16, ProtocolConstants.MarioModelIdSize));
+        return true;
     }
 
     public static byte[] BuildWarpRequest(byte targetSlot, byte courseId, byte episodeId)
@@ -105,8 +120,8 @@ public static class PacketSerializer
 
     public static byte[] BuildGameModeState(in GameModeStatePacket state)
     {
-        // mode(1)+flags(1)+seq(2)+roundStartMs(4)+tagEventId(1)+roles[StableMaxPlayers]+lastTaggedSlot(1)
-        var payload = new byte[9 + ProtocolConstants.StableMaxPlayers + 1];
+        // mode(1)+flags(1)+seq(2)+roundStartMs(4)+tagEventId(1)+roles[N]+lastTaggedSlot(1)+graceRemainingMs(2)
+        var payload = new byte[9 + ProtocolConstants.StableMaxPlayers + 1 + 2];
         payload[0] = (byte)state.GameMode;
         payload[1] = (byte)state.Flags;
         BinaryPrimitives.WriteUInt16LittleEndian(payload.AsSpan(2, 2), state.Seq);
@@ -115,6 +130,8 @@ public static class PacketSerializer
         for (int i = 0; i < ProtocolConstants.StableMaxPlayers; i++)
             payload[9 + i] = state.GetRole((byte)i);
         payload[9 + ProtocolConstants.StableMaxPlayers] = state.LastTaggedSlot;
+        BinaryPrimitives.WriteUInt16LittleEndian(
+            payload.AsSpan(10 + ProtocolConstants.StableMaxPlayers, 2), state.GraceRemainingMs);
         return WrapTcp(TcpPacketId.GameModeState, payload);
     }
 
@@ -132,6 +149,10 @@ public static class PacketSerializer
         for (int i = 0; i < ProtocolConstants.StableMaxPlayers; i++)
             state.SetRole((byte)i, (HideSeekRole)payload[9 + i]);
         state.LastTaggedSlot = payload[9 + ProtocolConstants.StableMaxPlayers];
+        // GraceRemainingMs added with hide grace; older payloads omit it (treat as 0).
+        if (payload.Length >= 11 + ProtocolConstants.StableMaxPlayers)
+            state.GraceRemainingMs = BinaryPrimitives.ReadUInt16LittleEndian(
+                payload.Slice(10 + ProtocolConstants.StableMaxPlayers, 2));
         return true;
     }
 
@@ -181,6 +202,9 @@ public static class PacketSerializer
         return true;
     }
 
+    public static byte[] BuildWorldProgressRequest()
+        => WrapTcp(TcpPacketId.WorldProgressRequest, ReadOnlySpan<byte>.Empty);
+
     public static byte[] BuildWorldEventRequest(in WorldEventRequest request)
     {
         var payload = new byte[ProtocolConstants.WorldEventClientPayloadSize];
@@ -191,6 +215,7 @@ public static class PacketSerializer
         payload[5] = request.Payload0;
         payload[6] = request.Reserved;
         BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(7, 4), request.Payload1);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(11, 4), request.Payload2);
         return WrapTcp(TcpPacketId.WorldEvent, payload);
     }
 
@@ -212,7 +237,8 @@ public static class PacketSerializer
             payload[4],
             payload[5],
             payload[6],
-            BinaryPrimitives.ReadUInt32LittleEndian(payload.Slice(7, 4)));
+            BinaryPrimitives.ReadUInt32LittleEndian(payload.Slice(7, 4)),
+            BinaryPrimitives.ReadUInt32LittleEndian(payload.Slice(11, 4)));
         return true;
     }
 
@@ -226,6 +252,7 @@ public static class PacketSerializer
         payload[7] = packet.Payload0;
         payload[8] = packet.Reserved;
         BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(9, 4), packet.Payload1);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(13, 4), packet.Payload2);
         return WrapTcp(TcpPacketId.WorldEvent, payload);
     }
 
@@ -241,6 +268,7 @@ public static class PacketSerializer
             return false;
 
         var payload1 = BinaryPrimitives.ReadUInt32LittleEndian(payload.Slice(9, 4));
+        var payload2 = BinaryPrimitives.ReadUInt32LittleEndian(payload.Slice(13, 4));
         packet = new WorldEventPacket(
             eventId,
             type,
@@ -248,7 +276,8 @@ public static class PacketSerializer
             payload[6],
             payload[7],
             payload[8],
-            payload1);
+            payload1,
+            payload2);
         return true;
     }
 
@@ -378,12 +407,21 @@ public static class PacketSerializer
     public static PlayerSnapshot SnapshotFromBytes(byte[] data) => SnapshotFromBytes(data.AsSpan());
 
     public static PlayerSnapshot SnapshotFromBytes(ReadOnlySpan<byte> data)
-    {
-        if (data.Length < ProtocolConstants.PlayerSnapshotSize)
-            return new PlayerSnapshot { Name = new byte[16] };
+        => SnapshotFromBytes(data, new byte[16]);
 
-        var name = new byte[16];
-        data.Slice(44, 16).CopyTo(name);
+    public static PlayerSnapshot SnapshotFromBytes(ReadOnlySpan<byte> data, byte[] nameBuffer)
+    {
+        ArgumentNullException.ThrowIfNull(nameBuffer);
+        if (nameBuffer.Length < 16)
+            throw new ArgumentException("Snapshot name buffer is too small.", nameof(nameBuffer));
+
+        if (data.Length < ProtocolConstants.PlayerSnapshotSize)
+        {
+            Array.Clear(nameBuffer, 0, 16);
+            return new PlayerSnapshot { Name = nameBuffer };
+        }
+
+        data.Slice(44, 16).CopyTo(nameBuffer);
 
         return new PlayerSnapshot
         {
@@ -412,7 +450,7 @@ public static class PacketSerializer
             Connected = data[40],
             Slot = data[41],
             PingMs = BinaryPrimitives.ReadUInt16LittleEndian(data.Slice(42, 2)),
-            Name = name,
+            Name = nameBuffer,
             AnimFrame = BinaryPrimitives.ReadUInt16LittleEndian(data.Slice(60, 2)),
             ActionIdHi = BinaryPrimitives.ReadUInt16LittleEndian(data.Slice(62, 2)),
         };

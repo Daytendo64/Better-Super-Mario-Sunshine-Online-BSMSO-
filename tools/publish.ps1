@@ -35,6 +35,30 @@ New-Item -ItemType Directory -Force -Path $serverAssetsDest | Out-Null
 Copy-Item (Join-Path $AssetsSrc "levels.ntsc-u.json") $serverAssetsDest -Force
 Copy-Item (Join-Path $AssetsSrc "episode-names.ntsc-u.json") $serverAssetsDest -Force
 
+# Bundle custom Mario packs next to the published launcher (same layout as the zip).
+$CustomModelsSrc = Join-Path $env:APPDATA "SMSO\CustomModels"
+$modelsDest = Join-Path $DistLauncher "CustomModels"
+if (Test-Path $CustomModelsSrc) {
+    if (Test-Path $modelsDest) {
+        Remove-Item $modelsDest -Recurse -Force
+    }
+    New-Item -ItemType Directory -Force -Path $modelsDest | Out-Null
+    $libraryJson = Join-Path $CustomModelsSrc "library.json"
+    if (Test-Path $libraryJson) {
+        Copy-Item $libraryJson (Join-Path $modelsDest "library.json") -Force
+    }
+    Get-ChildItem $CustomModelsSrc -File -Filter "*.arc" | ForEach-Object {
+        Copy-Item $_.FullName (Join-Path $modelsDest $_.Name) -Force
+    }
+    Get-ChildItem $CustomModelsSrc -File -Filter "*.szs" | ForEach-Object {
+        Copy-Item $_.FullName (Join-Path $modelsDest $_.Name) -Force
+    }
+    $arcCount = @(Get-ChildItem $modelsDest -File -Filter "*.arc").Count
+    Write-Host "Published $arcCount CustomModels pack(s) from $CustomModelsSrc"
+} else {
+    Write-Warning "No AppData CustomModels library - published launcher will not include packs."
+}
+
 # Optional Authenticode signing (set CODESIGN_PFX + CODESIGN_PASSWORD env vars)
 $pfxPath = $env:CODESIGN_PFX
 $pfxPassword = $env:CODESIGN_PASSWORD

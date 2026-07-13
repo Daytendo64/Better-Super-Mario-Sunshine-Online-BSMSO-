@@ -20,6 +20,8 @@ namespace {
 constexpr u32 kModelWaterCullRadiusOffset = 0x5E08;
 constexpr f32 kVanillaWaterCullRadius = 5000.0f;
 constexpr f32 kRemoteSprayReachMargin = 2000.0f;
+// Cap so one distant remote cannot explode ModelWaterManager cost for everyone.
+constexpr f32 kMaxWaterCullRadius = 7500.0f;
 constexpr s32 kRemoteWaterDropletMaxPerRequest = 48;
 constexpr u8 kRemoteYoshiJuiceTintUnset = 0xFF;
 // doldecomp TModelWaterManager::perform — 0x8 drawWaterVolume (drawTouching tint),
@@ -30,6 +32,7 @@ using ModelWaterPerformFn = void (*)(TModelWaterManager *, u32, JDrama::TGraphic
 
 static ModelWaterPerformFn sOrigModelWaterPerform = nullptr;
 static u8 gRemoteYoshiJuiceDrawTint = kRemoteYoshiJuiceTintUnset;
+static u8 sWaterCullUpdateCounter = 0;
 
 static f32 *getWaterCullRadius() {
     if (!gpModelWaterManager)
@@ -71,6 +74,8 @@ static f32 computeNeededWaterCullRadius() {
             radius = needed;
     }
 
+    if (radius > kMaxWaterCullRadius)
+        radius = kMaxWaterCullRadius;
     return radius;
 }
 
@@ -163,6 +168,10 @@ void initRemoteWaterSync() {
 }
 
 void updateRemoteWaterSync() {
+    // Remotes rarely jump thousands of units in one frame; recompute cull every 8 frames
+    // when idle. Spray emit path still forces an immediate widen.
+    if ((++sWaterCullUpdateCounter & 7u) != 0)
+        return;
     applyWaterCullRadius();
 }
 

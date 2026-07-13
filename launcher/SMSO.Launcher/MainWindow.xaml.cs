@@ -4,6 +4,7 @@ using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
@@ -14,6 +15,7 @@ using Microsoft.Win32;
 using SMSO.Bridge;
 using SMSO.Launcher.Controls;
 using SMSO.Net;
+using SMSO.Net.MarioPack;
 
 namespace SMSO.Launcher;
 
@@ -23,7 +25,6 @@ public partial class MainWindow : Window
     private readonly SessionCoordinator _session;
     private readonly ObservableCollection<RosterViewModel> _rosterItems = new();
     private readonly ObservableCollection<WarpTargetItem> _warpTargets = new();
-    private readonly ObservableCollection<WarpTargetItem> _clientWarpTargets = new();
     private LevelCatalog? _levels;
     private byte[] _lastRosterSlots = Array.Empty<byte>();
     private bool _sessionShutdownComplete;
@@ -32,10 +33,14 @@ public partial class MainWindow : Window
     private RosterViewModel? _hideSeekDragSource;
     private Point _hideSeekDragStartPoint;
     private bool _suppressHideSeekUiSync;
+    private bool _suppressMaxPlayersSave;
+    private bool _syncingMarioModelCombo;
+    private bool _marioModelInstallInProgress;
     private bool _tagRunning;
     private static readonly Random _random = new();
     private readonly Dictionary<byte, int> _randomTagExemptRoundsBySlot = new();
     private readonly Queue<byte> _recentRandomLevelCourseIds = new();
+    private DispatcherTimer? _clientWarpStatusClearTimer;
 
     public MainWindow()
     {
@@ -43,7 +48,6 @@ public partial class MainWindow : Window
         ClientRosterList.ItemsSource = _rosterItems;
         ServerRosterList.ItemsSource = _rosterItems;
         WarpTargetCombo.ItemsSource = _warpTargets;
-        ClientWarpTargetCombo.ItemsSource = _clientWarpTargets;
         _config.Load();
         _session = new SessionCoordinator(_config);
         WireEvents();
@@ -99,10 +103,13 @@ public partial class MainWindow : Window
         void QueueSave() => _config.SaveDebounced();
 
         DolphinPathBox.TextChanged += (_, _) => QueueSave();
-        IsoPathBox.TextChanged += (_, _) => QueueSave();
+        IsoPathBox.TextChanged += (_, _) =>
+        {
+            QueueSave();
+            UpdateModuleInstallUi();
+        };
         ServerIpBox.TextChanged += (_, _) => QueueSave();
         ServerPortBox.TextChanged += (_, _) => QueueSave();
-        MaxPlayersBox.TextChanged += (_, _) => QueueSave();
         UsernameBox.TextChanged += (_, _) =>
         {
             QueuePreviewRefresh();
@@ -183,6 +190,8 @@ public partial class MainWindow : Window
         });
         _session.DolphinLinkStateChanged += _ => SafeRunOnUiThread(RefreshDolphinStateUi);
         _session.GameModeStateChanged += state => RunOnUiThread(() => ApplyGameModeStateToUi(state));
+        _session.WarpEveryoneReceived += (courseId, episodeId) =>
+            RunOnUiThread(() => ShowWarpingEveryoneStatus(courseId, episodeId));
         WireNameTagColorControls();
         GameModeCombo.SelectedIndex = 0;
     }
@@ -236,19 +245,48 @@ public partial class MainWindow : Window
         IsoPathBox.Text = _config.Config.IsoPath;
         ServerIpBox.Text = _config.Config.ServerIp;
         ServerPortBox.Text = _config.Config.ServerPort.ToString();
-        MaxPlayersBox.Text = _config.Config.MaxPlayers.ToString();
+        PopulateMaxPlayersCombo(_config.Config.MaxPlayers);
         ApplyNameTagColorToUi(
             ParseStoredColor(_config.Config.NameTagColor, 255, 255, 255),
             ParseStoredColor(_config.Config.NameTagGradientColor, 136, 136, 136),
             ParseStoredColor(_config.Config.NameTagOutlineColor, 0, 0, 0),
             _config.Config.NameTagGradientEnabled,
             persist: false);
+        // Release zips ship CustomModels/ next to the launcher; seed AppData so
+        // the dropdown matches the packager's library on first run.
+        ModelLibrary.SeedBundledModels(m => _config.Log(m));
+        RefreshMarioModelCombo();
+        if (!string.IsNullOrWhiteSpace(_config.Config.IsoPath))
+        {
+            var isoPath = _config.Config.IsoPath;
+            // Disc extract/rebuild must not freeze the WPF UI thread on startup.
+            _ = Task.Run(() =>
+            {
+                try
+                {
+                    MarioPackInstaller.EnsureAllLibraryPacksPresent(isoPath, m =>
+                        Dispatcher.BeginInvoke(() => _config.Log(m)));
+                }
+                catch (Exception ex)
+                {
+                    Dispatcher.BeginInvoke(() =>
+                        _config.Log($"Custom model install skipped: {ex.Message}"));
+                }
+            });
+        }
+
+        // Push the saved model id into the bridge immediately so solo Launch Dolphin
+        // mounts the configured pack on the first stage (not retail until combo change).
+        _session.ApplySelectedMarioModelToBridge();
+
         AllowClientTeleportToggle.IsChecked = _config.Config.AllowClientTeleporting;
+        ApplyRecommendedDolphinSettingsToggle.IsChecked = _config.Config.ApplyRecommendedDolphinSettings;
         WorldSyncToggle.IsChecked = IsWorldSyncEnabled(
             _config.Config.SyncFlags,
             _config.Config.SyncObjects,
             _config.Config.SyncProgress);
         UpdateClientWorldSyncStatus();
+        UpdateModuleInstallUi();
     }
 
     private void SaveConfigFromUi()
@@ -261,11 +299,149 @@ public partial class MainWindow : Window
         _config.Config.NameTagGradientColor = FormatStoredColor(ReadNameTagColorFromUi(NameTagTarget.Gradient));
         _config.Config.NameTagOutlineColor = FormatStoredColor(ReadNameTagColorFromUi(NameTagTarget.Outline));
         _config.Config.NameTagGradientEnabled = NameTagGradientToggle.IsChecked == true;
+        if (MarioModelCombo.SelectedItem is ModelLibraryEntry selected)
+            _config.Config.SelectedMarioModelId = CharacterPack.NormalizeModelId(selected.Id);
         if (int.TryParse(ServerPortBox.Text, out var port))
             _config.Config.ServerPort = Math.Clamp(port, 1024, 65535);
-        if (int.TryParse(MaxPlayersBox.Text, out var max))
-            _config.Config.MaxPlayers = Math.Clamp(max, 2, ProtocolConstants.StableMaxPlayers);
+        _config.Config.MaxPlayers = ReadMaxPlayersFromUi();
+        _config.Config.ApplyRecommendedDolphinSettings =
+            ApplyRecommendedDolphinSettingsToggle.IsChecked == true;
         _config.SaveDebounced();
+    }
+
+    private void PopulateMaxPlayersCombo(int selected)
+    {
+        if (MaxPlayersCombo == null)
+            return;
+
+        selected = Math.Clamp(selected, 2, ProtocolConstants.StableMaxPlayers);
+        _suppressMaxPlayersSave = true;
+        try
+        {
+            MaxPlayersCombo.Items.Clear();
+            for (var n = 2; n <= ProtocolConstants.StableMaxPlayers; n++)
+            {
+                var label = n == ProtocolConstants.StableMaxPlayers
+                    ? $"{n} (max)"
+                    : n.ToString();
+                MaxPlayersCombo.Items.Add(new ComboBoxItem
+                {
+                    Content = label,
+                    Tag = n,
+                });
+            }
+            MaxPlayersCombo.SelectedIndex = selected - 2;
+        }
+        finally
+        {
+            _suppressMaxPlayersSave = false;
+        }
+    }
+
+    private int ReadMaxPlayersFromUi()
+    {
+        if (MaxPlayersCombo?.SelectedItem is ComboBoxItem item && item.Tag is int n)
+            return Math.Clamp(n, 2, ProtocolConstants.StableMaxPlayers);
+        return Math.Clamp(_config.Config.MaxPlayers, 2, ProtocolConstants.StableMaxPlayers);
+    }
+
+    private void MaxPlayersCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_suppressMaxPlayersSave || MaxPlayersCombo?.SelectedItem is not ComboBoxItem)
+            return;
+        _config.Config.MaxPlayers = ReadMaxPlayersFromUi();
+        _config.SaveDebounced();
+    }
+
+    private void RefreshMarioModelCombo(string? selectId = null)
+    {
+        if (MarioModelCombo == null)
+            return;
+
+        _syncingMarioModelCombo = true;
+        try
+        {
+            var entries = ModelLibrary.ListEntries(includeRetail: true);
+            MarioModelCombo.ItemsSource = entries;
+            var want = CharacterPack.NormalizeModelId(selectId ?? _config.Config.SelectedMarioModelId);
+            var match = entries.FirstOrDefault(e =>
+                CharacterPack.NormalizeModelId(e.Id) == want) ?? entries[0];
+            MarioModelCombo.SelectedItem = match;
+            _config.Config.SelectedMarioModelId = CharacterPack.NormalizeModelId(match.Id);
+        }
+        finally
+        {
+            _syncingMarioModelCombo = false;
+        }
+    }
+
+    private async void MarioModelCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_syncingMarioModelCombo)
+            return;
+        if (MarioModelCombo.SelectedItem is not ModelLibraryEntry entry)
+            return;
+
+        var id = CharacterPack.NormalizeModelId(entry.Id);
+        var previousId = CharacterPack.NormalizeModelId(_config.Config.SelectedMarioModelId);
+        if (_marioModelInstallInProgress)
+        {
+            RefreshMarioModelCombo(previousId);
+            return;
+        }
+
+        _marioModelInstallInProgress = true;
+        MarioModelCombo.IsEnabled = false;
+        LogLine.Text = string.IsNullOrEmpty(id)
+            ? "Restoring Retail Mario…"
+            : $"Installing model {entry.DisplayName}…";
+        MarioPackInstallResult result;
+        try
+        {
+            var gamePath = _config.Config.IsoPath;
+            if (string.IsNullOrWhiteSpace(gamePath))
+            {
+                result = string.IsNullOrEmpty(id)
+                    ? new MarioPackInstallResult(true, false, 0, "Retail Mario selected.")
+                    : new MarioPackInstallResult(
+                        false, false, 0, "Set Game ISO / extracted folder before selecting a custom model.");
+            }
+            else
+            {
+                IProgress<string> progress = new Progress<string>(message =>
+                {
+                    _config.Log(message);
+                    LogLine.Text = message;
+                });
+                result = await Task.Run(() =>
+                        MarioPackInstaller.InstallPackToGame(
+                            gamePath, id, message => progress.Report(message)))
+                    .ConfigureAwait(true);
+            }
+        }
+        catch (Exception ex)
+        {
+            result = new MarioPackInstallResult(false, false, 0, $"Model install failed: {ex.Message}");
+        }
+        finally
+        {
+            _marioModelInstallInProgress = false;
+            MarioModelCombo.IsEnabled = true;
+        }
+
+        if (!result.Succeeded)
+        {
+            var prefix = result.Deferred ? "Model install deferred" : "Model install failed";
+            _config.Log($"{prefix}: {result.Message}");
+            LogLine.Text = $"{prefix}: {result.Message}";
+            RefreshMarioModelCombo(previousId);
+            return;
+        }
+
+        _config.Config.SelectedMarioModelId = id;
+        _config.SaveDebounced();
+        _session.NotifyLocalMarioModelChanged(id);
+        LogLine.Text = result.Message;
     }
 
     private void LoadLevels()
@@ -326,20 +502,22 @@ public partial class MainWindow : Window
     {
         _rosterItems.Clear();
         _warpTargets.Clear();
-        _clientWarpTargets.Clear();
         _lastRosterSlots = Array.Empty<byte>();
         HideSeekHidersList.ItemsSource = null;
         HideSeekSeekersList.ItemsSource = null;
+        ClientHideSeekHidersList.ItemsSource = null;
+        ClientHideSeekSeekersList.ItemsSource = null;
         _tagRunning = false;
         StartStopTagButton.Content = "Start Tag";
+        ClientGameModeText.Text = "Normal";
+        ClientHideSeekPanel.Visibility = Visibility.Collapsed;
+        ClientHideSeekStatusText.Text = string.Empty;
+        ClearClientWarpStatus();
     }
 
     private void UpdateRosterCore(PlayerRosterEntry[] entries)
     {
         var selectedWarpSlot = WarpTargetCombo.SelectedItem is WarpTargetItem warp ? warp.Slot : (byte)0;
-        var selectedClientWarpSlot = ClientWarpTargetCombo.SelectedItem is WarpTargetItem clientWarp
-            ? clientWarp.Slot
-            : (byte)0;
 
         var ordered = entries.OrderBy(e => e.Slot).ToArray();
         var slotSet = ordered.Select(e => e.Slot).ToArray();
@@ -370,6 +548,8 @@ public partial class MainWindow : Window
             else
             {
                 row.LevelName = _levels?.GetCourseName(entry.StageId) ?? entry.StageId.ToString();
+                // Roster episode ids are catalog-normalized by the server; still run through
+                // GetEpisodeDisplayName so Pinna/hotel/plaza remaps resolve if a raw scenario slips in.
                 row.EpisodeName = _levels?.GetEpisodeDisplayName(entry.StageId, entry.EpisodeId)
                                   ?? $"Episode {entry.EpisodeId + 1}";
             }
@@ -386,15 +566,8 @@ public partial class MainWindow : Window
             foreach (var entry in ordered)
                 _warpTargets.Add(new WarpTargetItem { Username = entry.Username, Slot = entry.Slot });
 
-            _clientWarpTargets.Clear();
-            foreach (var entry in ordered.Where(e => e.Slot != _session.LocalSlot))
-                _clientWarpTargets.Add(new WarpTargetItem { Username = entry.Username, Slot = entry.Slot });
-
             var warpMatch = _warpTargets.FirstOrDefault(w => w.Slot == selectedWarpSlot);
             WarpTargetCombo.SelectedItem = warpMatch ?? _warpTargets.FirstOrDefault();
-
-            var clientWarpMatch = _clientWarpTargets.FirstOrDefault(w => w.Slot == selectedClientWarpSlot);
-            ClientWarpTargetCombo.SelectedItem = clientWarpMatch ?? _clientWarpTargets.FirstOrDefault();
 
             if (GameModeCombo.SelectedIndex == 1)
             {
@@ -402,8 +575,9 @@ public partial class MainWindow : Window
                 UpdateStartStopTagButtonState();
             }
 
-            if (rosterShrunk && (_session.IsConnected || _session.IsHosting))
-                MainTabControl.SelectedItem = SettingsTab;
+            // Keep the client read-only game-mode view in sync when players join/leave.
+            if (_session.IsConnected)
+                ApplyClientGameModeView(_session.GameModeState);
         }
     }
 
@@ -428,7 +602,113 @@ public partial class MainWindow : Window
         {
             IsoPathBox.Text = dlg.FileName;
             SaveConfigFromUi();
+            UpdateModuleInstallUi();
         }
+    }
+
+    private async void InstallModules_Click(object sender, RoutedEventArgs e)
+    {
+        SaveConfigFromUi();
+        var isoPath = IsoPathBox.Text.Trim().Trim('"');
+        InstallModulesButton.IsEnabled = false;
+        OpenModsFolderButton.IsEnabled = false;
+        ModuleInstallStatusText.Text = "Installing modules…";
+        try
+        {
+            var (success, message) = await ModuleInstaller.InstallAsync(
+                    isoPath,
+                    progress: status => Dispatcher.Invoke(() => ModuleInstallStatusText.Text = status),
+                    log: m => _config.Log(m))
+                .ConfigureAwait(true);
+            if (success)
+            {
+                ModelLibrary.SeedBundledModels(m => _config.Log(m));
+                try
+                {
+                    await Task.Run(() =>
+                            MarioPackInstaller.EnsureAllLibraryPacksPresent(isoPath, m => _config.Log(m)))
+                        .ConfigureAwait(true);
+                }
+                catch (Exception packEx)
+                {
+                    _config.Log($"Custom model install after modules skipped: {packEx.Message}");
+                }
+                Dispatcher.Invoke(() => RefreshMarioModelCombo());
+            }
+            _config.Log(success ? $"Module install succeeded: {message}" : $"Module install failed: {message}");
+            var title = success
+                ? (message.StartsWith("Patched disc image", StringComparison.Ordinal)
+                    ? "BSMSO — Disc image patched"
+                    : "BSMSO — Modules installed")
+                : "BSMSO — Install failed";
+            MessageBox.Show(message, title,
+                MessageBoxButton.OK, success ? MessageBoxImage.Information : MessageBoxImage.Error);
+        }
+        catch (Exception ex)
+        {
+            _config.Log($"Module install error: {ex.Message}");
+            MessageBox.Show($"Install failed: {ex.Message}", "BSMSO — Install failed",
+                MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+        finally
+        {
+            UpdateModuleInstallUi();
+        }
+    }
+
+    private void OpenModsFolder_Click(object sender, RoutedEventArgs e)
+    {
+        SaveConfigFromUi();
+        var gamePath = IsoPathBox.Text.Trim().Trim('"');
+        var kind = ModuleInstallValidator.ClassifyInstallTarget(gamePath);
+        if (kind == ModuleInstallTargetKind.DiscImage || kind == ModuleInstallTargetKind.CompressedDiscImage)
+        {
+            MessageBox.Show(
+                "Mods live inside the disc image for .iso/.gcm paths.\n\n" +
+                "Use Install / patch modules to update them, or set Game ISO to an extracted folder to browse Mods on disk.",
+                "BSMSO", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        if (!ModuleInstallValidator.TryResolveModsDirectory(gamePath, out var modsDir) ||
+            modsDir == null)
+        {
+            MessageBox.Show(
+                "Could not resolve the Mods folder from the Game ISO path. Set Paths → Game ISO to your extracted SMS folder (or sys\\main.dol), or use Install / patch modules on a .iso/.gcm.",
+                "BSMSO", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        try
+        {
+            Directory.CreateDirectory(modsDir);
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = "explorer.exe",
+                Arguments = modsDir,
+                UseShellExecute = true,
+            });
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"Could not open Mods folder:\n{ex.Message}", "BSMSO",
+                MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+    }
+
+    private void UpdateModuleInstallUi()
+    {
+        if (ModuleInstallStatusText == null || InstallModulesButton == null || OpenModsFolderButton == null)
+            return;
+
+        var status = ModuleInstaller.GetInstallStatus(IsoPathBox.Text.Trim().Trim('"'));
+        ModuleInstallStatusText.Text = status.Message;
+        InstallModulesButton.IsEnabled = status.CanInstall;
+        InstallModulesButton.Opacity = status.CanInstall ? 1.0 : 0.45;
+        var canOpenMods = status.TargetKind == ModuleInstallTargetKind.ExtractedFolder &&
+                          !string.IsNullOrWhiteSpace(status.ModsDirectory);
+        OpenModsFolderButton.IsEnabled = canOpenMods;
+        OpenModsFolderButton.Opacity = canOpenMods ? 1.0 : 0.45;
     }
 
     private async void Host_Click(object sender, RoutedEventArgs e)
@@ -492,7 +772,7 @@ public partial class MainWindow : Window
         DisconnectButton.IsEnabled = false;
         try
         {
-            await _session.DisconnectAsync();
+            await _session.DisconnectAsync(endSession: _session.IsHosting);
         }
         finally
         {
@@ -619,6 +899,7 @@ public partial class MainWindow : Window
                 ? $"Dolphin is open — link will restore when the game loads {ModuleVersionMessages.ModuleFileName}."
                 : "Launch Dolphin here before hosting or connecting (button enables when paths are set).",
         };
+        UpdateModuleInstallUi();
         UpdateConnectionUi();
     }
 
@@ -731,10 +1012,15 @@ public partial class MainWindow : Window
         ClientLevelCombo.IsEnabled = teleportActive;
         ClientEpisodeCombo.IsEnabled = teleportActive;
         ClientWarpButton.IsEnabled = teleportActive;
-        ClientWarpTargetCombo.IsEnabled = teleportActive;
-        ClientTeleportToPlayerButton.IsEnabled = teleportActive;
         ClientTeleportOverlay.Visibility = showOverlay ? Visibility.Visible : Visibility.Collapsed;
         ClientTeleportOverlayText.Text = "The host needs to enable client teleporting to use this.";
+
+        // Game Modes on Client Actions is always view-only; dim when disconnected.
+        ClientGameModesPanel.Opacity = connected ? 1.0 : 0.45;
+        if (connected)
+            ApplyClientGameModeView(_session.GameModeState);
+        else
+            ApplyClientGameModeView(GameModeStatePacket.CreateDefault());
     }
 
     private async void ClientWarp_Click(object sender, RoutedEventArgs e)
@@ -743,17 +1029,6 @@ public partial class MainWindow : Window
         if (course == null || ClientEpisodeCombo.SelectedItem is not EpisodeEntry episode)
             return;
         await _session.WarpSelfAsync(course.CourseId, episode.EpisodeId);
-    }
-
-    private async void ClientTeleportToPlayer_Click(object sender, RoutedEventArgs e)
-    {
-        if (ClientWarpTargetCombo.SelectedItem is not WarpTargetItem target)
-        {
-            MessageBox.Show("Select a player in Warp target first.", "BSMSO", MessageBoxButton.OK, MessageBoxImage.Information);
-            return;
-        }
-
-        await _session.WarpToPlayerAsync(target.Slot);
     }
 
     private void ServerWarpAll_Click(object sender, RoutedEventArgs e)
@@ -785,6 +1060,14 @@ public partial class MainWindow : Window
         _session.SetAllowClientTeleport(AllowClientTeleportToggle.IsChecked == true);
         UpdateServerClientTeleportStatus();
         UpdateClientActionsUi();
+    }
+
+    private void ApplyRecommendedDolphinSettings_Changed(object sender, RoutedEventArgs e)
+    {
+        if (!IsLoaded) return;
+        _config.Config.ApplyRecommendedDolphinSettings =
+            ApplyRecommendedDolphinSettingsToggle.IsChecked == true;
+        _config.SaveDebounced();
     }
 
     private void WorldSync_Changed(object sender, RoutedEventArgs e)
@@ -1167,19 +1450,63 @@ public partial class MainWindow : Window
 
             _tagRunning = state.TagActive;
             StartStopTagButton.Content = state.TagActive ? "Stop Tag" : "Start Tag";
-            HideSeekStatusText.Text = state.GameMode == GameMode.HideSeek
-                ? state.RoundComplete
-                    ? "All hiders found!"
-                    : state.TagActive
-                        ? "Tag is running."
-                        : "Assign seekers, then start tag."
-                : string.Empty;
+            HideSeekStatusText.Text = FormatHideSeekStatus(state, forClient: false);
             UpdateStartStopTagButtonState();
+            ApplyClientGameModeView(state);
         }
         finally
         {
             _suppressHideSeekUiSync = false;
         }
+    }
+
+    private void ApplyClientGameModeView(GameModeStatePacket state)
+    {
+        ClientGameModeText.Text = state.GameMode == GameMode.HideSeek ? "Hide and Seek" : "Normal";
+        ClientHideSeekPanel.Visibility = state.GameMode == GameMode.HideSeek ? Visibility.Visible : Visibility.Collapsed;
+
+        if (state.GameMode == GameMode.HideSeek)
+        {
+            var hiders = new ObservableCollection<RosterViewModel>();
+            var seekers = new ObservableCollection<RosterViewModel>();
+            foreach (var row in _rosterItems.OrderBy(r => r.Slot))
+            {
+                if (row.Slot >= state.Roles.Length)
+                    hiders.Add(row);
+                else if (state.Roles[row.Slot] == HideSeekRole.Seeker)
+                    seekers.Add(row);
+                else
+                    hiders.Add(row);
+            }
+
+            ClientHideSeekHidersList.ItemsSource = hiders;
+            ClientHideSeekSeekersList.ItemsSource = seekers;
+            ClientHideSeekStatusText.Text = FormatHideSeekStatus(state, forClient: true);
+        }
+        else
+        {
+            ClientHideSeekHidersList.ItemsSource = null;
+            ClientHideSeekSeekersList.ItemsSource = null;
+            ClientHideSeekStatusText.Text = string.Empty;
+        }
+    }
+
+    private static string FormatHideSeekStatus(GameModeStatePacket state, bool forClient)
+    {
+        if (state.GameMode != GameMode.HideSeek)
+            return string.Empty;
+        if (state.RoundComplete)
+            return "All hiders found!";
+        if (state.TagActive && state.GraceActive)
+        {
+            var seconds = Math.Max(1, (state.GraceRemainingMs + 999) / 1000);
+            return $"Hide grace: {seconds}s — seekers frozen.";
+        }
+        if (state.TagActive)
+            return "Tag is running.";
+        return forClient
+            ? "Waiting for host to assign seekers and start tag."
+            : "Assign seekers, then start tag.";
     }
 
     private void ResetGameModeUiToNormal()
@@ -1372,19 +1699,29 @@ public partial class MainWindow : Window
         if (!_session.IsHosting || _levels == null)
             return;
 
-        const int levelCooldownRounds = 3;
+        const int levelCooldownRounds = 5;
         const byte defaultEpisodeId = 7; // 0-indexed: episodeId 7 == "Episode 8"
         // Per-course episode overrides (0-indexed episode IDs).
+        // Pinna: always warp to Park Area (course 13), never the beach (course 5).
+        // Catalog ep 7 maps to pinnaParco5 (scenario 5) via PinnaParkInteriorMapping —
+        // raw scenario 7 is Episode 1 post–Mecha-Bowser shine spawn, not balloons.
+        // Sirena: stay on the beach (area 6). Catalog eps 6–7 remap to hotel interior
+        // (area 7) via TryResolveWarpDestination and can hang Random Level loads;
+        // default Episode 8 would also hit that path, so override to Episode 5.
         var episodeOverrides = new Dictionary<byte, byte>
         {
-            { 9, 5 }, // Noki Bay  -> Episode 6
+            { 13, 7 }, // Pinna Park Area -> Episode 8 catalog (→ scenario 5 / pinnaParco5)
+            { 6, 4 },  // Sirena Beach -> Episode 5 (King Boo Down Below catalog id; not hotel)
+            { 9, 5 },  // Noki Bay -> Episode 6
         };
 
         static byte TargetEpisode(CourseEntry c, Dictionary<byte, byte> overrides) =>
             overrides.TryGetValue(c.CourseId, out var ep) ? ep : defaultEpisodeId;
 
         bool HasTargetEpisode(CourseEntry c) =>
-            c.Warpable && c.Episodes.Any(ep => ep.EpisodeId == TargetEpisode(c, episodeOverrides));
+            c.CourseId != 5 && // Pinna beach — use Park Area (13) instead
+            c.Warpable &&
+            c.Episodes.Any(ep => ep.EpisodeId == TargetEpisode(c, episodeOverrides));
 
         var all = _levels.Courses.Where(HasTargetEpisode).ToList();
         if (all.Count == 0)
@@ -1408,8 +1745,37 @@ public partial class MainWindow : Window
             _recentRandomLevelCourseIds.Dequeue();
 
         _session.HostWarp(ProtocolConstants.WarpAllSlots, course.CourseId, episodeId);
-        var episodeLabel = _levels.GetEpisodeDisplayName(course.CourseId, episodeId);
-        HideSeekStatusText.Text = $"Warping everyone to {course.DisplayName} — {episodeLabel}";
+        // Status text is set for host + clients via WarpEveryoneReceived when the
+        // warp-all command is applied.
+    }
+
+    private void ShowWarpingEveryoneStatus(byte courseId, byte episodeId)
+    {
+        var courseName = _levels?.GetCourseName(courseId) ?? $"Course {courseId}";
+        var episodeLabel = _levels?.GetEpisodeDisplayName(courseId, episodeId) ?? $"Episode {episodeId + 1}";
+        var text = $"Warping everyone to {courseName} — {episodeLabel}";
+        HideSeekStatusText.Text = text;
+
+        // Client: keep waiting/tag status separate; warp notice is its own line.
+        ClientWarpStatusText.Text = text;
+        ClientWarpStatusText.Visibility = Visibility.Visible;
+        _clientWarpStatusClearTimer?.Stop();
+        _clientWarpStatusClearTimer ??= new DispatcherTimer { Interval = TimeSpan.FromSeconds(8) };
+        _clientWarpStatusClearTimer.Tick -= ClientWarpStatusClearTimer_Tick;
+        _clientWarpStatusClearTimer.Tick += ClientWarpStatusClearTimer_Tick;
+        _clientWarpStatusClearTimer.Start();
+    }
+
+    private void ClientWarpStatusClearTimer_Tick(object? sender, EventArgs e)
+    {
+        ClearClientWarpStatus();
+    }
+
+    private void ClearClientWarpStatus()
+    {
+        _clientWarpStatusClearTimer?.Stop();
+        ClientWarpStatusText.Text = string.Empty;
+        ClientWarpStatusText.Visibility = Visibility.Collapsed;
     }
 
     private void HideSeekRoleList_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)

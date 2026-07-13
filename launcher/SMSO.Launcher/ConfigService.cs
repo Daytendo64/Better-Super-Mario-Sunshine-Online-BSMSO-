@@ -17,11 +17,18 @@ public sealed class AppConfig
     public string NameTagGradientColor { get; set; } = "888888";
     public string NameTagOutlineColor { get; set; } = "000000";
     public bool NameTagGradientEnabled { get; set; }
+    /// <summary>Empty = retail Mario; otherwise 8-char hex pack id from CustomModels library.</summary>
+    public string SelectedMarioModelId { get; set; } = "";
     public uint MailboxAddress { get; set; } = 0x817FC000;
     public bool SyncFlags { get; set; }
     public bool SyncObjects { get; set; }
     public bool SyncProgress { get; set; }
     public bool AllowClientTeleporting { get; set; }
+    /// <summary>
+    /// When true, Launch Dolphin applies the BSMSO performance/stability profile.
+    /// When false, restores the backed-up original Dolphin settings (RAM override still kept).
+    /// </summary>
+    public bool ApplyRecommendedDolphinSettings { get; set; }
 }
 
 public sealed class ConfigService
@@ -116,6 +123,7 @@ public sealed class ConfigService
             _config.NameTagGradientColor = shared.NameTagGradientColor;
             _config.NameTagOutlineColor = shared.NameTagOutlineColor;
             _config.NameTagGradientEnabled = shared.NameTagGradientEnabled;
+            _config.SelectedMarioModelId = shared.SelectedMarioModelId;
             _config.MailboxAddress = shared.MailboxAddress;
             _config.SyncFlags = shared.SyncFlags;
             _config.SyncObjects = shared.SyncObjects;
@@ -188,6 +196,7 @@ public sealed class ConfigService
             shared.NameTagGradientColor = _config.NameTagGradientColor;
             shared.NameTagOutlineColor = _config.NameTagOutlineColor;
             shared.NameTagGradientEnabled = _config.NameTagGradientEnabled;
+            shared.SelectedMarioModelId = _config.SelectedMarioModelId;
             var sharedJson = JsonSerializer.Serialize(shared, new JsonSerializerOptions { WriteIndented = true });
             File.WriteAllText(SharedConfigPath, sharedJson);
         }

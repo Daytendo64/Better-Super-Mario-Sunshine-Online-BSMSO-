@@ -26,21 +26,57 @@ public sealed class LevelCatalog
         return course.Episodes.Any(e => e.EpisodeId == episodeId);
     }
 
-    public static byte NormalizeEpisodeFromGame(byte courseId, byte gameScenarioId)
+    /// <summary>
+    /// Maps an in-game scenario index (<c>mEpisodeID</c>) to a catalog episode id for roster/display.
+    /// Plaza and hotel interiors use dedicated scenario↔catalog tables; other courses usually match 1:1.
+    /// When <paramref name="catalog"/> is provided, unknown ids on single-episode courses (secrets,
+    /// plaza minigames) coerce to that course's sole catalog episode — the game often inherits the
+    /// parent episode id when entering those areas.
+    /// </summary>
+    public static byte NormalizeEpisodeFromGame(byte courseId, byte gameScenarioId,
+        LevelCatalog? catalog = null)
     {
+        byte catalogId;
         if (courseId == DelfinoPlazaMapping.AreaId &&
-            DelfinoPlazaMapping.TryScenarioToCatalog(gameScenarioId, out var catalogId))
+            DelfinoPlazaMapping.TryScenarioToCatalog(gameScenarioId, out catalogId))
         {
-            return catalogId;
+            // mapped
+        }
+        else if (courseId == SirenaHotelInteriorMapping.AreaId &&
+                 SirenaHotelInteriorMapping.TryScenarioToCatalog(gameScenarioId, out catalogId))
+        {
+            // mapped
+        }
+        else if (courseId == PinnaParkInteriorMapping.AreaId &&
+                 PinnaParkInteriorMapping.TryScenarioToCatalog(gameScenarioId, out catalogId))
+        {
+            // mapped
+        }
+        else
+        {
+            catalogId = gameScenarioId;
         }
 
-        if (courseId == SirenaHotelInteriorMapping.AreaId &&
-            SirenaHotelInteriorMapping.TryScenarioToCatalog(gameScenarioId, out catalogId))
-        {
-            return catalogId;
-        }
+        return catalog?.CoerceToKnownEpisode(courseId, catalogId) ?? catalogId;
+    }
 
-        return gameScenarioId;
+    /// <summary>
+    /// If <paramref name="catalogEpisodeId"/> is not listed for the course but the course has exactly
+    /// one catalog episode, return that episode (typical for secret/plaza sub-areas).
+    /// </summary>
+    public byte CoerceToKnownEpisode(byte courseId, byte catalogEpisodeId)
+    {
+        var course = FindCourse(courseId);
+        if (course == null || course.Episodes.Count == 0)
+            return catalogEpisodeId;
+
+        if (course.Episodes.Any(e => e.EpisodeId == catalogEpisodeId))
+            return catalogEpisodeId;
+
+        if (course.Episodes.Count == 1)
+            return course.Episodes[0].EpisodeId;
+
+        return catalogEpisodeId;
     }
 
     public static byte ResolveEpisodeForWarp(byte courseId, byte catalogEpisodeId)
@@ -56,6 +92,12 @@ public sealed class LevelCatalog
 
         if (courseId == SirenaHotelInteriorMapping.AreaId &&
             SirenaHotelInteriorMapping.TryCatalogToScenario(catalogEpisodeId, out scenarioId))
+        {
+            return scenarioId;
+        }
+
+        if (courseId == PinnaParkInteriorMapping.AreaId &&
+            PinnaParkInteriorMapping.TryCatalogToScenario(catalogEpisodeId, out scenarioId))
         {
             return scenarioId;
         }
@@ -91,8 +133,50 @@ public sealed class LevelCatalog
     public string GetEpisodeDisplayName(byte courseId, byte catalogEpisodeId)
     {
         var course = FindCourse(courseId);
-        return course?.Episodes.FirstOrDefault(e => e.EpisodeId == catalogEpisodeId)?.DisplayName
-               ?? $"Episode {catalogEpisodeId + 1}";
+        if (course == null)
+            return $"Episode {catalogEpisodeId + 1}";
+
+        var match = course.Episodes.FirstOrDefault(e => e.EpisodeId == catalogEpisodeId);
+        if (match != null)
+            return match.DisplayName;
+
+        // Accept raw in-game scenario ids when the roster/UI path skipped Normalize.
+        // Only remap when the scenario is not already a listed catalog episode id (plaza
+        // catalog 0..7 overlaps some scenario numbers — never reinterpret a direct miss
+        // that Normalize would change into a different listed id via ambiguous overlap).
+        if (courseId == DelfinoPlazaMapping.AreaId &&
+            DelfinoPlazaMapping.TryScenarioToCatalog(catalogEpisodeId, out var plazaMapped) &&
+            plazaMapped != catalogEpisodeId)
+        {
+            match = course.Episodes.FirstOrDefault(e => e.EpisodeId == plazaMapped);
+            if (match != null)
+                return match.DisplayName;
+        }
+
+        // Hotel / Pinna park: accept raw mission scenarios if not already normalized.
+        if (courseId == SirenaHotelInteriorMapping.AreaId &&
+            SirenaHotelInteriorMapping.TryScenarioToCatalog(catalogEpisodeId, out var mapped) &&
+            mapped != catalogEpisodeId)
+        {
+            match = course.Episodes.FirstOrDefault(e => e.EpisodeId == mapped);
+            if (match != null)
+                return match.DisplayName;
+        }
+
+        if (courseId == PinnaParkInteriorMapping.AreaId &&
+            PinnaParkInteriorMapping.TryScenarioToCatalog(catalogEpisodeId, out mapped) &&
+            mapped != catalogEpisodeId)
+        {
+            match = course.Episodes.FirstOrDefault(e => e.EpisodeId == mapped);
+            if (match != null)
+                return match.DisplayName;
+        }
+
+        // Secrets / plaza interiors: game may still report a parent scenario id.
+        if (course.Episodes.Count == 1)
+            return course.Episodes[0].DisplayName;
+
+        return $"Episode {catalogEpisodeId + 1}";
     }
 
     /// <summary>Warpable courses sorted for teleport dropdowns (story → plaza → secrets → minigames).</summary>
@@ -197,4 +281,6 @@ public sealed class PlayerRosterEntry
   public DolphinState State { get; set; }
   public ushort PingMs { get; set; }
   public bool Connected { get; set; } = true;
+  /// <summary>8-char hex model id, or empty for retail Mario.</summary>
+  public string MarioModelId { get; set; } = "";
 }

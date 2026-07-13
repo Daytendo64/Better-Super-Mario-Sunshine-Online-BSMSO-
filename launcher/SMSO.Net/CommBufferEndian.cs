@@ -29,9 +29,9 @@ public static class CommBufferEndian
         buf.WarpPosZ = ReadF32(data, ref o);
         buf.WarpFacingY = ReadF32(data, ref o);
         Array.Copy(data, o, buf.LocalPlayerName, 0, 16); o += 16;
-        buf.LocalSnapshot = ReadSnapshot(data, ref o);
+        ReadSnapshotInto(data, ref o, ref buf.LocalSnapshot);
         for (int i = 0; i < buf.RemoteSnapshots.Length; i++)
-            buf.RemoteSnapshots[i] = ReadSnapshot(data, ref o);
+            ReadSnapshotInto(data, ref o, ref buf.RemoteSnapshots[i]);
         buf.LocalNameTagAppearance = ReadAppearance(data, ref o);
         buf.RemoteNameTagAppearances ??= CommBuffer.CreateRemoteAppearanceArray();
         for (int i = 0; i < buf.RemoteNameTagAppearances.Length; i++)
@@ -40,9 +40,15 @@ public static class CommBufferEndian
         buf.RemoteMarioVoiceEvents ??= CommBuffer.CreateRemoteMarioVoiceEventArray();
         for (int i = 0; i < buf.RemoteMarioVoiceEvents.Length; i++)
             buf.RemoteMarioVoiceEvents[i] = ReadMarioVoiceEvent(data, ref o);
-        buf.GameModeState = ReadGameModeState(data, ref o);
+        ReadGameModeStateInto(data, ref o, ref buf.GameModeState);
         buf.WorldSync = ReadWorldSyncState(data, ref o);
-        buf.RosterHud = ReadRosterHudSync(data, ref o);
+        ReadRosterHudSyncInto(data, ref o, ref buf.RosterHud);
+        buf.LocalMarioModelId ??= new byte[ProtocolConstants.MarioModelIdSize];
+        Array.Copy(data, o, buf.LocalMarioModelId, 0, ProtocolConstants.MarioModelIdSize);
+        o += ProtocolConstants.MarioModelIdSize;
+        buf.RemoteMarioModelIds ??=
+            new byte[ProtocolConstants.MarioModelIdSize * ProtocolConstants.MaxRemoteSlots];
+        Array.Copy(data, o, buf.RemoteMarioModelIds, 0, buf.RemoteMarioModelIds.Length);
         return buf;
     }
 
@@ -137,6 +143,13 @@ public static class CommBufferEndian
         WriteGameModeState(data, ref o, buffer.GameModeState);
         WriteWorldSyncState(data, ref o, buffer.WorldSync);
         WriteRosterHudSync(data, ref o, buffer.RosterHud);
+        var localModel = buffer.LocalMarioModelId ?? new byte[ProtocolConstants.MarioModelIdSize];
+        localModel.AsSpan(0, ProtocolConstants.MarioModelIdSize).CopyTo(data.AsSpan(o, ProtocolConstants.MarioModelIdSize));
+        o += ProtocolConstants.MarioModelIdSize;
+        var remoteModels = buffer.RemoteMarioModelIds ??
+            new byte[ProtocolConstants.MarioModelIdSize * ProtocolConstants.MaxRemoteSlots];
+        remoteModels.AsSpan(0, ProtocolConstants.CommMarioModelIdsSize - ProtocolConstants.MarioModelIdSize)
+            .CopyTo(data.AsSpan(o, ProtocolConstants.CommMarioModelIdsSize - ProtocolConstants.MarioModelIdSize));
         return data;
     }
 
@@ -173,6 +186,28 @@ public static class CommBufferEndian
         var slots = remotes ?? CommBuffer.CreateRemoteAppearanceArray();
         for (int i = 0; i < ProtocolConstants.MaxRemoteSlots; i++)
             WriteAppearance(dest, ref o, i < slots.Length ? slots[i] : NameTagAppearance.CreateDefault());
+    }
+
+    public static byte[] ToMarioModelIdsDolphinBytes(byte[] localModelId, byte[] remoteModelIds)
+    {
+        var data = new byte[ProtocolConstants.CommMarioModelIdsSize];
+        WriteMarioModelIdsInto(data, localModelId, remoteModelIds);
+        return data;
+    }
+
+    public static void WriteMarioModelIdsInto(Span<byte> dest, byte[] localModelId, byte[] remoteModelIds)
+    {
+        if (dest.Length < ProtocolConstants.CommMarioModelIdsSize)
+            throw new ArgumentException("Mario model id buffer is too small.", nameof(dest));
+
+        dest.Clear();
+        var local = localModelId ?? new byte[ProtocolConstants.MarioModelIdSize];
+        local.AsSpan(0, Math.Min(ProtocolConstants.MarioModelIdSize, local.Length))
+            .CopyTo(dest.Slice(0, ProtocolConstants.MarioModelIdSize));
+        var remotes = remoteModelIds ??
+            new byte[ProtocolConstants.MarioModelIdSize * ProtocolConstants.MaxRemoteSlots];
+        remotes.AsSpan(0, Math.Min(remotes.Length, ProtocolConstants.MarioModelIdSize * ProtocolConstants.MaxRemoteSlots))
+            .CopyTo(dest.Slice(ProtocolConstants.MarioModelIdSize));
     }
 
     public static byte[] ToRemoteMarioVoiceEventsDolphinBytes(MarioVoiceEvent[] remotes)
@@ -296,14 +331,13 @@ public static class CommBufferEndian
         o += 4;
     }
 
-    private static CommRosterHudSync ReadRosterHudSync(byte[] data, ref int o)
+    private static void ReadRosterHudSyncInto(byte[] data, ref int o, ref CommRosterHudSync sync)
     {
-        var sync = CommRosterHudSync.CreateDefault();
+        sync.Events ??= CommRosterHudSync.CreateDefault().Events;
         sync.LatestSequence = BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(o, 2));
         o += 2;
         for (int i = 0; i < sync.Events.Length; i++)
-            sync.Events[i] = ReadRosterHudEvent(data, ref o);
-        return sync;
+            ReadRosterHudEventInto(data, ref o, ref sync.Events[i]);
     }
 
     private static void WriteRosterHudSync(Span<byte> data, ref int o, in CommRosterHudSync sync)
@@ -315,16 +349,15 @@ public static class CommBufferEndian
             WriteRosterHudEvent(data, ref o, i < events.Length ? events[i] : default);
     }
 
-    private static CommRosterHudEvent ReadRosterHudEvent(byte[] data, ref int o)
+    private static void ReadRosterHudEventInto(byte[] data, ref int o, ref CommRosterHudEvent ev)
     {
-        var ev = new CommRosterHudEvent { Name = new byte[16] };
+        ev.Name ??= new byte[16];
         ev.Sequence = BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(o, 2));
         o += 2;
         ev.Kind = (RosterHudEventKind)data[o++];
         ev.Slot = data[o++];
         Array.Copy(data, o, ev.Name, 0, 16);
         o += 16;
-        return ev;
     }
 
     private static void WriteRosterHudEvent(Span<byte> data, ref int o, in CommRosterHudEvent ev)
@@ -350,6 +383,7 @@ public static class CommBufferEndian
             Payload0 = data[o + 9],
             Reserved = data[o + 10],
             Payload1 = BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(o + 11, 4)),
+            Payload2 = BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(o + 15, 4)),
         };
         o += ProtocolConstants.CommWorldEventSize;
         return worldEvent;
@@ -365,24 +399,23 @@ public static class CommBufferEndian
         data[o + 9] = worldEvent.Payload0;
         data[o + 10] = worldEvent.Reserved;
         BinaryPrimitives.WriteUInt32BigEndian(data.Slice(o + 11, 4), worldEvent.Payload1);
+        BinaryPrimitives.WriteUInt32BigEndian(data.Slice(o + 15, 4), worldEvent.Payload2);
         o += ProtocolConstants.CommWorldEventSize;
     }
 
-    private static CommGameModeState ReadGameModeState(byte[] data, ref int o)
+    private static void ReadGameModeStateInto(byte[] data, ref int o, ref CommGameModeState state)
     {
-        var state = new CommGameModeState
-        {
-            Mode = data[o],
-            Flags = data[o + 1],
-            LocalRole = data[o + 2],
-            LastTaggedSlot = data[o + 3],
-            TagEventId = data[o + 4],
-            RoundStartMs = BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(o + 5, 4)),
-            RoleBySlot = new byte[ProtocolConstants.StableMaxPlayers],
-        };
+        state.RoleBySlot ??= new byte[ProtocolConstants.StableMaxPlayers];
+        state.Mode = data[o];
+        state.Flags = data[o + 1];
+        state.LocalRole = data[o + 2];
+        state.LastTaggedSlot = data[o + 3];
+        state.TagEventId = data[o + 4];
+        state.RoundStartMs = BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(o + 5, 4));
         Array.Copy(data, o + 9, state.RoleBySlot, 0, ProtocolConstants.StableMaxPlayers);
+        state.GraceRemainingMs = BinaryPrimitives.ReadUInt16BigEndian(
+            data.AsSpan(o + 9 + ProtocolConstants.StableMaxPlayers, 2));
         o += ProtocolConstants.CommGameModeStateSize;
-        return state;
     }
 
     private static void WriteGameModeState(Span<byte> data, ref int o, in CommGameModeState state)
@@ -397,14 +430,16 @@ public static class CommBufferEndian
         var roles = state.RoleBySlot ?? new byte[ProtocolConstants.StableMaxPlayers];
         for (int i = 0; i < ProtocolConstants.StableMaxPlayers; i++)
             data[o++] = i < roles.Length ? roles[i] : (byte)HideSeekRole.Hider;
+        BinaryPrimitives.WriteUInt16BigEndian(data.Slice(o, 2), state.GraceRemainingMs);
+        o += 2;
     }
 
     private static void WriteGameModeState(byte[] data, ref int o, in CommGameModeState state) =>
         WriteGameModeState(data.AsSpan(), ref o, state);
 
-    private static PlayerSnapshot ReadSnapshot(byte[] data, ref int o)
+    private static void ReadSnapshotInto(byte[] data, ref int o, ref PlayerSnapshot snap)
     {
-        var snap = new PlayerSnapshot { Name = new byte[16] };
+        snap.Name ??= new byte[16];
         snap.Position = ReadVec3(data, ref o);
         snap.Velocity = ReadVec3(data, ref o);
         snap.RotationY = ReadF32(data, ref o);
@@ -423,7 +458,6 @@ public static class CommBufferEndian
         Array.Copy(data, o, snap.Name, 0, 16); o += 16;
         snap.AnimFrame = BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(o, 2)); o += 2;
         snap.ActionIdHi = BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(o, 2)); o += 2;
-        return snap;
     }
 
     private static void WriteSnapshot(Span<byte> data, ref int o, PlayerSnapshot snap)

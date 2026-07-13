@@ -25,10 +25,14 @@ public sealed class NetClient : IDisposable
     private readonly byte[] _udpPingScratch =
         new byte[ProtocolConstants.UdpSnapshotPayloadOffset + ProtocolConstants.UdpPingPayloadSize];
     private int _udpPingTickCount;
-    private readonly Dictionary<byte, uint> _lastReceivedSnapshotSeq = new();
+    private readonly uint[] _lastReceivedSnapshotSeq =
+        new uint[ProtocolConstants.MaxRemoteSlots];
+    private readonly bool[] _hasReceivedSnapshotSeq =
+        new bool[ProtocolConstants.MaxRemoteSlots];
     private readonly HashSet<byte> _knownRosterSlots = new();
     private PlayerSnapshot _pendingSnapshot;
     private bool _hasPendingSnapshot;
+    private string? _pendingMarioModelId;
 
     public event Action<PlayerRosterEntry[]>? RosterUpdated;
     public event Action<byte, byte, byte, byte>? WarpCommandReceived;
@@ -48,7 +52,12 @@ public sealed class NetClient : IDisposable
     public bool IsConnected => _tcp?.Connected == true && !_isDisconnecting;
     public ushort MeasuredPingMs { get; private set; }
 
-    public async Task ConnectAsync(string host, int port, string username, CancellationToken ct = default)
+    /// <summary>Model id included on subsequent heartbeats so the server can refresh roster.</summary>
+    public void SetMarioModelId(string? modelId) =>
+        _pendingMarioModelId = MarioPack.CharacterPack.NormalizeModelId(modelId);
+
+    public async Task ConnectAsync(string host, int port, string username, CancellationToken ct = default,
+        string? marioModelId = null)
     {
         EnsureFullyDisposed();
 
@@ -57,7 +66,12 @@ public sealed class NetClient : IDisposable
         _snapshotSeq = 0;
         _hasPendingSnapshot = false;
         MeasuredPingMs = 0;
-        _lastReceivedSnapshotSeq.Clear();
+        // Always track the join-time model so heartbeats re-advertise it. Leaving this null
+        // used to send 8 zero bytes every 2s, which the server treated as "switch to retail"
+        // and wiped the roster model id — remotes then always spawned as retail Mario.
+        _pendingMarioModelId = MarioPack.CharacterPack.NormalizeModelId(marioModelId);
+        Array.Clear(_lastReceivedSnapshotSeq);
+        Array.Clear(_hasReceivedSnapshotSeq);
         _knownRosterSlots.Clear();
 
         var joinTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -87,7 +101,7 @@ public sealed class NetClient : IDisposable
             _tcpReadTask = Task.Run(() => TcpReadLoop(_cts.Token), _cts.Token);
 
             await SendTcpAsync(PacketSerializer.BuildHandshake(Guid.NewGuid()), _cts.Token);
-            await SendTcpAsync(PacketSerializer.BuildJoinRequest(username), _cts.Token);
+            await SendTcpAsync(PacketSerializer.BuildJoinRequest(username, marioModelId), _cts.Token);
 
             using var joinCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             joinCts.CancelAfter(TimeSpan.FromMilliseconds(ProtocolConstants.ConnectTimeoutMs));
@@ -192,6 +206,12 @@ public sealed class NetClient : IDisposable
     public async Task SendWorldEventAsync(WorldEventRequest request)
     {
         await SendTcpAsync(PacketSerializer.BuildWorldEventRequest(request),
+            _cts?.Token ?? default);
+    }
+
+    public async Task SendWorldProgressRequestAsync()
+    {
+        await SendTcpAsync(PacketSerializer.BuildWorldProgressRequest(),
             _cts?.Token ?? default);
     }
 
@@ -516,6 +536,9 @@ public sealed class NetClient : IDisposable
                 if (PacketSerializer.TryReadWorldStateReplay(payload, out var replayEvents))
                     WorldStateReplayReceived?.Invoke(replayEvents);
                 break;
+            case TcpPacketId.WorldProgressRequest:
+                // Server→client should not receive this; ignore if echoed.
+                break;
             case TcpPacketId.Disconnect:
                 if (!_isDisconnecting)
                     Disconnected?.Invoke(payload.Length > 0 ? (DisconnectReason)payload[0] : DisconnectReason.ServerShutdown);
@@ -537,9 +560,14 @@ public sealed class NetClient : IDisposable
         int count = data[0];
         var entries = new List<PlayerRosterEntry>(count);
         int offset = 1;
-        for (int i = 0; i < count && offset + 22 <= data.Length; i++)
+        // Prefer v9 roster entries (30 bytes); fall back to legacy 22-byte entries.
+        int entrySize = ProtocolConstants.RosterEntrySize;
+        if (count > 0 && offset + entrySize * count > data.Length)
+            entrySize = 22;
+
+        for (int i = 0; i < count && offset + entrySize <= data.Length; i++)
         {
-            entries.Add(new PlayerRosterEntry
+            var entry = new PlayerRosterEntry
             {
                 Slot = data[offset],
                 Username = System.Text.Encoding.UTF8.GetString(TrimNullBytes(data.Slice(offset + 1, 16))),
@@ -547,15 +575,28 @@ public sealed class NetClient : IDisposable
                 EpisodeId = data[offset + 18],
                 State = (DolphinState)data[offset + 19],
                 PingMs = BinaryPrimitives.ReadUInt16LittleEndian(data.Slice(offset + 20, 2)),
-            });
-            offset += 22;
+            };
+            if (entrySize >= ProtocolConstants.RosterEntrySize)
+            {
+                entry.MarioModelId = MarioPack.CharacterPack.DecodeModelId(
+                    data.Slice(offset + 22, ProtocolConstants.MarioModelIdSize));
+            }
+
+            entries.Add(entry);
+            offset += entrySize;
         }
 
         var activeSlots = new HashSet<byte>(entries.Select(e => e.Slot));
         foreach (var slot in _knownRosterSlots.Where(s => !activeSlots.Contains(s)).ToArray())
-            _lastReceivedSnapshotSeq.Remove(slot);
+        {
+            if (slot < _hasReceivedSnapshotSeq.Length)
+                _hasReceivedSnapshotSeq[slot] = false;
+        }
         foreach (var slot in activeSlots.Where(s => !_knownRosterSlots.Contains(s)))
-            _lastReceivedSnapshotSeq.Remove(slot);
+        {
+            if (slot < _hasReceivedSnapshotSeq.Length)
+                _hasReceivedSnapshotSeq[slot] = false;
+        }
 
         _knownRosterSlots.Clear();
         foreach (var slot in activeSlots)
@@ -596,14 +637,18 @@ public sealed class NetClient : IDisposable
                 }
 
                 var slot = result.Buffer[5];
+                if (slot >= ProtocolConstants.MaxRemoteSlots)
+                    continue;
+
                 var seq = BinaryPrimitives.ReadUInt32LittleEndian(result.Buffer.AsSpan(6, 4));
-                if (_lastReceivedSnapshotSeq.TryGetValue(slot, out var lastSeq) &&
-                    !SequenceIsNewer(seq, lastSeq))
+                if (_hasReceivedSnapshotSeq[slot] &&
+                    !SequenceIsNewer(seq, _lastReceivedSnapshotSeq[slot]))
                 {
                     continue;
                 }
 
                 _lastReceivedSnapshotSeq[slot] = seq;
+                _hasReceivedSnapshotSeq[slot] = true;
                 var snap = PacketSerializer.SnapshotFromBytes(
                     result.Buffer.AsSpan(ProtocolConstants.UdpSnapshotPayloadOffset,
                         ProtocolConstants.PlayerSnapshotSize));
@@ -636,10 +681,14 @@ public sealed class NetClient : IDisposable
 
             try
             {
-                var payload = new byte[10];
+                // timestamp(8)+ping(2)+marioModelId(8) — always include the current model id.
+                // Zero-filled trailing bytes previously cleared the server's join-time model.
+                var payload = new byte[10 + ProtocolConstants.MarioModelIdSize];
                 var sentMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
                 BinaryPrimitives.WriteInt64LittleEndian(payload.AsSpan(0, 8), sentMs);
                 BinaryPrimitives.WriteUInt16LittleEndian(payload.AsSpan(8, 2), MeasuredPingMs);
+                MarioPack.CharacterPack.EncodeModelId(_pendingMarioModelId ?? string.Empty)
+                    .CopyTo(payload, 10);
                 await SendTcpAsync(PacketSerializer.BuildHeartbeat(payload), ct).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)

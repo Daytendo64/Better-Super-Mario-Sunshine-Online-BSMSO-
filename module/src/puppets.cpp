@@ -4,7 +4,9 @@
 #include "stage_guard.hpp"
 #include "yoshi_sync.hpp"
 
+#include <BetterSMS/libs/constmath.hxx>
 #include <BetterSMS/loading.hxx>
+#include <Dolphin/OS.h>
 #include <Dolphin/mem.h>
 #include <Dolphin/string.h>
 #include <Dolphin/types.h>
@@ -92,8 +94,31 @@ static constexpr SirenaHotelEpisode kSirenaHotelEpisodes[] = {
     {7, 4, 4}, // Sirena ep 8 — Red Coins (logical ep 5 → scenario 4)
 };
 
+// Pinna Park interior (area 13 / pinnaParco). Archive indices != beach episode IDs.
+// TCRF / timenoe/RAScripts: pinnaParco5 = Episode 8 balloons; pinnaParco7 = Ep1 shine spawn.
+struct PinnaParkEpisode {
+    u8 catalogId;
+    u8 loadScenario;
+    u8 missionEpisode;
+};
+
+static constexpr u8 kPinnaParkAreaId = 13;
+
+static constexpr PinnaParkEpisode kPinnaParkEpisodes[] = {
+    {0, 0, 0}, // pinnaParco0 — Mecha-Bowser Appears!
+    {7, 5, 5}, // pinnaParco5 — Roller Coaster Balloons (Episode 8)
+};
+
 static WarpTarget resolveHotelWarpTarget(u8 catalogEpisodeId) {
     for (const auto &ep : kSirenaHotelEpisodes) {
+        if (ep.catalogId == catalogEpisodeId)
+            return {ep.loadScenario, ep.missionEpisode};
+    }
+    return {catalogEpisodeId, catalogEpisodeId};
+}
+
+static WarpTarget resolvePinnaParkWarpTarget(u8 catalogEpisodeId) {
+    for (const auto &ep : kPinnaParkEpisodes) {
         if (ep.catalogId == catalogEpisodeId)
             return {ep.loadScenario, ep.missionEpisode};
     }
@@ -103,6 +128,9 @@ static WarpTarget resolveHotelWarpTarget(u8 catalogEpisodeId) {
 static WarpTarget resolveWarpTarget(u8 areaId, u8 catalogEpisodeId) {
     if (areaId == kSirenaHotelAreaId)
         return resolveHotelWarpTarget(catalogEpisodeId);
+
+    if (areaId == kPinnaParkAreaId)
+        return resolvePinnaParkWarpTarget(catalogEpisodeId);
 
     if (areaId == kDelfinoPlazaAreaId) {
         for (const auto &ep : kDelfinoPlazaEpisodes) {

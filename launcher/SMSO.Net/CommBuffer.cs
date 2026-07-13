@@ -43,6 +43,12 @@ public struct CommBuffer
 
     public CommRosterHudSync RosterHud;
 
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = ProtocolConstants.MarioModelIdSize)]
+    public byte[] LocalMarioModelId;
+
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = ProtocolConstants.MarioModelIdSize * ProtocolConstants.MaxRemoteSlots)]
+    public byte[] RemoteMarioModelIds;
+
     public static CommBuffer CreateDefault()
     {
         return new CommBuffer
@@ -58,6 +64,8 @@ public struct CommBuffer
             RemoteMarioVoiceEvents = CreateRemoteMarioVoiceEventArray(),
             GameModeState = CommGameModeState.CreateDefault(),
             RosterHud = CommRosterHudSync.CreateDefault(),
+            LocalMarioModelId = new byte[ProtocolConstants.MarioModelIdSize],
+            RemoteMarioModelIds = new byte[ProtocolConstants.MarioModelIdSize * ProtocolConstants.MaxRemoteSlots],
         };
     }
 
@@ -178,6 +186,9 @@ public static class CommBufferMarshal
             buffer.RosterHud.Events ??= CommRosterHudSync.CreateDefault().Events;
             buffer.LocalPlayerName ??= new byte[16];
             buffer.LocalSnapshot.Name ??= new byte[16];
+            buffer.LocalMarioModelId ??= new byte[ProtocolConstants.MarioModelIdSize];
+            buffer.RemoteMarioModelIds ??=
+                new byte[ProtocolConstants.MarioModelIdSize * ProtocolConstants.MaxRemoteSlots];
             for (int i = 0; i < buffer.RemoteSnapshots.Length; i++)
                 buffer.RemoteSnapshots[i].Name ??= new byte[16];
             return buffer;
