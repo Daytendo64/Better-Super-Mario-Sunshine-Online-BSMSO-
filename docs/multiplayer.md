@@ -35,7 +35,7 @@ Flag Sync uses a grow-only server authority set plus snapshots (join / ~45s / st
 ## Hide & Seek
 
 - Host assigns seekers/hiders, then **Start Tag**.
-- **Start Tag grace (30s):** server-authoritative hide window. Seekers get a blue screen wash; everyone sees the `HIDE N` countdown, then a brief flash with **GO** when grace ends. Seekers cannot move; hiders can. Proximity tags are blocked until grace ends. Death still promotes hiders to seekers (new seekers stay frozen until grace ends).
+- **Start Tag grace (30s):** server-authoritative hide window. Seekers get a blue screen wash; everyone sees the `HIDE N` countdown. Hiders see retail **GO** when Tag starts; seekers see **GO** (plus a brief flash) when grace ends. Seekers cannot move; hiders can. Proximity tags are blocked until grace ends. Death still promotes hiders to seekers (new seekers stay frozen until grace ends).
 - **Mid-round warp:** re-arms a short **4s proximity-only** immunity (no blue wash / no freeze) so spawn clustering does not mass-tag.
 - **Stop Tag / Reset** clears grace immediately.
 

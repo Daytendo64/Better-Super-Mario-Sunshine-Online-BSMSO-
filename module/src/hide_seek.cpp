@@ -112,6 +112,7 @@ static u8 s_tagPlayStageEpisode = 0;
 static u16 s_tagDeathGraceFrames = 0;
 static u32 s_lastNetworkRoundStartMs = 0;
 static bool s_graceWasActive = false;
+static bool s_tagWasActiveForGo = false;
 static bool s_seekerGraceInputLocked = false;
 static bool s_seekerGracePosPinned = false;
 static f32 s_seekerGracePinX = 0.0f;
@@ -375,11 +376,21 @@ static void updateHideSeekGrace(TMario *mario, const GameModeState &gm, bool loc
     else
         releaseSeekerGraceInputLock(mario);
 
-    // Rising edge: grace → hunt. All clients see GMF_GRACE_ACTIVE clear from
-    // the server broadcast, so every player pulses retail GO locally.
+    // Hiders: retail GO as soon as Start Tag begins (they can move during grace).
+    // Seekers: wait until grace ends (freeze lifts) — same as before. If Tag starts
+    // with no grace window, seekers also get GO on the tag rising edge.
+    if (tagActive && !s_tagWasActiveForGo) {
+        if (!localIsSeeker)
+            pulseRetailGoHud();
+        else if (!graceActive)
+            pulseRetailGoHud();
+    }
+
+    // Rising edge: grace → hunt. Seekers pulse GO; everyone still gets the end cue.
     if (s_graceWasActive && !graceActive && tagActive) {
         playGraceEndSound(mario);
-        pulseRetailGoHud();
+        if (localIsSeeker)
+            pulseRetailGoHud();
         s_graceEndFlashFrames = kGraceEndFlashFrames;
     }
 
@@ -389,6 +400,7 @@ static void updateHideSeekGrace(TMario *mario, const GameModeState &gm, bool loc
         --s_graceEndFlashFrames;
 
     s_graceWasActive = graceActive;
+    s_tagWasActiveForGo = tagActive;
 }
 
 static void drawGraceCountdownText(int secondsLeft, bool localIsSeeker) {
@@ -1355,6 +1367,7 @@ void clearHideSeek() {
     s_tagDeathGraceFrames = 0;
     releaseSeekerGraceInputLock(gpMarioAddress);
     s_graceWasActive = false;
+    s_tagWasActiveForGo = false;
     s_graceEndFlashFrames = 0;
 }
 
