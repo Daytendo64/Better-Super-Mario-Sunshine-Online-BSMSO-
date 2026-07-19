@@ -11,7 +11,7 @@ public static class ProtocolConstants
     /// clients are rejected with <see cref="JoinRejectReason.VersionMismatch"/>.
     /// Independent of <see cref="CommVersion"/> / <see cref="ProtocolVersion"/>.
     /// </summary>
-    public const ushort ModBuildId = 3;
+    public const ushort ModBuildId = 4;
     public const int DefaultPort = 27015;
     public const int StableMaxPlayers = 10;
     public const int MaxPlayers = 10;

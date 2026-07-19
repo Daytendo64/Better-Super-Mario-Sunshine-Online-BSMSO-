@@ -157,6 +157,10 @@
       "warpable": true,
       "episodes": [
         { "episodeId": 0, "displayName": "Episode 1 \u2014 Mecha-Bowser Appears!" },
+        { "episodeId": 2, "displayName": "Episode 3 \u2014 Red Coins of the Pirate Ships" },
+        { "episodeId": 4, "displayName": "Episode 5 \u2014 The Runaway Ferris Wheel" },
+        { "episodeId": 5, "displayName": "Episode 6 \u2014 The Yoshi-Go-Round's Secret" },
+        { "episodeId": 6, "displayName": "Episode 7 \u2014 Shadow Mario in the Park" },
         { "episodeId": 7, "displayName": "Episode 8 \u2014 Roller Coaster Balloons" }
       ]
     },

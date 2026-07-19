@@ -112,7 +112,11 @@ static bool isSirenaSingleEpisodeSecretArea(u8 areaId) {
 }
 
 // Pinna Park interior (area 13 / pinnaParco). Archive indices != beach episode IDs.
-// TCRF / timenoe/RAScripts: pinnaParco5 = Episode 8 balloons; pinnaParco7 = Ep1 shine spawn.
+// TCRF Internal Name Oddities + timenoe/RAScripts:
+//   pinnaParco0 = Ep1 Mecha-Bowser; pinnaParco1 = Ep3; pinnaParco2 = Ep5;
+//   pinnaParco3 = Ep6; pinnaParco4 = Ep7 Shadow Mario; pinnaParco5 = Ep8 balloons;
+//   pinnaParco6 = Ep1 Noki dialogue; pinnaParco7 = Ep1 shine spawn.
+// Beach→park 0xFF same-shine must remap — raw beach ep 6/7 loads Noki/shine-spawn.
 struct PinnaParkEpisode {
     u8 catalogId;
     u8 loadScenario;
@@ -120,11 +124,26 @@ struct PinnaParkEpisode {
 };
 
 static constexpr u8 kPinnaParkAreaId = 13;
+static constexpr u8 kPinnaBeachAreaId = 5;
 
 static constexpr PinnaParkEpisode kPinnaParkEpisodes[] = {
     {0, 0, 0}, // pinnaParco0 — Mecha-Bowser Appears!
+    {2, 1, 1}, // pinnaParco1 — Red Coins of the Pirate Ships
+    {4, 2, 2}, // pinnaParco2 — The Runaway Ferris Wheel
+    {5, 3, 3}, // pinnaParco3 — Yoshi-Go-Round's Secret
+    {6, 4, 4}, // pinnaParco4 — Shadow Mario in the Park
     {7, 5, 5}, // pinnaParco5 — Roller Coaster Balloons (Episode 8)
 };
+
+static bool tryPinnaBeachCatalogToParkLoad(u8 beachCatalogEpisode, u8 *outLoad) {
+    for (const auto &ep : kPinnaParkEpisodes) {
+        if (ep.catalogId == beachCatalogEpisode) {
+            *outLoad = ep.loadScenario;
+            return true;
+        }
+    }
+    return false;
+}
 
 static WarpTarget resolveHotelWarpTarget(u8 catalogEpisodeId) {
     for (const auto &ep : kSirenaHotelEpisodes) {
@@ -765,6 +784,56 @@ static u8 resolveSirenaCasinoMissionToStash() {
              "curScene=%u/%u chosen=%u\n",
              flag, hotelSync, dirEp, curArea, curEp, result);
     return result;
+}
+
+void normalizePinnaParkNextSceneForLoad() {
+    const u8 nextArea = gpApplication.mNextScene.mAreaID;
+    const u8 nextEp = gpApplication.mNextScene.mEpisodeID;
+    const u8 curArea = gpApplication.mCurrentScene.mAreaID;
+    const u8 curEp = gpApplication.mCurrentScene.mEpisodeID;
+
+    // Beach→park gate uses same-shine episode 0xFF. Copying the beach catalog id loads
+    // the wrong pinnaParco archive (ep6→Noki dialogue, ep7→Ep1 shine spawn).
+    if (nextArea != kPinnaParkAreaId || nextEp != 0xFF)
+        return;
+    if (curArea != kPinnaBeachAreaId)
+        return;
+
+    u8 parkLoad = 0;
+    if (!tryPinnaBeachCatalogToParkLoad(curEp, &parkLoad))
+        return;
+
+    gpApplication.mNextScene.mEpisodeID = parkLoad;
+    TFlagManager::smInstance->setFlag(0x40003, parkLoad);
+    OSReport("[SMSO] Pinna park next-scene remap beach=%u -> load=%u (was 0xFF)\n", curEp,
+             parkLoad);
+}
+
+void normalizeMareUnderseaNextSceneForLoad() {
+    // stageArc.bin area 16 = mareUndersea.arc (single scenario). Waterfall dive from
+    // Noki Bay Ep4 (Eely-Mouth) / Ep8 (Red Coin Fish) sets next=16/255. Same-shine
+    // routing would keep bay episode as the load id (e.g. 16/7) — that archive does
+    // not exist and the game boots intro → title (area 15). dolphin.log:
+    // moveStage next=16/255 cur=9/7 → Entrance.thp → option.szs.
+    constexpr u8 kMareBayAreaId = 9;
+    constexpr u8 kMareUnderseaAreaId = 16;
+
+    const u8 nextArea = gpApplication.mNextScene.mAreaID;
+    const u8 nextEp = gpApplication.mNextScene.mEpisodeID;
+    if (nextArea != kMareUnderseaAreaId || nextEp != 0xFF)
+        return;
+
+    const u8 curArea = gpApplication.mCurrentScene.mAreaID;
+    const u8 curEp = gpApplication.mCurrentScene.mEpisodeID;
+    u8 mission = static_cast<u8>(TFlagManager::smInstance->getFlag(0x40003));
+    // Prefer the bay episode we are leaving so Ep4 vs Ep8 scripts still see 3 vs 7.
+    if (curArea == kMareBayAreaId)
+        mission = curEp;
+
+    gpApplication.mNextScene.mEpisodeID = 0;
+    TFlagManager::smInstance->setFlag(0x40003, mission);
+    OSReport("[SMSO] mareUndersea (ep 0xFF) → load ep0 mission=%u (from %u/%u)\n", mission,
+             curArea, curEp);
 }
 
 void normalizeSirenaNextSceneForLoad() {

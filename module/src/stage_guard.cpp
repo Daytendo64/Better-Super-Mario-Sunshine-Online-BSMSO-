@@ -71,7 +71,10 @@ static void beginEpisodeSelectTransition(TMarDirector *director, s32 curShine, s
 //
 // Casino hotel stage 14 is NOT here: normalizeSirenaNextSceneForLoad rewrites
 // its 0xFF doors to load 0/1 from beach mission 3/4.
-// Pinna park interior (13) and Sirena hotel (7) keep multi-episode routing.
+// Pinna park interior (13): normalizePinnaParkNextSceneForLoad remaps beach→park
+// 0xFF doors to the correct pinnaParco archive; hotel (7) keeps multi-episode routing.
+// mareUndersea (16): normalizeMareUnderseaNextSceneForLoad forces load ep0 while
+// keeping bay mission 3/7 — must NOT clear 0x40003 via this list.
 static bool isSingleEpisodeLoadArea(u8 areaId) {
     // BSE EX-stage range (dolpic_ex* … coro_ex*) covers most plaza/stage secrets.
     if (BetterSMS::Stage::isExStage(areaId, 0))
@@ -147,6 +150,10 @@ void performSmsoMoveStage(TMarDirector *director) {
     // casino0 vs casino1 from beach mission 3/4). Hotel→casino same-shine doors use
     // episode 0xFF — normalize rewrites that to load 0 or 1 and stashes mission 3/4.
     normalizeSirenaNextSceneForLoad();
+    // Pinna beach→park 0xFF must remap catalog→pinnaParco archive (ep6≠Shadow Mario).
+    normalizePinnaParkNextSceneForLoad();
+    // Noki waterfall→mareUndersea 0xFF must load ep0 (keep mission 3/7 for Ep4/Ep8).
+    normalizeMareUnderseaNextSceneForLoad();
 
     const u8 nextArea = gpApplication.mNextScene.mAreaID;
     const u8 nextEp = gpApplication.mNextScene.mEpisodeID;
@@ -167,8 +174,9 @@ void performSmsoMoveStage(TMarDirector *director) {
     // Same-area 0xFF soft-reloads then skip exitStageCallbacks; Shadow Mario/Luigi
     // TexAnim MActors survive into the next init and crash mid-rebind (dolphin.log:
     // moveStage next=N/255 cur=N/E → initMarioModelSystem with no Stage exit).
-    // After normalizeSirenaNextSceneForLoad, casino 0xFF is already load 0/1 so it
-    // still takes moveStage here (ep != 0xFF). Test/debug areas > 60 always move.
+    // After normalizeSirena / Pinna / mareUndersea, casino 0xFF is load 0/1,
+    // Pinna beach→park 0xFF is a pinnaParco archive id, and mareUndersea 0xFF is
+    // load 0 — all take moveStage here (ep != 0xFF). Test/debug areas > 60 always move.
     if (gpApplication.mNextScene.mAreaID > 60 ||
         gpApplication.mNextScene.mEpisodeID != 0xFF) {
         director->moveStage();

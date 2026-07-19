@@ -48,6 +48,8 @@ using StopMoveTimerFn = void (*)(TGCConsole2 *);
 using SetTimerFn = void (*)(TGCConsole2 *, s32);
 using CountShineFn = void (*)(TGCConsole2 *);
 using StartBgmFn = void (*)(u32);
+// Retail level-start "GO" banner (TConsoleStr::startAppearGo).
+using StartAppearGoFn = void (*)(TConsoleStr *);
 
 // gc-forever asset list / OST track 42: demo BGM index 0x26 = Race Fanfare (Il Piantissimo).
 constexpr u32 kRaceFanfareBgm = 0x80010026u;
@@ -175,8 +177,25 @@ static StartBgmFn startBgmFn() {
     return reinterpret_cast<StartBgmFn>(SMS_PORT_REGION(0x80016978, 0x800169D4, 0, 0));
 }
 
+static StartAppearGoFn startAppearGoFn() {
+    // NTSC-U / PAL from BSE maps (us.map / eu.map).
+    return reinterpret_cast<StartAppearGoFn>(SMS_PORT_REGION(0x80171BB8, 0x801679d0, 0, 0));
+}
+
 static TGCConsole2 *getConsole(TMarDirector *director) {
     return director && director->mGCConsole ? director->mGCConsole : nullptr;
+}
+
+// One-shot retail "GO" HUD — same path as stage-load start banner (processGo).
+static void pulseRetailGoHud() {
+    TGCConsole2 *console = getConsole(gpMarDirector);
+    if (!console || !console->mConsoleStr)
+        return;
+
+    StartAppearGoFn fn = startAppearGoFn();
+    if (!fn)
+        return;
+    fn(console->mConsoleStr);
 }
 
 static u16 scaleFramesFrom30(u16 frames30) {
@@ -356,8 +375,11 @@ static void updateHideSeekGrace(TMario *mario, const GameModeState &gm, bool loc
     else
         releaseSeekerGraceInputLock(mario);
 
+    // Rising edge: grace → hunt. All clients see GMF_GRACE_ACTIVE clear from
+    // the server broadcast, so every player pulses retail GO locally.
     if (s_graceWasActive && !graceActive && tagActive) {
         playGraceEndSound(mario);
+        pulseRetailGoHud();
         s_graceEndFlashFrames = kGraceEndFlashFrames;
     }
 
