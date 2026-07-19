@@ -739,6 +739,40 @@ public sealed class HideSeekServiceTests
     }
 
     [Fact]
+    public void StartTag_UsesConfiguredGraceDuration()
+    {
+        var levels = new LevelCatalog();
+        var server = new GameServer(levels);
+        server.Start(27149);
+        try
+        {
+            var service = server.HideSeek;
+            service.StartTagGraceDurationMs = 10_000;
+            service.SetGameMode(GameMode.HideSeek);
+            service.SetRoles(new Dictionary<byte, HideSeekRole>
+            {
+                [0] = HideSeekRole.Seeker,
+                [1] = HideSeekRole.Hider,
+            });
+            Assert.True(service.TryStartTag(out _));
+
+            var state = service.CurrentState;
+            Assert.True(state.GraceActive);
+            Assert.True(state.GraceRemainingMs > 9000);
+            Assert.True(state.GraceRemainingMs <= 10_000);
+            Assert.Equal(10_000, service.StartTagGraceDurationMs);
+            Assert.Equal(HideSeekService.MinStartTagGraceMs,
+                HideSeekService.ClampGraceMs(1_000));
+            Assert.Equal(HideSeekService.MaxStartTagGraceMs,
+                HideSeekService.ClampGraceMs(120_000));
+        }
+        finally
+        {
+            server.Stop();
+        }
+    }
+
+    [Fact]
     public void NotifyPlayersWarped_DoesNotRearmFullStartTagGrace()
     {
         var levels = new LevelCatalog();

@@ -106,15 +106,71 @@ public sealed class RarcArchive
     }
 
     /// <summary>
+    /// Optional per-node gate for <see cref="ReplaceFilesByBasename"/>. Return
+    /// false to leave the retail node unchanged.
+    /// </summary>
+    /// <param name="basename">File basename (no directory).</param>
+    /// <param name="retailData">Bytes currently stored for this retail node.</param>
+    /// <param name="retailOffset">Absolute offset of <paramref name="retailData"/> in the RARC buffer.</param>
+    /// <param name="retailLength">Length of the retail file payload.</param>
+    /// <param name="replacement">Candidate replacement bytes.</param>
+    public delegate bool ReplacementAcceptFilter(
+        string basename, byte[] archiveBuffer, int retailOffset, int retailLength, byte[] replacement);
+
+    /// <summary>
     /// Patch files into an existing RARC buffer by basename while preserving the
     /// original directory/node/string layout (ROOT fourcc, global file IDs, entry
     /// order). Same-size replacements overwrite in place; different sizes append
     /// at the end and retarget the file entry. Critical for SMS mario.arc remounts
     /// — a full Save() rebuild can mute animSound/BAS lookups.
+    /// <para>
+    /// Optional <paramref name="acceptReplacement"/> is evaluated per retail target
+    /// node (not once per basename). SMS ships duplicate basenames such as
+    /// <c>bck/wg_pump.bck</c> (16 joints) and <c>watergun2/body/wg_pump.bck</c>
+    /// (14 joints); rejecting a mismatched target keeps that node retail while
+    /// still allowing the matching sibling to be patched. The multi-candidate
+    /// overload tries each custom buffer until one is accepted so a pack can
+    /// ship both joint variants under the same basename.
+    /// </para>
     /// </summary>
+    /// <param name="acceptReplacement">
+    /// Per-node filter; null accepts every basename match.
+    /// </param>
+    /// <param name="rejectedNames">
+    /// Optional sink for basenames skipped by <paramref name="acceptReplacement"/>.
+    /// </param>
     public static byte[] ReplaceFilesByBasename(ReadOnlySpan<byte> retailRarc,
         IReadOnlyDictionary<string, byte[]> replacementsByBasename,
-        out List<string> replacedNames)
+        out List<string> replacedNames,
+        ReplacementAcceptFilter? acceptReplacement = null,
+        List<string>? rejectedNames = null)
+    {
+        var multi = new Dictionary<string, IReadOnlyList<byte[]>>(StringComparer.OrdinalIgnoreCase);
+        if (replacementsByBasename != null)
+        {
+            foreach (var kvp in replacementsByBasename)
+            {
+                if (kvp.Value != null)
+                    multi[kvp.Key] = new[] { kvp.Value };
+            }
+        }
+
+        return ReplaceFilesByBasename(retailRarc, multi, out replacedNames, acceptReplacement,
+            rejectedNames);
+    }
+
+    /// <summary>
+    /// Same as the single-buffer overload, but each basename may supply multiple
+    /// candidate payloads. Per retail node the first candidate accepted by
+    /// <paramref name="acceptReplacement"/> is used (or the first candidate when
+    /// the filter is null). Enables joint-matched Mario-body vs FLUDD
+    /// <c>wg_pump.bck</c> replacements from one custom pack.
+    /// </summary>
+    public static byte[] ReplaceFilesByBasename(ReadOnlySpan<byte> retailRarc,
+        IReadOnlyDictionary<string, IReadOnlyList<byte[]>> replacementsByBasename,
+        out List<string> replacedNames,
+        ReplacementAcceptFilter? acceptReplacement = null,
+        List<string>? rejectedNames = null)
     {
         replacedNames = new List<string>();
         if (replacementsByBasename == null || replacementsByBasename.Count == 0)
@@ -125,21 +181,28 @@ public sealed class RarcArchive
             retailRarc[2] != (byte)'R' || retailRarc[3] != (byte)'C')
             throw new InvalidDataException("Not an RARC archive.");
 
-        var map = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
-        foreach (var kvp in replacementsByBasename)
-            map[kvp.Key] = kvp.Value;
+        // Materialize once so the accept filter can slice retail payloads without
+        // ReadOnlySpan-in-Func (ref structs are banned as generic type args).
+        var archiveBuffer = retailRarc.ToArray();
 
-        uint dataHeaderOff = BinaryPrimitives.ReadUInt32BigEndian(retailRarc.Slice(0x08, 4));
-        if (dataHeaderOff == 0 || dataHeaderOff >= (uint)retailRarc.Length)
+        var map = new Dictionary<string, IReadOnlyList<byte[]>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var kvp in replacementsByBasename)
+        {
+            if (kvp.Value != null && kvp.Value.Count > 0)
+                map[kvp.Key] = kvp.Value;
+        }
+
+        uint dataHeaderOff = BinaryPrimitives.ReadUInt32BigEndian(archiveBuffer.AsSpan(0x08, 4));
+        if (dataHeaderOff == 0 || dataHeaderOff >= (uint)archiveBuffer.Length)
             dataHeaderOff = 0x20;
 
         int hb = (int)dataHeaderOff;
-        uint nodeCount = BinaryPrimitives.ReadUInt32BigEndian(retailRarc.Slice(hb + 0x08, 4));
-        uint nodeRel = BinaryPrimitives.ReadUInt32BigEndian(retailRarc.Slice(hb + 0x0C, 4));
-        uint stringRel = BinaryPrimitives.ReadUInt32BigEndian(retailRarc.Slice(hb + 0x14, 4));
+        uint nodeCount = BinaryPrimitives.ReadUInt32BigEndian(archiveBuffer.AsSpan(hb + 0x08, 4));
+        uint nodeRel = BinaryPrimitives.ReadUInt32BigEndian(archiveBuffer.AsSpan(hb + 0x0C, 4));
+        uint stringRel = BinaryPrimitives.ReadUInt32BigEndian(archiveBuffer.AsSpan(hb + 0x14, 4));
         int absNode = hb + (int)nodeRel;
         int absString = hb + (int)stringRel;
-        int absFileData = GetFileDataAbsoluteOffset(retailRarc);
+        int absFileData = GetFileDataAbsoluteOffset(archiveBuffer);
 
         // Collect patches first so we know how much to append.
         var patches = new List<(int NodeOffset, int OldDataAbs, uint OldSize, byte[] NewData)>();
@@ -147,10 +210,10 @@ public sealed class RarcArchive
         for (int i = 0; i < (int)nodeCount; i++)
         {
             int no = absNode + i * 0x14;
-            ushort id = BinaryPrimitives.ReadUInt16BigEndian(retailRarc.Slice(no + 0x00, 2));
-            ushort type = BinaryPrimitives.ReadUInt16BigEndian(retailRarc.Slice(no + 0x04, 2));
-            ushort nameOff = BinaryPrimitives.ReadUInt16BigEndian(retailRarc.Slice(no + 0x06, 2));
-            string name = ReadCString(retailRarc, absString + nameOff);
+            ushort id = BinaryPrimitives.ReadUInt16BigEndian(archiveBuffer.AsSpan(no + 0x00, 2));
+            ushort type = BinaryPrimitives.ReadUInt16BigEndian(archiveBuffer.AsSpan(no + 0x04, 2));
+            ushort nameOff = BinaryPrimitives.ReadUInt16BigEndian(archiveBuffer.AsSpan(no + 0x06, 2));
+            string name = ReadCString(archiveBuffer, absString + nameOff);
             if (name is "." or "..")
                 continue;
 
@@ -160,12 +223,39 @@ public sealed class RarcArchive
             if (isDir)
                 continue;
 
-            if (!map.TryGetValue(name, out var replacement) || replacement == null)
+            if (!map.TryGetValue(name, out var candidates) || candidates == null || candidates.Count == 0)
                 continue;
 
-            uint oldSize = BinaryPrimitives.ReadUInt32BigEndian(retailRarc.Slice(no + 0x0C, 4));
-            uint dataOff = BinaryPrimitives.ReadUInt32BigEndian(retailRarc.Slice(no + 0x08, 4));
+            uint oldSize = BinaryPrimitives.ReadUInt32BigEndian(archiveBuffer.AsSpan(no + 0x0C, 4));
+            uint dataOff = BinaryPrimitives.ReadUInt32BigEndian(archiveBuffer.AsSpan(no + 0x08, 4));
             int oldDataAbs = absFileData + (int)dataOff;
+            if (oldDataAbs < 0 || oldSize > int.MaxValue ||
+                oldDataAbs + (int)oldSize > archiveBuffer.Length)
+            {
+                continue;
+            }
+
+            byte[]? replacement = null;
+            foreach (var candidate in candidates)
+            {
+                if (candidate == null)
+                    continue;
+                if (acceptReplacement != null &&
+                    !acceptReplacement(name, archiveBuffer, oldDataAbs, (int)oldSize, candidate))
+                {
+                    continue;
+                }
+
+                replacement = candidate;
+                break;
+            }
+
+            if (replacement == null)
+            {
+                rejectedNames?.Add(name);
+                continue;
+            }
+
             patches.Add((no, oldDataAbs, oldSize, replacement));
             replacedNames.Add(name);
             if (replacement.Length != (int)oldSize)
@@ -262,10 +352,46 @@ public sealed class RarcArchive
 
         // Match retail SMS RARC layout: children first, then "." / ".." at the end.
         // Root directory fourcc is "ROOT" (not the folder name). File IDs are global.
+        // Prefer original FileIds from Open() so inject-via-Save keeps retail BAS/BCK
+        // IDs stable; only newly added files (BTK inject) get fresh IDs.
         var nodeList = new List<NodeWrite>();
         var dirFirstNode = new int[dirList.Count];
         var dirNodeCount = new int[dirList.Count];
-        ushort nextFileId = 0;
+        var usedIds = new HashSet<ushort>();
+        ushort maxPreservedId = 0;
+        foreach (var existing in flatFiles)
+        {
+            if (!existing.FileId.HasValue)
+                continue;
+            usedIds.Add(existing.FileId.Value);
+            if (existing.FileId.Value > maxPreservedId)
+                maxPreservedId = existing.FileId.Value;
+        }
+
+        ushort nextFileId = usedIds.Count > 0 ? (ushort)(maxPreservedId + 1) : (ushort)0;
+        ushort AllocFileId(RarcFileEntry file)
+        {
+            if (file.FileId.HasValue && usedIds.Contains(file.FileId.Value))
+            {
+                // Already reserved during the scan; reclaim for this node.
+                return file.FileId.Value;
+            }
+
+            if (file.FileId.HasValue && !usedIds.Contains(file.FileId.Value))
+            {
+                usedIds.Add(file.FileId.Value);
+                return file.FileId.Value;
+            }
+
+            while (usedIds.Contains(nextFileId) && nextFileId < 0xFFFE)
+                nextFileId++;
+            var id = nextFileId;
+            if (nextFileId < 0xFFFE)
+                nextFileId++;
+            usedIds.Add(id);
+            file.FileId = id;
+            return id;
+        }
 
         for (int di = 0; di < dirList.Count; di++)
         {
@@ -289,7 +415,7 @@ public sealed class RarcArchive
             {
                 nodeList.Add(new NodeWrite
                 {
-                    Id = nextFileId++,
+                    Id = AllocFileId(file),
                     Type = 0x11,
                     Name = file.Name,
                     File = file,
@@ -457,6 +583,9 @@ public sealed class RarcArchive
                 Name = entry.Name,
                 FullPath = entry.Name,
                 Data = data.Slice(dataOff, (int)entry.DataSize).ToArray(),
+                // Keep retail IDs so a later Save() (BTK/custom inject) does not
+                // renumber BAS/BCK nodes — SMS animSound resolves by file ID.
+                FileId = entry.Id == 0xFFFF ? null : entry.Id,
             });
         }
 
@@ -533,4 +662,11 @@ public sealed class RarcFileEntry
     public string Name { get; set; } = "";
     public string FullPath { get; set; } = "";
     public byte[] Data { get; set; } = Array.Empty<byte>();
+    /// <summary>
+    /// Original RARC file ID when loaded from disk. Preserved across
+    /// <see cref="RarcArchive.Save"/> so BTK/custom inject does not renumber
+    /// retail BAS/BCK entries (ID churn mutes animSound lookups and crashes
+    /// Shadow packs on stage entry).
+    /// </summary>
+    public ushort? FileId { get; set; }
 }

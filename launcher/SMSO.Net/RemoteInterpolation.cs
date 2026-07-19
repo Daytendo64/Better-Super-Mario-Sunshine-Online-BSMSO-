@@ -11,7 +11,10 @@ public sealed class RemoteInterpolation
 {
     private readonly object _lock = new();
     private readonly Dictionary<byte, InterpState> _states = new();
-    private const float SnapDistance = 4.0f;
+    private readonly Func<double> _nowMs;
+    // SMS positions are world units; normal movement can cover far more than
+    // four units between 60 Hz samples. Keep hard snaps for genuine teleports.
+    private const float SnapDistance = 700.0f;
     // One network tick of buffering (~33 ms @ 60 Hz) gives two samples to Hermite-blend.
     private const int RenderDelayMs = 33;
     private const int MaxExtrapolateMs = 200;
@@ -40,6 +43,17 @@ public sealed class RemoteInterpolation
         public bool HasDisplay;
     }
 
+    public RemoteInterpolation()
+        : this(StopwatchNowMs)
+    {
+    }
+
+    /// <summary>Clock-injected constructor for deterministic interpolation tests.</summary>
+    public RemoteInterpolation(Func<double> nowMs)
+    {
+        _nowMs = nowMs ?? throw new ArgumentNullException(nameof(nowMs));
+    }
+
     /// <summary>
     /// High-resolution monotonic clock in milliseconds. <see cref="Environment.TickCount64"/>
     /// is backed by GetTickCount64 (~15.6 ms granularity on default Windows), which quantizes
@@ -47,7 +61,7 @@ public sealed class RemoteInterpolation
     /// is backed by QueryPerformanceCounter (sub-microsecond), so the interpolation parameter
     /// advances smoothly between packets.
     /// </summary>
-    private static double NowMs()
+    private static double StopwatchNowMs()
     {
         return Stopwatch.GetTimestamp() * 1000.0 / Stopwatch.Frequency;
     }
@@ -57,7 +71,7 @@ public sealed class RemoteInterpolation
     {
         lock (_lock)
         {
-            var now = NowMs();
+            var now = _nowMs();
             var packet = incoming;
             packet.Slot = slot;
             if (packet.Connected == 0)
@@ -119,10 +133,33 @@ public sealed class RemoteInterpolation
             if (!_states.TryGetValue(slot, out var state))
                 return default;
 
-            var now = NowMs();
+            var now = _nowMs();
             AdvanceDisplay(state, now);
             state.LastAdvanceMs = now;
             return BuildDisplaySnapshot(state);
+        }
+    }
+
+    /// <summary>
+    /// Advance if the slot exists using one dictionary lookup and one lock.
+    /// The bridge hot path previously called HasSlot then Advance for every
+    /// remote, doubling lock traffic at 60 Hz.
+    /// </summary>
+    public bool TryAdvance(byte slot, out PlayerSnapshot snapshot)
+    {
+        lock (_lock)
+        {
+            if (!_states.TryGetValue(slot, out var state))
+            {
+                snapshot = default;
+                return false;
+            }
+
+            var now = _nowMs();
+            AdvanceDisplay(state, now);
+            state.LastAdvanceMs = now;
+            snapshot = BuildDisplaySnapshot(state);
+            return true;
         }
     }
 
@@ -183,6 +220,28 @@ public sealed class RemoteInterpolation
                 state.DisplayRotationY = state.LastRaw.RotationY;
             else
                 state.DisplayRotationY = LerpAngle(state.PreviousRaw.RotationY, state.LastRaw.RotationY, t);
+
+            // A coalesced batch may be delayed or one UDP datagram may be lost.
+            // Once delayed render time passes the newest sample, continue from
+            // that sample's velocity instead of holding at t=1 until another
+            // batch arrives. The cap bounds divergence during a real outage.
+            if (renderTime > state.LastPacketMs)
+            {
+                var extrapolateMs =
+                    Math.Min(renderTime - state.LastPacketMs, (double)MaxExtrapolateMs);
+                var extrapolate = (float)(extrapolateMs / 1000.0);
+                state.DisplayPosition = new Vec3
+                {
+                    X = state.LastRaw.Position.X +
+                        state.LastRaw.Velocity.X * extrapolate * ExtrapolateVelocityScale,
+                    Y = state.LastRaw.Position.Y +
+                        state.LastRaw.Velocity.Y * extrapolate * ExtrapolateVelocityScale,
+                    Z = state.LastRaw.Position.Z +
+                        state.LastRaw.Velocity.Z * extrapolate * ExtrapolateVelocityScale,
+                };
+                state.DisplayVelocity = state.LastRaw.Velocity;
+                state.DisplayRotationY = state.LastRaw.RotationY;
+            }
         }
         else
         {

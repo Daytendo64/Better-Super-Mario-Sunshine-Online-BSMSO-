@@ -53,15 +53,27 @@ static constexpr f32 kHideSeekFontSizeReduce = 2.0f;
 static constexpr f32 kScaleSmoothRate = 16.0f;
 static constexpr f32 kAlphaSmoothRate = 14.0f;
 static constexpr f32 kOcclusionSmoothRate = 18.0f;
+static constexpr f32 kAnchorSmoothRate = 30.0f;
 
 // doldecomp TMapCollisionData::intersectLine — margin before the head anchor so floor
 // collision under the target does not false-positive as a wall block.
 static constexpr f32 kOcclusionAnchorMargin = 72.0f;
 static constexpr f32 kOcclusionMinRayLength = 120.0f;
+static constexpr u8 kOcclusionRefreshFrames = 6; // 10 Hz at 60 fps, staggered per slot
+static constexpr u8 kOcclusionHideSamples = 2;
+static constexpr u8 kNearbyOcclusionHideSamples = 3;
+static constexpr u8 kOcclusionShowSamples = 2;
+static constexpr f32 kNearbyOcclusionDistance = 1800.0f;
+static constexpr u8 kProjectionMissGraceFrames = 3;
 
 // Snap thresholds for teleports and large scale discontinuities.
 static constexpr f32 kTeleportDistance = 700.0f;
 static constexpr f32 kSnapFontDelta = 8.0f;
+// Only treat a screen jump as a LOD/anchor correction when the body barely moved.
+// A small absolute screen threshold falsely snapped during ordinary camera/player
+// motion and looked like nametag flicker, especially on clients.
+static constexpr f32 kSnapScreenDelta = 48.0f;
+static constexpr f32 kSnapScreenBodyMoveMax = 40.0f;
 
 static constexpr f32 kGameScreenHeight = 448.0f;
 static constexpr int kJ2DPrintDefaultLeading = static_cast<int>(0x80000000);
@@ -91,6 +103,12 @@ struct SlotRuntime {
     f32 targetOcclusion;
     f32 smoothedOcclusion;
     bool drawVisible;
+    u8 occlusionRefresh;
+    u8 occludedSamples;
+    u8 visibleSamples;
+    u8 projectionMissFrames;
+    int measuredFontSize;
+    f32 measuredTextWidth;
 };
 
 static SlotRuntime gSlots[MAX_REMOTE_SLOTS];
@@ -113,6 +131,18 @@ static f32 clampf(f32 value, f32 minValue, f32 maxValue) {
     if (value > maxValue)
         return maxValue;
     return value;
+}
+
+static bool boundedNameEquals(const char *a, const char *b) {
+    if (!a || !b)
+        return a == b;
+    for (u32 i = 0; i < MAX_PLAYER_NAME; ++i) {
+        if (a[i] != b[i])
+            return false;
+        if (a[i] == '\0')
+            return true;
+    }
+    return true;
 }
 
 static f32 smoothstep01(f32 t) {
@@ -213,7 +243,12 @@ static bool isNameTagAnchorOccluded(f32 anchorX, f32 anchorY, f32 anchorZ) {
     if (fullLenSq < kOcclusionMinRayLength * kOcclusionMinRayLength)
         return false;
 
-    const f32 anchorGuard = fullLenSq - kOcclusionAnchorMargin * kOcclusionAnchorMargin;
+    // Compare against (ray length - margin)^2. Subtracting margin^2 from the
+    // squared ray length only excluded a few world units on long rays, so the
+    // target's nearby floor/wall contact repeatedly toggled occlusion while it
+    // moved.
+    const f32 guardedLength = sqrtf(fullLenSq) - kOcclusionAnchorMargin;
+    const f32 anchorGuard = guardedLength * guardedLength;
 
     for (int attempt = 0; attempt < 4; ++attempt) {
         TVec3f hitPos{};
@@ -503,10 +538,17 @@ static void resetSlotRuntime(SlotRuntime &slot) {
     slot.targetOcclusion = 1.0f;
     slot.smoothedOcclusion = 1.0f;
     slot.drawVisible = false;
+    slot.occlusionRefresh = 0;
+    slot.occludedSamples = 0;
+    slot.visibleSamples = 0;
+    slot.projectionMissFrames = 0;
+    slot.measuredFontSize = -1;
+    slot.measuredTextWidth = 0.0f;
     slot.name[0] = '\0';
 }
 
-static bool shouldSnapMotion(const SlotRuntime &slot, f32 bodyX, f32 bodyY, f32 bodyZ, f32 targetFont) {
+static bool shouldSnapMotion(const SlotRuntime &slot, f32 bodyX, f32 bodyY, f32 bodyZ, f32 targetFont,
+                             bool projected, f32 rawScreenX, f32 rawScreenY) {
     if (!slot.initialized)
         return true;
 
@@ -519,6 +561,16 @@ static bool shouldSnapMotion(const SlotRuntime &slot, f32 bodyX, f32 bodyY, f32 
 
     if (fabsf(targetFont - slot.smoothedFontSize) >= kSnapFontDelta)
         return true;
+
+    // Large screen jumps without body motion usually mean the world head anchor
+    // corrected after a stale pose sample — snap instead of easing through it.
+    // Do not snap during ordinary movement; that caused client-side flicker.
+    if (projected && bodyJump <= kSnapScreenBodyMoveMax) {
+        const f32 sdx = rawScreenX - slot.screenX;
+        const f32 sdy = rawScreenY - slot.screenY;
+        if (sdx * sdx + sdy * sdy >= kSnapScreenDelta * kSnapScreenDelta)
+            return true;
+    }
 
     return false;
 }
@@ -558,27 +610,76 @@ void updateSlot(u8 slot, bool active, f32 anchorX, f32 anchorY, f32 anchorZ, f32
 
     state.active = true;
     state.appearance = appearance;
+    const bool nameChanged =
+        name && name[0] != '\0'
+            ? !boundedNameEquals(state.name, name)
+            : state.name[0] != '\0';
     if (name && name[0] != '\0')
         strncpy(state.name, name, MAX_PLAYER_NAME - 1);
     else
         state.name[0] = '\0';
     state.name[MAX_PLAYER_NAME - 1] = '\0';
+    if (nameChanged) {
+        state.measuredFontSize = -1;
+        state.measuredTextWidth = 0.0f;
+    }
 
     f32 rawScreenX = 0.0f;
     f32 rawScreenY = 0.0f;
-    const bool onScreen = projectWorldToScreen(anchorX, anchorY, anchorZ, rawScreenX, rawScreenY);
+    const bool projected =
+        projectWorldToScreen(anchorX, anchorY, anchorZ, rawScreenX, rawScreenY);
+    if (projected) {
+        state.projectionMissFrames = 0;
+    } else if (state.projectionMissFrames < 0xFF) {
+        ++state.projectionMissFrames;
+    }
+    // Temporal LOD and camera matrices can disagree for one update at the edge.
+    // Keep the last valid anchor briefly instead of alternating drawVisible.
+    const bool onScreen =
+        projected || (state.initialized && state.projectionMissFrames < kProjectionMissGraceFrames);
+    if (!projected) {
+        rawScreenX = state.screenX;
+        rawScreenY = state.screenY;
+    }
     const f32 distance = measureCameraDistance(anchorX, anchorY, anchorZ);
 
     state.cameraDistance = distance;
-    state.screenX = rawScreenX;
-    state.screenY = rawScreenY;
+    const f32 moveDx = bodyX - state.lastBodyX;
+    const f32 moveDy = bodyY - state.lastBodyY;
+    const f32 moveDz = bodyZ - state.lastBodyZ;
+    const bool largeMove = !state.initialized ||
+                           moveDx * moveDx + moveDy * moveDy + moveDz * moveDz >=
+                               kTeleportDistance * kTeleportDistance;
     if (isHideSeekNameTagMode()) {
         state.targetFontSize =
             onScreen ? evaluateHideSeekFontSize(distance, anchorX, anchorY, anchorZ, rawScreenY)
                      : 0.0f;
         state.targetAlpha = onScreen ? evaluateTargetAlpha(distance) : 0.0f;
-        state.targetOcclusion =
-            onScreen && isNameTagAnchorOccluded(anchorX, anchorY, anchorZ) ? 0.0f : 1.0f;
+        if (!onScreen) {
+            // Preserve the last stable occlusion decision while off-screen.
+        } else if (largeMove || state.occlusionRefresh == 0) {
+            const bool occluded = isNameTagAnchorOccluded(anchorX, anchorY, anchorZ);
+            if (occluded) {
+                state.visibleSamples = 0;
+                if (state.occludedSamples < 0xFF)
+                    ++state.occludedSamples;
+                const u8 hideSamples = distance <= kNearbyOcclusionDistance
+                                           ? kNearbyOcclusionHideSamples
+                                           : kOcclusionHideSamples;
+                if (state.occludedSamples >= hideSamples)
+                    state.targetOcclusion = 0.0f;
+            } else {
+                state.occludedSamples = 0;
+                if (state.visibleSamples < 0xFF)
+                    ++state.visibleSamples;
+                if (state.visibleSamples >= kOcclusionShowSamples)
+                    state.targetOcclusion = 1.0f;
+            }
+            state.occlusionRefresh =
+                static_cast<u8>(kOcclusionRefreshFrames + (slot % 3));
+        } else {
+            --state.occlusionRefresh;
+        }
         state.drawVisible = onScreen && state.targetFontSize >= kMinFontSize;
     } else {
         state.targetFontSize =
@@ -586,7 +687,18 @@ void updateSlot(u8 slot, bool active, f32 anchorX, f32 anchorY, f32 anchorZ, f32
                      : 0.0f;
         state.targetAlpha = onScreen ? evaluateTargetAlpha(distance) : 0.0f;
         state.targetOcclusion = 1.0f;
-        state.drawVisible = onScreen && state.targetAlpha > 0.02f && state.targetFontSize > 0.5f;
+        state.occlusionRefresh = 0;
+        state.occludedSamples = 0;
+        state.visibleSamples = 0;
+        // Hysteresis: once visible, keep drawing while the smoothed alpha is still
+        // readable. Toggling drawVisible on the raw 0.02 target threshold flickered
+        // at fade distances as players moved.
+        if (state.drawVisible)
+            state.drawVisible = onScreen && state.smoothedAlpha > 0.02f &&
+                                state.targetFontSize > 0.25f;
+        else
+            state.drawVisible = onScreen && state.targetAlpha > 0.05f &&
+                                state.targetFontSize > 0.5f;
     }
 
     const f32 combinedAlphaTarget = state.targetAlpha * state.targetOcclusion;
@@ -595,14 +707,17 @@ void updateSlot(u8 slot, bool active, f32 anchorX, f32 anchorY, f32 anchorZ, f32
     state.anchorWorldY = anchorY;
     state.anchorWorldZ = anchorZ;
 
-    const bool snap = shouldSnapMotion(state, bodyX, bodyY, bodyZ, state.targetFontSize) ||
-                      fabsf(state.targetOcclusion - state.smoothedOcclusion) >= 0.45f;
+    const bool snap =
+        shouldSnapMotion(state, bodyX, bodyY, bodyZ, state.targetFontSize, projected, rawScreenX,
+                         rawScreenY);
     const f32 dt = getFrameDelta();
 
     if (snap || !state.initialized) {
         state.smoothedFontSize = state.targetFontSize;
         state.smoothedOcclusion = state.targetOcclusion;
         state.smoothedAlpha = combinedAlphaTarget;
+        state.screenX = rawScreenX;
+        state.screenY = rawScreenY;
         state.initialized = true;
     } else {
         state.smoothedFontSize =
@@ -611,6 +726,10 @@ void updateSlot(u8 slot, bool active, f32 anchorX, f32 anchorY, f32 anchorZ, f32
             exponentialSmooth(state.smoothedOcclusion, state.targetOcclusion, kOcclusionSmoothRate, dt);
         state.smoothedAlpha =
             exponentialSmooth(state.smoothedAlpha, combinedAlphaTarget, kAlphaSmoothRate, dt);
+        if (projected) {
+            state.screenX = exponentialSmooth(state.screenX, rawScreenX, kAnchorSmoothRate, dt);
+            state.screenY = exponentialSmooth(state.screenY, rawScreenY, kAnchorSmoothRate, dt);
+        }
     }
 
     if (isHideSeekNameTagMode())
@@ -623,6 +742,10 @@ void updateSlot(u8 slot, bool active, f32 anchorX, f32 anchorY, f32 anchorZ, f32
 }
 
 void drawAll(const J2DOrthoGraph *graph) {
+#if defined(SMSO_HIDE_NAMETAGS)
+    (void)graph;
+    return;
+#else
     if (!graph || !gpSystemFont)
         return;
 
@@ -630,7 +753,7 @@ void drawAll(const J2DOrthoGraph *graph) {
     ctx->setup2D();
 
     for (u32 slot = 0; slot < MAX_REMOTE_SLOTS; ++slot) {
-        const SlotRuntime &state = gSlots[slot];
+        SlotRuntime &state = gSlots[slot];
         if (!state.active || !state.drawVisible || state.smoothedAlpha <= 0.03f)
             continue;
 
@@ -643,8 +766,12 @@ void drawAll(const J2DOrthoGraph *graph) {
         const f32 centerX = state.screenX;
         const f32 centerY = screenAnchorCenterY(state.screenY, state.smoothedFontSize);
 
-        const f32 textWidth =
-            measureTextWidth(state.name, fontSize, state.appearance.textTopColor);
+        if (state.measuredFontSize != fontSize) {
+            state.measuredTextWidth =
+                measureTextWidth(state.name, fontSize, state.appearance.textTopColor);
+            state.measuredFontSize = fontSize;
+        }
+        const f32 textWidth = state.measuredTextWidth;
         const f32 textHeight = measureTextHeight(fontSize);
 
         int x = 0;
@@ -655,6 +782,7 @@ void drawAll(const J2DOrthoGraph *graph) {
     }
 
     ctx->setScissor();
+#endif
 }
 
 bool getSlotDebugState(u8 slot, DebugState &out) {

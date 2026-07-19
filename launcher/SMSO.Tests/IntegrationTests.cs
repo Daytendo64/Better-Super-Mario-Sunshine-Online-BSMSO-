@@ -1,5 +1,7 @@
 using SMSO.Net;
+using SMSO.Net.MarioPack;
 using SMSO.Server;
+using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
@@ -39,6 +41,201 @@ public class IntegrationTests
 
             await client1.DisconnectAsync();
             await client2.DisconnectAsync();
+        }
+        finally
+        {
+            server.Stop();
+        }
+    }
+
+    [Fact]
+    public async Task MarioModelIntent_UpdatesRosterBeforeHeartbeat()
+    {
+        var port = GetFreePort();
+        var server = new GameServer(new LevelCatalog());
+        server.Start(port);
+        using var sender = new NetClient();
+        using var observer = new NetClient();
+        try
+        {
+            await sender.ConnectAsync("127.0.0.1", port, "ModelSender");
+            await observer.ConnectAsync("127.0.0.1", port, "ModelObserver");
+            await WaitForRosterCountAsync(observer, 2);
+
+            var updated = new TaskCompletionSource<PlayerRosterEntry[]>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            var observedModels = new ConcurrentQueue<string>();
+            observer.RosterUpdated += roster =>
+            {
+                var senderEntry = roster.FirstOrDefault(
+                    entry => entry.Slot == sender.AssignedSlot);
+                if (senderEntry != null)
+                    observedModels.Enqueue(senderEntry.MarioModelId);
+                if (senderEntry?.MarioModelId == "4ef21b6e")
+                {
+                    updated.TrySetResult(roster);
+                }
+            };
+
+            // Rapid changes may race at the client's serialized TCP writer. The
+            // sequenced intent policy must leave the newest choice authoritative.
+            sender.SetMarioModelId("aabbccdd");
+            sender.SetMarioModelId("4ef21b6e");
+            var roster = await updated.Task.WaitAsync(TimeSpan.FromMilliseconds(1500));
+            Assert.Contains(roster, entry => entry.Slot == sender.AssignedSlot &&
+                                             entry.MarioModelId == "4ef21b6e");
+            await Task.Delay(300);
+            Assert.Equal("4ef21b6e", observedModels.Last());
+
+            await sender.DisconnectAsync();
+            await observer.DisconnectAsync();
+        }
+        finally
+        {
+            server.Stop();
+        }
+    }
+
+    [Fact]
+    public async Task Heartbeat_UpdatesRosterModel_AfterSequencedIntent()
+    {
+        // After a sequenced MarioModelIntent is accepted, heartbeats must still
+        // advance MarioModelId. Otherwise a dropped/coalesced later intent leaves
+        // remotes permanently frozen on the last accepted appearance.
+        var port = GetFreePort();
+        var server = new GameServer(new LevelCatalog());
+        server.Start(port);
+        using var raw = new TcpClient();
+        using var observer = new NetClient();
+        try
+        {
+            await observer.ConnectAsync("127.0.0.1", port, "HbObserver");
+            await raw.ConnectAsync(IPAddress.Loopback, port);
+            var stream = raw.GetStream();
+            await stream.WriteAsync(PacketSerializer.BuildHandshake(Guid.NewGuid()));
+            await stream.WriteAsync(PacketSerializer.BuildJoinRequest("HbSender", "retail00"));
+
+            byte senderSlot = 0xFF;
+            using (var joinTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(3)))
+            {
+                while (senderSlot == 0xFF)
+                {
+                    var frame = await ReadTcpFrameAsync(stream, joinTimeout.Token);
+                    Assert.True(PacketSerializer.TryUnwrapTcp(frame, out var id, out var payload));
+                    if (id == TcpPacketId.JoinAccepted && payload.Length >= 1)
+                        senderSlot = payload[0];
+                }
+            }
+
+            await WaitForRosterCountAsync(observer, 2);
+
+            await stream.WriteAsync(PacketSerializer.BuildMarioModelIntent("aabbccdd", 1));
+            await WaitForRosterModelAsync(observer, senderSlot, "aabbccdd");
+
+            // Simulate a lost intent: heartbeat advertises the newer selection.
+            var heartbeat = new byte[10 + ProtocolConstants.MarioModelIdSize];
+            BinaryPrimitives.WriteInt64LittleEndian(heartbeat.AsSpan(0, 8),
+                DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+            BinaryPrimitives.WriteUInt16LittleEndian(heartbeat.AsSpan(8, 2), 12);
+            CharacterPack.EncodeModelId("4ef21b6e").CopyTo(heartbeat, 10);
+            await stream.WriteAsync(PacketSerializer.BuildHeartbeat(heartbeat));
+
+            await WaitForRosterModelAsync(observer, senderSlot, "4ef21b6e");
+        }
+        finally
+        {
+            server.Stop();
+        }
+    }
+
+    [Fact]
+    public async Task MarioModelIntent_StaleSequence_IsRejected_ButHeartbeatCanAdvance()
+    {
+        var port = GetFreePort();
+        var server = new GameServer(new LevelCatalog());
+        server.Start(port);
+        using var raw = new TcpClient();
+        using var observer = new NetClient();
+        try
+        {
+            await observer.ConnectAsync("127.0.0.1", port, "SeqObserver");
+            await raw.ConnectAsync(IPAddress.Loopback, port);
+            var stream = raw.GetStream();
+            await stream.WriteAsync(PacketSerializer.BuildHandshake(Guid.NewGuid()));
+            await stream.WriteAsync(PacketSerializer.BuildJoinRequest("SeqSender", null));
+
+            byte senderSlot = 0xFF;
+            using (var joinTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(3)))
+            {
+                while (senderSlot == 0xFF)
+                {
+                    var frame = await ReadTcpFrameAsync(stream, joinTimeout.Token);
+                    Assert.True(PacketSerializer.TryUnwrapTcp(frame, out var id, out var payload));
+                    if (id == TcpPacketId.JoinAccepted && payload.Length >= 1)
+                        senderSlot = payload[0];
+                }
+            }
+
+            await WaitForRosterCountAsync(observer, 2);
+            var observed = new ConcurrentQueue<string>();
+            observer.RosterUpdated += roster =>
+            {
+                var entry = roster.FirstOrDefault(e => e.Slot == senderSlot);
+                if (entry != null)
+                    observed.Enqueue(entry.MarioModelId);
+            };
+
+            await stream.WriteAsync(PacketSerializer.BuildMarioModelIntent("aabbccdd", 5));
+            await WaitForRosterModelAsync(observer, senderSlot, "aabbccdd");
+
+            // Stale sequenced intent must not roll the roster back.
+            await stream.WriteAsync(PacketSerializer.BuildMarioModelIntent("deadbeef", 4));
+            await Task.Delay(500);
+            Assert.DoesNotContain("deadbeef", observed);
+
+            var heartbeat = new byte[10 + ProtocolConstants.MarioModelIdSize];
+            BinaryPrimitives.WriteInt64LittleEndian(heartbeat.AsSpan(0, 8),
+                DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+            CharacterPack.EncodeModelId("4ef21b6e").CopyTo(heartbeat, 10);
+            await stream.WriteAsync(PacketSerializer.BuildHeartbeat(heartbeat));
+            await WaitForRosterModelAsync(observer, senderSlot, "4ef21b6e");
+            Assert.DoesNotContain("deadbeef", observed);
+        }
+        finally
+        {
+            server.Stop();
+        }
+    }
+
+    [Fact]
+    public async Task MarioModelIntent_BeforeJoin_IsNotAuthorized()
+    {
+        var port = GetFreePort();
+        var server = new GameServer(new LevelCatalog());
+        server.Start(port);
+        using var raw = new TcpClient();
+        try
+        {
+            await raw.ConnectAsync(IPAddress.Loopback, port);
+            var stream = raw.GetStream();
+            await stream.WriteAsync(PacketSerializer.BuildHandshake(Guid.NewGuid()));
+            await stream.WriteAsync(PacketSerializer.BuildMarioModelIntent("aabbccdd", 99));
+            await stream.WriteAsync(PacketSerializer.BuildJoinRequest("RawIntent", null));
+
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+            byte[]? acceptedPayload = null;
+            while (acceptedPayload == null)
+            {
+                var frame = await ReadTcpFrameAsync(stream, timeout.Token);
+                Assert.True(PacketSerializer.TryUnwrapTcp(
+                    frame, out var id, out var payload));
+                if (id == TcpPacketId.JoinAccepted)
+                    acceptedPayload = payload;
+            }
+
+            Assert.True(acceptedPayload.Length >= 2 + ProtocolConstants.RosterEntrySize);
+            Assert.Equal(string.Empty, CharacterPack.DecodeModelId(
+                acceptedPayload.AsSpan(2 + 22, ProtocolConstants.MarioModelIdSize)));
         }
         finally
         {
@@ -88,6 +285,110 @@ public class IntegrationTests
         {
             server.Stop();
         }
+    }
+
+    [Fact]
+    public async Task WrongModBuildId_IsRejectedAsVersionMismatch()
+    {
+        var server = new GameServer(new LevelCatalog());
+        var port = GetFreePort();
+        server.Start(port);
+        try
+        {
+            using var tcp = new TcpClient();
+            await tcp.ConnectAsync("127.0.0.1", port);
+            var stream = tcp.GetStream();
+            await stream.WriteAsync(PacketSerializer.BuildHandshake(Guid.NewGuid()));
+            // Drain HandshakeAck
+            var ackBuf = new byte[64];
+            _ = await stream.ReadAsync(ackBuf);
+
+            var wrongBuild = (ushort)(ProtocolConstants.ModBuildId == ushort.MaxValue
+                ? ProtocolConstants.ModBuildId - 1
+                : ProtocolConstants.ModBuildId + 1);
+            await stream.WriteAsync(PacketSerializer.BuildJoinRequest("WrongBuild", null, wrongBuild));
+
+            var reject = await ReadJoinRejectedReasonAsync(stream);
+            Assert.Equal(JoinRejectReason.VersionMismatch, reject);
+        }
+        finally
+        {
+            server.Stop();
+        }
+    }
+
+    [Fact]
+    public async Task LegacyJoinWithoutModBuildId_IsRejectedAsVersionMismatch()
+    {
+        var server = new GameServer(new LevelCatalog());
+        var port = GetFreePort();
+        server.Start(port);
+        try
+        {
+            using var tcp = new TcpClient();
+            await tcp.ConnectAsync("127.0.0.1", port);
+            var stream = tcp.GetStream();
+            await stream.WriteAsync(PacketSerializer.BuildHandshake(Guid.NewGuid()));
+            var ackBuf = new byte[64];
+            _ = await stream.ReadAsync(ackBuf);
+
+            // Build a current JoinRequest then truncate ModBuildId (legacy 24-byte payload).
+            var full = PacketSerializer.BuildJoinRequest("LegacyClient", "retail00");
+            Assert.True(PacketSerializer.TryUnwrapTcp(full, out _, out var payload));
+            var legacyLen = 16 + ProtocolConstants.MarioModelIdSize;
+            var legacyPayload = new byte[legacyLen];
+            Array.Copy(payload, 0, legacyPayload, 0, legacyLen);
+            await stream.WriteAsync(PacketSerializer.WrapTcp(TcpPacketId.JoinRequest, legacyPayload));
+
+            var reject = await ReadJoinRejectedReasonAsync(stream);
+            Assert.Equal(JoinRejectReason.VersionMismatch, reject);
+        }
+        finally
+        {
+            server.Stop();
+        }
+    }
+
+    private static async Task<JoinRejectReason> ReadJoinRejectedReasonAsync(NetworkStream stream)
+    {
+        var pending = new List<byte>();
+        var scratch = new byte[256];
+        var deadline = DateTime.UtcNow.AddSeconds(3);
+        while (DateTime.UtcNow < deadline)
+        {
+            if (stream.DataAvailable || pending.Count == 0)
+            {
+                var read = await stream.ReadAsync(scratch);
+                if (read <= 0)
+                    break;
+                for (var i = 0; i < read; i++)
+                    pending.Add(scratch[i]);
+            }
+
+            while (pending.Count >= 9)
+            {
+                var buffer = pending.ToArray();
+                if (!PacketSerializer.TryGetTcpFrameLength(buffer, out var frameLength) ||
+                    pending.Count < frameLength)
+                    break;
+
+                var frame = new byte[frameLength];
+                Array.Copy(buffer, 0, frame, 0, frameLength);
+                if (PacketSerializer.TryUnwrapTcp(frame, out var id, out var payload))
+                {
+                    pending.RemoveRange(0, frameLength);
+                    if (id == TcpPacketId.JoinRejected && payload.Length > 0)
+                        return (JoinRejectReason)payload[0];
+                    continue;
+                }
+
+                pending.RemoveAt(0);
+            }
+
+            await Task.Delay(20);
+        }
+
+        throw new TimeoutException("Did not receive JoinRejected.");
     }
 
     [Fact]
@@ -669,6 +970,19 @@ public class IntegrationTests
         return client;
     }
 
+    private static async Task<byte[]> ReadTcpFrameAsync(
+        NetworkStream stream, CancellationToken cancellationToken)
+    {
+        var header = new byte[9];
+        await stream.ReadExactlyAsync(header, cancellationToken);
+        var payloadLength = BinaryPrimitives.ReadUInt16LittleEndian(header.AsSpan(7, 2));
+        var frame = new byte[9 + payloadLength + 4];
+        header.CopyTo(frame, 0);
+        await stream.ReadExactlyAsync(
+            frame.AsMemory(9, payloadLength + 4), cancellationToken);
+        return frame;
+    }
+
     private static async Task<PlayerRosterEntry[]> WaitForRosterCountAsync(NetClient client, int count)
     {
         var tcs = new TaskCompletionSource<PlayerRosterEntry[]>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -679,6 +993,31 @@ public class IntegrationTests
         };
 
         return await tcs.Task.WaitAsync(TimeSpan.FromSeconds(3));
+    }
+
+    private static async Task WaitForRosterModelAsync(NetClient client, byte slot, string modelId)
+    {
+        var want = CharacterPack.NormalizeModelId(modelId);
+        var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        void OnRoster(PlayerRosterEntry[] roster)
+        {
+            var entry = roster.FirstOrDefault(e => e.Slot == slot);
+            if (entry != null &&
+                string.Equals(entry.MarioModelId, want, StringComparison.Ordinal))
+            {
+                tcs.TrySetResult(true);
+            }
+        }
+
+        client.RosterUpdated += OnRoster;
+        try
+        {
+            await tcs.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        }
+        finally
+        {
+            client.RosterUpdated -= OnRoster;
+        }
     }
 
     private static int GetFreePort()

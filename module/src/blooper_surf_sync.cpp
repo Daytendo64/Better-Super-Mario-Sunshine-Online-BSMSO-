@@ -16,23 +16,38 @@ namespace smso {
 
 namespace {
 
+// doldecomp MoveBG/MapObjManager.hpp — shared surf-blooper SDLModelData + MActor templates.
+constexpr u32 kMapObjManagerSurfGessoModelDataOffset = 0x98u;
 constexpr u32 kMapObjManagerRedGessoOffset = 0x9Cu;
 constexpr u32 kMapObjManagerYellowGessoOffset = 0xA0u;
 constexpr u32 kMapObjManagerGreenGessoOffset = 0xA4u;
+constexpr u32 kMapObjManagerRedGessoColorOffset = 0xA8u;
+constexpr u32 kMapObjManagerYellowGessoColorOffset = 0xB0u;
+constexpr u32 kMapObjManagerGreenGessoColorOffset = 0xB8u;
 constexpr u8 kSurfGessoCloneTypeNone = 0xFFu;
-constexpr size_t kRemoteSurfGessoActorSize = 0x48u;
+// Retail SMS_MakeMActorFromSDLModelData uses flag 3 + SDLModel(..., 1).
+constexpr u32 kSurfGessoSdlModelFlags = 3u;
+constexpr u32 kGxTevReg1 = 1u;
 
 struct RemoteSurfGessoActor {
     void *anmData;
     J3DModel *model;
 };
 
+struct SurfGessoColorS10 {
+    s16 r;
+    s16 g;
+    s16 b;
+    s16 a;
+};
+
 using RemoteSurfGessoSetBckFn = void (*)(void *, const char *);
 using RemoteSurfGessoSetFrameRateFn = void (*)(void *, f32, int);
 using RemoteSurfGessoPerformFn = void (*)(void *, u32, JDrama::TGraphics *);
-using RemoteSurfGessoActorCtorFn = void (*)(void *, void *);
-using RemoteSurfGessoActorSetModelFn = void (*)(void *, J3DModel *, u32);
-using RemoteSurfGessoModelDtorFn = void (*)(J3DModel *);
+using MakeMActorFromSDLModelDataFn = void *(*)(void *sdlModelData, void *anmData, u32 flags);
+using InitPacketMatColorFn = void (*)(J3DModel *, u32 tevRegId, const SurfGessoColorS10 *);
+// MW complete destructor: second arg non-zero deletes the object after dtors run.
+using RemoteSurfGessoModelDtorFn = void (*)(J3DModel *, s16);
 
 RemoteSurfGessoSetBckFn sSurfGessoSetBck =
     reinterpret_cast<RemoteSurfGessoSetBckFn>(SMS_PORT_REGION(0x80238E40, 0, 0, 0));
@@ -40,13 +55,14 @@ RemoteSurfGessoSetFrameRateFn sSurfGessoSetFrameRate =
     reinterpret_cast<RemoteSurfGessoSetFrameRateFn>(SMS_PORT_REGION(0x80238E7C, 0, 0, 0));
 RemoteSurfGessoPerformFn sSurfGessoPerform =
     reinterpret_cast<RemoteSurfGessoPerformFn>(SMS_PORT_REGION(0x802391BC, 0, 0, 0));
-RemoteSurfGessoActorCtorFn sSurfGessoActorCtor =
-    reinterpret_cast<RemoteSurfGessoActorCtorFn>(SMS_PORT_REGION(0x8023A408, 0x80232194, 0, 0));
-RemoteSurfGessoActorSetModelFn sSurfGessoActorSetModel =
-    reinterpret_cast<RemoteSurfGessoActorSetModelFn>(
-        SMS_PORT_REGION(0x8023A110, 0x80231E9C, 0, 0));
+MakeMActorFromSDLModelDataFn sMakeMActorFromSDLModelData =
+    reinterpret_cast<MakeMActorFromSDLModelDataFn>(
+        SMS_PORT_REGION(0x8023E81C, 0x802365A8, 0, 0));
+InitPacketMatColorFn sInitPacketMatColor =
+    reinterpret_cast<InitPacketMatColorFn>(SMS_PORT_REGION(0x801BA650, 0x801B2508, 0, 0));
+// Prefer SDLModel dtor — clones are SDLModel (0xAC), not plain J3DModel.
 RemoteSurfGessoModelDtorFn sSurfGessoModelDtor =
-    reinterpret_cast<RemoteSurfGessoModelDtorFn>(SMS_PORT_REGION(0x802DDEA0, 0x802D6048, 0, 0));
+    reinterpret_cast<RemoteSurfGessoModelDtorFn>(SMS_PORT_REGION(0x8023D308, 0x80235094, 0, 0));
 
 void *resolveSurfGessoTemplate(u8 gessoType) {
     if (!gpMapObjManager)
@@ -62,6 +78,32 @@ void *resolveSurfGessoTemplate(u8 gessoType) {
     case 2:
         return *reinterpret_cast<void *const *>(mgr + kMapObjManagerGreenGessoOffset);
     }
+}
+
+void *resolveSurfGessoModelData() {
+    if (!gpMapObjManager)
+        return nullptr;
+    const u8 *mgr = reinterpret_cast<const u8 *>(gpMapObjManager);
+    return *reinterpret_cast<void *const *>(mgr + kMapObjManagerSurfGessoModelDataOffset);
+}
+
+const SurfGessoColorS10 *resolveSurfGessoColor(u8 gessoType) {
+    if (!gpMapObjManager)
+        return nullptr;
+
+    const u8 *mgr = reinterpret_cast<const u8 *>(gpMapObjManager);
+    u32 offset = kMapObjManagerRedGessoColorOffset;
+    switch (gessoType) {
+    case 1:
+        offset = kMapObjManagerYellowGessoColorOffset;
+        break;
+    case 2:
+        offset = kMapObjManagerGreenGessoColorOffset;
+        break;
+    default:
+        break;
+    }
+    return reinterpret_cast<const SurfGessoColorS10 *>(mgr + offset);
 }
 
 void syncSurfGessoBaseMtx(TMario *mario, void *gesso) {
@@ -94,16 +136,21 @@ void applySurfWaterContext(TMario *body) {
     body->mAttributes.mIsShallowWater = false;
 }
 
+// Stage templates (mRed/Yellow/GreenGesso) are singletons. Sharing them across local +
+// remotes (or across remotes) crashes when multiple players surf. Clone via the retail
+// SMS_MakeMActorFromSDLModelData helper so each remote gets a real SDLModel (0xAC) with
+// the correct vtable — plain J3DModel(modelData, 0, 0) crashes in MActor::perform.
 void *createRemoteSurfGessoClone(u8 gessoType, J3DModel **outModel) {
     if (outModel)
         *outModel = nullptr;
 
+    void *sdlModelData = resolveSurfGessoModelData();
     void *templateActor = resolveSurfGessoTemplate(gessoType);
-    if (!templateActor)
+    if (!sdlModelData || !templateActor)
         return nullptr;
 
     auto *templateSurf = reinterpret_cast<RemoteSurfGessoActor *>(templateActor);
-    if (!templateSurf->anmData || !templateSurf->model || !templateSurf->model->mModelData)
+    if (!templateSurf->anmData || !templateSurf->model)
         return nullptr;
 
     JKRHeap *remoteHeap = borrowRemoteActorHeap();
@@ -113,22 +160,25 @@ void *createRemoteSurfGessoClone(u8 gessoType, J3DModel **outModel) {
     JKRHeap *previousHeap = JKRHeap::sCurrentHeap;
     remoteHeap->becomeCurrentHeap();
 
-    J3DModel *model = new (remoteHeap, 4) J3DModel(templateSurf->model->mModelData, 0, 0);
-    void *actorMem = operator new(kRemoteSurfGessoActorSize, remoteHeap, 4);
-    if (!model || !actorMem) {
-        if (model) {
-            sSurfGessoModelDtor(model);
-            operator delete(model);
-        }
-        if (actorMem)
-            operator delete(actorMem);
+    void *actorMem = sMakeMActorFromSDLModelData(sdlModelData, templateSurf->anmData,
+                                                 kSurfGessoSdlModelFlags);
+    if (!actorMem) {
         if (previousHeap)
             previousHeap->becomeCurrentHeap();
         return nullptr;
     }
 
-    sSurfGessoActorCtor(actorMem, templateSurf->anmData);
-    sSurfGessoActorSetModel(actorMem, model, 0);
+    auto *actor = reinterpret_cast<RemoteSurfGessoActor *>(actorMem);
+    if (!actor->model) {
+        operator delete(actorMem);
+        if (previousHeap)
+            previousHeap->becomeCurrentHeap();
+        return nullptr;
+    }
+
+    if (const SurfGessoColorS10 *color = resolveSurfGessoColor(gessoType))
+        sInitPacketMatColor(actor->model, kGxTevReg1, color);
+
     sSurfGessoSetBck(actorMem, "surfgeso_run1");
     sSurfGessoSetFrameRate(actorMem, 0.5f, 0);
 
@@ -136,7 +186,7 @@ void *createRemoteSurfGessoClone(u8 gessoType, J3DModel **outModel) {
         previousHeap->becomeCurrentHeap();
 
     if (outModel)
-        *outModel = model;
+        *outModel = actor->model;
     return actorMem;
 }
 
@@ -152,10 +202,12 @@ void releaseClone(BlooperSurfSlot &slot) {
         JKRHeap *previousHeap = JKRHeap::sCurrentHeap;
         remoteHeap->becomeCurrentHeap();
 
-        if (slot.cloneModel) {
-            sSurfGessoModelDtor(slot.cloneModel);
-            operator delete(slot.cloneModel);
-        }
+        // Model is owned by the MActor from SMS_MakeMActorFromSDLModelData. SDLModel's
+        // complete dtor (2nd arg > 0) runs the chain and operator-deletes the model.
+        // Anm objects from setBck live on the remote heap until that heap is destroyed.
+        if (slot.cloneModel)
+            sSurfGessoModelDtor(slot.cloneModel, 1);
+        slot.cloneModel = nullptr;
         if (slot.cloneActor)
             operator delete(slot.cloneActor);
 
@@ -263,7 +315,6 @@ void applyRemoteBlooperSurfSnapshot(TMario *body, BlooperSurfSlot &slot, const P
     if (!body)
         return;
 
-    const u32 rawState = snapshotMarioState(snap);
     const bool surfing = snapshotIsBlooperSurfing(snap);
 
     if (surfing) {
@@ -278,8 +329,6 @@ void applyRemoteBlooperSurfSnapshot(TMario *body, BlooperSurfSlot &slot, const P
         slot.gessoType = 0;
         bindRemoteSurfGesso(body, slot, 0, false);
     }
-
-    (void)rawState;
 }
 
 void updateRemoteBlooperSurfFrame(TMario *body, BlooperSurfSlot *slot, JDrama::TGraphics *graphics) {
@@ -306,6 +355,8 @@ void updateRemoteBlooperSurfFrame(TMario *body, BlooperSurfSlot *slot, JDrama::T
         return;
 
     syncSurfGessoBaseMtx(body, body->mSurfGesso);
+    // Anim/calc only. With a valid SDLModel clone, retail calcView/entryModels keep the
+    // surf draw flag and call MActor::perform(4 / 0x200) for view + entry.
     sSurfGessoPerform(body->mSurfGesso, 2, graphics);
 }
 

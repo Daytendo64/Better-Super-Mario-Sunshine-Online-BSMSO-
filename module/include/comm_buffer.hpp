@@ -74,6 +74,8 @@ enum BridgeFlags : u32 {
     BF_SYNC_SECRET = 1 << 9,
     BF_SYNC_OBJECTS = 1 << 10,
     BF_SYNC_PROGRESS = 1 << 11,
+    /// Module → launcher: request an immediate WorldProgress snapshot (co-op death reload).
+    BF_REQUEST_PROGRESS = 1 << 12,
     BF_WARP_TO_POINT = 1 << 13,   // apply warpPos* after stage load (or immediately if same stage)
     BF_WARP_ALL = 1 << 14,        // warp command explicitly targets every connected slot
 };
@@ -427,11 +429,25 @@ inline bool readNameTagGradientEnabled(const char name[MAX_PLAYER_NAME]) {
 }
 
 inline int readNameTagTextLength(const char name[MAX_PLAYER_NAME]) {
-    for (int i = 0; i < static_cast<int>(MAX_PLAYER_NAME); ++i) {
+    // Legacy overlay packing stores colors in bytes 5-14 with a marker at 15:
+    //   gradient (0x7B): text is only bytes 0-4
+    //   extended (0x7D): text is bytes 0-10 (byte 11 forced 0)
+    //   text-only (0x7F): text is bytes 0-11
+    // Pure / sidecar names are C-strings with no marker.
+    const u8 marker = static_cast<u8>(name[15]);
+    int limit = static_cast<int>(MAX_PLAYER_NAME) - 1;
+    if (marker == kNameTagGradientMarker)
+        limit = 5;
+    else if (marker == kNameTagExtendedMarker)
+        limit = 11;
+    else if (marker == kNameTagColorMarker)
+        limit = 12;
+
+    for (int i = 0; i < limit; ++i) {
         if (name[i] == '\0')
             return i;
     }
-    return static_cast<int>(MAX_PLAYER_NAME);
+    return limit;
 }
 
 inline void copyPurePlayerName(char dest[MAX_PLAYER_NAME], const char src[MAX_PLAYER_NAME]) {
@@ -590,6 +606,13 @@ enum WorldEventType : u8 {
     // payload1 = packed NPC world position. Gated by BF_SYNC_EVENT|BF_SYNC_MISSION.
     // Apply forces clean+unsunk so checkMonteClear / mission HUD catch up on late join.
     WE_NPC_CLEANED = 17,
+    // Surface graffiti / goop cleaned via TPollutionManager::clean. Durable, grow-only
+    // per stage cell. payload0 = quantized radius (units/8), payload1 = packed XYZ,
+    // payload2 = 32u 3D cell pack: bits0-9=cellX, 10-19=cellY, 20-29=cellZ (signed
+    // 10-bit), bit30=valid. XZ-only cells collapsed vertical wall M into one stamp.
+    // Remote applies retail stamp(0) all planes (walls+ground); late-join via snapshot.
+    // Gated by BF_SYNC_EVENT|MISSION.
+    WE_GRAFFITI_CLEANED = 18,
 };
 
 struct CommWorldEvent {

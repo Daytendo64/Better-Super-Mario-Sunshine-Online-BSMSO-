@@ -27,8 +27,39 @@ public static class ModelLibrary
     public const string PackExtension = ".arc";
     public const string SzsExtension = ".szs";
 
+    // Pack files are read repeatedly by launch-time sync, remote-roster ensure,
+    // validation, and disc patching. Keep a small immutable byte cache so those
+    // paths share the same OS read instead of allocating another ~2 MiB buffer
+    // per caller. File identity is checked on every lookup, so imports/seed
+    // updates become visible without an explicit cache flush.
+    private const long PackByteCacheLimit = 32L * 1024 * 1024;
+    private static readonly object PackByteCacheLock = new();
+    private static readonly Dictionary<string, PackByteCacheEntry> PackByteCache =
+        new(StringComparer.OrdinalIgnoreCase);
+    private static long s_packByteCacheSize;
+    private static long s_packByteCacheSequence;
+
+    private sealed class PackByteCacheEntry
+    {
+        public required long Length { get; init; }
+        public required long LastWriteUtcTicks { get; init; }
+        public required byte[] Bytes { get; init; }
+        public long LastUseSequence { get; set; }
+    }
+
     /// <summary>Optional redirect for tests / tools. Null uses %AppData%\SMSO\CustomModels.</summary>
-    public static string? LibraryDirectoryOverride { get; set; }
+    private static string? s_libraryDirectoryOverride;
+    public static string? LibraryDirectoryOverride
+    {
+        get => s_libraryDirectoryOverride;
+        set
+        {
+            if (string.Equals(s_libraryDirectoryOverride, value, StringComparison.OrdinalIgnoreCase))
+                return;
+            s_libraryDirectoryOverride = value;
+            ClearPackByteCache();
+        }
+    }
 
     public static string LibraryDirectory =>
         LibraryDirectoryOverride ??
@@ -381,8 +412,14 @@ public static class ModelLibrary
         if (string.IsNullOrWhiteSpace(sourceSzsPath) || !File.Exists(sourceSzsPath))
             throw new FileNotFoundException("Custom SZS not found.", sourceSzsPath);
 
+        var name = string.IsNullOrWhiteSpace(displayName)
+            ? CharacterPack.DisplayNameFromFileName(sourceSzsPath)
+            : displayName.Trim();
+
         var customBytes = File.ReadAllBytes(sourceSzsPath);
-        var merge = CharacterPack.BuildMergedPack(retailArchiveBytes, customBytes);
+        var merge = CharacterPack.BuildMergedPack(retailArchiveBytes, customBytes,
+            replaceMatchingBcks: CharacterPack.AllowsBckReplacement(name),
+            injectBodyAngleFreePrm: CharacterPack.AllowsBodyAngleFreeReplacement(name));
         if (!CharacterPack.TryValidatePackForInit(merge.PackArc, out var unsafeReason))
         {
             throw new InvalidDataException(
@@ -390,10 +427,6 @@ public static class ModelLibrary
         }
 
         EnsureLibraryDirectory();
-
-        var name = string.IsNullOrWhiteSpace(displayName)
-            ? CharacterPack.DisplayNameFromFileName(sourceSzsPath)
-            : displayName.Trim();
 
         var map = LoadMap();
         map[merge.ModelId] = name;
@@ -409,7 +442,7 @@ public static class ModelLibrary
             File.Delete(legacyPack);
         }
 
-        File.WriteAllBytes(packPath, merge.PackArc);
+        WriteAllBytesAtomically(packPath, merge.PackArc);
 
         var srcCopy = GetSzsPath(merge.ModelId, map);
         var legacySzs = Path.Combine(LibraryDirectory, merge.ModelId + SzsExtension);
@@ -423,7 +456,7 @@ public static class ModelLibrary
         var srcFull = Path.GetFullPath(sourceSzsPath);
         var destFull = Path.GetFullPath(srcCopy);
         if (!string.Equals(srcFull, destFull, StringComparison.OrdinalIgnoreCase))
-            File.Copy(sourceSzsPath, srcCopy, overwrite: true);
+            CopyFileAtomically(sourceSzsPath, srcCopy);
 
         return new ModelLibraryEntry
         {
@@ -467,13 +500,6 @@ public static class ModelLibrary
         if (!File.Exists(srcCopy))
             return null;
 
-        var merge = CharacterPack.BuildMergedPack(retailArchiveBytes, File.ReadAllBytes(srcCopy));
-        if (!CharacterPack.TryValidatePackForInit(merge.PackArc, out var unsafeReason))
-        {
-            throw new InvalidDataException(
-                "Reimported pack is unsafe for multiplayer (would crash remotes): " + unsafeReason);
-        }
-
         EnsureLibraryDirectory();
 
         var map = LoadMap();
@@ -481,11 +507,21 @@ public static class ModelLibrary
         var name = string.IsNullOrWhiteSpace(existingName)
             ? CharacterPack.DisplayNameFromFileName(srcCopy)
             : existingName.Trim();
+
+        var merge = CharacterPack.BuildMergedPack(retailArchiveBytes, File.ReadAllBytes(srcCopy),
+            replaceMatchingBcks: CharacterPack.AllowsBckReplacement(name),
+            injectBodyAngleFreePrm: CharacterPack.AllowsBodyAngleFreeReplacement(name));
+        if (!CharacterPack.TryValidatePackForInit(merge.PackArc, out var unsafeReason))
+        {
+            throw new InvalidDataException(
+                "Reimported pack is unsafe for multiplayer (would crash remotes): " + unsafeReason);
+        }
+
         map[id] = name;
         SaveMap(map);
 
         var packPath = GetPackPath(id, map);
-        File.WriteAllBytes(packPath, merge.PackArc);
+        WriteAllBytesAtomically(packPath, merge.PackArc);
 
         return new ModelLibraryEntry
         {
@@ -504,8 +540,145 @@ public static class ModelLibrary
         var path = GetPackPath(id);
         if (!File.Exists(path))
             return false;
-        bytes = File.ReadAllBytes(path);
-        return true;
+
+        // A seed/import may atomically replace the file between the first stat
+        // and read. Retry once when its identity changes so cache entries always
+        // describe a complete version, never a mixed/partial handoff.
+        for (var attempt = 0; attempt < 2; attempt++)
+        {
+            FileInfo before;
+            try
+            {
+                before = new FileInfo(path);
+                if (!before.Exists)
+                    return false;
+            }
+            catch
+            {
+                return false;
+            }
+
+            var fullPath = Path.GetFullPath(path);
+            lock (PackByteCacheLock)
+            {
+                if (PackByteCache.TryGetValue(fullPath, out var cached) &&
+                    cached.Length == before.Length &&
+                    cached.LastWriteUtcTicks == before.LastWriteTimeUtc.Ticks)
+                {
+                    cached.LastUseSequence = ++s_packByteCacheSequence;
+                    bytes = cached.Bytes;
+                    return true;
+                }
+            }
+
+            byte[] loaded;
+            try
+            {
+                // Readers share with launcher seed/import atomic replacements.
+                using var stream = new FileStream(
+                    fullPath, FileMode.Open, FileAccess.Read,
+                    FileShare.Read | FileShare.Delete,
+                    bufferSize: 128 * 1024,
+                    FileOptions.SequentialScan);
+                loaded = new byte[stream.Length];
+                stream.ReadExactly(loaded);
+            }
+            catch
+            {
+                return false;
+            }
+
+            var after = new FileInfo(fullPath);
+            if (!after.Exists)
+                return false;
+            if (before.Length != after.Length ||
+                before.LastWriteTimeUtc.Ticks != after.LastWriteTimeUtc.Ticks)
+            {
+                continue;
+            }
+
+            lock (PackByteCacheLock)
+            {
+                // Another caller may have won the same read while ours was in
+                // flight. Reuse its buffer so validation caching can deduplicate too.
+                if (PackByteCache.TryGetValue(fullPath, out var winner) &&
+                    winner.Length == after.Length &&
+                    winner.LastWriteUtcTicks == after.LastWriteTimeUtc.Ticks)
+                {
+                    winner.LastUseSequence = ++s_packByteCacheSequence;
+                    bytes = winner.Bytes;
+                    return true;
+                }
+
+                if (PackByteCache.Remove(fullPath, out var stale))
+                    s_packByteCacheSize -= stale.Bytes.LongLength;
+                PackByteCache[fullPath] = new PackByteCacheEntry
+                {
+                    Length = after.Length,
+                    LastWriteUtcTicks = after.LastWriteTimeUtc.Ticks,
+                    Bytes = loaded,
+                    LastUseSequence = ++s_packByteCacheSequence,
+                };
+                s_packByteCacheSize += loaded.LongLength;
+                TrimPackByteCache_NoLock(fullPath);
+                bytes = loaded;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static void TrimPackByteCache_NoLock(string keepPath)
+    {
+        while (s_packByteCacheSize > PackByteCacheLimit && PackByteCache.Count > 1)
+        {
+            string? oldestPath = null;
+            long oldestSequence = long.MaxValue;
+            foreach (var kvp in PackByteCache)
+            {
+                if (string.Equals(kvp.Key, keepPath, StringComparison.OrdinalIgnoreCase))
+                    continue;
+                if (kvp.Value.LastUseSequence >= oldestSequence)
+                    continue;
+                oldestSequence = kvp.Value.LastUseSequence;
+                oldestPath = kvp.Key;
+            }
+
+            if (oldestPath == null || !PackByteCache.Remove(oldestPath, out var removed))
+                break;
+            s_packByteCacheSize -= removed.Bytes.LongLength;
+        }
+    }
+
+    private static void ClearPackByteCache()
+    {
+        lock (PackByteCacheLock)
+        {
+            PackByteCache.Clear();
+            s_packByteCacheSize = 0;
+            s_packByteCacheSequence = 0;
+        }
+    }
+
+    private static void InvalidatePackByteCache(string path)
+    {
+        string fullPath;
+        try
+        {
+            fullPath = Path.GetFullPath(path);
+        }
+        catch
+        {
+            return;
+        }
+
+        lock (PackByteCacheLock)
+        {
+            if (!PackByteCache.Remove(fullPath, out var removed))
+                return;
+            s_packByteCacheSize -= removed.Bytes.LongLength;
+        }
     }
 
     public static string ResolveDisplayName(string? modelId)
@@ -542,54 +715,76 @@ public static class ModelLibrary
     }
 
     /// <summary>
-    /// Copy release-bundled <c>CustomModels/</c> packs into the AppData library
-    /// so first-run users get the same model list as the packager. Existing
-    /// AppData packs are kept; missing ids / library labels are filled in.
+    /// Copy release-bundled <c>CustomModels/</c> packs into the AppData library.
+    /// Zip updates always overwrite matching pack / SZS files and library labels
+    /// so testers get the same content as the release. User-imported packs whose
+    /// ids are not in the bundle are left alone; stale entries that reuse a
+    /// bundled display name under an older id are removed.
     /// </summary>
-    /// <returns>Number of pack files newly copied into AppData.</returns>
-    public static int SeedBundledModels(Action<string>? log = null)
+    /// <returns>Number of pack/SZS files written or updated in AppData.</returns>
+    public static int SeedBundledModels(Action<string>? log = null) =>
+        SeedBundledModelsFrom(EnumerateBundledModelDirectories().FirstOrDefault(), log);
+
+    /// <summary>Testable seed entry point with an explicit bundled directory.</summary>
+    public static int SeedBundledModelsFrom(string? bundledDir, Action<string>? log = null)
     {
-        var bundledDir = EnumerateBundledModelDirectories().FirstOrDefault();
-        if (bundledDir == null)
+        if (string.IsNullOrWhiteSpace(bundledDir) || !Directory.Exists(bundledDir))
             return 0;
 
         EnsureLibraryDirectory();
         var map = LoadMap();
         var dirty = false;
-        var copied = 0;
+        var updated = 0;
 
+        Dictionary<string, string>? bundledMap = null;
         var bundledMapPath = Path.Combine(bundledDir, LibraryFileName);
         if (File.Exists(bundledMapPath))
         {
             try
             {
-                var bundledMap = JsonSerializer.Deserialize<Dictionary<string, string>>(
+                bundledMap = JsonSerializer.Deserialize<Dictionary<string, string>>(
                     File.ReadAllText(bundledMapPath));
-                if (bundledMap != null)
-                {
-                    foreach (var kvp in bundledMap)
-                    {
-                        var id = CharacterPack.NormalizeModelId(kvp.Key);
-                        if (id.Length == 0 || string.IsNullOrWhiteSpace(kvp.Value))
-                            continue;
-                        if (map.TryGetValue(id, out var existing) &&
-                            string.Equals(existing, kvp.Value.Trim(), StringComparison.Ordinal))
-                        {
-                            continue;
-                        }
-
-                        // Prefer an existing user-edited label; only fill blanks.
-                        if (!map.ContainsKey(id) || string.IsNullOrWhiteSpace(map[id]))
-                        {
-                            map[id] = kvp.Value.Trim();
-                            dirty = true;
-                        }
-                    }
-                }
             }
             catch
             {
                 // Ignore corrupt bundled library.json; packs below still seed.
+            }
+        }
+
+        if (bundledMap != null)
+        {
+            foreach (var kvp in bundledMap)
+            {
+                var id = CharacterPack.NormalizeModelId(kvp.Key);
+                var name = kvp.Value?.Trim() ?? string.Empty;
+                if (id.Length == 0 || name.Length == 0)
+                    continue;
+
+                // Drop other ids that claim the same display name (stale reimports
+                // after a pack content-hash / id change in a newer zip).
+                foreach (var otherKey in map.Keys.ToList())
+                {
+                    var otherId = CharacterPack.NormalizeModelId(otherKey);
+                    if (otherId.Length == 0 ||
+                        string.Equals(otherId, id, StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    if (!string.Equals(map[otherKey]?.Trim(), name, StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    DeleteLibraryPackFiles(otherId, map);
+                    map.Remove(otherKey);
+                    dirty = true;
+                }
+
+                if (!map.TryGetValue(id, out var existing) ||
+                    !string.Equals(existing, name, StringComparison.Ordinal))
+                {
+                    map[id] = name;
+                    dirty = true;
+                }
             }
         }
 
@@ -599,44 +794,79 @@ public static class ModelLibrary
             var id = CharacterPack.NormalizeModelId(stem);
             if (id.Length == 0)
             {
-                // Bundled already uses a display-name file — resolve via bundled map.
+                // Bundled already uses a display-name file — resolve via map / bundle.
                 id = FindModelIdForLibraryFile(pack, map) ?? string.Empty;
+                if (id.Length == 0 && bundledMap != null)
+                {
+                    foreach (var kvp in bundledMap)
+                    {
+                        var label = kvp.Value?.Trim() ?? string.Empty;
+                        if (string.Equals(SanitizeFileStem(label), stem, StringComparison.OrdinalIgnoreCase) ||
+                            string.Equals(label, stem, StringComparison.OrdinalIgnoreCase))
+                        {
+                            id = CharacterPack.NormalizeModelId(kvp.Key);
+                            break;
+                        }
+                    }
+                }
+
                 if (id.Length == 0)
                     continue;
             }
 
-            if (!map.ContainsKey(id) || string.IsNullOrWhiteSpace(map[id]))
-            {
-                map[id] = id.Length == CharacterPack.ModelIdLength &&
-                          string.Equals(stem, id, StringComparison.OrdinalIgnoreCase)
+            var display = map.TryGetValue(id, out var mapped) && !string.IsNullOrWhiteSpace(mapped)
+                ? mapped.Trim()
+                : (id.Length == CharacterPack.ModelIdLength &&
+                   string.Equals(stem, id, StringComparison.OrdinalIgnoreCase)
                     ? id
-                    : CharacterPack.DisplayNameFromFileName(pack);
-                dirty = true;
-            }
-
-            var destPack = GetPackPath(id, map);
-            if (!File.Exists(destPack))
+                    : CharacterPack.DisplayNameFromFileName(pack));
+            if (!map.TryGetValue(id, out var currentLabel) ||
+                string.IsNullOrWhiteSpace(currentLabel) ||
+                !string.Equals(currentLabel, display, StringComparison.Ordinal))
             {
-                Directory.CreateDirectory(Path.GetDirectoryName(destPack)!);
-                File.Copy(pack, destPack, overwrite: false);
-                copied++;
+                map[id] = display;
                 dirty = true;
             }
 
+            var preferredStem = ChooseFileStem(id, map[id], map);
+            var destPack = Path.Combine(LibraryDirectory, preferredStem + PackExtension);
+            if (CopyLibraryFileOverwriting(pack, destPack))
+            {
+                updated++;
+                dirty = true;
+            }
+
+            DeleteAlternateLibraryPaths(id, map[id], PackExtension, destPack);
+
+            var destSzs = Path.Combine(LibraryDirectory, preferredStem + SzsExtension);
+            var srcSzsNamed = Path.Combine(bundledDir, stem + SzsExtension);
             var srcSzsHex = Path.Combine(bundledDir, id + SzsExtension);
-            var srcSzsNamed = Path.Combine(bundledDir, Path.GetFileNameWithoutExtension(destPack) + SzsExtension);
-            var destSzs = GetSzsPath(id, map);
             foreach (var srcSzs in new[] { srcSzsNamed, srcSzsHex })
             {
-                if (File.Exists(srcSzs) && !File.Exists(destSzs))
+                if (!File.Exists(srcSzs))
+                    continue;
+                if (CopyLibraryFileOverwriting(srcSzs, destSzs))
                 {
-                    File.Copy(srcSzs, destSzs, overwrite: false);
-                    break;
+                    updated++;
+                    dirty = true;
                 }
+
+                DeleteAlternateLibraryPaths(id, map[id], SzsExtension, destSzs);
+                break;
             }
 
             if (TryMigratePackFilesToDisplayName(id, map[id], map))
                 dirty = true;
+
+            // Zip seed copies prebuilt .arcs; stamp BodyAngleFree.prm for tall
+            // packs so an older/missing PRM in the bundle cannot stick around.
+            var stampPath = GetPackPath(id, map);
+            if (CharacterPack.AllowsBodyAngleFreeReplacement(map[id]) &&
+                CharacterPack.EnsureBodyAngleFreePrmInPackFile(stampPath))
+            {
+                updated++;
+                dirty = true;
+            }
         }
 
         DiscoverOrphanPacks(map, ref dirty);
@@ -644,9 +874,187 @@ public static class ModelLibrary
         if (dirty)
             SaveMap(map);
 
-        if (copied > 0)
-            log?.Invoke($"Seeded {copied} bundled custom model pack(s) into {LibraryDirectory}.");
-        return copied;
+        if (updated > 0)
+            log?.Invoke($"Updated {updated} bundled custom model file(s) into {LibraryDirectory}.");
+        return updated;
+    }
+
+    private static bool CopyLibraryFileOverwriting(string sourcePath, string destPath)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(destPath)!);
+        if (File.Exists(destPath))
+        {
+            try
+            {
+                var sourceInfo = new FileInfo(sourcePath);
+                var destInfo = new FileInfo(destPath);
+                if (sourceInfo.Length == destInfo.Length &&
+                    sourceInfo.LastWriteTimeUtc == destInfo.LastWriteTimeUtc)
+                    return false;
+
+                if (sourceInfo.Length == destInfo.Length &&
+                    FilesEqual(sourcePath, destPath))
+                {
+                    // Future seeds become an O(1) metadata check.
+                    File.SetLastWriteTimeUtc(destPath, sourceInfo.LastWriteTimeUtc);
+                    return false;
+                }
+            }
+            catch
+            {
+                // Fall through and rewrite.
+            }
+        }
+
+        CopyFileAtomically(sourcePath, destPath);
+        return true;
+    }
+
+    private static bool FilesEqual(string leftPath, string rightPath)
+    {
+        const int bufferSize = 128 * 1024;
+        using var left = new FileStream(
+            leftPath, FileMode.Open, FileAccess.Read,
+            FileShare.Read | FileShare.Delete, bufferSize, FileOptions.SequentialScan);
+        using var right = new FileStream(
+            rightPath, FileMode.Open, FileAccess.Read,
+            FileShare.Read | FileShare.Delete, bufferSize, FileOptions.SequentialScan);
+        if (left.Length != right.Length)
+            return false;
+
+        var leftBuffer = new byte[bufferSize];
+        var rightBuffer = new byte[bufferSize];
+        while (true)
+        {
+            var leftRead = left.Read(leftBuffer, 0, leftBuffer.Length);
+            var rightRead = right.Read(rightBuffer, 0, rightBuffer.Length);
+            if (leftRead != rightRead)
+                return false;
+            if (leftRead == 0)
+                return true;
+            if (!leftBuffer.AsSpan(0, leftRead).SequenceEqual(rightBuffer.AsSpan(0, rightRead)))
+                return false;
+        }
+    }
+
+    private static void CopyFileAtomically(string sourcePath, string destinationPath)
+    {
+        var directory = Path.GetDirectoryName(destinationPath)
+                        ?? throw new InvalidOperationException("Destination has no directory.");
+        Directory.CreateDirectory(directory);
+        var tempPath = Path.Combine(
+            directory, $".{Path.GetFileName(destinationPath)}.{Guid.NewGuid():N}.tmp");
+        try
+        {
+            File.Copy(sourcePath, tempPath, overwrite: true);
+            File.Move(tempPath, destinationPath, overwrite: true);
+            InvalidatePackByteCache(destinationPath);
+        }
+        finally
+        {
+            try
+            {
+                if (File.Exists(tempPath))
+                    File.Delete(tempPath);
+            }
+            catch
+            {
+                // Best-effort temp cleanup.
+            }
+        }
+    }
+
+    private static void WriteAllBytesAtomically(string destinationPath, ReadOnlySpan<byte> bytes)
+    {
+        var directory = Path.GetDirectoryName(destinationPath)
+                        ?? throw new InvalidOperationException("Destination has no directory.");
+        Directory.CreateDirectory(directory);
+        var tempPath = Path.Combine(
+            directory, $".{Path.GetFileName(destinationPath)}.{Guid.NewGuid():N}.tmp");
+        try
+        {
+            using (var stream = new FileStream(
+                       tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None,
+                       bufferSize: 128 * 1024, FileOptions.SequentialScan))
+            {
+                stream.Write(bytes);
+                stream.Flush(flushToDisk: true);
+            }
+
+            File.Move(tempPath, destinationPath, overwrite: true);
+            InvalidatePackByteCache(destinationPath);
+        }
+        finally
+        {
+            try
+            {
+                if (File.Exists(tempPath))
+                    File.Delete(tempPath);
+            }
+            catch
+            {
+                // Best-effort temp cleanup.
+            }
+        }
+    }
+
+    private static void DeleteLibraryPackFiles(string modelId, Dictionary<string, string> map)
+    {
+        var id = CharacterPack.NormalizeModelId(modelId);
+        if (id.Length == 0)
+            return;
+
+        map.TryGetValue(id, out var display);
+        foreach (var ext in new[] { PackExtension, SzsExtension })
+        {
+            foreach (var path in EnumerateLibraryPathsForId(id, display, ext))
+            {
+                try
+                {
+                    if (File.Exists(path))
+                        File.Delete(path);
+                }
+                catch
+                {
+                    // Best-effort cleanup of stale packs.
+                }
+            }
+        }
+    }
+
+    private static void DeleteAlternateLibraryPaths(
+        string modelId, string? displayName, string extension, string keepPath)
+    {
+        var id = CharacterPack.NormalizeModelId(modelId);
+        if (id.Length == 0)
+            return;
+
+        foreach (var path in EnumerateLibraryPathsForId(id, displayName, extension))
+        {
+            if (string.Equals(path, keepPath, StringComparison.OrdinalIgnoreCase))
+                continue;
+            try
+            {
+                if (File.Exists(path))
+                    File.Delete(path);
+            }
+            catch
+            {
+                // Best-effort.
+            }
+        }
+    }
+
+    private static IEnumerable<string> EnumerateLibraryPathsForId(
+        string id, string? displayName, string extension)
+    {
+        yield return Path.Combine(LibraryDirectory, id + extension);
+        var sanitized = SanitizeFileStem(displayName);
+        if (sanitized.Length > 0)
+        {
+            yield return Path.Combine(LibraryDirectory, sanitized + extension);
+            yield return Path.Combine(LibraryDirectory, $"{sanitized}-{id}{extension}");
+        }
     }
 
     private static Dictionary<string, string> LoadMap()
@@ -669,6 +1077,6 @@ public static class ModelLibrary
     {
         EnsureLibraryDirectory();
         var json = JsonSerializer.Serialize(map, new JsonSerializerOptions { WriteIndented = true });
-        File.WriteAllText(LibraryJsonPath, json);
+        WriteAllBytesAtomically(LibraryJsonPath, Encoding.UTF8.GetBytes(json));
     }
 }

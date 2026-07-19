@@ -89,6 +89,7 @@
     { "courseId": 7, "episodeId": 7, "title": "Red Coins in the Hotel", "format": "numbered", "expectedScenario": 4 },
     { "courseId": 56, "episodeId": 0, "title": "King Boo Down Below", "format": "single" },
     { "courseId": 14, "episodeId": 0, "title": "The Secret of Casino Delfino", "format": "single" },
+    { "courseId": 14, "episodeId": 1, "title": "King Boo Down Below (Casino)", "format": "single" },
     { "courseId": 50, "episodeId": 0, "title": "The Beach Cannon's Secret", "format": "single" },
     { "courseId": 51, "episodeId": 0, "title": "The Hotel Lobby's Secret", "format": "single" },
     { "courseId": 40, "episodeId": 0, "title": "The Secret of Casino Delfino", "format": "single" },

@@ -52,6 +52,11 @@ public sealed class LevelCatalog
         {
             // mapped
         }
+        else if (courseId == SirenaCasinoMapping.AreaId &&
+                 SirenaCasinoMapping.TryScenarioToCatalog(gameScenarioId, out catalogId))
+        {
+            // mapped
+        }
         else
         {
             catalogId = gameScenarioId;
@@ -98,6 +103,12 @@ public sealed class LevelCatalog
 
         if (courseId == PinnaParkInteriorMapping.AreaId &&
             PinnaParkInteriorMapping.TryCatalogToScenario(catalogEpisodeId, out scenarioId))
+        {
+            return scenarioId;
+        }
+
+        if (courseId == SirenaCasinoMapping.AreaId &&
+            SirenaCasinoMapping.TryCatalogToMission(catalogEpisodeId, out scenarioId))
         {
             return scenarioId;
         }
@@ -165,6 +176,15 @@ public sealed class LevelCatalog
 
         if (courseId == PinnaParkInteriorMapping.AreaId &&
             PinnaParkInteriorMapping.TryScenarioToCatalog(catalogEpisodeId, out mapped) &&
+            mapped != catalogEpisodeId)
+        {
+            match = course.Episodes.FirstOrDefault(e => e.EpisodeId == mapped);
+            if (match != null)
+                return match.DisplayName;
+        }
+
+        if (courseId == SirenaCasinoMapping.AreaId &&
+            SirenaCasinoMapping.TryScenarioToCatalog(catalogEpisodeId, out mapped) &&
             mapped != catalogEpisodeId)
         {
             match = course.Episodes.FirstOrDefault(e => e.EpisodeId == mapped);

@@ -25,6 +25,11 @@ public sealed class AppConfig
     public bool SyncProgress { get; set; }
     public bool AllowClientTeleporting { get; set; }
     /// <summary>
+    /// Start Tag hide-grace duration in seconds (seekers frozen).
+    /// Allowed values: 15, 30, 45, 60.
+    /// </summary>
+    public int HideSeekGraceSeconds { get; set; } = 30;
+    /// <summary>
     /// When true, Launch Dolphin applies the BSMSO performance/stability profile.
     /// When false, restores the backed-up original Dolphin settings (RAM override still kept).
     /// </summary>
@@ -135,9 +140,29 @@ public sealed class ConfigService
     private static int ClampMaxPlayers(int value) =>
         Math.Clamp(value, 2, ProtocolConstants.StableMaxPlayers);
 
+    /// <summary>Start Tag hide grace: 15 / 30 / 45 / 60 seconds.</summary>
+    private static int ClampHideSeekGraceSeconds(int value)
+    {
+        ReadOnlySpan<int> options = [15, 30, 45, 60];
+        var best = options[0];
+        var bestDist = Math.Abs(value - best);
+        foreach (var opt in options)
+        {
+            var dist = Math.Abs(value - opt);
+            if (dist < bestDist)
+            {
+                best = opt;
+                bestDist = dist;
+            }
+        }
+
+        return best;
+    }
+
     private static void NormalizeConfig(AppConfig config)
     {
         config.MaxPlayers = ClampMaxPlayers(config.MaxPlayers);
+        config.HideSeekGraceSeconds = ClampHideSeekGraceSeconds(config.HideSeekGraceSeconds);
     }
 
     /// <summary>

@@ -7,6 +7,10 @@ namespace SMSO.Server;
 /// Authoritative durable story state. This is a grow-only set: vanilla resets and
 /// transient clears are observations about one client, never permission to erase
 /// shared session progress.
+///
+/// Pattern (same family as red-coin MissionBitset):
+///   admit → broadcast immediately → clients apply live or hold pending overlay →
+///   snapshots are recovery only.
 /// </summary>
 public sealed class StoryFlagAuthority
 {
@@ -19,6 +23,15 @@ public sealed class StoryFlagAuthority
     public const uint BlueCoinFlagEnd = 0x1023A;
     public const uint StageBoolBase = 0x50000;
     public const uint StageBoolEnd = 0x50064;
+
+    /// <summary>Delfino Plaza area id. Allowlist Type5 latches are hub-global here.</summary>
+    public const byte PlazaAreaId = 1;
+
+    /// <summary>
+    /// Wildcard episode for plaza hub-global Type5 allowlist. dolpic scenarios use
+    /// distinct mEpisodeID values (8/7/6/…) while 0x50001/02/04 mean the same thing.
+    /// </summary>
+    public const byte PlazaHubEpisode = 0xFF;
 
     /// <summary>
     /// TFlagManager Type5Flag.mRedCoinSwitchPressed (stage bool bit 9). Cleared by
@@ -63,8 +76,16 @@ public sealed class StoryFlagAuthority
     {
         if (!IsDurableStageTrigger(flagId) || value == 0)
             return false;
+
+        // Plaza MapEvent / MareGate latches only — Type5 ids reused as scratch on
+        // other courses must never enter authority.
+        if (courseId != PlazaAreaId)
+            return false;
+
+        // Coalesce every dolpic scenario into one hub-global key.
+        var key = new StageFlagKey(PlazaAreaId, PlazaHubEpisode, flagId);
         lock (_gate)
-            return TryAcceptSet(_triggerFlags, new StageFlagKey(courseId, episodeId, flagId));
+            return TryAcceptSet(_triggerFlags, key);
     }
 
     public static bool IsEphemeralStageSessionTrigger(uint flagId)
@@ -90,8 +111,15 @@ public sealed class StoryFlagAuthority
     public static bool IsDurableStageTrigger(uint flagId)
         // Type5 is resetStage scratch space. Most IDs are reused by graffiti,
         // timers, switches, and one-shot episode logic; these are the verified
-        // MapEvent progression latches with durable shared meaning.
+        // plaza MapEvent / MareGate latches with durable shared meaning.
         => flagId is 0x50001 or 0x50002 or 0x50004;
+
+    /// <summary>
+    /// True when a TriggerFlag event should apply on the local plaza visit
+    /// regardless of dolpic scenario episode id.
+    /// </summary>
+    public static bool IsPlazaHubTrigger(byte courseId, uint flagId)
+        => courseId == PlazaAreaId && IsDurableStageTrigger(flagId);
 
     public IReadOnlyDictionary<uint, byte> StoryFlags
     {

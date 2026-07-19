@@ -81,6 +81,9 @@ static constexpr u8 kInvalidHotelMission = 0xFF;
 // doldecomp/BSE Stage::getStageName indexes mStageArchiveAry by episode; delfino6 is missing on disc.
 static u8 s_hotelMissionEpisodeSync = kInvalidHotelMission;
 static u8 s_hotelWarpDemoSkipFrames = 0;
+// Beach/hotel mission 3 (Casino) or 4 (King Boo) preserved across casino archive load.
+// Archive index is separate: mission 3 → casino0, mission 4 → casino1.
+static u8 s_casinoMissionEpisodeSync = kInvalidHotelMission;
 
 struct ResolvedWarp {
     u8 areaId;
@@ -90,9 +93,23 @@ struct ResolvedWarp {
 static constexpr SirenaHotelEpisode kSirenaHotelEpisodes[] = {
     {0, 0, 0}, // delfino0 lobby
     {2, 2, 2}, // Sirena ep 3 — Mysterious Hotel Delfino
+    {3, 2, 3}, // Sirena ep 4 — Casino path (delfino2 map, keep ep4 mission in hotel)
+    {4, 2, 4}, // Sirena ep 5 — King Boo path (delfino2 map, keep ep5 mission in hotel)
     {6, 0, 6}, // Sirena ep 7 — Shadow Mario (delfino0 map, ep7 mission scripts)
     {7, 4, 4}, // Sirena ep 8 — Red Coins (logical ep 5 → scenario 4)
 };
+
+// Single-episode Sirena secret stages. Beach ep4 leaves 0x40003=3 through the hotel;
+// if that mission flag rides into casino/King Boo/etc., scripts hang on a black screen.
+static constexpr u8 kSirenaCasinoAreaId = 14;
+static constexpr u8 kSirenaKingBooAreaId = 56;
+static constexpr u8 kSirenaHotelLobbySecretAreaId = 51;
+static constexpr u8 kSirenaCasinoSecretAreaId = 40;
+
+static bool isSirenaSingleEpisodeSecretArea(u8 areaId) {
+    return areaId == kSirenaCasinoAreaId || areaId == kSirenaKingBooAreaId ||
+           areaId == kSirenaHotelLobbySecretAreaId || areaId == kSirenaCasinoSecretAreaId;
+}
 
 // Pinna Park interior (area 13 / pinnaParco). Archive indices != beach episode IDs.
 // TCRF / timenoe/RAScripts: pinnaParco5 = Episode 8 balloons; pinnaParco7 = Ep1 shine spawn.
@@ -125,9 +142,22 @@ static WarpTarget resolvePinnaParkWarpTarget(u8 catalogEpisodeId) {
     return {catalogEpisodeId, catalogEpisodeId};
 }
 
+static WarpTarget resolveCasinoWarpTarget(u8 catalogEpisodeId) {
+    // timenoe/RAScripts: casino0 = load 0 (Ep4 slots), casino1 = load 1 (Ep5 HipDrop).
+    // Catalog may be archive index (0/1) or beach mission (3/4).
+    if (catalogEpisodeId == 1 || catalogEpisodeId == 4)
+        return {1, 4};
+    if (catalogEpisodeId == 0 || catalogEpisodeId == 3)
+        return {0, 3};
+    return {catalogEpisodeId, catalogEpisodeId};
+}
+
 static WarpTarget resolveWarpTarget(u8 areaId, u8 catalogEpisodeId) {
     if (areaId == kSirenaHotelAreaId)
         return resolveHotelWarpTarget(catalogEpisodeId);
+
+    if (areaId == kSirenaCasinoAreaId)
+        return resolveCasinoWarpTarget(catalogEpisodeId);
 
     if (areaId == kPinnaParkAreaId)
         return resolvePinnaParkWarpTarget(catalogEpisodeId);
@@ -497,16 +527,18 @@ void exportLocalPlayer(TMario *mario, TMarDirector *director) {
                       (static_cast<u16>(encodeSprayPressure(sprayPressure)) << 8);
 
     // water: tank level by default; Y-cam and hold-pump reuse it for upper BCK frame;
-    // while spraying water it carries synced nozzle pressure (0..1 -> 0..255);
+    // while spraying water it carries synced nozzle pressure (0..1 -> 0..255) —
+    // pressure wins over Y-cam upperEnc so remotes keep a continuous droplet stream
+    // during C-up aim (Y-cam pitch still rides pingMs high / VFX aux);
     // dry spray reuses the byte as an explicit empty-tank marker (0);
     // blooper surf reuses it for mSurfGessoID (purple/yellow/green);
     // host on Yoshi reuses it for TYoshi BCK index (set in exportYoshiSnapshotFields).
     if (snapshotHostOnYoshi(snap.nozzleId, snap.vfxFlags)) {
         // snap.water already carries host Yoshi BCK.
-    } else if (yCam || (pumpHold && !sprayingWater && !drySpray))
-        snap.water = upperEnc;
-    else if (sprayingWater)
+    } else if (sprayingWater)
         snap.water = encodeSprayPressure(sprayPressure);
+    else if (yCam || (pumpHold && !drySpray))
+        snap.water = upperEnc;
     else if (drySpray)
         snap.water = 0;
     else if (smso::isLocalBlooperSurf(mario))
@@ -645,6 +677,12 @@ void consumeWarpIntent() {
     else
         s_hotelMissionEpisodeSync = kInvalidHotelMission;
 
+    if (areaId == kSirenaCasinoAreaId &&
+        (warpTarget.missionEpisode == 3 || warpTarget.missionEpisode == 4))
+        s_casinoMissionEpisodeSync = warpTarget.missionEpisode;
+    else
+        s_casinoMissionEpisodeSync = kInvalidHotelMission;
+
     BetterSMS::Loading::setLoading(false);
 
     setHideSeekAllowStageTransition(true);
@@ -672,6 +710,191 @@ void applyHotelWarpMissionOverride(TMarDirector *director) {
 
     OSReport("[SMSO] Hotel mission override load=%u mission=%u\n",
              gpApplication.mCurrentScene.mEpisodeID, missionEpisode);
+}
+
+static bool isSirenaCasinoMissionEpisode(u8 mission) {
+    // Ep4 Casino Delfino (3) and Ep5 King Boo (4) — beach/hotel mission ids.
+    return mission == 3 || mission == 4;
+}
+
+static u8 sirenaCasinoLoadForMission(u8 mission) {
+    // timenoe/RAScripts courseStateIDs: casino0=0 (Ep4 slots), casino1=1 (Ep5 purple HipDrop).
+    return mission == 4 ? 1 : 0;
+}
+
+static u8 sirenaCasinoMissionForLoad(u8 loadEp) {
+    if (loadEp == 1)
+        return 4;
+    if (loadEp == 0)
+        return 3;
+    return 0xFF;
+}
+
+static bool isSirenaCasinoOrSecretDest(u8 areaId) {
+    return areaId == kSirenaCasinoAreaId || areaId == kSirenaKingBooAreaId ||
+           areaId == kSirenaHotelLobbySecretAreaId || areaId == kSirenaCasinoSecretAreaId;
+}
+
+// Resolve beach/hotel mission 3/4 before moveStage. Hotel→casino loading zones set
+// mNextScene.mEpisodeID to 0xFF (same-shine convention) — that is NOT the mission id.
+// Never prefer stale 0x40003 over hotel sync / hotel director / beach catalog.
+static u8 resolveSirenaCasinoMissionToStash() {
+    const u8 flag = static_cast<u8>(TFlagManager::smInstance->getFlag(0x40003));
+    const u8 hotelSync = s_hotelMissionEpisodeSync;
+    const u8 dirEp = gpMarDirector ? gpMarDirector->mEpisodeID : static_cast<u8>(0xFF);
+    const u8 curArea = gpApplication.mCurrentScene.mAreaID;
+    const u8 curEp = gpApplication.mCurrentScene.mEpisodeID;
+
+    u8 chosen = 0xFF;
+    if (isSirenaCasinoMissionEpisode(hotelSync))
+        chosen = hotelSync;
+    else if (curArea == kSirenaHotelAreaId && isSirenaCasinoMissionEpisode(dirEp))
+        chosen = dirEp;
+    else if (curArea == kSirenaBeachAreaId && isSirenaCasinoMissionEpisode(curEp))
+        chosen = curEp;
+    else if (isSirenaCasinoMissionEpisode(flag))
+        chosen = flag;
+
+    // Conflict: prefer 4 when beach/hotel catalog or director says Ep5.
+    if (hotelSync == 4 || (curArea == kSirenaHotelAreaId && dirEp == 4) ||
+        (curArea == kSirenaBeachAreaId && curEp == 4))
+        chosen = 4;
+
+    const u8 result = isSirenaCasinoMissionEpisode(chosen) ? chosen : flag;
+    OSReport("[SMSO] Sirena casino stash candidates flag=%u hotelSync=%u director=%u "
+             "curScene=%u/%u chosen=%u\n",
+             flag, hotelSync, dirEp, curArea, curEp, result);
+    return result;
+}
+
+void normalizeSirenaNextSceneForLoad() {
+    const u8 nextArea = gpApplication.mNextScene.mAreaID;
+    const u8 nextEp = gpApplication.mNextScene.mEpisodeID;
+
+    // Same-shine loading zones use episode 0xFF. Still must stash/clear mission for
+    // Sirena casino / King Boo / secrets — do not bail for those destinations.
+    if (nextEp == 0xFF && !isSirenaCasinoOrSecretDest(nextArea))
+        return;
+
+    // Natural beach→hotel door uses episode 3 (casino path) even for King Boo (ep5).
+    // Only delfino0/2/4 exist — remap archive to 2 and keep beach mission 3/4 in sync.
+    // (Never runs for 0xFF — hotel doors use real catalog ids.)
+    if (nextArea == kSirenaHotelAreaId && (nextEp == 3 || nextEp == 4)) {
+        u8 mission = static_cast<u8>(TFlagManager::smInstance->getFlag(0x40003));
+        if (nextEp == 4)
+            mission = 4;
+        else if (!isSirenaCasinoMissionEpisode(mission))
+            mission = 3;
+
+        gpApplication.mNextScene.mEpisodeID = 2;
+        TFlagManager::smInstance->setFlag(0x40003, mission);
+        s_hotelMissionEpisodeSync = mission;
+        s_casinoMissionEpisodeSync = kInvalidHotelMission;
+        OSReport("[SMSO] Sirena hotel next-scene remap door=%u -> load=2 mission=%u\n", nextEp,
+                 mission);
+        return;
+    }
+
+    // Casino: Ep4 → casino0 (load 0, mission 3); Ep5 → casino1 (load 1, mission 4).
+    // 0xFF hotel→casino doors must pick load from mission — never always-0.
+    if (nextArea == kSirenaCasinoAreaId) {
+        const u8 mission = resolveSirenaCasinoMissionToStash();
+        const u8 loadEp =
+            isSirenaCasinoMissionEpisode(mission) ? sirenaCasinoLoadForMission(mission) : 0;
+
+        gpApplication.mNextScene.mEpisodeID = loadEp;
+        if (isSirenaCasinoMissionEpisode(mission)) {
+            s_casinoMissionEpisodeSync = mission;
+            TFlagManager::smInstance->setFlag(0x40003, mission);
+            OSReport("[SMSO] Sirena casino next-scene stash area=%u mission=%u load=%u "
+                     "(nextEpWas=%u archive=casino%u)\n",
+                     nextArea, mission, loadEp, nextEp, loadEp);
+        } else {
+            s_casinoMissionEpisodeSync = kInvalidHotelMission;
+            OSReport("[SMSO] Sirena casino next-scene load=%u mission=%u (no stash, "
+                     "nextEpWas=%u)\n",
+                     loadEp, mission, nextEp);
+        }
+        return;
+    }
+
+    // Boss arena + secrets only have scenario 0 — do not inherit hotel load/mission.
+    // Includes 0xFF same-shine doors (treat as keep load 0, clear mission).
+    if (nextArea == kSirenaKingBooAreaId || nextArea == kSirenaHotelLobbySecretAreaId ||
+        nextArea == kSirenaCasinoSecretAreaId) {
+        if (nextEp != 0) {
+            gpApplication.mNextScene.mEpisodeID = 0;
+            TFlagManager::smInstance->setFlag(0x40003, 0);
+            s_casinoMissionEpisodeSync = kInvalidHotelMission;
+            OSReport("[SMSO] Sirena secret/boss next-scene force load=0 mission=0 "
+                     "area=%u nextEpWas=%u\n",
+                     nextArea, nextEp);
+        }
+    }
+}
+
+void normalizeSirenaSecretMissionEpisode(TMarDirector *director) {
+    if (!director || !isSirenaSingleEpisodeSecretArea(director->mAreaID))
+        return;
+
+    // Casino (14): native scenarios are archive indices 0/1 (casino0/casino1) — see
+    // assets/levels.ntsc-u.json course 14 and ScenarioArchiveNames. MarDirector::mEpisodeID
+    // is unk7D (scenario); MapObjManager and scene appear tables key off that, NOT beach
+    // mission 3/4. Forcing director=4 after loading casino1 skips Ep5 HipDropHideObj.
+    // Hotel still uses director=mission because delfino2 is shared across missions 3/4.
+    if (director->mAreaID == kSirenaCasinoAreaId) {
+        const u8 stashed = s_casinoMissionEpisodeSync;
+        u8 mission = stashed;
+        if (!isSirenaCasinoMissionEpisode(mission))
+            mission = static_cast<u8>(TFlagManager::smInstance->getFlag(0x40003));
+        if (!isSirenaCasinoMissionEpisode(mission)) {
+            // Infer from already-loaded archive index (CurrentScene after loadStageConfig).
+            const u8 loadEp = gpApplication.mCurrentScene.mEpisodeID;
+            mission = sirenaCasinoMissionForLoad(loadEp);
+            if (!isSirenaCasinoMissionEpisode(mission)) {
+                OSReport("[SMSO] Sirena casino mission missing area=%u stashed=%u "
+                         "flag=%u dir=%u load=%u — leaving archive load\n",
+                         director->mAreaID, stashed,
+                         static_cast<u8>(TFlagManager::smInstance->getFlag(0x40003)),
+                         director->mEpisodeID, loadEp);
+                s_casinoMissionEpisodeSync = kInvalidHotelMission;
+                return;
+            }
+        }
+
+        const u8 loadEp = sirenaCasinoLoadForMission(mission);
+        // scene + director = casino0/1 load identity (already mounted by loadStageConfig).
+        // 0x40003 keeps beach mission 3/4 for hotel return / catalog equivalence.
+        if (gpApplication.mCurrentScene.mEpisodeID != loadEp)
+            gpApplication.mCurrentScene.mEpisodeID = loadEp;
+        director->mEpisodeID = loadEp;
+        TFlagManager::smInstance->setFlag(0x40003, mission);
+        s_casinoMissionEpisodeSync = kInvalidHotelMission;
+        // Preserve mission so hotel stageInit can re-apply director=3/4 on return.
+        s_hotelMissionEpisodeSync = mission;
+        s_hotelWarpDemoSkipFrames = 0;
+        OSReport("[SMSO] Sirena casino mission restore area=%u stashed=%u mission=%u "
+                 "directorLoad=%u sceneLoad=%u (casino%u)\n",
+                 director->mAreaID, stashed, mission, loadEp,
+                 gpApplication.mCurrentScene.mEpisodeID, loadEp);
+        return;
+    }
+
+    // King Boo arena / lobby+casino secrets: only scenario 0. Inherited hotel mission
+    // (3/4) or load (2) blacks out stage scripts.
+    const u8 loadEpisode = director->mEpisodeID;
+    const u8 forced = 0;
+    if (loadEpisode != forced)
+        director->mEpisodeID = forced;
+    TFlagManager::smInstance->setFlag(0x40003, forced);
+    if (gpApplication.mCurrentScene.mEpisodeID != 0)
+        gpApplication.mCurrentScene.mEpisodeID = 0;
+    s_casinoMissionEpisodeSync = kInvalidHotelMission;
+    s_hotelMissionEpisodeSync = kInvalidHotelMission;
+    s_hotelWarpDemoSkipFrames = 0;
+
+    OSReport("[SMSO] Sirena secret mission normalize area=%u load=%u -> mission=%u\n",
+             director->mAreaID, loadEpisode, forced);
 }
 
 void syncHotelWarpMissionEpisode(TMarDirector *director) {

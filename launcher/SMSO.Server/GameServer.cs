@@ -15,6 +15,7 @@ public sealed class GameServer : IDisposable
     private readonly Dictionary<string, byte> _usernames = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, (byte Slot, DateTime ReleasedUtc)> _recentReleases = new(StringComparer.OrdinalIgnoreCase);
     private readonly object _lock = new();
+    private readonly object _udpSendLock = new();
 
     private TcpListener? _tcpListener;
     private UdpClient? _udp;
@@ -32,6 +33,7 @@ public sealed class GameServer : IDisposable
     private readonly WorldEventRelay _worldEvents = new();
     private readonly RedCoinAuthority _redCoinAuthority = new();
     private readonly NpcCleanAuthority _npcCleanAuthority = new();
+    private readonly GraffitiCleanAuthority _graffitiCleanAuthority = new();
     private readonly ShineAuthority _shineAuthority = new();
     private readonly BlueCoinAuthority _blueCoinAuthority = new();
     private readonly StoryFlagAuthority _storyFlagAuthority = new();
@@ -45,6 +47,8 @@ public sealed class GameServer : IDisposable
     private ClientSession[] _peerScratch = new ClientSession[ProtocolConstants.StableMaxPlayers];
     private readonly byte[] _udpPongScratch =
         new byte[ProtocolConstants.UdpSnapshotPayloadOffset + ProtocolConstants.UdpPingPayloadSize];
+    private readonly byte[] _udpSnapshotBatchScratch =
+        new byte[ProtocolConstants.UdpSnapshotBatchMaxSize];
 
     public event Action<string>? Log;
     public event Action<PlayerRosterEntry[]>? RosterChanged;
@@ -82,6 +86,7 @@ public sealed class GameServer : IDisposable
         Log?.Invoke($"Server listening on TCP+UDP port {port}");
         _ = Task.Run(() => AcceptLoop(_cts.Token));
         _ = Task.Run(() => UdpRelayLoop(_cts.Token));
+        _ = Task.Run(() => UdpSnapshotBroadcastLoop(_cts.Token));
         _ = Task.Run(() => WatchdogLoop(_cts.Token));
     }
 
@@ -121,6 +126,7 @@ public sealed class GameServer : IDisposable
         }
         _redCoinAuthority.Reset();
         _npcCleanAuthority.Reset();
+        _graffitiCleanAuthority.Reset();
         _shineAuthority.Reset();
         _blueCoinAuthority.Reset();
         _storyFlagAuthority.Reset();
@@ -186,6 +192,11 @@ public sealed class GameServer : IDisposable
         => _hideSeek.SetRoles(roles);
 
     public bool TryStartHideSeekTag(out string? error) => _hideSeek.TryStartTag(out error);
+
+    public void SetHideSeekGraceDurationMs(int graceMs) =>
+        _hideSeek.StartTagGraceDurationMs = graceMs;
+
+    public int GetHideSeekGraceDurationMs() => _hideSeek.StartTagGraceDurationMs;
 
     public void StopHideSeekTag() => _hideSeek.StopTag();
 
@@ -263,13 +274,19 @@ public sealed class GameServer : IDisposable
 
     private void UpdateStageOccupancy(byte previousStage, byte previousEpisode, byte newStage, byte newEpisode)
     {
+        bool reachedCoop = false;
         lock (_lock)
         {
             if (IsTrackedStage(previousStage, previousEpisode))
                 ReleaseStageOccupancyLocked(previousStage, previousEpisode);
             if (IsTrackedStage(newStage, newEpisode))
-                AcquireStageOccupancyLocked(newStage, newEpisode);
+                reachedCoop = AcquireStageOccupancyLocked(newStage, newEpisode);
         }
+
+        // Second player entered a stage that may already have red-coin authority — push
+        // a progress snapshot so the joiner is not stuck waiting for the 45s resync.
+        if (reachedCoop)
+            MaybeBroadcastProgressResync(force: true);
     }
 
     private void ReleaseSessionStageOccupancy(ClientSession session)
@@ -284,11 +301,14 @@ public sealed class GameServer : IDisposable
     private static bool IsTrackedStage(byte courseId, byte episodeId)
         => courseId != 0;
 
-    private void AcquireStageOccupancyLocked(byte courseId, byte episodeId)
+    /// <returns>True when occupancy transitioned to 2+ (co-op just started on this stage).</returns>
+    private bool AcquireStageOccupancyLocked(byte courseId, byte episodeId)
     {
         var key = (courseId, episodeId);
         _stageOccupancy.TryGetValue(key, out var count);
-        _stageOccupancy[key] = count + 1;
+        var next = count + 1;
+        _stageOccupancy[key] = next;
+        return next == 2;
     }
 
     private void ReleaseStageOccupancyLocked(byte courseId, byte episodeId)
@@ -302,13 +322,46 @@ public sealed class GameServer : IDisposable
         {
             _stageOccupancy.Remove(key);
             _redCoinAuthority.ResetStage(courseId, episodeId);
+            _worldEvents.RemoveRedCoinHistory(courseId, episodeId);
             _npcCleanAuthority.ResetStage(courseId, episodeId);
-            Log?.Invoke($"World sync: reset red-coin/npc-clean state for course={courseId}/{episodeId} (stage empty)");
+            // Plaza graffiti is hub-global (episode 255). Only reset when no plaza
+            // episode bucket still has players — otherwise decideNextScenario splits
+            // would wipe stamps while peers remain on another dolpic episode.
+            if (courseId == StoryFlagAuthority.PlazaAreaId)
+            {
+                if (!HasAnyPlazaOccupancyLocked())
+                {
+                    _graffitiCleanAuthority.ResetStage(courseId, episodeId);
+                    Log?.Invoke(
+                        $"World sync: reset red-coin/npc-clean + graffiti hub for plaza (last episode vacated was {episodeId})");
+                }
+                else
+                {
+                    Log?.Invoke(
+                        $"World sync: reset red-coin/npc-clean for course={courseId}/{episodeId} (plaza graffiti hub retained — peers remain)");
+                }
+            }
+            else
+            {
+                _graffitiCleanAuthority.ResetStage(courseId, episodeId);
+                Log?.Invoke($"World sync: reset red-coin/npc-clean/graffiti state for course={courseId}/{episodeId} (stage empty)");
+            }
         }
         else
         {
             _stageOccupancy[key] = count;
         }
+    }
+
+    private bool HasAnyPlazaOccupancyLocked()
+    {
+        foreach (var pair in _stageOccupancy)
+        {
+            if (pair.Key.Item1 == StoryFlagAuthority.PlazaAreaId && pair.Value > 0)
+                return true;
+        }
+
+        return false;
     }
 
     private async Task AcceptLoop(CancellationToken ct)
@@ -365,10 +418,19 @@ public sealed class GameServer : IDisposable
 
                         case TcpPacketId.JoinRequest:
                             if (session == null) break;
-                            if (!PacketSerializer.TryReadJoinRequest(payload, out var name, out var joinModelId))
+                            if (!PacketSerializer.TryReadJoinRequest(payload, out var name, out var joinModelId, out var joinBuildId))
                             {
                                 name = System.Text.Encoding.UTF8.GetString(payload).TrimEnd('\0');
                                 joinModelId = string.Empty;
+                                joinBuildId = 0;
+                            }
+                            if (joinBuildId != ProtocolConstants.ModBuildId)
+                            {
+                                EnqueueSend(session, PacketSerializer.WrapTcp(TcpPacketId.JoinRejected,
+                                    new[] { (byte)JoinRejectReason.VersionMismatch }));
+                                RemoveSession(session);
+                                session = null;
+                                return;
                             }
                             if (!TryRegisterName(session, name, out var reason))
                             {
@@ -419,6 +481,7 @@ public sealed class GameServer : IDisposable
                             {
                                 session.LastSeen = DateTime.UtcNow;
                                 var rosterDirty = false;
+                                var modelChanged = false;
                                 if (payload.Length >= 10)
                                 {
                                     session.PingMs = BinaryPrimitives.ReadUInt16LittleEndian(payload.AsSpan(8, 2));
@@ -426,6 +489,10 @@ public sealed class GameServer : IDisposable
                                 }
                                 // Model id is always present on modern heartbeats. Empty means
                                 // intentional retail; do not treat a short legacy heartbeat as clear.
+                                // Heartbeats advertise the client's current selection every tick and
+                                // remain authoritative for roster appearance even after sequenced
+                                // MarioModelIntent traffic — otherwise a dropped/coalesced intent
+                                // permanently freezes remotes on the last accepted id.
                                 if (payload.Length >= 10 + ProtocolConstants.MarioModelIdSize)
                                 {
                                     var modelId = CharacterPack.DecodeModelId(
@@ -434,11 +501,54 @@ public sealed class GameServer : IDisposable
                                     {
                                         session.MarioModelId = modelId;
                                         rosterDirty = true;
+                                        modelChanged = true;
                                     }
                                 }
                                 if (rosterDirty)
-                                    MaybeBroadcastRoster();
+                                    MaybeBroadcastRoster(force: modelChanged);
                                 EnqueueSend(session, PacketSerializer.WrapTcp(TcpPacketId.Heartbeat, payload));
+                            }
+                            break;
+
+                        case TcpPacketId.MarioModelIntent:
+                            if (session == null ||
+                                string.IsNullOrEmpty(session.Username) ||
+                                !PacketSerializer.TryReadMarioModelIntent(
+                                    payload, out var modelIntentSequence, out var modelIntent))
+                            {
+                                break;
+                            }
+                            // TCP preserves wire order, but concurrent client tasks
+                            // can queue rapid selections in scheduler order. Reject
+                            // stale sequenced frames. Legacy/unsequenced intents
+                            // cannot override an active sequenced stream; heartbeats
+                            // still refresh MarioModelId independently (current look).
+                            if (modelIntentSequence == 0)
+                            {
+                                if (session.LastMarioModelIntentSequence != 0)
+                                    break;
+                            }
+                            else
+                            {
+                                if (session.LastMarioModelIntentSequence != 0 &&
+                                    (int)(modelIntentSequence -
+                                          session.LastMarioModelIntentSequence) <= 0)
+                                {
+                                    break;
+                                }
+                                session.LastMarioModelIntentSequence = modelIntentSequence;
+                            }
+                            modelIntent = CharacterPack.NormalizeModelId(modelIntent);
+                            session.LastSeen = DateTime.UtcNow;
+                            if (!string.Equals(session.MarioModelId, modelIntent,
+                                    StringComparison.Ordinal))
+                            {
+                                session.MarioModelId = modelIntent;
+                                Log?.Invoke($"Model intent slot {session.Slot}: " +
+                                            $"{(modelIntent.Length == 0 ? "retail" : modelIntent)}");
+                                // Bypass the periodic roster throttle so every
+                                // client can begin local preparation immediately.
+                                MaybeBroadcastRoster(force: true);
                             }
                             break;
 
@@ -486,21 +596,75 @@ public sealed class GameServer : IDisposable
                             switch (worldRequest.Type)
                             {
                                 case WorldEventType.RedCoinCollected:
+                                    // Solo stage-enter / death reload: clear authority so
+                                    // periodic resync cannot resurrect vanilla-cleared coins.
+                                    // Require occupancy <= 1 so a brief remote-snapshot gap
+                                    // during load cannot wipe live co-op progress.
+                                    if (RedCoinAuthority.IsMissionResetRequest(worldRequest))
+                                    {
+                                        var resetCourse = worldRequest.CourseId;
+                                        var resetEpisode = LevelCatalog.NormalizeEpisodeFromGame(
+                                            worldRequest.CourseId, worldRequest.EpisodeId, _levels);
+                                        var resetOcc = GetEquivalentStageOccupancy(resetCourse,
+                                            resetEpisode);
+                                        // Refuse when any other session is already on this stage
+                                        // (occupancy can lag one tick behind a joiner's module reset).
+                                        var peerOnStage = false;
+                                        foreach (var other in _sessions.Values)
+                                        {
+                                            if (other.Slot == session.Slot)
+                                                continue;
+                                            if (other.StageId == resetCourse &&
+                                                StagesEquivalent(resetCourse, other.EpisodeId,
+                                                    resetEpisode))
+                                            {
+                                                peerOnStage = true;
+                                                break;
+                                            }
+                                        }
+
+                                        if (resetOcc <= 1 && !peerOnStage)
+                                        {
+                                            _redCoinAuthority.ResetStage(resetCourse, resetEpisode);
+                                            _worldEvents.RemoveRedCoinHistory(resetCourse, resetEpisode);
+                                            Log?.Invoke(
+                                                $"World sync: red-coin solo mission reset course={resetCourse}/{resetEpisode} slot={session.Slot} occupancy={resetOcc}");
+                                        }
+                                        else
+                                        {
+                                            Log?.Invoke(
+                                                $"World sync: ignored red-coin solo mission reset course={resetCourse}/{resetEpisode} slot={session.Slot} occupancy={resetOcc} peerOnStage={(peerOnStage ? 1 : 0)}");
+                                            // Dying client cleared its local mask on stageInit and
+                                            // would otherwise wait up to 45s for periodic resync.
+                                            EnqueueProgressSnapshot(session, reason: "co-op-death-catchup");
+                                        }
+
+                                        break;
+                                    }
+
                                     if (!_redCoinAuthority.TryAcceptCollected(worldRequest, out var coinPayload0,
-                                            out var coinReserved, out var coinPayload1))
+                                            out var coinReserved, out var coinPayload1, out var coinPayload2))
                                     {
                                         Log?.Invoke(
                                             $"World sync: rejected duplicate red coin index course={worldRequest.CourseId}/{worldRequest.EpisodeId} slot={session.Slot} reserved={worldRequest.Reserved} payload1={worldRequest.Payload1}");
                                         break;
                                     }
 
+                                    var redEpisode = LevelCatalog.NormalizeEpisodeFromGame(
+                                        worldRequest.CourseId, worldRequest.EpisodeId, _levels);
                                     broadcast = _worldEvents.CreateWorldEvent(
                                         worldRequest.Type,
                                         worldRequest.CourseId,
-                                        worldRequest.EpisodeId,
+                                        redEpisode,
                                         coinPayload0,
                                         coinReserved,
-                                        coinPayload1);
+                                        coinPayload1,
+                                        coinPayload2);
+                                    // Live co-op: also push a thin progress snapshot to every
+                                    // other session already on this stage so a peer stuck behind
+                                    // graffiti in the incoming queue still hides coins promptly.
+                                    NotifySameStageRedCoinPeers(worldRequest.CourseId,
+                                        redEpisode, session.Slot);
                                     break;
 
                                 case WorldEventType.NpcCleaned:
@@ -512,13 +676,38 @@ public sealed class GameServer : IDisposable
                                         break;
                                     }
 
+                                    var npcEpisode = LevelCatalog.NormalizeEpisodeFromGame(
+                                        worldRequest.CourseId, worldRequest.EpisodeId, _levels);
                                     broadcast = _worldEvents.CreateWorldEvent(
                                         worldRequest.Type,
                                         worldRequest.CourseId,
-                                        worldRequest.EpisodeId,
+                                        npcEpisode,
                                         cleanPayload0,
                                         cleanReserved,
                                         cleanPayload1);
+                                    break;
+
+                                case WorldEventType.GraffitiCleaned:
+                                    if (!_graffitiCleanAuthority.TryAcceptCleaned(worldRequest, out var grafPayload0,
+                                            out var grafReserved, out var grafPayload1, out var grafPayload2))
+                                    {
+                                        Log?.Invoke(
+                                            $"World sync: rejected duplicate/full graffiti cell course={worldRequest.CourseId}/{worldRequest.EpisodeId} slot={session.Slot} payload2={worldRequest.Payload2}");
+                                        break;
+                                    }
+
+                                    // Plaza: broadcast under hub episode 255 so late-join /
+                                    // decideNextScenario peers share one authority bucket.
+                                    var grafEpisode = GraffitiCleanAuthority.NormalizeEpisode(
+                                        worldRequest.CourseId, worldRequest.EpisodeId);
+                                    broadcast = _worldEvents.CreateWorldEvent(
+                                        worldRequest.Type,
+                                        worldRequest.CourseId,
+                                        grafEpisode,
+                                        grafPayload0,
+                                        grafReserved,
+                                        grafPayload1,
+                                        grafPayload2);
                                     break;
 
                                 default:
@@ -591,10 +780,17 @@ public sealed class GameServer : IDisposable
                                                 break;
                                             }
 
+                                            // Plaza MapEvent latches are hub-global (episode 255),
+                                            // matching StoryFlagAuthority storage and snapshots.
+                                            var triggerEpisode =
+                                                StoryFlagAuthority.IsPlazaHubTrigger(
+                                                    worldRequest.CourseId, worldRequest.Payload1)
+                                                    ? StoryFlagAuthority.PlazaHubEpisode
+                                                    : worldRequest.EpisodeId;
                                             broadcast = _worldEvents.CreateWorldEvent(
                                                 worldRequest.Type,
                                                 worldRequest.CourseId,
-                                                worldRequest.EpisodeId,
+                                                triggerEpisode,
                                                 worldRequest.Payload0,
                                                 worldRequest.Reserved,
                                                 worldRequest.Payload1,
@@ -857,6 +1053,7 @@ public sealed class GameServer : IDisposable
             session.LastSnapshot = default;
             session.LastSnapshotReceivedMs = 0;
             session.UdpEndPoint = null;
+            session.LastMarioModelIntentSequence = 0;
 
             // Reconnect slot preference: if this player just disconnected within the reconnect
             // window and their previous slot is still free, migrate them back so roster identity,
@@ -986,6 +1183,7 @@ public sealed class GameServer : IDisposable
         try { session.Tcp.Close(); } catch { }
 
         session.LastSnapshot = default;
+        session.LatestUdpSnapshotPacket = null;
         session.LastSnapshotSeq = 0;
         session.LastSnapshotReceivedMs = 0;
         session.UdpEndPoint = null;
@@ -1176,19 +1374,81 @@ public sealed class GameServer : IDisposable
         HashRosterByte(ref hash, 0xFF);
     }
 
+    private int GetStageOccupancy(byte courseId, byte episodeId)
+    {
+        lock (_lock)
+        {
+            return _stageOccupancy.TryGetValue((courseId, episodeId), out var count) ? count : 0;
+        }
+    }
+
+    /// <summary>
+    /// Occupancy across Sirena casino/hotel mission↔catalog aliases so co-op death
+    /// rules and red-coin snapshot filters match roster stage keys.
+    /// </summary>
+    private int GetEquivalentStageOccupancy(byte courseId, byte episodeId)
+    {
+        lock (_lock)
+        {
+            var total = 0;
+            foreach (var pair in _stageOccupancy)
+            {
+                if (pair.Key.Item1 != courseId)
+                    continue;
+                if (StagesEquivalent(courseId, pair.Key.Item2, episodeId))
+                    total += pair.Value;
+            }
+
+            return total;
+        }
+    }
+
+    private static bool StagesEquivalent(byte courseId, byte episodeA, byte episodeB)
+    {
+        if (episodeA == episodeB)
+            return true;
+        return LevelCatalog.NormalizeEpisodeFromGame(courseId, episodeA) ==
+               LevelCatalog.NormalizeEpisodeFromGame(courseId, episodeB);
+    }
+
+    private bool ShouldResyncRedCoinStage(byte courseId, byte episodeId) =>
+        GetEquivalentStageOccupancy(courseId, episodeId) >= 2;
+
+    /// <summary>
+    /// After a live red-coin collect, push authority catch-up to every other player already
+    /// on that stage so hides are not stuck behind graffiti in the single incoming slot.
+    /// </summary>
+    private void NotifySameStageRedCoinPeers(byte courseId, byte episodeId, byte collectorSlot)
+    {
+        ClientSession[] peers;
+        lock (_lock)
+        {
+            peers = _sessions.Values
+                .Where(s => s.Slot != collectorSlot &&
+                            s.StageId == courseId &&
+                            StagesEquivalent(courseId, s.EpisodeId, episodeId))
+                .ToArray();
+        }
+
+        foreach (var peer in peers)
+            EnqueueProgressSnapshot(peer, reason: "live-red-coin-peer");
+    }
+
     private void EnqueueProgressSnapshot(ClientSession session, string reason)
     {
         var frame = _worldEvents.BuildAuthoritySnapshotReplay(
-            _shineAuthority, _blueCoinAuthority, _redCoinAuthority, _npcCleanAuthority, _storyFlagAuthority);
+            _shineAuthority, _blueCoinAuthority, _redCoinAuthority, _npcCleanAuthority,
+            _graffitiCleanAuthority, _storyFlagAuthority, ShouldResyncRedCoinStage);
         // Empty snapshot (2-byte count) is still useful so clients clear "waiting for sync".
         EnqueueSend(session, frame);
         var shineCount = _shineAuthority.Collected.Count;
         var blueCourses = _blueCoinAuthority.AllCourses.Count;
         var redStages = _redCoinAuthority.AllStages.Count;
         var npcCleanStages = _npcCleanAuthority.AllStages.Count;
+        var graffitiStages = _graffitiCleanAuthority.AllStages.Count;
         var storyFlags = _storyFlagAuthority.TotalCount;
         Log?.Invoke(
-            $"World sync: progress snapshot → slot {session.Slot} ({reason}) shines={shineCount} blueCourses={blueCourses} redStages={redStages} npcCleans={npcCleanStages} storyFlags={storyFlags} durableHistory={_worldEvents.History.Count}");
+            $"World sync: progress snapshot → slot {session.Slot} ({reason}) shines={shineCount} blueCourses={blueCourses} redStages={redStages} npcCleans={npcCleanStages} graffitiStages={graffitiStages} storyFlags={storyFlags} durableHistory={_worldEvents.History.Count}");
     }
 
     private void MaybeBroadcastProgressResync(bool force = false)
@@ -1207,6 +1467,7 @@ public sealed class GameServer : IDisposable
             _blueCoinAuthority.AllCourses.Count == 0 &&
             _redCoinAuthority.AllStages.Count == 0 &&
             _npcCleanAuthority.AllStages.Count == 0 &&
+            _graffitiCleanAuthority.AllStages.Count == 0 &&
             _storyFlagAuthority.TotalCount == 0)
         {
             _lastProgressResyncUtc = DateTime.UtcNow;
@@ -1215,10 +1476,11 @@ public sealed class GameServer : IDisposable
 
         _lastProgressResyncUtc = DateTime.UtcNow;
         var frame = _worldEvents.BuildAuthoritySnapshotReplay(
-            _shineAuthority, _blueCoinAuthority, _redCoinAuthority, _npcCleanAuthority, _storyFlagAuthority);
+            _shineAuthority, _blueCoinAuthority, _redCoinAuthority, _npcCleanAuthority,
+            _graffitiCleanAuthority, _storyFlagAuthority, ShouldResyncRedCoinStage);
         BroadcastTcp(frame);
         Log?.Invoke(
-            $"World sync: periodic progress resync shines={_shineAuthority.Collected.Count} blueCourses={_blueCoinAuthority.AllCourses.Count} redStages={_redCoinAuthority.AllStages.Count} npcCleans={_npcCleanAuthority.AllStages.Count} storyFlags={_storyFlagAuthority.TotalCount}");
+            $"World sync: periodic progress resync shines={_shineAuthority.Collected.Count} blueCourses={_blueCoinAuthority.AllCourses.Count} redStages={_redCoinAuthority.AllStages.Count} npcCleans={_npcCleanAuthority.AllStages.Count} graffitiStages={_graffitiCleanAuthority.AllStages.Count} storyFlags={_storyFlagAuthority.TotalCount}");
     }
 
     private void BroadcastRoster()
@@ -1342,32 +1604,8 @@ public sealed class GameServer : IDisposable
                 var applied = TryApplySnapshotFromUdp(result.Buffer, result.RemoteEndPoint);
                 if (!applied)
                     continue;
-
-                var peers = CopyPeersToScratch(out var peerCount);
-                var buffer = result.Buffer;
-                var length = buffer.Length;
-                var sender = result.RemoteEndPoint;
-                for (var i = 0; i < peerCount; i++)
-                {
-                    var s = peers[i];
-                    if (s.UdpEndPoint == null || s.UdpEndPoint.Equals(sender))
-                        continue;
-                    try
-                    {
-                        _udp.Send(buffer, length, s.UdpEndPoint);
-                    }
-                    catch (Exception ex)
-                    {
-                        // #region agent log
-                        AgentDebugLog.Write("B", "GameServer.UdpRelayLoop", "relay send failed", new
-                        {
-                            targetSlot = s.Slot,
-                            target = s.UdpEndPoint.ToString(),
-                            error = ex.Message,
-                        });
-                        // #endregion
-                    }
-                }
+                // Fanout is coalesced by UdpSnapshotBroadcastLoop. At 10 players,
+                // this replaces 90 sends per network tick with 10 bounded datagrams.
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
@@ -1395,6 +1633,93 @@ public sealed class GameServer : IDisposable
                 });
                 // #endregion
                 Log?.Invoke($"UDP relay error: {ex.Message}");
+            }
+        }
+    }
+
+    private async Task UdpSnapshotBroadcastLoop(CancellationToken ct)
+    {
+        if (_udp == null)
+            return;
+
+        using var timer =
+            new PeriodicTimer(TimeSpan.FromMilliseconds(ProtocolConstants.UdpSnapshotIntervalMs));
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                await timer.WaitForNextTickAsync(ct).ConfigureAwait(false);
+
+                var count = 0;
+                for (byte slot = 0; slot < _maxPlayers; slot++)
+                {
+                    if (!_sessions.TryGetValue(slot, out var session) ||
+                        session.UdpEndPoint == null)
+                    {
+                        continue;
+                    }
+
+                    var packet = session.LatestUdpSnapshotPacket;
+                    if (packet == null ||
+                        packet.Length <
+                            ProtocolConstants.UdpSnapshotPayloadOffset +
+                            ProtocolConstants.PlayerSnapshotSize ||
+                        (UdpPacketId)packet[4] != UdpPacketId.PlayerSnapshot ||
+                        packet[5] != slot)
+                    {
+                        continue;
+                    }
+
+                    var offset = ProtocolConstants.UdpSnapshotBatchHeaderSize +
+                                 count * ProtocolConstants.UdpSnapshotBatchEntrySize;
+                    _udpSnapshotBatchScratch[offset] = slot;
+                    packet.AsSpan(6, 4).CopyTo(_udpSnapshotBatchScratch.AsSpan(offset + 1, 4));
+                    packet.AsSpan(
+                            ProtocolConstants.UdpSnapshotPayloadOffset,
+                            ProtocolConstants.PlayerSnapshotSize)
+                        .CopyTo(_udpSnapshotBatchScratch.AsSpan(
+                            offset + 5,
+                            ProtocolConstants.PlayerSnapshotSize));
+                    count++;
+                }
+
+                if (count == 0)
+                    continue;
+
+                PacketSerializer.WriteUdpSnapshotBatchHeader(
+                    _udpSnapshotBatchScratch,
+                    (byte)count);
+                var length = ProtocolConstants.UdpSnapshotBatchHeaderSize +
+                             count * ProtocolConstants.UdpSnapshotBatchEntrySize;
+
+                for (byte slot = 0; slot < _maxPlayers; slot++)
+                {
+                    if (!_sessions.TryGetValue(slot, out var session) ||
+                        session.UdpEndPoint == null)
+                    {
+                        continue;
+                    }
+
+                    try
+                    {
+                        lock (_udpSendLock)
+                            _udp.Send(_udpSnapshotBatchScratch, length, session.UdpEndPoint);
+                    }
+                    catch (SocketException) when (!ct.IsCancellationRequested)
+                    {
+                        // A stale UDP endpoint is reclaimed by the normal
+                        // heartbeat/watchdog path; one failed recipient must not
+                        // delay the rest of the batch.
+                    }
+                }
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (Exception ex) when (!ct.IsCancellationRequested)
+            {
+                Log?.Invoke($"UDP batch broadcast error: {ex.Message}");
             }
         }
     }
@@ -1463,7 +1788,8 @@ public sealed class GameServer : IDisposable
 
         try
         {
-            _udp!.Send(_udpPongScratch, _udpPongScratch.Length, session.UdpEndPoint);
+            lock (_udpSendLock)
+                _udp!.Send(_udpPongScratch, _udpPongScratch.Length, session.UdpEndPoint);
         }
         catch (Exception ex) when (!_cts!.IsCancellationRequested)
         {
@@ -1532,6 +1858,10 @@ public sealed class GameServer : IDisposable
         session.State = DolphinState.Active;
         session.LastSeen = DateTime.UtcNow;
         session.LastSnapshot = snap;
+        // ReceiveAsync owns this immutable datagram array. Keep the latest one
+        // so the fixed-rate broadcast loop can batch raw payloads without
+        // reserializing snapshots or racing the reusable name buffer.
+        session.LatestUdpSnapshotPacket = buffer;
         session.LastSnapshotReceivedMs = Environment.TickCount64;
         ProcessHideSeekTagsForSnapshot(slot, snap);
         _hideSeek.ProcessHiderDeath(slot, snap);
@@ -1594,9 +1924,11 @@ public sealed class GameServer : IDisposable
         public byte EpisodeId { get; set; }
         public DolphinState State { get; set; }
         public ushort PingMs { get; set; }
+        public uint LastMarioModelIntentSequence { get; set; }
         public DateTime LastSeen { get; set; }
         public long LastSnapshotReceivedMs { get; set; }
         public byte[] SnapshotNameBuffer { get; } = new byte[16];
+        public byte[]? LatestUdpSnapshotPacket { get; set; }
         public PlayerSnapshot LastSnapshot { get; set; }
         public uint LastSnapshotSeq { get; set; }
         public IPEndPoint? UdpEndPoint { get; set; }

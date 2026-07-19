@@ -14,6 +14,12 @@ if(SMSO_REMOTE_ENEMY_MARIO)
     add_compile_definitions(SMSO_REMOTE_ENEMY_MARIO)
 endif()
 
+option(SMSO_HIDE_NAMETAGS "Disable in-game player nametag drawing" OFF)
+if(SMSO_HIDE_NAMETAGS)
+    add_compile_definitions(SMSO_HIDE_NAMETAGS)
+    message(STATUS "SMSO_HIDE_NAMETAGS=ON — nametag draw disabled")
+endif()
+
 set(SMSO_SOURCES
     src/comm_buffer.cpp
     src/puppets.cpp
@@ -38,6 +44,7 @@ set(SMSO_SOURCES
     src/fruit_sync.cpp
     src/npc_sync.cpp
     src/monte_clean_sync.cpp
+    src/graffiti_clean_sync.cpp
     src/mario_model_system.cpp
     src/mario_tex_anim.cpp
 )

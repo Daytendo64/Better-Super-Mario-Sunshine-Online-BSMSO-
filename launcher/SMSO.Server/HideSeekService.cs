@@ -15,7 +15,10 @@ public sealed class HideSeekService
     /// Full Start Tag hide grace: blue wash + seeker freeze on clients, proximity tags blocked.
     /// Server clock is authoritative via GraceActive / GraceRemainingMs.
     /// </summary>
-    internal const int StartTagGraceMs = 30_000;
+    public const int DefaultStartTagGraceMs = 30_000;
+    public const int MinStartTagGraceMs = 5_000;
+    public const int MaxStartTagGraceMs = 60_000;
+    internal const int StartTagGraceMs = DefaultStartTagGraceMs;
     /// <summary>
     /// After mid-round warp-all, ignore proximity tags briefly so clustered spawn positions
     /// do not mass-promote hiders. Does NOT re-arm the full 30s freeze/tint (too long on warp).
@@ -40,8 +43,19 @@ public sealed class HideSeekService
     private long _startTagGraceUntilTick;
     private long _proximityTagImmunityUntilTick;
     private ushort _lastBroadcastGraceSec = ushort.MaxValue;
+    private int _startTagGraceMs = DefaultStartTagGraceMs;
 
     public HideSeekService(GameServer server) => _server = server;
+
+    /// <summary>Start Tag hide-grace duration in milliseconds (clamped).</summary>
+    public int StartTagGraceDurationMs
+    {
+        get => _startTagGraceMs;
+        set => _startTagGraceMs = ClampGraceMs(value);
+    }
+
+    public static int ClampGraceMs(int ms) =>
+        Math.Clamp(ms, MinStartTagGraceMs, MaxStartTagGraceMs);
 
     public GameModeStatePacket CurrentState
     {
@@ -83,10 +97,10 @@ public sealed class HideSeekService
 
     private void ArmStartTagGrace()
     {
-        _startTagGraceUntilTick = Environment.TickCount64 + StartTagGraceMs;
+        _startTagGraceUntilTick = Environment.TickCount64 + _startTagGraceMs;
         _state.Flags |= GameModeFlags.GraceActive;
-        _state.GraceRemainingMs = StartTagGraceMs;
-        _lastBroadcastGraceSec = (ushort)(StartTagGraceMs / 1000);
+        _state.GraceRemainingMs = (ushort)Math.Min(ushort.MaxValue, _startTagGraceMs);
+        _lastBroadcastGraceSec = (ushort)(_startTagGraceMs / 1000);
     }
 
     private void ClearStartTagGrace()
@@ -297,7 +311,7 @@ public sealed class HideSeekService
         BumpAndBroadcast();
         _server.LogMessage(isResume
             ? "Hide & Seek tag resumed (no hide grace)."
-            : "Hide & Seek tag started (30s hide grace).");
+            : $"Hide & Seek tag started ({_startTagGraceMs / 1000}s hide grace).");
         return true;
     }
 

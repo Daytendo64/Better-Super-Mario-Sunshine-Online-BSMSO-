@@ -34,13 +34,24 @@ public partial class MainWindow : Window
     private Point _hideSeekDragStartPoint;
     private bool _suppressHideSeekUiSync;
     private bool _suppressMaxPlayersSave;
+    private bool _suppressHideSeekGraceSave;
     private bool _syncingMarioModelCombo;
     private bool _marioModelInstallInProgress;
+    private bool _restartRequiredForModUpdate;
+    /// When true, a newer `_BSMSO.kxe` was synced while Dolphin was still running
+    /// the old module. Do not clear `_restartRequiredForModUpdate` on ModuleReady
+    /// until Dolphin has fully stopped (then a fresh ModuleReady means the new kxe).
+    private bool _restartGateAwaitingDolphinStop;
+    private bool _updateRequired;
     private bool _tagRunning;
     private static readonly Random _random = new();
     private readonly Dictionary<byte, int> _randomTagExemptRoundsBySlot = new();
     private readonly Queue<byte> _recentRandomLevelCourseIds = new();
     private DispatcherTimer? _clientWarpStatusClearTimer;
+    private DispatcherTimer? _tagElapsedUiTimer;
+    private bool _tagElapsedLive;
+    private uint _tagElapsedBaseMs;
+    private long _tagElapsedAnchorTick;
 
     public MainWindow()
     {
@@ -53,10 +64,17 @@ public partial class MainWindow : Window
         WireEvents();
         LoadConfigToUi();
         LoadLevels();
+        ApplyClientLiteLayout();
         Title = _config.InstanceIndex == 0
-            ? "BSMSO — Better Super Mario Sunshine Online"
-            : $"BSMSO — Better Super Mario Sunshine Online ({_config.InstanceLabel})";
-        VersionText.Text = $"BSMSO v1.0 | comm v{ProtocolConstants.CommVersion} | {_config.InstanceLabel} | .NET {Environment.Version}";
+            ? (BuildFeatures.ClientLite
+                ? "BSMSO Lite — Better Super Mario Sunshine Online"
+                : "BSMSO — Better Super Mario Sunshine Online")
+            : (BuildFeatures.ClientLite
+                ? $"BSMSO Lite — Better Super Mario Sunshine Online ({_config.InstanceLabel})"
+                : $"BSMSO — Better Super Mario Sunshine Online ({_config.InstanceLabel})");
+        VersionText.Text = BuildFeatures.ClientLite
+            ? $"BSMSO Lite v1.0 | build {ProtocolConstants.ModBuildId} | comm v{ProtocolConstants.CommVersion} | {_config.InstanceLabel} | .NET {Environment.Version}"
+            : $"BSMSO v1.0 | build {ProtocolConstants.ModBuildId} | comm v{ProtocolConstants.CommVersion} | {_config.InstanceLabel} | .NET {Environment.Version}";
         UpdateConnectionUi();
         UpdateDolphinUi();
         UpdateSessionStatusColor();
@@ -246,14 +264,15 @@ public partial class MainWindow : Window
         ServerIpBox.Text = _config.Config.ServerIp;
         ServerPortBox.Text = _config.Config.ServerPort.ToString();
         PopulateMaxPlayersCombo(_config.Config.MaxPlayers);
+        PopulateHideSeekGraceSecondsCombo(_config.Config.HideSeekGraceSeconds);
         ApplyNameTagColorToUi(
             ParseStoredColor(_config.Config.NameTagColor, 255, 255, 255),
             ParseStoredColor(_config.Config.NameTagGradientColor, 136, 136, 136),
             ParseStoredColor(_config.Config.NameTagOutlineColor, 0, 0, 0),
             _config.Config.NameTagGradientEnabled,
             persist: false);
-        // Release zips ship CustomModels/ next to the launcher; seed AppData so
-        // the dropdown matches the packager's library on first run.
+        // Release zips ship CustomModels/ next to the launcher; sync AppData so
+        // the dropdown matches the packager's library (overwrites on zip updates).
         ModelLibrary.SeedBundledModels(m => _config.Log(m));
         RefreshMarioModelCombo();
         if (!string.IsNullOrWhiteSpace(_config.Config.IsoPath))
@@ -264,8 +283,13 @@ public partial class MainWindow : Window
             {
                 try
                 {
+                    // Zip updates: force-sync _BSMSO.kxe / Moveset / BSE from beside
+                    // the launcher into Kuribo Mods, then refresh model packs.
+                    var sync = ModuleInstaller.SyncBundledModulesIntoGame(isoPath, m =>
+                        Dispatcher.BeginInvoke(() => _config.Log(m)));
                     MarioPackInstaller.EnsureAllLibraryPacksPresent(isoPath, m =>
                         Dispatcher.BeginInvoke(() => _config.Log(m)));
+                    Dispatcher.BeginInvoke(() => ApplyBundledModuleSyncResult(sync));
                 }
                 catch (Exception ex)
                 {
@@ -299,11 +323,16 @@ public partial class MainWindow : Window
         _config.Config.NameTagGradientColor = FormatStoredColor(ReadNameTagColorFromUi(NameTagTarget.Gradient));
         _config.Config.NameTagOutlineColor = FormatStoredColor(ReadNameTagColorFromUi(NameTagTarget.Outline));
         _config.Config.NameTagGradientEnabled = NameTagGradientToggle.IsChecked == true;
-        if (MarioModelCombo.SelectedItem is ModelLibraryEntry selected)
+        if (SettingsMarioModelCombo.SelectedItem is ModelLibraryEntry settingsSelected)
+            _config.Config.SelectedMarioModelId = CharacterPack.NormalizeModelId(settingsSelected.Id);
+        else if (MarioModelCombo.SelectedItem is ModelLibraryEntry selected)
             _config.Config.SelectedMarioModelId = CharacterPack.NormalizeModelId(selected.Id);
+        else if (ServerMarioModelCombo.SelectedItem is ModelLibraryEntry serverSelected)
+            _config.Config.SelectedMarioModelId = CharacterPack.NormalizeModelId(serverSelected.Id);
         if (int.TryParse(ServerPortBox.Text, out var port))
             _config.Config.ServerPort = Math.Clamp(port, 1024, 65535);
         _config.Config.MaxPlayers = ReadMaxPlayersFromUi();
+        _config.Config.HideSeekGraceSeconds = ReadHideSeekGraceSecondsFromUi();
         _config.Config.ApplyRecommendedDolphinSettings =
             ApplyRecommendedDolphinSettingsToggle.IsChecked == true;
         _config.SaveDebounced();
@@ -353,21 +382,107 @@ public partial class MainWindow : Window
         _config.SaveDebounced();
     }
 
+    private static readonly int[] HideSeekGraceSecondOptions = { 15, 30, 45, 60 };
+
+    private static int SnapHideSeekGraceSeconds(int value)
+    {
+        var best = HideSeekGraceSecondOptions[0];
+        var bestDist = Math.Abs(value - best);
+        for (var i = 1; i < HideSeekGraceSecondOptions.Length; i++)
+        {
+            var opt = HideSeekGraceSecondOptions[i];
+            var dist = Math.Abs(value - opt);
+            if (dist < bestDist)
+            {
+                best = opt;
+                bestDist = dist;
+            }
+        }
+
+        return best;
+    }
+
+    private void PopulateHideSeekGraceSecondsCombo(int selected)
+    {
+        if (HideSeekGraceSecondsCombo == null)
+            return;
+
+        selected = SnapHideSeekGraceSeconds(selected);
+        _suppressHideSeekGraceSave = true;
+        try
+        {
+            HideSeekGraceSecondsCombo.Items.Clear();
+            foreach (var seconds in HideSeekGraceSecondOptions)
+            {
+                var label = seconds == 60 ? "1 minute" : $"{seconds} seconds";
+                HideSeekGraceSecondsCombo.Items.Add(new ComboBoxItem
+                {
+                    Content = label,
+                    Tag = seconds,
+                });
+            }
+
+            HideSeekGraceSecondsCombo.SelectedIndex =
+                Array.IndexOf(HideSeekGraceSecondOptions, selected);
+        }
+        finally
+        {
+            _suppressHideSeekGraceSave = false;
+        }
+    }
+
+    private int ReadHideSeekGraceSecondsFromUi()
+    {
+        if (HideSeekGraceSecondsCombo?.SelectedItem is ComboBoxItem item && item.Tag is int seconds)
+            return SnapHideSeekGraceSeconds(seconds);
+        return SnapHideSeekGraceSeconds(_config.Config.HideSeekGraceSeconds);
+    }
+
+    private void ApplyHideSeekGraceSecondsFromUi(bool persist)
+    {
+        var seconds = ReadHideSeekGraceSecondsFromUi();
+        _config.Config.HideSeekGraceSeconds = seconds;
+        _session.SetHideSeekGraceSeconds(seconds);
+        if (persist)
+            _config.SaveDebounced();
+    }
+
+    private void HideSeekGraceSecondsCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_suppressHideSeekGraceSave || HideSeekGraceSecondsCombo?.SelectedItem is not ComboBoxItem)
+            return;
+        ApplyHideSeekGraceSecondsFromUi(persist: true);
+    }
+
     private void RefreshMarioModelCombo(string? selectId = null)
     {
-        if (MarioModelCombo == null)
+        if (SettingsMarioModelCombo == null && MarioModelCombo == null && ServerMarioModelCombo == null)
             return;
 
         _syncingMarioModelCombo = true;
         try
         {
             var entries = ModelLibrary.ListEntries(includeRetail: true);
-            MarioModelCombo.ItemsSource = entries;
             var want = CharacterPack.NormalizeModelId(selectId ?? _config.Config.SelectedMarioModelId);
             var match = entries.FirstOrDefault(e =>
                 CharacterPack.NormalizeModelId(e.Id) == want) ?? entries[0];
-            MarioModelCombo.SelectedItem = match;
             _config.Config.SelectedMarioModelId = CharacterPack.NormalizeModelId(match.Id);
+
+            if (SettingsMarioModelCombo != null)
+            {
+                SettingsMarioModelCombo.ItemsSource = entries;
+                SettingsMarioModelCombo.SelectedItem = match;
+            }
+            if (MarioModelCombo != null)
+            {
+                MarioModelCombo.ItemsSource = entries;
+                MarioModelCombo.SelectedItem = match;
+            }
+            if (ServerMarioModelCombo != null)
+            {
+                ServerMarioModelCombo.ItemsSource = entries;
+                ServerMarioModelCombo.SelectedItem = match;
+            }
         }
         finally
         {
@@ -379,11 +494,18 @@ public partial class MainWindow : Window
     {
         if (_syncingMarioModelCombo)
             return;
-        if (MarioModelCombo.SelectedItem is not ModelLibraryEntry entry)
+        if (sender is not ComboBox combo || combo.SelectedItem is not ModelLibraryEntry entry)
             return;
 
         var id = CharacterPack.NormalizeModelId(entry.Id);
         var previousId = CharacterPack.NormalizeModelId(_config.Config.SelectedMarioModelId);
+        if (id == previousId)
+        {
+            // Keep both tabs' combos visually aligned when one was just refreshed.
+            SyncMarioModelComboSelection(entry);
+            return;
+        }
+
         if (_marioModelInstallInProgress)
         {
             RefreshMarioModelCombo(previousId);
@@ -391,7 +513,7 @@ public partial class MainWindow : Window
         }
 
         _marioModelInstallInProgress = true;
-        MarioModelCombo.IsEnabled = false;
+        SetMarioModelCombosEnabled(false);
         LogLine.Text = string.IsNullOrEmpty(id)
             ? "Restoring Retail Mario…"
             : $"Installing model {entry.DisplayName}…";
@@ -426,7 +548,7 @@ public partial class MainWindow : Window
         finally
         {
             _marioModelInstallInProgress = false;
-            MarioModelCombo.IsEnabled = true;
+            SetMarioModelCombosEnabled(true);
         }
 
         if (!result.Succeeded)
@@ -440,8 +562,37 @@ public partial class MainWindow : Window
 
         _config.Config.SelectedMarioModelId = id;
         _config.SaveDebounced();
+        SyncMarioModelComboSelection(entry);
         _session.NotifyLocalMarioModelChanged(id);
         LogLine.Text = result.Message;
+    }
+
+    private void SyncMarioModelComboSelection(ModelLibraryEntry entry)
+    {
+        _syncingMarioModelCombo = true;
+        try
+        {
+            if (SettingsMarioModelCombo != null && !ReferenceEquals(SettingsMarioModelCombo.SelectedItem, entry))
+                SettingsMarioModelCombo.SelectedItem = entry;
+            if (MarioModelCombo != null && !ReferenceEquals(MarioModelCombo.SelectedItem, entry))
+                MarioModelCombo.SelectedItem = entry;
+            if (ServerMarioModelCombo != null && !ReferenceEquals(ServerMarioModelCombo.SelectedItem, entry))
+                ServerMarioModelCombo.SelectedItem = entry;
+        }
+        finally
+        {
+            _syncingMarioModelCombo = false;
+        }
+    }
+
+    private void SetMarioModelCombosEnabled(bool enabled)
+    {
+        if (SettingsMarioModelCombo != null)
+            SettingsMarioModelCombo.IsEnabled = enabled;
+        if (MarioModelCombo != null)
+            MarioModelCombo.IsEnabled = enabled;
+        if (ServerMarioModelCombo != null)
+            ServerMarioModelCombo.IsEnabled = enabled;
     }
 
     private void LoadLevels()
@@ -626,7 +777,11 @@ public partial class MainWindow : Window
                 try
                 {
                     await Task.Run(() =>
-                            MarioPackInstaller.EnsureAllLibraryPacksPresent(isoPath, m => _config.Log(m)))
+                        {
+                            var sync = ModuleInstaller.SyncBundledModulesIntoGame(isoPath, m => _config.Log(m));
+                            MarioPackInstaller.EnsureAllLibraryPacksPresent(isoPath, m => _config.Log(m));
+                            Dispatcher.Invoke(() => ApplyBundledModuleSyncResult(sync));
+                        })
                         .ConfigureAwait(true);
                 }
                 catch (Exception packEx)
@@ -696,13 +851,75 @@ public partial class MainWindow : Window
         }
     }
 
+    private void ApplyBundledModuleSyncResult(BundledModuleSyncResult sync)
+    {
+        if (sync.BundledModuleAvailable && !sync.InstalledMatchesBundled)
+        {
+            _updateRequired = true;
+            _restartRequiredForModUpdate = false;
+            _restartGateAwaitingDolphinStop = false;
+        }
+        else
+        {
+            _updateRequired = false;
+            if (sync.BsmsoModuleChanged &&
+                (_session.IsDolphinRunning || _session.DolphinLinkState != DolphinLinkState.NotRunning))
+            {
+                _restartRequiredForModUpdate = true;
+                _restartGateAwaitingDolphinStop = true;
+            }
+        }
+
+        UpdateModuleInstallUi();
+        UpdateDolphinUi();
+        UpdateConnectionUi();
+    }
+
+    private void ClearModUpdateGatesIfReady()
+    {
+        // A ModuleReady link after syncing a newer kxe still runs the *old* in-memory
+        // module until Dolphin fully restarts. Only clear the restart gate once
+        // Dolphin has stopped (armed) and then becomes ModuleReady again.
+        if (_restartGateAwaitingDolphinStop)
+        {
+            if (_session.DolphinLinkState == DolphinLinkState.NotRunning ||
+                !_session.IsDolphinRunning)
+            {
+                _restartGateAwaitingDolphinStop = false;
+            }
+            return;
+        }
+
+        if (_restartRequiredForModUpdate &&
+            _session.DolphinLinkState == DolphinLinkState.ModuleReady)
+        {
+            _restartRequiredForModUpdate = false;
+        }
+    }
+
     private void UpdateModuleInstallUi()
     {
         if (ModuleInstallStatusText == null || InstallModulesButton == null || OpenModsFolderButton == null)
             return;
 
         var status = ModuleInstaller.GetInstallStatus(IsoPathBox.Text.Trim().Trim('"'));
-        ModuleInstallStatusText.Text = status.Message;
+        var needsUpdate = status.NeedsUpdate || _updateRequired;
+
+        if (_restartRequiredForModUpdate)
+            ModuleInstallStatusText.Text = ModuleVersionMessages.RestartRequiredForUpdate;
+        else if (needsUpdate)
+            ModuleInstallStatusText.Text = string.IsNullOrWhiteSpace(status.Message) || !status.NeedsUpdate
+                ? ModuleVersionMessages.UpdateRequired
+                : status.Message;
+        else
+            ModuleInstallStatusText.Text = status.Message;
+
+        InstallModulesButton.Content = needsUpdate
+            ? ModuleVersionMessages.UpdateModuleButtonLabel
+            : ModuleVersionMessages.InstallModuleButtonLabel;
+        InstallModulesButton.ToolTip = needsUpdate
+            ? ModuleVersionMessages.UpdateRequired
+            : "Install or reinstall BSE / Kuribo runtime and _BSMSO.kxe into the Game ISO path.";
         InstallModulesButton.IsEnabled = status.CanInstall;
         InstallModulesButton.Opacity = status.CanInstall ? 1.0 : 0.45;
         var canOpenMods = status.TargetKind == ModuleInstallTargetKind.ExtractedFolder &&
@@ -711,10 +928,31 @@ public partial class MainWindow : Window
         OpenModsFolderButton.Opacity = canOpenMods ? 1.0 : 0.45;
     }
 
+    private bool IsModuleUpdateRequired()
+    {
+        if (_updateRequired)
+            return true;
+
+        var status = ModuleInstaller.GetInstallStatus(IsoPathBox.Text.Trim().Trim('"'));
+        return status.NeedsUpdate;
+    }
+
     private async void Host_Click(object sender, RoutedEventArgs e)
     {
         SaveConfigFromUi();
         _config.Save();
+        if (_restartRequiredForModUpdate || IsModuleUpdateRequired())
+        {
+            MessageBox.Show(
+                _restartRequiredForModUpdate
+                    ? ModuleVersionMessages.RestartRequiredForUpdate
+                    : ModuleVersionMessages.UpdateRequired,
+                "BSMSO",
+                MessageBoxButton.OK,
+                MessageBoxImage.Warning);
+            UpdateConnectionUi();
+            return;
+        }
         if (_session.DolphinLinkState != DolphinLinkState.ModuleReady)
         {
             MessageBox.Show($"Launch Dolphin with {ModuleVersionMessages.ModuleFileName} loaded and wait until BSMSO is linked to the game before hosting.", "BSMSO", MessageBoxButton.OK, MessageBoxImage.Information);
@@ -742,6 +980,18 @@ public partial class MainWindow : Window
     private async void Connect_Click(object sender, RoutedEventArgs e)
     {
         SaveConfigFromUi();
+        if (_restartRequiredForModUpdate || IsModuleUpdateRequired())
+        {
+            MessageBox.Show(
+                _restartRequiredForModUpdate
+                    ? ModuleVersionMessages.RestartRequiredForUpdate
+                    : ModuleVersionMessages.UpdateRequired,
+                "BSMSO",
+                MessageBoxButton.OK,
+                MessageBoxImage.Warning);
+            UpdateConnectionUi();
+            return;
+        }
         if (_session.DolphinLinkState != DolphinLinkState.ModuleReady)
         {
             MessageBox.Show($"Launch Dolphin with {ModuleVersionMessages.ModuleFileName} loaded and wait until BSMSO is linked to the game before connecting.", "BSMSO", MessageBoxButton.OK, MessageBoxImage.Information);
@@ -879,8 +1129,11 @@ public partial class MainWindow : Window
         var moduleInstallWarning = ModuleInstallValidator.ValidateInstalledModule(IsoPathBox.Text);
         var linkError = _session.DolphinLinkError;
         var searchSeconds = _session.DolphinMailboxSearchDuration.TotalSeconds;
+        ClearModUpdateGatesIfReady();
         DolphinDetailText.Text = link switch
         {
+            _ when _restartRequiredForModUpdate => ModuleVersionMessages.RestartRequiredForUpdate,
+            _ when IsModuleUpdateRequired() => ModuleVersionMessages.UpdateRequired,
             DolphinLinkState.ModuleReady when !string.IsNullOrWhiteSpace(moduleInstallWarning) => moduleInstallWarning,
             DolphinLinkState.ModuleReady =>
                 "BSMSO link active — warps and player sync enabled.",
@@ -921,13 +1174,19 @@ public partial class MainWindow : Window
         var hosting = _session.IsHosting;
         var gameLinked = _session.DolphinLinkState == DolphinLinkState.ModuleReady;
         var sessionActive = connected || hosting;
+        var modGateBlocked = _restartRequiredForModUpdate || IsModuleUpdateRequired();
+        var canHostOrConnect = gameLinked && !sessionActive && !modGateBlocked;
         DisconnectButton.IsEnabled = sessionActive;
-        ConnectButton.IsEnabled = gameLinked && !sessionActive;
-        HostButton.IsEnabled = gameLinked && !sessionActive;
+        ConnectButton.IsEnabled = canHostOrConnect;
+        HostButton.IsEnabled = canHostOrConnect;
         ConnectButton.Opacity = ConnectButton.IsEnabled ? 1.0 : 0.45;
         HostButton.Opacity = HostButton.IsEnabled ? 1.0 : 0.45;
         DisconnectButton.Opacity = DisconnectButton.IsEnabled ? 1.0 : 0.45;
         GameLinkOverlay.Visibility = gameLinked ? Visibility.Collapsed : Visibility.Visible;
+        var clientActionsActive = connected;
+        ClientActionsPanel.IsEnabled = clientActionsActive;
+        ClientActionsPanel.Opacity = clientActionsActive ? 1.0 : 0.45;
+        ClientActionsOverlay.Visibility = clientActionsActive ? Visibility.Collapsed : Visibility.Visible;
         var serverActionsActive = hosting && connected;
         ServerActionsPanel.IsEnabled = serverActionsActive;
         ServerActionsPanel.Opacity = serverActionsActive ? 1.0 : 0.45;
@@ -1015,12 +1274,32 @@ public partial class MainWindow : Window
         ClientTeleportOverlay.Visibility = showOverlay ? Visibility.Visible : Visibility.Collapsed;
         ClientTeleportOverlayText.Text = "The host needs to enable client teleporting to use this.";
 
+#if !BSMSO_CLIENT_LITE
         // Game Modes on Client Actions is always view-only; dim when disconnected.
         ClientGameModesPanel.Opacity = connected ? 1.0 : 0.45;
         if (connected)
             ApplyClientGameModeView(_session.GameModeState);
         else
             ApplyClientGameModeView(GameModeStatePacket.CreateDefault());
+#endif
+    }
+
+    private void ApplyClientLiteLayout()
+    {
+#if BSMSO_CLIENT_LITE
+        if (ClientGameModesPanel != null)
+            ClientGameModesPanel.Visibility = Visibility.Collapsed;
+        if (ClientRosterPanel != null)
+            ClientRosterPanel.Visibility = Visibility.Collapsed;
+        if (ClientActionsMidSpacer != null)
+            ClientActionsMidSpacer.Width = new GridLength(0);
+        if (ClientGameModesColumn != null)
+            ClientGameModesColumn.Width = new GridLength(0);
+
+        // Drop the empty roster row so Teleport fills the tab (Model is above this panel).
+        if (ClientActionsPanel?.RowDefinitions.Count >= 2)
+            ClientActionsPanel.RowDefinitions[1].Height = new GridLength(0);
+#endif
     }
 
     private async void ClientWarp_Click(object sender, RoutedEventArgs e)
@@ -1453,6 +1732,7 @@ public partial class MainWindow : Window
             HideSeekStatusText.Text = FormatHideSeekStatus(state, forClient: false);
             UpdateStartStopTagButtonState();
             ApplyClientGameModeView(state);
+            SyncTagElapsedUi(state);
         }
         finally
         {
@@ -1462,6 +1742,12 @@ public partial class MainWindow : Window
 
     private void ApplyClientGameModeView(GameModeStatePacket state)
     {
+#if BSMSO_CLIENT_LITE
+        return;
+#else
+        if (ClientGameModeText == null)
+            return;
+
         ClientGameModeText.Text = state.GameMode == GameMode.HideSeek ? "Hide and Seek" : "Normal";
         ClientHideSeekPanel.Visibility = state.GameMode == GameMode.HideSeek ? Visibility.Visible : Visibility.Collapsed;
 
@@ -1489,6 +1775,71 @@ public partial class MainWindow : Window
             ClientHideSeekSeekersList.ItemsSource = null;
             ClientHideSeekStatusText.Text = string.Empty;
         }
+#endif
+    }
+
+    private void SyncTagElapsedUi(GameModeStatePacket state)
+    {
+        var live = state.GameMode == GameMode.HideSeek && state.TagActive;
+        if (live)
+        {
+            if (!_tagElapsedLive || state.RoundStartMs != _tagElapsedBaseMs)
+            {
+                _tagElapsedBaseMs = state.RoundStartMs;
+                _tagElapsedAnchorTick = Environment.TickCount64;
+            }
+
+            _tagElapsedLive = true;
+            EnsureTagElapsedUiTimer();
+            _tagElapsedUiTimer!.Start();
+        }
+        else
+        {
+            _tagElapsedLive = false;
+            _tagElapsedBaseMs = state.GameMode == GameMode.HideSeek ? state.RoundStartMs : 0;
+            _tagElapsedUiTimer?.Stop();
+        }
+
+        RefreshTagElapsedTexts(state.GameMode == GameMode.HideSeek);
+    }
+
+    private void EnsureTagElapsedUiTimer()
+    {
+        if (_tagElapsedUiTimer != null)
+            return;
+
+        _tagElapsedUiTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(250) };
+        _tagElapsedUiTimer.Tick += (_, _) => RefreshTagElapsedTexts(hideSeekActive: true);
+    }
+
+    private uint CurrentTagElapsedMs()
+    {
+        if (!_tagElapsedLive)
+            return _tagElapsedBaseMs;
+
+        var delta = Environment.TickCount64 - _tagElapsedAnchorTick;
+        if (delta <= 0)
+            return _tagElapsedBaseMs;
+        return _tagElapsedBaseMs + (uint)delta;
+    }
+
+    private static string FormatTagElapsed(uint ms)
+    {
+        var totalSec = ms / 1000u;
+        var minutes = totalSec / 60u;
+        var seconds = totalSec % 60u;
+        return minutes >= 60
+            ? $"{minutes / 60}:{minutes % 60:D2}:{seconds:D2}"
+            : $"{minutes}:{seconds:D2}";
+    }
+
+    private void RefreshTagElapsedTexts(bool hideSeekActive)
+    {
+        var text = hideSeekActive
+            ? $"Tag time: {FormatTagElapsed(CurrentTagElapsedMs())}"
+            : "Tag time: —";
+        HideSeekTagElapsedText.Text = text;
+        ClientHideSeekTagElapsedText.Text = text;
     }
 
     private static string FormatHideSeekStatus(GameModeStatePacket state, bool forClient)

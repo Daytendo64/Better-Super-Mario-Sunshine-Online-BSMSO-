@@ -25,6 +25,10 @@ constexpr u16 kBlooperSurfRideShellAnim = 0x6Du;
 constexpr u8 kSurfGessoTypeCount = 3u;
 constexpr u8 kSurfGessoTypeMask = 0x03u;
 
+// Per-remote-slot clone state. One BlooperSurfSlot lives on each RemoteActorSlot in
+// remote_actor.cpp (array size MAX_REMOTE_SLOTS == MAX_PLAYERS == 10). Never share
+// stage MapObjManager mRed/Yellow/GreenGesso templates across riders — that crashes
+// when two+ players surf the same color (including local + remotes).
 struct BlooperSurfSlot {
     u8 gessoType;
     void *cloneActor;
@@ -32,6 +36,9 @@ struct BlooperSurfSlot {
     u8 cloneType;
     bool bindPending;
 };
+
+static_assert(MAX_REMOTE_SLOTS >= 10, "blooper surf clones require 10-player remote slots");
+static_assert(MAX_PLAYERS == 10, "blooper surf capacity tracked against MaxPlayers=10");
 
 inline u32 snapshotMarioState(const PlayerSnapshot &snap) {
     return static_cast<u32>(snap.actionId) | (static_cast<u32>(snap.actionIdHi) << 16);

@@ -29,3 +29,44 @@ Launcher (WPF) ←→ TCP/UDP Server ←→ Other Launchers
 ## Comm Buffer
 
 672-byte packed struct shared between C++ module and C# bridge. Magic `0x534D534F`, version 1.
+
+## Custom Mario model preparation
+
+Installed uncompressed `/data/bsmso_models/<id>.arc` packs are loaded by one
+demand-driven `DVDReadAsyncPrio` job. DVD callbacks only record completion;
+validation and cache publication occur on the main thread, and body construction
+waits for loading screens or eight consecutive safe idle frames. A model commit
+only swaps a fully initialized body pointer, so the previous model stays visible
+while preparation is pending.
+
+The expanded MEM1 arena uses separate JKR heaps:
+
+- 23.875 MiB arena: 16.5 MiB pack heap + 7.375 MiB body/J3D heap.
+- 7.5 MiB fallback arena: 2.25 MiB pack heap + 5.25 MiB body/J3D heap.
+
+The full split fits ten typical 1.6 MiB packs but only eight worst-case 2 MiB
+packs; excess identities remain on the old/retail visual until a safe stage
+boundary recycle. The fallback intentionally admits one worst-case pack.
+Published packs and active body graphs remain pinned. Custom mid-stage
+replacements are always born into 768 KiB child ExpHeap arenas (preferred
+2-arena ping-pong for first staging, plus overflow children while the body
+heap has room). Activation is pointer-only so the previous model stays
+visible. Mid-stage never runs `teardownRemoteBodyGraph` / `~TMario` /
+`freeAll` on a constructed remote body graph — SMS engine subsystems UAF when
+those arenas are recycled before a stage boundary. Parked graphs remain
+module-owned until stage-boundary body-heap recycle.
+
+Main-heap prewarm / first-residency bodies (`arena == nullptr`) are never
+scrub-and-forgotten mid-stage. Demotion parks them in a permanent spare table
+(still module-owned so perform never falls through to retail) until
+stage-boundary heap recycle. Ready/variant capacity pressure never frees
+graphs mid-stage; when the body heap cannot allocate another arena the live
+model stays visible and prepare soft-defers until RAM frees via warp recycle.
+
+Sequential body churn therefore never crashes via address reuse; the honest
+same-stage soft bound is body-heap RAM (~7 MiB ≈ ~9 arenas). Absolute
+exhaustion keeps the current visible model and retries later.
+`gRemoteHeapRecycleOnStageExit` remains a last-resort hint when RAM is
+exhausted. The remaining same-stage distinct-identity soft bound is the
+immutable pack heap/cache, which may LRU-unpin packs that are no longer
+referenced by live/ready bodies.

@@ -3,13 +3,21 @@ namespace SMSO.Net;
 public static class ProtocolConstants
 {
     public const uint Magic = 0x534D534F;
-    public const ushort ProtocolVersion = 1;
+    // v2 adds coalesced UDP SnapshotBatch server fanout.
+    public const ushort ProtocolVersion = 2;
     public const ushort CommVersion = 11;
+    /// <summary>
+    /// Release build gate for multiplayer. Bump on every zip build so mismatched
+    /// clients are rejected with <see cref="JoinRejectReason.VersionMismatch"/>.
+    /// Independent of <see cref="CommVersion"/> / <see cref="ProtocolVersion"/>.
+    /// </summary>
+    public const ushort ModBuildId = 3;
     public const int DefaultPort = 27015;
     public const int StableMaxPlayers = 10;
     public const int MaxPlayers = 10;
     public const int MaxRemoteSlots = 10;
     public const int MarioModelIdSize = 8;
+    public const int MarioModelIntentSize = 4 + MarioModelIdSize;
     public const int MarioVoiceEventSize = 12;
     public const int CommMarioVoiceEventsOffset = 862;
     public const int CommMarioVoiceEventsSize = MarioVoiceEventSize * (MaxRemoteSlots + 1);
@@ -29,7 +37,8 @@ public static class ProtocolConstants
     public const int CommMarioModelIdsSize = MarioModelIdSize * (MaxRemoteSlots + 1);
     public const int CommBufferSize = CommMarioModelIdsOffset + CommMarioModelIdsSize;
     public const int RosterEntrySize = 30; // slot(1)+name(16)+stage(1)+ep(1)+state(1)+ping(2)+modelId(8)
-    public const int JoinRequestSize = 16 + MarioModelIdSize;
+    // name(16)+modelId(8)+modBuildId(2)
+    public const int JoinRequestSize = 16 + MarioModelIdSize + 2;
     public const int WorldEventClientPayloadSize = 15;
     public const int WorldEventBroadcastPayloadSize = 17;
     public const int CommNameTagAppearancesOffset = 752;
@@ -40,6 +49,12 @@ public static class ProtocolConstants
     public const int CommRemoteSnapshotsSize = PlayerSnapshotSize * MaxRemoteSlots;
     public const int UdpSnapshotPayloadOffset = 10;
     public const int PlayerSnapshotSize = 64;
+    // Batched server fanout: magic(4)+id(1)+count(1), then
+    // slot(1)+source sequence(4)+snapshot(64) per player.
+    public const int UdpSnapshotBatchHeaderSize = 6;
+    public const int UdpSnapshotBatchEntrySize = 1 + 4 + PlayerSnapshotSize;
+    public const int UdpSnapshotBatchMaxSize =
+        UdpSnapshotBatchHeaderSize + UdpSnapshotBatchEntrySize * StableMaxPlayers;
     public const int UdpPingPayloadSize = 8;
     // Must fit the worst-case sparse authority snapshot (collectibles + every durable
     // card bit + stage-scoped trigger bits). 32 KiB truncated the tail — exactly where
@@ -87,6 +102,12 @@ public enum TcpPacketId : byte
     WorldStateReplay = 18,
     /// <summary>Client asks server to rebroadcast authoritative collectible state.</summary>
     WorldProgressRequest = 19,
+    /// <summary>
+    /// Client immediately announces its desired Mario model. Unknown TCP ids are
+    /// ignored by v2 peers, so heartbeat advertisement remains a safe fallback
+    /// without changing protocol or CommBuffer versions.
+    /// </summary>
+    MarioModelIntent = 20,
 }
 
 public enum UdpPacketId : byte
@@ -130,6 +151,8 @@ public enum BridgeFlags : uint
     SyncSecret = 1 << 9,
     SyncObjects = 1 << 10,
     SyncProgress = 1 << 11,
+    /// Module requests an immediate WorldProgress snapshot (e.g. co-op same-stage death reload).
+    RequestProgress = 1 << 12,
     WarpToPoint = 1 << 13,
     WarpAll = 1 << 14,
 }
@@ -185,4 +208,5 @@ public enum WorldEventType : byte
     MarioFruitSync = 15,
     NpcReact = 16,
     NpcCleaned = 17,
+    GraffitiCleaned = 18,
 }

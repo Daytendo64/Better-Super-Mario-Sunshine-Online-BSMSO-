@@ -28,6 +28,7 @@ public sealed class DolphinBridge : IDisposable
                  ProtocolConstants.CommGameModeStateSize];
     private readonly byte[] _incomingWorldEventScratch = new byte[ProtocolConstants.CommWorldEventSize];
     private readonly byte[] _localPendingClearScratch = new byte[ProtocolConstants.CommWorldEventSize];
+    private readonly byte[] _localPendingReadScratch = new byte[ProtocolConstants.CommWorldEventSize];
     private readonly byte[] _marioModelIdsScratch = new byte[ProtocolConstants.CommMarioModelIdsSize];
     private readonly byte[] _lastRemoteSyncSnapName =
         new byte[ProtocolConstants.CommRemoteSnapshotsSize + ProtocolConstants.CommNameTagAppearancesSize];
@@ -650,6 +651,22 @@ public sealed class DolphinBridge : IDisposable
         }
     }
 
+    public bool TryWriteRosterHudOnly(in CommRosterHudSync rosterHud)
+    {
+        lock (_processLock)
+        {
+            if (_processHandle == IntPtr.Zero)
+                return false;
+
+            if (!_mailbox.IsResolved && !TryResolveMailboxAddressLocked())
+                return false;
+
+            var bytes = CommBufferEndian.ToRosterHudSyncDolphinBytes(rosterHud);
+            var address = new UIntPtr(MailboxHost.ToUInt64() + ProtocolConstants.CommRosterHudOffset);
+            return TryWriteProcessMemoryLocked(address, bytes);
+        }
+    }
+
     public bool TryWriteMarioModelIdsOnly(byte[] localModelId, byte[] remoteModelIds)
     {
         lock (_processLock)
@@ -744,6 +761,59 @@ public sealed class DolphinBridge : IDisposable
             Array.Clear(_localPendingClearScratch, 0, _localPendingClearScratch.Length);
             var address = new UIntPtr(MailboxHost.ToUInt64() + ProtocolConstants.CommWorldSyncOffset);
             return TryWriteProcessMemoryLocked(address, _localPendingClearScratch);
+        }
+    }
+
+    /// <summary>
+    /// Lightweight re-read of localPending only. Used after TryClearLocalPendingWorldEvent so
+    /// the same poll can drain a graffiti backlog if the module already flushed the next event.
+    /// </summary>
+    public bool TryReadLocalPendingWorldEvent(out CommWorldEvent worldEvent)
+    {
+        worldEvent = default;
+        lock (_processLock)
+        {
+            if (_processHandle == IntPtr.Zero)
+                return false;
+
+            if (!_mailbox.IsResolved && !TryResolveMailboxAddressLocked())
+                return false;
+
+            var address = new UIntPtr(MailboxHost.ToUInt64() + ProtocolConstants.CommWorldSyncOffset);
+            if (!NativeMethods.ReadProcessMemory(
+                    _processHandle,
+                    address,
+                    _localPendingReadScratch,
+                    _localPendingReadScratch.Length,
+                    out int read) ||
+                read != _localPendingReadScratch.Length)
+            {
+                return false;
+            }
+
+            worldEvent = CommBufferEndian.ReadWorldEventFromDolphinBytes(_localPendingReadScratch);
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Zeroes the incoming world-event slot in Dolphin RAM. Used when an authority resync
+    /// replaces pending delivery so a previously stuck durable event cannot block live
+    /// shine/blue ownership applies forever.
+    /// </summary>
+    public bool TryClearIncomingWorldEvent()
+    {
+        lock (_processLock)
+        {
+            if (_processHandle == IntPtr.Zero)
+                return false;
+
+            if (!_mailbox.IsResolved && !TryResolveMailboxAddressLocked())
+                return false;
+
+            Array.Clear(_incomingWorldEventScratch, 0, _incomingWorldEventScratch.Length);
+            var address = new UIntPtr(MailboxHost.ToUInt64() + ProtocolConstants.CommIncomingWorldEventOffset);
+            return TryWriteProcessMemoryLocked(address, _incomingWorldEventScratch);
         }
     }
 

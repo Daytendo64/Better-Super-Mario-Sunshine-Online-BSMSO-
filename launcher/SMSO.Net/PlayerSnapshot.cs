@@ -50,8 +50,14 @@ public struct PlayerSnapshot
     public string GetPureName()
     {
         if (Name == null || Name.Length == 0) return string.Empty;
-        int len = Array.IndexOf(Name, (byte)0);
-        if (len < 0) len = Name.Length;
+        var marker = Name.Length >= 16 ? Name[15] : (byte)0;
+        var limit = Name.Length;
+        if (NameTagColorCodec.HasAppearanceMarker(marker))
+            limit = Math.Min(limit, NameTagColorCodec.GetNameTextByteLimit(marker));
+
+        int len = 0;
+        while (len < limit && Name[len] != 0)
+            ++len;
         return System.Text.Encoding.UTF8.GetString(Name, 0, len);
     }
 

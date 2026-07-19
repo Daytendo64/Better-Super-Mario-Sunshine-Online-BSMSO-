@@ -181,7 +181,10 @@
       "courseId": 14,
       "displayName": "Sirena Beach \u2014 Casino Delfino",
       "warpable": true,
-      "episodes": [{ "episodeId": 0, "displayName": "Episode 1 \u2014 The Secret of Casino Delfino" }]
+      "episodes": [
+        { "episodeId": 0, "displayName": "Episode 1 \u2014 The Secret of Casino Delfino" },
+        { "episodeId": 1, "displayName": "Episode 2 \u2014 King Boo Down Below (Casino)" }
+      ]
     },
     {
       "courseId": 50,

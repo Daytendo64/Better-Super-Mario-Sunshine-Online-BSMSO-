@@ -1,6 +1,7 @@
 #include "remote_actor.hpp"
 #include "blooper_surf_sync.hpp"
 #include "fruit_sync.hpp"
+#include "graffiti_clean_sync.hpp"
 #include "remote_mario_audio.hpp"
 #include "world_sync.hpp"
 #include "comm_buffer.hpp"
@@ -22,6 +23,7 @@ class JKRHeap;
 #include <Dolphin/OS.h>
 #include <Dolphin/string.h>
 #include <math.h>
+#include <SMS/Camera/PolarSubCamera.hxx>
 #include <SMS/Manager/MarioParticleManager.hxx>
 #include <SMS/Manager/ModelWaterManager.hxx>
 #include <SMS/MSound/MSound.hxx>
@@ -53,6 +55,7 @@ class JKRHeap;
 extern TMarDirector *gpMarDirector;
 extern TMario *gpMarioAddress;
 extern TMap *gpMap;
+extern CPolarSubCamera *gpCamera;
 extern MSound *gpMSound;
 extern TModelWaterManager *gpModelWaterManager;
 
@@ -71,8 +74,9 @@ static const char kPlayerGroupName[] =
     "\x83\x76\x83\x8C\x81\x5B\x83\x84\x81\x5B\x83\x4F\x83\x8B\x81\x5B\x83\x76";
 
 // Full TMario puppets are heavy (model + ~199 anims + cap + Yoshi), ~612 KiB each
-// in practice. We pre-spawn the pool staggered (at most 1 body per frame) on hub /
-// loading / early gameplay so stage entry never pays 9× initValues in one hitch.
+// in practice. We pre-spawn a three-body spare pool on hub/loading and grow it
+// on demand (at most 1 body per frame), avoiding both first-join work and a
+// nine-body startup burst.
 // Bodies + pack buffers live on the expanded-MEM1 remote heap and are kept across
 // stage exits while BF_CONNECTED — only perform-group membership is cleared.
 // A full MAX_PLAYERS session has MAX_PLAYERS-1 remotes (one body per remote
@@ -85,7 +89,40 @@ static const char kPlayerGroupName[] =
 // a dense 0..MAX_PLAYERS-2 range. Slot 9 must be addressable when localSlot != 9.
 // kSessionMaxRemotes is the expected BODY COUNT (local left null), not the array size.
 constexpr u32 kSessionMaxRemotes = MAX_PLAYERS - 1;
-constexpr size_t kRemoteBodySpawnMinFree = 0x00090000u;
+// Observed TMario graphs consume ~612 KiB. Reserve 704 KiB so initValues plus
+// the custom BTK/MActor tail cannot exhaust the body heap or spill elsewhere.
+constexpr size_t kRemoteBodySpawnMinFree = 0x000B0000u;
+// Keep a small retail spare pool for immediate joins instead of allocating all
+// nine heavy TMarios before anyone needs them. Additional bodies are prepared
+// on demand, one at a time.
+constexpr u32 kBaselinePrewarmBodies = 3;
+// Ready-cache parking for prepared + demoted arena-backed graphs. Sized above
+// the honest body-heap soft limit (~7 MiB / 768 KiB ≈ 9 arenas) so mid-stage
+// never needs freeAll to admit a new identity — soft-defer when RAM is full.
+constexpr u32 kReadyCustomBodyCapacity = 16;
+// Soft A↔B retention hint (per-slot variant table). Never triggers mid-stage
+// teardown; excess graphs stay parked until stage-boundary heap recycle.
+constexpr u32 kRecentBodyVariantCapacity = 2;
+// Child ExpHeap arenas hold one replacement TMario graph. Mid-stage never
+// freeAll / ~TMario / destroy arenas — only stage-boundary recycle may. Live
+// pool arenas are never freeAll'd while still referenced by gBodyPool / an actor.
+constexpr size_t kRemoteBodyArenaBytes = 0x000C0000u; // 768 KiB
+// Two preferred staging arenas created at stage start. Once a graph is born
+// into one, that arena stays occupied until stage recycle; further identities
+// allocate additional child ExpHeaps while the body heap has room.
+constexpr u32 kBodyPingPongArenaCount = 2;
+// Main-heap prewarm / first-residency bodies have no child arena. They are never
+// scrub-and-forgotten mid-stage; demotion parks them here until stage recycle.
+constexpr u32 kMainHeapParkedSpareCapacity = MAX_REMOTE_SLOTS;
+constexpr u8 kReadyBodyActivationDelayTicks = 2;
+// Legacy demotion delay (unused for mid-stage freeAll — reclaim is stage-only).
+// Kept so stamp/log paths remain stable if a future stage-pass needs pacing.
+constexpr u32 kBodyGraphReclaimDelayTicks = 6;
+// Separate expensive archive/body phases so joins cannot create a burst of
+// consecutive heavy frames even when several identities arrive together.
+constexpr u8 kHeavyPreparationSpacingFrames = 6;
+constexpr f32 kPreparationIdleSpeedSq = 4.0f * 4.0f;
+constexpr u8 kSafePreparationIdleFrames = 8;
 // Dolphin expanded MEM1 (48 MiB) puppet+pack arena. Retail SMS only configures
 // CPU BATs for the stock 24 MiB, so this region faults until we map it
 // (see ensureExtendedMem1Mapping).
@@ -105,6 +142,13 @@ constexpr size_t kRemoteBodySpawnMinFree = 0x00090000u;
 constexpr u32 kRemoteActorExpandedHeapAddress = 0x81810000u;
 constexpr size_t kRemoteActorExpandedHeapSize = 0x017E0000u; // 23.875 MiB → 0x82FF0000
 constexpr size_t kRemoteActorExpandedHeapSizeFallback = 0x00780000u; // 7.5 MiB proven
+// Full arena: 16.5 MiB immutable packs + 7.375 MiB bodies/J3D. This admits ten
+// typical ~1.6 MiB roster archives while reserving >11 conservative 640 KiB
+// body graphs. Worst-case 2 MiB packs soft-fail after eight entries.
+constexpr size_t kRemotePackHeapSize = 0x01080000u;
+// Fallback arena: 2.25 MiB packs + 5.25 MiB bodies. It intentionally admits
+// one worst-case custom archive and about seven conservative body graphs.
+constexpr size_t kRemotePackHeapSizeFallback = 0x00240000u;
 // Only attempt the extended arena when Dolphin actually backs >24 MiB of MEM1.
 constexpr u32 kMinMem1ForExpandedHeap = 0x02800000u; // 40 MiB
 constexpr u32 kMem1CachedEnd = 0x83000000u;          // 48 MiB ceiling
@@ -133,7 +177,9 @@ constexpr u32 kStateSideFlipEnd = 0x0C000233u;
 constexpr u16 kAnimSideFlipAir = 0xBF;  // ANIM_TJMP1
 constexpr u16 kAnimSideFlipLand = 0xBE; // ANIM_TJMP2
 constexpr s16 kModelFaceHalfTurn = 0x8000;
-constexpr u8 kFluddSprayEmitHz = 30; // remote FLUDD spray + turbo dash particles (~30 Hz)
+// ModelWater droplet emit is LOD-exempt and always runs at full game rate (60 Hz).
+// Sound / mist JPA may still use a lighter cadence below.
+constexpr u8 kFluddSprayEmitHz = 60;
 constexpr u8 kFluddSprayEmitInterval = 60 / kFluddSprayEmitHz;
 constexpr u8 kFluddSpraySoundHz = 30;
 constexpr u8 kFluddSpraySoundInterval = 60 / kFluddSpraySoundHz;
@@ -174,6 +220,7 @@ static bool ensureRemoteActorHeap();
 static void dismissRemoteBody(u8 slotIndex, RemoteActorSlot &slot);
 static void removeBodyFromViewList(TMario *body);
 static void parkRemoteBody(TMario *body);
+static void detachBodyBeforeReclaim(TMario *body);
 
 static u32 stripSurfDrawFlag(u32 state) {
     return state & ~smso::kBlooperSurfDrawFlag;
@@ -242,16 +289,56 @@ constexpr u32 kStateDisappear = 0x0000133Fu;
 constexpr u32 kStateWait = 0x0C400201u;
 constexpr u16 kAnimWarpOutGate = 0x12Eu;
 constexpr u16 kAnimWarpOutAlt = 0x13Bu;
-// doldecomp TMario::warpOut() case 1 waits 0xB4 frames before rolling (kind 2 appear).
-constexpr u16 kStageAppearHideFrames = 0xB4u;
 // doldecomp TMario::warpIn() after warpInEffect: mWarpInBallsTime (70) + mWarpInCapturedTime (120).
 constexpr u16 kWarpInAppearHideFrames = 190u;
 constexpr u8 kShirtShapeIndex = 10u;
 constexpr s16 kSpinYawStepPerFrame = 4096; // retail rotating()/rotateJumping() use mStatusTimer * 0x1000
-constexpr f32 kRemoteMotionSnapDistance = 4.0f;
+// SMS world coordinates move by tens of units per frame. A four-unit threshold
+// treated ordinary running as a teleport and repeatedly bypassed smoothing.
+constexpr f32 kRemoteMotionSnapDistance = 700.0f;
 constexpr f32 kRemotePositionBlendRate = 24.0f;
 constexpr f32 kRemoteVelocityBlendRate = 20.0f;
 constexpr f32 kRemoteRotationBlendRate = 30.0f;
+// Visual scheduling is deliberately separate from snapshot/state application.
+// Visible remotes never drop below a 30 Hz sampled pose, while their cached pose
+// is re-rooted at render rate below. Off-screen remotes can use the cheaper 15 Hz
+// cadence. The enter/exit gap prevents a remote near the quality boundary from
+// alternating tiers as either player moves.
+constexpr f32 kRemoteFullRateEnterDistanceSq = 2600.0f * 2600.0f;
+constexpr f32 kRemoteFullRateExitDistanceSq = 3400.0f * 3400.0f;
+constexpr f32 kRemoteShadowDistanceSq = 4500.0f * 4500.0f;
+constexpr u8 kRemoteOffscreenGraceFrames = 6;
+constexpr u8 kRemoteFullAnimInterval = 1;
+constexpr u8 kRemoteVisibleAnimInterval = 2;
+constexpr u8 kRemoteOffscreenAnimInterval = 4;
+// Attachment-space contract:
+// - J3D joint matrices are world-space matrices for the last sampled pose, then
+//   re-rooted every rendered frame so translation/rotation stay smooth.
+// - Nametags read the live head joint (same matrix the mesh uses) so the tag
+//   cannot drift above a visible crown from a stale root-local conversion.
+// - contact VFX positions are world-space and never bind to sampled joints.
+constexpr f32 kHeadCrownWorldOffset = 18.0f;
+constexpr f32 kHeadFallbackWorldOffset = 160.0f;
+constexpr f32 kHeadAnchorMaxAboveBody = 220.0f;
+
+constexpr u8 selectRemoteVisualInterval(u8 previousInterval, bool potentiallyOnScreen,
+                                        f32 distanceSq) {
+    if (!potentiallyOnScreen)
+        return kRemoteOffscreenAnimInterval;
+
+    const bool wasFullRate = previousInterval == kRemoteFullAnimInterval;
+    const f32 threshold =
+        wasFullRate ? kRemoteFullRateExitDistanceSq : kRemoteFullRateEnterDistanceSq;
+    return distanceSq <= threshold ? kRemoteFullAnimInterval : kRemoteVisibleAnimInterval;
+}
+
+// Compile-time scheduler coverage: visible far actors stay at 30 Hz, tier
+// hysteresis is stable in both directions, and only hidden actors reach 15 Hz.
+static_assert(selectRemoteVisualInterval(2, true, 2500.0f * 2500.0f) == 1);
+static_assert(selectRemoteVisualInterval(1, true, 3000.0f * 3000.0f) == 1);
+static_assert(selectRemoteVisualInterval(2, true, 3000.0f * 3000.0f) == 2);
+static_assert(selectRemoteVisualInterval(1, true, 3600.0f * 3600.0f) == 2);
+static_assert(selectRemoteVisualInterval(1, false, 1000.0f * 1000.0f) == 4);
 
 constexpr bool kRemoteHotPathOsReport = false; // gate periodic / spammy OSReport in hot paths
 constexpr u32 kVisibilityDiagInterval = 1800;  // 30s @ 60 Hz when hot-path reports enabled
@@ -391,7 +478,6 @@ struct RemoteActorSlot {
     f32 syncAnimRate;
     bool spinYawLatched;
     s16 spinYaw;
-    bool pendingStageAppear;
     bool pendingWarpInVfx;
     bool pendingWarpOutVfx;
     u8 pendingWarpOutKind;
@@ -409,6 +495,18 @@ struct RemoteActorSlot {
     u8 invalidSnapshotStreak;
     f32 remoteSprayPressure;
     bool inWarpTransition;
+    bool renderVisible;
+    bool visualStateDirty;
+    bool visualUpdateThisFrame;
+    bool cosmeticUpdateThisFrame;
+    bool drawShadowThisFrame;
+    u8 visualUpdateInterval;
+    u8 offscreenFrames;
+    u32 lastVisualWorkFrame;
+    Mtx cachedPoseRoot;
+    bool cachedPoseRootValid;
+    u8 pendingContactVfx;
+    Vec pendingContactPos;
     Vec3 targetPos;
     Vec3 targetVel;
     Vec3 displayPos;
@@ -428,13 +526,13 @@ struct RemoteActorSlot {
 };
 
 static RemoteActorSlot gActors[MAX_REMOTE_SLOTS];
+static u32 gRemoteVisualFrame = 0;
+static u32 gRemotePerformBodyCount = 0;
 
 // Pre-spawned remote puppet pool. Adapted from the SMSO 2 design principle in
-// createMarios.c (makeMarios): every remote body is allocated up front while the
-// heap is freshest, then reused. Spawns are staggered (1/frame) and prefer an
-// already-cached custom pack so first-residency need not rebuild. The previous
-// design spawned all 9 bodies in one frame and destroyed the heap every stage
-// exit — both caused multi-frame freezes on join / stage entry.
+// createMarios.c (makeMarios), but bounded to a small spare baseline rather than
+// allocating all nine before the roster is known. Spawns are staggered and
+// prefer an already-cached custom pack so first-residency need not rebuild.
 // Indexed by network slot (0..MAX_REMOTE_SLOTS-1); localSlot entry stays nullptr.
 static TMario *gBodyPool[MAX_REMOTE_SLOTS] = {};
 // Model id that was mounted when each pool body was initValues()'d (empty = retail).
@@ -443,10 +541,72 @@ static char gBodyPoolModelIds[MAX_REMOTE_SLOTS][8] = {};
 static bool gBodyPoolIsCustom[MAX_REMOTE_SLOTS] = {};
 // Capless packs (Yoshi/Birdo): retail hat BMDs stay for initValues; hide meshes.
 static bool gBodyPoolHideCaps[MAX_REMOTE_SLOTS] = {};
+// Superseded / staged bodies are retained for fast A↔B reuse until stage
+// recycle. Mid-stage never teardownRemoteBodyGraph / freeAll / destroy arenas —
+// research proved SMS engine subsystems UAF when TMario arenas are recycled
+// before a stage boundary even after detach + TexAnim + ~TMario.
+// Main-heap prewarm graphs (arena == nullptr) park in gMainHeapParkedSpares.
+struct RemoteBodyVariant {
+    TMario *body;
+    JKRExpHeap *arena;
+    char modelId[MARIO_MODEL_ID_SIZE];
+    bool isCustom;
+    bool hideCaps;
+    u8 readyDelay;
+    u8 ownerSlot;
+    u32 generation;
+    // Stamp-only: mid-stage freeAll is disabled. Stage recycle ignores this.
+    u32 reclaimAfterTick;
+};
+static RemoteBodyVariant gBodyVariants[MAX_REMOTE_SLOTS] = {};
+static RemoteBodyVariant gReadyCustomBodies[kReadyCustomBodyCapacity] = {};
+// Child arenas for live gBodyPool graphs that were built as staged
+// replacements (ready-commit). nullptr means a main-heap prewarm/legacy body.
+static JKRExpHeap *gBodyPoolArenas[MAX_REMOTE_SLOTS] = {};
+// Preferred staging ExpHeaps. Occupied for the rest of the stage once a graph
+// is born into them; additional identities create new child ExpHeaps.
+static JKRExpHeap *gBodyPingPongArenas[kBodyPingPongArenaCount] = {};
+// Non-destroyed main-heap TMario graphs demoted off the live/ready/variant
+// tables. Still module-owned (perform must no-op). Freed only at stage recycle.
+static TMario *gMainHeapParkedSpares[kMainHeapParkedSpareCapacity] = {};
+static u32 gReadyCustomPrewarmCursor = 0;
+static bool gRemoteHeapRecycleOnStageExit = false;
+// Monotonic preload tick (diagnostics / demotion stamps only).
+static u32 gBodyReclaimTick = 1;
+// Heavy-work budget shared by loading prewarm and live first-residency upgrades.
+// These flags accumulate until updateRemoteActors consumes a normal gameplay
+// update, preventing preload + live assignment from both constructing bodies in
+// one video frame. Archive I/O and TMario::initValues are never combined.
+static bool gArchiveLoadAttemptedSinceActorUpdate = false;
+static bool gBodyConstructedSinceActorUpdate = false;
+static bool gFirstVisibleBodyPendingThisUpdate = false;
+static bool gBodyConstructionWindowOpen = false;
+static u8 gHeavyPreparationCooldown = 0;
+static u16 gPreparationIdleWaitFrames = 0;
+constexpr bool bodyConstructionBudgetAvailable(bool bodyConstructed) {
+    return !bodyConstructed;
+}
+static_assert(bodyConstructionBudgetAvailable(false));
+static_assert(!bodyConstructionBudgetAvailable(true));
+
+static bool canConstructRemoteBodyThisUpdate() {
+    return gBodyConstructionWindowOpen &&
+           bodyConstructionBudgetAvailable(gBodyConstructedSinceActorUpdate);
+}
 // Once true for a slot, mid-stage CommBuffer id changes must not rebuild the body
 // until requestRemoteMarioModelReapply (or dismiss / next stage). Cleared when the
 // body is dismissed back to the pool so a later first-residency can re-apply.
 static bool gBodyModelApplied[MAX_REMOTE_SLOTS] = {};
+// Monotonic per-slot request generations cancel stale preparation/activation.
+// Desired ids are mirrored here so a mailbox write is noticed even if the
+// higher-level model-system update and actor update straddle that write.
+static u32 gBodyModelRequestGeneration[MAX_REMOTE_SLOTS] = {};
+static char gBodyRequestedModelIds[MAX_REMOTE_SLOTS][MARIO_MODEL_ID_SIZE] = {};
+static u32 gBodyPreparingGeneration[MAX_REMOTE_SLOTS] = {};
+static char gBodyPreparingModelIds[MAX_REMOTE_SLOTS][MARIO_MODEL_ID_SIZE] = {};
+static u32 gBodyReadyGeneration[MAX_REMOTE_SLOTS] = {};
+static char gBodyReadyModelIds[MAX_REMOTE_SLOTS][MARIO_MODEL_ID_SIZE] = {};
+static u32 gBodyAppliedGeneration[MAX_REMOTE_SLOTS] = {};
 // Frames spent assigned with an empty (retail) id before freezing. Lets a late
 // CommBuffer model-id write win over retail-prewarm without allowing mid-stage
 // hot-swaps after the grace window (reapply still unlocks on a later non-empty id).
@@ -456,6 +616,7 @@ constexpr u8 kRemoteModelRetailGraceFrames = 180; // 3s @ 60 Hz (roster/pack ins
 // do not SMSLoadArchive every frame while still recovering when the pack appears.
 static u8 gBodyModelRetryCooldown[MAX_REMOTE_SLOTS] = {};
 constexpr u8 kRemoteModelRetryCooldownFrames = 45; // 0.75s @ 60 Hz
+constexpr u8 kRemoteModelPendingRetryFrames = 1; // cache readiness polling only
 static u32 gBodyPoolCount = 0;
 // Staggered prewarm: walk slots one spawn per frame until the pool is full.
 static u32 gBodyPoolPrewarmIndex = 0;
@@ -468,7 +629,10 @@ static bool gRemotePerformGroupRegistered = false;
 static bool gReportedMissingPlayerGroup = false;
 static bool gReportedBodyCap = false;
 static JKRHeap *gRemoteActorHeap = nullptr;
+static JKRHeap *gRemoteActorPackHeap = nullptr;
 static bool gRemoteActorHeapOwned = false;
+static u32 gRemoteActorHeapCapacity = 0;
+static u32 gRemoteActorPackHeapCapacity = 0;
 static bool gReportedHeapShortage = false;
 static bool gExpandedHeapFailed = false;
 // Set once an extended-MEM1 data BAT is installed and verified. Persists for the
@@ -479,6 +643,11 @@ static u32 gExtendedMappedEnd = 0; // exclusive end of the verified mapped windo
 static RemoteActorSlot *gRemoteWaistSlot = nullptr;
 
 static u32 gRemotePerformDrawDiag = 0;
+static u32 gModelBuildCount = 0;
+static u32 gModelBuildDeferredCount = 0;
+static u32 gModelPointerCommitCount = 0;
+static u32 gModelBuildMilliseconds = 0;
+static u32 gModelDiagnosticsFrame = 0;
 
 static bool gReportedPerformGroupAllocFail = false;
 
@@ -521,6 +690,7 @@ static JDrama::TViewObjPtrListT<JDrama::TViewObj> *ensureRemotePerformGroup() {
 }
 
 static void clearRemotePerformGroupMembers() {
+    gRemotePerformBodyCount = 0;
     if (!gRemotePerformGroup)
         return;
 
@@ -531,14 +701,7 @@ static void clearRemotePerformGroupMembers() {
 }
 
 static bool remotePerformGroupHasActiveBodies() {
-    if (!gRemotePerformGroup)
-        return false;
-    for (auto it = gRemotePerformGroup->mViewObjList.begin();
-         it != gRemotePerformGroup->mViewObjList.end(); ++it) {
-        if (*it)
-            return true;
-    }
-    return false;
+    return gRemotePerformGroup && gRemotePerformBodyCount != 0;
 }
 
 // Retail only walks perform lists built during preEntry for the Player Group.
@@ -552,9 +715,10 @@ static void mirrorRemotePerformGroup(u32 flags, JDrama::TGraphics *graphics) {
     if (mirrorFlags == 0)
         return;
 
-    // Reset juice draw tint only on the calc pass — later mirror passes (0x4 / 0x200) must
-    // keep the tint until ModelWaterManager draws droplets (doldecomp uses global unk5D5F).
-    if (mirrorFlags & 0x205)
+    // Reset juice draw tint only on the calc bit (0x1). The old `mirrorFlags & 0x205`
+    // also matched draw (0x200) / viewCalc (0x4) and cleared the tint before
+    // ModelWaterManager drew droplets (doldecomp uses global unk5D5F / mWaterCardType).
+    if ((flags & 0x1u) != 0)
         smso::resetRemoteYoshiJuiceDrawTint();
 
     gRemotePerformGroup->perform(mirrorFlags, graphics);
@@ -633,6 +797,17 @@ static bool snapshotPacksWaistPitchForState(u16 vfxFlags, u16 animId, u32 state)
     return smso::isBlooperSurfState(state);
 }
 
+static bool pointerInHeap(const void *ptr, const JKRHeap *heap) {
+    if (!ptr || !heap || !heap->mStart || !heap->mEnd)
+        return false;
+    const u32 p = reinterpret_cast<u32>(ptr);
+    return p >= reinterpret_cast<u32>(heap->mStart) && p < reinterpret_cast<u32>(heap->mEnd);
+}
+
+// ANY module-owned puppet: live pool, demoted variants, ready cache, active
+// actor binding, or resident of a tracked child / ping-pong arena. Demoted
+// graphs must never fall through to retail TMario::perform (BetterSMS player
+// data / gamepad paths) — that is the intermittent mid-stage swap crash.
 static bool isRemoteBody(const TMario *mario) {
     if (!mario)
         return false;
@@ -641,6 +816,28 @@ static bool isRemoteBody(const TMario *mario) {
     // puppets (e.g. slot 9 when local is not 9) are misclassified as local.
     for (u32 i = 0; i < MAX_REMOTE_SLOTS; ++i) {
         if (gBodyPool[i] == mario)
+            return true;
+        if (gBodyVariants[i].body == mario)
+            return true;
+        if (gActors[i].body == mario)
+            return true;
+        if (gBodyPoolArenas[i] && pointerInHeap(mario, gBodyPoolArenas[i]))
+            return true;
+        if (gBodyVariants[i].arena && pointerInHeap(mario, gBodyVariants[i].arena))
+            return true;
+    }
+    for (const auto &ready : gReadyCustomBodies) {
+        if (ready.body == mario)
+            return true;
+        if (ready.arena && pointerInHeap(mario, ready.arena))
+            return true;
+    }
+    for (u32 i = 0; i < kMainHeapParkedSpareCapacity; ++i) {
+        if (gMainHeapParkedSpares[i] == mario)
+            return true;
+    }
+    for (u32 i = 0; i < kBodyPingPongArenaCount; ++i) {
+        if (gBodyPingPongArenas[i] && pointerInHeap(mario, gBodyPingPongArenas[i]))
             return true;
     }
     return false;
@@ -956,16 +1153,18 @@ static void syncRemoteAnimation(TMario *body, RemoteActorSlot *slot, const Playe
     if ((yCam || pumpUpper) && !smso::isBlooperSurfState(body->mState) &&
         !snapshotHostOnYoshi(snap.nozzleId, snap.vfxFlags)) {
         // Y-cam and pump/hold drive the upper (FLUDD pump) BCK authoritatively.
-        // The host packs the upper BCK frame into snap.water EXCEPT while spraying —
-        // while spraying snap.water carries spray pressure (see puppets.cpp), and the
-        // upper frame is packed in the pingMs high byte (upperEnc) instead. Using the
-        // pressure value as a frame is what froze the pump during hover; read the frame
-        // from upperEnc whenever the host is spraying so the pump keeps animating.
+        // While spraying, snap.water carries spray pressure (including under Y-cam /
+        // C-up) so remotes keep nozzle->_378 non-zero for droplet emit. Y-cam pitch
+        // still rides pingMs high — do not reinterpret pressure or pitch as a frame.
         const bool hostSpraying = (snap.vfxFlags & (VFX_WATER_SPRAY | VFX_FLUDD_EMPTY)) != 0;
-        const bool upperFromWater = yCam || (pumpUpper && !hostSpraying);
-        const f32 syncedUpper = upperFromWater
-            ? (static_cast<f32>(snap.water) / 8.0f)
-            : upperFrame;
+        f32 syncedUpper;
+        if (!hostSpraying && (yCam || pumpUpper)) {
+            syncedUpper = static_cast<f32>(snap.water) / 8.0f;
+        } else if (hostSpraying && yCam && slot) {
+            syncedUpper = slot->syncUpperFrame;
+        } else {
+            syncedUpper = upperFrame;
+        }
         body->mModelData->mFrameCtrl[1].mCurFrame = syncedUpper;
         body->mModelData->mFrameCtrl[1].mFrameRate = 0.0f;
         if (slot)
@@ -1211,6 +1410,78 @@ static void advanceRemoteDisplayMotion(RemoteActorSlot &slot, TMario *body) {
         sqrtf(slot.displayVel.x * slot.displayVel.x + slot.displayVel.z * slot.displayVel.z);
 }
 
+static f32 remoteDistanceFromLocalSq(const TMario *body) {
+    if (!body || !gpMarioAddress)
+        return 0.0f;
+    return vecSquareDistance(body->mTranslation, gpMarioAddress->mTranslation);
+}
+
+static bool remotePotentiallyOnScreen(const TMario *body) {
+    if (!body || !gpCamera)
+        return true;
+
+    const Vec world = {body->mTranslation.x, body->mTranslation.y + 100.0f,
+                       body->mTranslation.z};
+    Vec view{};
+    MTXMultVec(gpCamera->mTRSMatrix, &world, &view);
+    if (view.z >= -40.0f)
+        return false;
+
+    // Deliberately wider than the actual projection. This is a conservative
+    // rejection test, not final clipping: camera turns reveal a remote on the
+    // very next update without edge popping.
+    const f32 depth = -view.z;
+    return fabsf(view.x) <= depth * 2.2f + 350.0f &&
+           fabsf(view.y) <= depth * 1.7f + 350.0f;
+}
+
+static bool remoteHasActiveCosmetics(const RemoteActorSlot &slot) {
+    const u16 activeVfx = VFX_WATER_SPRAY | VFX_FLUDD_EMPTY | VFX_HOVER | VFX_ROCKET |
+                          VFX_TURBO | VFX_NOZZLE_SWITCHING | VFX_WET_SLIDE;
+    return (slot.vfxFlags & activeVfx) != 0 || slot.fluddSwitchLatched ||
+           snapshotHostOnYoshi(slot.nozzleId, slot.vfxFlags) ||
+           smso::isBlooperSurfState(slot.body ? slot.body->mState : 0);
+}
+
+static void updateRemoteVisualSchedule(RemoteActorSlot &slot, u8 networkSlot) {
+    TMario *body = slot.body;
+    if (!body)
+        return;
+
+    const f32 distanceSq = remoteDistanceFromLocalSq(body);
+    const bool onScreen = remotePotentiallyOnScreen(body);
+    const bool wasRenderVisible = slot.renderVisible;
+
+    if (onScreen) {
+        slot.offscreenFrames = 0;
+        slot.renderVisible = true;
+    } else {
+        if (slot.offscreenFrames < 0xFF)
+            ++slot.offscreenFrames;
+        // Short hysteresis masks one-frame camera/projection disagreement.
+        if (slot.offscreenFrames >= kRemoteOffscreenGraceFrames)
+            slot.renderVisible = false;
+    }
+
+    u8 interval =
+        selectRemoteVisualInterval(slot.visualUpdateInterval, onScreen, distanceSq);
+    // A just-hidden Yoshi/blooper/hover gets one extra 30 Hz visual tail. This
+    // preserves accessory continuity without paying visible-body draw. FLUDD
+    // ModelWater droplets are NOT coupled here — they use a dedicated 60 Hz tick.
+    if (remoteHasActiveCosmetics(slot) && interval > kRemoteVisibleAnimInterval &&
+        slot.offscreenFrames < kRemoteOffscreenGraceFrames)
+        interval = kRemoteVisibleAnimInterval;
+
+    slot.visualUpdateInterval = interval;
+    const bool staggerDue = ((gRemoteVisualFrame + networkSlot) % interval) == 0;
+    slot.visualUpdateThisFrame =
+        slot.renderVisible &&
+        (staggerDue || slot.visualStateDirty || !wasRenderVisible);
+    slot.cosmeticUpdateThisFrame = slot.visualUpdateThisFrame;
+    slot.drawShadowThisFrame =
+        slot.renderVisible && distanceSq <= kRemoteShadowDistanceSq;
+}
+
 static s16 decodeYCamPitch(u16 vfxFlags) {
     return decodeSnapshotAngle6(unpackVfxAuxAngle(vfxFlags));
 }
@@ -1312,12 +1583,6 @@ static void emitPendingRemoteWarpVfx(TMario *body, RemoteActorSlot *slot) {
         beginRemoteAppearHide(*slot, kWarpInAppearHideFrames);
     }
 
-    if (slot->pendingStageAppear) {
-        slot->pendingStageAppear = false;
-        if (sWarpOutEffect)
-            sWarpOutEffect(body, 2, facing);
-        beginRemoteAppearHide(*slot, kStageAppearHideFrames);
-    }
 }
 
 static void bindModelToJoint(J3DModel *model, Mtx *jointMtx) {
@@ -1553,6 +1818,94 @@ static void remoteCalcAnim(TMario *mario, RemoteActorSlot *slot, JDrama::TGraphi
         smso::updateRemoteBlooperSurfFrame(mario, &slot->surf, graphics);
 
     calcRemoteYoshiAnim(mario, slot ? &slot->yoshi : nullptr);
+}
+
+// On budgeted frames, keep world/root motion smooth while reusing the previous
+// skeletal pose. The expensive J3D animation graph and accessory model calc
+// resume on the slot's staggered visual tick.
+static void captureRemotePoseRoot(TMario *mario, RemoteActorSlot *slot) {
+    if (!mario || !slot || !mario->mModelData || !mario->mModelData->mModel)
+        return;
+    J3DModel *model = mario->mModelData->mModel;
+    MTXCopy(model->mBaseMtx, slot->cachedPoseRoot);
+    slot->cachedPoseRootValid = true;
+}
+
+static void transformCachedModelBase(J3DModel *model, const Mtx delta) {
+    if (!model)
+        return;
+    Mtx moved;
+    MTXConcat(delta, model->mBaseMtx, moved);
+    MTXCopy(moved, model->mBaseMtx);
+}
+
+// J3D joint matrices are already concatenated world matrices. Merely replacing
+// J3DModel::mBaseMtx leaves those matrices at the prior sampled root, which made
+// a 15/30 Hz pose schedule also quantize the entire actor's movement. Re-root
+// the cached pose by newRoot * inverse(oldRoot): O(joints), no BCK evaluation,
+// material animation, particles, or accessory calc. This keeps translation and
+// rotation at render rate while preserving the sampled local skeletal pose.
+static void updateRemoteRootTransform(TMario *mario, RemoteActorSlot *slot) {
+    if (!mario || !slot)
+        return;
+
+    Mtx newRoot;
+    mario->calcBaseMtx(newRoot);
+
+    J3DModel *model =
+        mario->mModelData ? mario->mModelData->mModel : nullptr;
+    if (!model) {
+        slot->cachedPoseRootValid = false;
+        return;
+    }
+
+    if (!slot->cachedPoseRootValid || !model->mJointArray || !model->mModelData ||
+        model->mModelData->mJointNum == 0) {
+        MTXCopy(newRoot, model->mBaseMtx);
+        MTXCopy(newRoot, slot->cachedPoseRoot);
+        slot->cachedPoseRootValid = true;
+        return;
+    }
+
+    Mtx inverseOld;
+    if (MTXInverse(slot->cachedPoseRoot, inverseOld) == 0) {
+        MTXCopy(newRoot, model->mBaseMtx);
+        MTXCopy(newRoot, slot->cachedPoseRoot);
+        return;
+    }
+
+    Mtx delta;
+    MTXConcat(newRoot, inverseOld, delta);
+    for (u16 i = 0; i < model->mModelData->mJointNum; ++i) {
+        Mtx moved;
+        MTXConcat(delta, model->mJointArray[i], moved);
+        MTXCopy(moved, model->mJointArray[i]);
+    }
+    MTXCopy(newRoot, model->mBaseMtx);
+
+    // These models are bound to Mario joints on sampled-pose frames. Carry
+    // their cached world roots with Mario on the intervening frame.
+    transformCachedModelBase(mario->mHandModel2R, delta);
+    transformCachedModelBase(mario->mHandModel2L, delta);
+    transformCachedModelBase(mario->mHandModel3R, delta);
+    transformCachedModelBase(mario->mHandModel3L, delta);
+    transformCachedModelBase(mario->mHandModel4R, delta);
+    if (mario->mCap) {
+        transformCachedModelBase(mario->mCap->mCap1, delta);
+        transformCachedModelBase(mario->mCap->mCap3, delta);
+        transformCachedModelBase(mario->mCap->mDiverHelm, delta);
+        transformCachedModelBase(mario->mCap->maGlass1, delta);
+    }
+
+    // FLUDD's own perform remains budgeted, but its root follows the translated
+    // chest immediately so the pack does not lag one sampled pose behind.
+    if (mario->mFludd) {
+        const u8 chestJoint = mario->mBindBoneIDArray[0];
+        if (chestJoint < model->mModelData->mJointNum)
+            mario->mFludd->setBaseTRMtx(model->mJointArray[chestJoint]);
+    }
+
+    MTXCopy(newRoot, slot->cachedPoseRoot);
 }
 
 static Mtx *getFluddChestMtx(TMario *mario) {
@@ -2247,7 +2600,52 @@ static void syncRemoteContinuousParticles(TMario *body, RemoteActorSlot *slot) {
     }
 }
 
-// One-shot movement VFX — landing puff, ground-pound impact.
+enum PendingContactVfx : u8 {
+    CONTACT_VFX_LANDING = 1 << 0,
+    CONTACT_VFX_GROUND_POUND = 1 << 1,
+};
+
+static void queueRemoteContactVfx(RemoteActorSlot &slot, u8 flags,
+                                  const PlayerSnapshot &snap) {
+    slot.pendingContactVfx = static_cast<u8>(slot.pendingContactVfx | flags);
+    slot.pendingContactPos.x = snap.position.x;
+    slot.pendingContactPos.y = snap.position.y;
+    slot.pendingContactPos.z = snap.position.z;
+}
+
+static void emitPendingRemoteContactVfx(TMario *body, RemoteActorSlot &slot) {
+    const u8 pending = slot.pendingContactVfx;
+    if (!body || pending == 0 || !gpMarioParticleManager)
+        return;
+
+    TVec3f contact = {body->mTranslation.x, slot.pendingContactPos.y,
+                      body->mTranslation.z};
+    if (gpMap) {
+        const TBGCheckData *plane = nullptr;
+        const f32 groundY =
+            gpMap->checkGround(contact.x, body->mTranslation.y + kShadowGroundProbeLift,
+                               contact.z, &plane);
+        if (groundY == groundY && fabsf(groundY - body->mTranslation.y) < 800.0f)
+            contact.y = groundY;
+    }
+
+    // World-position emit is deliberate. TMario::emitParticle and touchdown
+    // helpers bind to the sampled body joints, which can still represent the
+    // preceding airborne pose under temporal LOD.
+    if ((pending & CONTACT_VFX_LANDING) != 0) {
+        gpMarioParticleManager->emit(particles::kJumpLandA, &contact, 0, nullptr);
+        gpMarioParticleManager->emit(particles::kJumpLandB, &contact, 0, nullptr);
+    }
+    if ((pending & CONTACT_VFX_GROUND_POUND) != 0) {
+        gpMarioParticleManager->emit(particles::kHipDropA, &contact, 0, nullptr);
+        gpMarioParticleManager->emit(particles::kHipDropB, &contact, 0, nullptr);
+        gpMarioParticleManager->emit(particles::kHipDropC, &contact, 0, nullptr);
+    }
+    slot.pendingContactVfx = 0;
+}
+
+// One-shot movement VFX — landing puff, ground-pound impact. State edges only
+// enqueue events; world-space emission occurs after render-root interpolation.
 static void syncRemoteParticleEdges(TMario *body, RemoteActorSlot &slot, const PlayerSnapshot &snap) {
     if (!body || !gpMarioParticleManager)
         return;
@@ -2262,10 +2660,8 @@ static void syncRemoteParticleEdges(TMario *body, RemoteActorSlot &slot, const P
     if (prevState != kInvalidTrackState && prevState != state) {
         const bool enteringLand = !isLandSlipState(prevState) && isLandSlipState(state);
         if (slot.wasAirborne && enteringLand) {
-            if (isHeavyLanding(state, prevState))
-                body->strongTouchDownEffect();
-            else
-                body->smallTouchDownEffect();
+            (void)isHeavyLanding(state, prevState);
+            queueRemoteContactVfx(slot, CONTACT_VFX_LANDING, snap);
         }
 
         if (!isTurnState(prevState) && isTurnState(state))
@@ -2279,9 +2675,7 @@ static void syncRemoteParticleEdges(TMario *body, RemoteActorSlot &slot, const P
         }
 
         if (isGroundPoundFallState(prevState) && state == TMario::STATE_SLAM) {
-            body->emitParticle(particles::kHipDropA);
-            body->emitParticle(particles::kHipDropB);
-            body->emitParticle(particles::kHipDropC);
+            queueRemoteContactVfx(slot, CONTACT_VFX_GROUND_POUND, snap);
         }
     }
 
@@ -2348,15 +2742,15 @@ static void syncRemoteSprayPressure(TWaterGun *fludd, RemoteActorSlot &slot, u16
         return;
     }
 
-    const f32 target = decodeSprayPressure(slot.syncedSprayPressure);
-    f32 &sim = slot.remoteSprayPressure;
-    if (target > sim)
-        sim += (target - sim) * 0.65f;
-    else
-        sim = target;
-    if (sim > 1.0f)
-        sim = 1.0f;
-    applyRemoteNozzlePressure(fludd, sim);
+    // Apply host pressure immediately. Ascent smoothing (*0.65) lagged pump-up and
+    // produced a thinner stream than local Mario's live _378 / trigger fill.
+    f32 target = decodeSprayPressure(slot.syncedSprayPressure);
+    if (target > 1.0f)
+        target = 1.0f;
+    if (target < 0.0f)
+        target = 0.0f;
+    slot.remoteSprayPressure = target;
+    applyRemoteNozzlePressure(fludd, target);
 }
 
 static bool shouldEmitRemoteSprayThisFrame(RemoteActorSlot &slot) {
@@ -2523,6 +2917,21 @@ static void emitRemoteWaterDroplets(TWaterGun *fludd, RemoteActorSlot &slot, boo
             break;
         }
     }
+
+    // Drive viewer graffiti assist from the same emit ray as visible droplets.
+    // A later-frame mtx probe alone left assist≈0 while spray VFX hit plaza walls.
+    Mtx *emitMtx = fludd->getEmitMtx(0);
+    if (emitMtx) {
+        const f32 ox = (*emitMtx)[0][3];
+        const f32 oy = (*emitMtx)[1][3];
+        const f32 oz = (*emitMtx)[2][3];
+        if (ox == ox && oy == oy && oz == oz) {
+            const f32 dx = (*emitMtx)[0][2];
+            const f32 dy = (*emitMtx)[1][2];
+            const f32 dz = (*emitMtx)[2][2];
+            smso::notifyRemoteSprayEmit(ox, oy, oz, dx, dy, dz);
+        }
+    }
 }
 
 static bool emitMtxTranslationValid(const Mtx &mtx) {
@@ -2651,9 +3060,9 @@ static void emitRemoteFluddVfx(TMario *body, TWaterGun *fludd, RemoteActorSlot *
     if (fludd->mCurrentWater <= 0)
         return;
 
-    bool emitThisFrame = false;
-    if (slot)
-        emitThisFrame = shouldEmitRemoteSprayThisFrame(*slot);
+    // Turbo particles used to share the 30 Hz shouldEmitRemoteSprayThisFrame gate;
+    // emit every visual frame so turbo spray density matches local.
+    constexpr bool emitThisFrame = true;
 
     if (fludd->mCurrentNozzle == TWaterGun::Turbo) {
         if (body && remoteMarioInWater(body)) {
@@ -2661,10 +3070,8 @@ static void emitRemoteFluddVfx(TMario *body, TWaterGun *fludd, RemoteActorSlot *
             return;
         }
 
-        if (emitThisFrame) {
-            emitRemoteTurboNozzleSpray(fludd);
-            emitRemoteTurboDashBoostVfx(fludd);
-        }
+        emitRemoteTurboNozzleSpray(fludd);
+        emitRemoteTurboDashBoostVfx(fludd);
         if (slot) {
             const u16 prev = slot->lastSoundVfx;
             if (!(prev & VFX_WATER_SPRAY))
@@ -2814,13 +3221,14 @@ static void emitRemoteYoshiJuiceSpray(TMario *body, RemoteActorSlot *slot, u16 v
     stageRemoteYoshiEmitFludd(fludd, pressure, savedFludd);
     syncFluddEmitPosFromMtx(fludd, *tongueMtx);
 
-    const bool emitThisFrame = shouldEmitRemoteSprayThisFrame(*slot);
-    if (emitThisFrame) {
-        if (gpMarioParticleManager)
-            gpMarioParticleManager->emitAndBindToMtxPtr(particles::kWaterSpray, *tongueMtx, 1,
-                                                        fludd->mNozzleList[TWaterGun::Yoshi]);
-        emitRemoteYoshiJuiceDroplets(fludd, pressure, juiceType);
-    }
+    // Match remote FLUDD droplets: emit every visual frame (60 Hz). The old 30 Hz
+    // shouldEmitRemoteSprayThisFrame gate left Yoshi juice half as dense as local.
+    if (gpMarioParticleManager)
+        gpMarioParticleManager->emitAndBindToMtxPtr(particles::kWaterSpray, *tongueMtx, 1,
+                                                    fludd->mNozzleList[TWaterGun::Yoshi]);
+    emitRemoteYoshiJuiceDroplets(fludd, pressure, juiceType);
+    smso::notifyRemoteSprayEmit((*tongueMtx)[0][3], (*tongueMtx)[1][3], (*tongueMtx)[2][3],
+                                (*tongueMtx)[0][2], (*tongueMtx)[1][2], (*tongueMtx)[2][2]);
 
     const u16 prev = slot->lastSoundVfx;
     if (!(prev & VFX_WATER_SPRAY))
@@ -2922,11 +3330,9 @@ static void setBodyVisible(TMario *body, bool visible) {
 static u8 networkSlotOf(const RemoteActorSlot *slot) {
     if (!slot)
         return 0xFF;
-    for (u32 i = 0; i < MAX_REMOTE_SLOTS; ++i) {
-        if (&gActors[i] == slot)
-            return static_cast<u8>(i);
-    }
-    return 0xFF;
+    if (slot < &gActors[0] || slot >= &gActors[MAX_REMOTE_SLOTS])
+        return 0xFF;
+    return static_cast<u8>(slot - &gActors[0]);
 }
 
 // Remote perform bypasses retail Mario draw gating — it must honor appear-hide,
@@ -2934,7 +3340,7 @@ static u8 networkSlotOf(const RemoteActorSlot *slot) {
 // Prior grace fix only cleared attr 0x114; draw still ran because this helper
 // previously only checked appearRevealFrames.
 static bool isRemoteBodyDrawVisible(const RemoteActorSlot *slot) {
-    if (!slot || slot->appearRevealFrames != 0)
+    if (!slot || !slot->renderVisible || slot->appearRevealFrames != 0)
         return false;
 
     const u8 netSlot = networkSlotOf(slot);
@@ -2950,7 +3356,7 @@ static bool isRemoteBodyDrawVisible(const RemoteActorSlot *slot) {
     return true;
 }
 
-static void resetRemoteRuntimeState(RemoteActorSlot &slot, bool stageAppear) {
+static void resetRemoteRuntimeState(RemoteActorSlot &slot) {
     slot.wasYCam = false;
     slot.turnRootLatched = false;
     slot.sideFlipOffsetLatched = false;
@@ -2980,7 +3386,6 @@ static void resetRemoteRuntimeState(RemoteActorSlot &slot, bool stageAppear) {
     slot.syncAnimRate = 1.0f;
     slot.spinYawLatched = false;
     slot.spinYaw = 0;
-    slot.pendingStageAppear = stageAppear;
     slot.pendingWarpInVfx = false;
     slot.pendingWarpOutVfx = false;
     slot.pendingWarpOutKind = 0;
@@ -3000,6 +3405,17 @@ static void resetRemoteRuntimeState(RemoteActorSlot &slot, bool stageAppear) {
     slot.hideSeekSeekerLook = false;
     slot.hideSeekSeekerLookWas = false;
     slot.inWarpTransition = false;
+    slot.renderVisible = true;
+    slot.visualStateDirty = true;
+    slot.visualUpdateThisFrame = true;
+    slot.cosmeticUpdateThisFrame = true;
+    slot.drawShadowThisFrame = true;
+    slot.visualUpdateInterval = 1;
+    slot.offscreenFrames = 0;
+    slot.lastVisualWorkFrame = 0xFFFFFFFFu;
+    slot.cachedPoseRootValid = false;
+    slot.pendingContactVfx = 0;
+    slot.pendingContactPos = {};
     slot.displayMotionInit = false;
     slot.lastAppliedState = kInvalidTrackState;
     slot.lastAppliedAnimId = 0xFFFF;
@@ -3472,19 +3888,47 @@ static bool tryCreateExpandedMem1RemoteHeap() {
         }
 
         JKRHeap *parent = resolveRemoteHeapParent();
-        void *heapStart = reinterpret_cast<void *>(regionStart);
-        JKRHeap *heap = JKRExpHeap::create(heapStart, size, parent, false);
-        if (!heap) {
-            OSReport("[SMSO] Expanded MEM1 heap create FAILED @ 0x%08X size=%u parent=%p\n",
-                     regionStart, static_cast<u32>(size), parent);
+        const size_t packSize =
+            size == kRemoteActorExpandedHeapSize ? kRemotePackHeapSize
+                                                 : kRemotePackHeapSizeFallback;
+        if (packSize >= size || size - packSize < kRemoteBodySpawnMinFree) {
+            OSReport("[SMSO] Expanded MEM1 split invalid total=%u pack=%u\n",
+                     static_cast<u32>(size), static_cast<u32>(packSize));
             continue;
         }
 
-        gRemoteActorHeap = heap;
+        // Construct two non-overlapping JKR heaps directly over the mapped arena.
+        // Neither heap allocates storage from the parent; parent is used only for
+        // JKR disposer ownership. Destroy body first, then pack, at arena teardown.
+        JKRExpHeap *packHeap =
+            JKRExpHeap::create(reinterpret_cast<void *>(regionStart), packSize, parent, false);
+        JKRExpHeap *bodyHeap = nullptr;
+        if (packHeap) {
+            bodyHeap = JKRExpHeap::create(
+                reinterpret_cast<void *>(regionStart + static_cast<u32>(packSize)),
+                size - packSize, parent, false);
+        }
+        if (!packHeap || !bodyHeap) {
+            OSReport("[SMSO] Expanded MEM1 split heap create FAILED @ 0x%08X total=%u "
+                     "pack=%u parent=%p\n",
+                     regionStart, static_cast<u32>(size), static_cast<u32>(packSize), parent);
+            if (bodyHeap)
+                bodyHeap->destroy();
+            if (packHeap)
+                packHeap->destroy();
+            continue;
+        }
+
+        gRemoteActorPackHeap = packHeap;
+        gRemoteActorHeap = bodyHeap;
         gRemoteActorHeapOwned = true;
-        OSReport("[SMSO] Remote actor EXPANDED MEM1 heap created @ %p size=%u heapFree=%u "
+        gRemoteActorPackHeapCapacity = static_cast<u32>(packSize);
+        gRemoteActorHeapCapacity = static_cast<u32>(size - packSize);
+        OSReport("[SMSO] Remote arena split pack=%p/%u (%u free) body=%p/%u (%u free) "
                  "memSize=%u\n",
-                 gRemoteActorHeap, static_cast<u32>(size),
+                 gRemoteActorPackHeap, gRemoteActorPackHeapCapacity,
+                 static_cast<u32>(gRemoteActorPackHeap->getTotalFreeSize()),
+                 gRemoteActorHeap, gRemoteActorHeapCapacity,
                  static_cast<u32>(gRemoteActorHeap->getTotalFreeSize()), memorySize);
         return true;
     }
@@ -3521,24 +3965,106 @@ static bool ensureRemoteActorHeap() {
 }
 
 static void destroyRemoteActorHeap() {
-    if (!gRemoteActorHeap)
+    if (!gRemoteActorHeap && !gRemoteActorPackHeap)
         return;
 
+    // Drop ping-pong children before the parent body heap is destroyed.
+    for (u32 i = 0; i < kBodyPingPongArenaCount; ++i) {
+        if (!gBodyPingPongArenas[i])
+            continue;
+        gBodyPingPongArenas[i]->freeAll();
+        gBodyPingPongArenas[i]->destroy();
+        gBodyPingPongArenas[i] = nullptr;
+    }
+
     if (gRemoteActorHeapOwned) {
-        OSReport("[SMSO] Remote actor heap destroyed @ %p free=%u totalFree=%u\n", gRemoteActorHeap,
-                 static_cast<u32>(gRemoteActorHeap->getFreeSize()),
-                 static_cast<u32>(gRemoteActorHeap->getTotalFreeSize()));
-        static_cast<JKRExpHeap *>(gRemoteActorHeap)->destroy();
+        OSReport("[SMSO] Remote split heaps destroy body=%p free=%u pack=%p free=%u\n",
+                 gRemoteActorHeap,
+                 gRemoteActorHeap ? static_cast<u32>(gRemoteActorHeap->getTotalFreeSize()) : 0,
+                 gRemoteActorPackHeap,
+                 gRemoteActorPackHeap
+                     ? static_cast<u32>(gRemoteActorPackHeap->getTotalFreeSize())
+                     : 0);
+        if (gRemoteActorHeap)
+            static_cast<JKRExpHeap *>(gRemoteActorHeap)->destroy();
+        if (gRemoteActorPackHeap)
+            static_cast<JKRExpHeap *>(gRemoteActorPackHeap)->destroy();
     } else {
         OSReport("[SMSO] Remote actor heap released borrowed heap @ %p\n", gRemoteActorHeap);
     }
     gRemoteActorHeap = nullptr;
+    gRemoteActorPackHeap = nullptr;
     gRemoteActorHeapOwned = false;
+    gRemoteActorHeapCapacity = 0;
+    gRemoteActorPackHeapCapacity = 0;
     gExpandedHeapFailed = false;
 }
 
 static bool modelIdsMatch(const char a[8], const char b[8]) {
     return memcmp(a, b, 8) == 0;
+}
+
+constexpr bool modelGenerationCanCommit(u32 desiredGeneration, u32 readyGeneration,
+                                        bool readyBodyComplete) {
+    return readyBodyComplete && desiredGeneration != 0 &&
+           desiredGeneration == readyGeneration;
+}
+static_assert(modelGenerationCanCommit(7, 7, true));
+static_assert(!modelGenerationCanCommit(8, 7, true));
+static_assert(!modelGenerationCanCommit(7, 7, false));
+
+static void clearRemoteModelPreparationState(u32 slotId) {
+    if (slotId >= MAX_REMOTE_SLOTS)
+        return;
+    gBodyPreparingGeneration[slotId] = 0;
+    memset(gBodyPreparingModelIds[slotId], 0, MARIO_MODEL_ID_SIZE);
+    gBodyReadyGeneration[slotId] = 0;
+    memset(gBodyReadyModelIds[slotId], 0, MARIO_MODEL_ID_SIZE);
+}
+
+static u32 refreshRemoteModelRequest(u32 slotId) {
+    if (slotId >= MAX_REMOTE_SLOTS)
+        return 0;
+    char desired[MARIO_MODEL_ID_SIZE] = {};
+    smso::readMarioModelIdForSlot(slotId, desired);
+    if (!modelIdsMatch(gBodyRequestedModelIds[slotId], desired)) {
+        memcpy(gBodyRequestedModelIds[slotId], desired, MARIO_MODEL_ID_SIZE);
+        ++gBodyModelRequestGeneration[slotId];
+        if (gBodyModelRequestGeneration[slotId] == 0)
+            ++gBodyModelRequestGeneration[slotId];
+        gBodyModelApplied[slotId] = false;
+        gBodyAppliedGeneration[slotId] = 0;
+        clearRemoteModelPreparationState(slotId);
+        gBodyRetailGraceFrames[slotId] = 0;
+        gBodyModelRetryCooldown[slotId] = 0;
+    }
+    return gBodyModelRequestGeneration[slotId];
+}
+
+static void beginRemoteModelRequest(u32 slotId) {
+    if (slotId >= MAX_REMOTE_SLOTS)
+        return;
+    smso::readMarioModelIdForSlot(slotId, gBodyRequestedModelIds[slotId]);
+    ++gBodyModelRequestGeneration[slotId];
+    if (gBodyModelRequestGeneration[slotId] == 0)
+        ++gBodyModelRequestGeneration[slotId];
+    gBodyModelApplied[slotId] = false;
+    gBodyAppliedGeneration[slotId] = 0;
+    clearRemoteModelPreparationState(slotId);
+    gBodyRetailGraceFrames[slotId] = 0;
+    gBodyModelRetryCooldown[slotId] = 0;
+}
+
+static bool remoteModelRequestStillCurrent(u32 slotId,
+                                           const char desired[MARIO_MODEL_ID_SIZE],
+                                           u32 generation) {
+    if (slotId >= MAX_REMOTE_SLOTS ||
+        generation != gBodyModelRequestGeneration[slotId])
+        return false;
+    char live[MARIO_MODEL_ID_SIZE] = {};
+    smso::readMarioModelIdForSlot(slotId, live);
+    return modelIdsMatch(live, desired) &&
+           modelIdsMatch(gBodyRequestedModelIds[slotId], desired);
 }
 
 static void formatModelIdStr(char out[9], const char id[8]) {
@@ -3548,7 +4074,281 @@ static void formatModelIdStr(char out[9], const char id[8]) {
     out[n] = '\0';
 }
 
-static TMario *spawnRemoteBody(u32 archiveSlot, bool bindPack) {
+static void destroyRemoteBodyArena(JKRExpHeap *&arena) {
+    if (!arena)
+        return;
+    // Ping-pong arenas are lifetime-owned by the module — reset in place only.
+    for (u32 i = 0; i < kBodyPingPongArenaCount; ++i) {
+        if (gBodyPingPongArenas[i] == arena) {
+            arena->freeAll();
+            arena = nullptr; // drop alias; ExpHeap object stays in gBodyPingPongArenas
+            return;
+        }
+    }
+    arena->freeAll();
+    arena->destroy();
+    arena = nullptr;
+}
+
+static bool arenaHasLiveOwner(const JKRExpHeap *arena) {
+    if (!arena)
+        return false;
+    for (u32 i = 0; i < MAX_REMOTE_SLOTS; ++i) {
+        if (gBodyPoolArenas[i] == arena)
+            return true;
+    }
+    return false;
+}
+
+// Tear down a parked TMario graph before freeAll. Prefer the real destructor so
+// FLUDD/cap/Yoshi/J3D subsystems release engine registrations; freeAll alone
+// leaves dangling manager pointers that crash on address reuse.
+static void teardownRemoteBodyGraph(TMario *body) {
+    if (!body)
+        return;
+    smso::releaseMarioTexAnims(body);
+    // Clear interaction / accessory aliases before ~TMario so any hooked
+    // paths that still observe this pointer cannot chase into half-destroyed state.
+    body->mHeldObject = nullptr;
+    body->mGrabTarget = nullptr;
+    body->mHolder = nullptr;
+    body->mSurfGesso = nullptr;
+    body->mSurfGessoID = 0;
+    body->mController = nullptr;
+    body->~TMario();
+}
+
+// Park a main-heap (arena == nullptr) TMario as a permanent mid-stage spare.
+// Never scrub-and-forget these graphs: FLUDD/cap/shadow/J3D stay engine-registered
+// until stage-boundary heap recycle. Returns false if the spare table is full
+// (caller must keep the pointer in ready/variant — never ~TMario mid-stage).
+static bool parkMainHeapBodySpare(TMario *body) {
+    if (!body)
+        return true;
+    for (u32 i = 0; i < kMainHeapParkedSpareCapacity; ++i) {
+        if (gMainHeapParkedSpares[i] == body)
+            return true;
+    }
+    for (u32 i = 0; i < kMainHeapParkedSpareCapacity; ++i) {
+        if (gMainHeapParkedSpares[i])
+            continue;
+        detachBodyBeforeReclaim(body);
+        gMainHeapParkedSpares[i] = body;
+        OSReport("[SMSO] Parked main-heap body %p as mid-stage spare[%u]\n", body, i);
+        return true;
+    }
+    return false;
+}
+
+// Keep spare pointers module-owned across stage keep-alive; only hide them.
+static void hideMainHeapParkedSpares() {
+    for (u32 i = 0; i < kMainHeapParkedSpareCapacity; ++i) {
+        if (gMainHeapParkedSpares[i])
+            parkRemoteBody(gMainHeapParkedSpares[i]);
+    }
+}
+
+// Stage-boundary / heap destroy: ~TMario then drop the spare table.
+static void destroyMainHeapParkedSpares() {
+    for (u32 i = 0; i < kMainHeapParkedSpareCapacity; ++i) {
+        TMario *body = gMainHeapParkedSpares[i];
+        if (!body)
+            continue;
+        gMainHeapParkedSpares[i] = nullptr;
+        teardownRemoteBodyGraph(body);
+    }
+}
+
+// freeAll() invalidates the parked TMario*. Custom bodies retain TexBinding
+// entries keyed by that pointer — release + destroy before the arena dies or
+// the next spawn can reuse the address and inherit stale MActor/BTK state.
+// Ping-pong arenas are freeAll'd in place (never destroy mid-stage). Live pool
+// arenas must never reach this path while still indexed by gBodyPoolArenas.
+static void destroyRemoteBodyGraph(TMario *body, JKRExpHeap *&arena) {
+    if (arena && arenaHasLiveOwner(arena)) {
+        OSReport("[SMSO] Refusing freeAll of live pool arena %p body=%p\n", arena, body);
+        if (body)
+            smso::releaseMarioTexAnims(body);
+        // Drop the cache alias only — live owner keeps the ExpHeap.
+        arena = nullptr;
+        return;
+    }
+    if (body)
+        teardownRemoteBodyGraph(body);
+    destroyRemoteBodyArena(arena);
+}
+
+static void removeBodyFromPlayerGroup(TMario *body) {
+    if (!body || !gPlayerGroup)
+        return;
+    for (auto it = gPlayerGroup->mViewObjList.begin();
+         it != gPlayerGroup->mViewObjList.end(); ++it) {
+        if (*it == body) {
+            gPlayerGroup->mViewObjList.erase(it);
+            OSReport("[SMSO] Removed remote body %p from Player group before reclaim\n", body);
+            return;
+        }
+    }
+}
+
+// Hard-detach a body before freeAll. Park alone is insufficient — perform-group
+// membership and leftover interaction pointers can outlive the pointer-only
+// commit that demoted a live graph into a variant/ready cache entry.
+static void detachBodyBeforeReclaim(TMario *body) {
+    if (!body)
+        return;
+    removeBodyFromViewList(body);
+    removeBodyFromPlayerGroup(body);
+    parkRemoteBody(body);
+    body->mHeldObject = nullptr;
+    body->mGrabTarget = nullptr;
+    body->mHolder = nullptr;
+    body->mSurfGesso = nullptr;
+    body->mSurfGessoID = 0;
+    body->mController = nullptr;
+}
+
+static void stampBodyReclaimDelay(RemoteBodyVariant &variant) {
+    if (!variant.body)
+        return;
+    const u32 earliest = gBodyReclaimTick + kBodyGraphReclaimDelayTicks;
+    if (variant.reclaimAfterTick < earliest)
+        variant.reclaimAfterTick = earliest;
+}
+
+static void ensurePingPongArenas() {
+    if (!gRemoteActorHeap || !gRemoteActorHeapOwned)
+        return;
+    for (u32 i = 0; i < kBodyPingPongArenaCount; ++i) {
+        if (gBodyPingPongArenas[i])
+            continue;
+        if (gRemoteActorHeap->getFreeSize() < kRemoteBodyArenaBytes ||
+            gRemoteActorHeap->getTotalFreeSize() < kRemoteBodyArenaBytes)
+            break;
+        gBodyPingPongArenas[i] =
+            JKRExpHeap::create(kRemoteBodyArenaBytes, gRemoteActorHeap, false);
+        if (gBodyPingPongArenas[i])
+            OSReport("[SMSO] Ping-pong body arena[%u] ready @ %p (%u KiB)\n", i,
+                     gBodyPingPongArenas[i],
+                     static_cast<u32>(kRemoteBodyArenaBytes / 1024));
+    }
+}
+
+static bool arenaIsReferencedByBodyCache(const JKRExpHeap *arena) {
+    if (!arena)
+        return false;
+    for (u32 i = 0; i < MAX_REMOTE_SLOTS; ++i) {
+        if (gBodyPoolArenas[i] == arena)
+            return true;
+        if (gBodyVariants[i].arena == arena)
+            return true;
+    }
+    for (const auto &ready : gReadyCustomBodies) {
+        if (ready.arena == arena)
+            return true;
+    }
+    return false;
+}
+
+static JKRExpHeap *acquireRemoteBodyArena() {
+    if (!gRemoteActorHeap || !gRemoteActorHeapOwned)
+        return nullptr;
+
+    ensurePingPongArenas();
+
+    // Prefer a ping-pong arena that is not referenced by live/ready/variant.
+    // Never freeAll mid-stage: occupied graphs stay parked until stage recycle.
+    // Unreferenced ping-pong slots are virgin (stage-init) or already empty.
+    for (u32 i = 0; i < kBodyPingPongArenaCount; ++i) {
+        JKRExpHeap *arena = gBodyPingPongArenas[i];
+        if (!arena || arenaIsReferencedByBodyCache(arena))
+            continue;
+        return arena;
+    }
+
+    // Additional child ExpHeap while the body heap has room. Soft-defer (nullptr)
+    // when RAM is exhausted — keep the current visible model and retry later.
+    if (gRemoteActorHeap->getFreeSize() < kRemoteBodyArenaBytes ||
+        gRemoteActorHeap->getTotalFreeSize() < kRemoteBodyArenaBytes)
+        return nullptr;
+    JKRExpHeap *created =
+        JKRExpHeap::create(kRemoteBodyArenaBytes, gRemoteActorHeap, false);
+    if (created)
+        OSReport("[SMSO] Allocated overflow body arena @ %p (%u KiB; stage-only reclaim)\n",
+                 created, static_cast<u32>(kRemoteBodyArenaBytes / 1024));
+    return created;
+}
+
+static bool bodyIsOnRemoteViewList(const TMario *body) {
+    if (!body || !gRemotePerformGroup)
+        return false;
+    for (auto it = gRemotePerformGroup->mViewObjList.begin();
+         it != gRemotePerformGroup->mViewObjList.end(); ++it) {
+        if (*it == body)
+            return true;
+    }
+    return false;
+}
+
+// True when any live owner still depends on this pointer: pool slot, actor
+// binding, or perform-group view list. Parked ready/variant entries are not
+// "live owners" — reclaim may target those after tex release.
+static bool bodyPointerIsLiveOwner(const TMario *body) {
+    if (!body)
+        return false;
+    for (u32 i = 0; i < MAX_REMOTE_SLOTS; ++i) {
+        if (gBodyPool[i] == body)
+            return true;
+        if (gActors[i].body == body)
+            return true;
+    }
+    return bodyIsOnRemoteViewList(body);
+}
+
+// Duplicate ready/variant refs to one TMario* must never freeAll the graph.
+static bool bodyPointerHeldInOtherCaches(const TMario *body,
+                                         const RemoteBodyVariant *self) {
+    if (!body)
+        return false;
+    for (auto &ready : gReadyCustomBodies) {
+        if (&ready != self && ready.body == body)
+            return true;
+    }
+    for (u32 i = 0; i < MAX_REMOTE_SLOTS; ++i) {
+        if (&gBodyVariants[i] != self && gBodyVariants[i].body == body)
+            return true;
+    }
+    return false;
+}
+
+// Drop a stale cache entry that aliases a live (or otherwise owned) body without
+// freeAll — the surviving owner keeps the arena.
+static void scrubStaleBodyCacheEntry(RemoteBodyVariant &entry) {
+    if (!entry.body && !entry.arena)
+        return;
+    OSReport("[SMSO] Scrubbed stale body cache entry body=%p arena=%p (no freeAll)\n",
+             entry.body, entry.arena);
+    entry = {};
+}
+
+static bool modelIdHasOutstandingRequest(const char id[MARIO_MODEL_ID_SIZE]) {
+    if (!id || marioModelIdIsEmpty(id))
+        return false;
+    for (u32 i = 0; i < MAX_REMOTE_SLOTS; ++i) {
+        if (modelIdsMatch(gBodyRequestedModelIds[i], id) ||
+            modelIdsMatch(gBodyPreparingModelIds[i], id) ||
+            modelIdsMatch(gBodyReadyModelIds[i], id))
+            return true;
+    }
+    return false;
+}
+
+// Forward decls used by spawn (definitions follow hasBodyForModelId).
+static bool isModelDesiredByRemote(const char id[MARIO_MODEL_ID_SIZE]);
+
+static TMario *spawnRemoteBody(u32 archiveSlot, bool bindPack,
+                               const char *explicitCachedModelId = nullptr,
+                               RemoteBodyVariant *outVariant = nullptr) {
     if (!ensureRemoteActorHeap())
         return nullptr;
 
@@ -3584,27 +4384,34 @@ static TMario *spawnRemoteBody(u32 archiveSlot, bool bindPack) {
     // SMSLoadArchive only on cache miss (see syncRemoteMarioArchiveSlot).
     // Prewarm passes bindPack=false so unique lobby packs cannot starve later
     // body slots — first-residency applies custom models once bodies exist.
-    if (bindPack && archiveSlot < MAX_REMOTE_SLOTS)
+    if (!explicitCachedModelId && bindPack && archiveSlot < MAX_REMOTE_SLOTS)
         smso::syncRemoteMarioArchiveSlot(archiveSlot);
-
-    JKRHeap *previousHeap = JKRHeap::sCurrentHeap;
-    gRemoteActorHeap->becomeCurrentHeap();
-
-    auto *body = new (gRemoteActorHeap, 4) TMario();
-    if (!body) {
-        if (previousHeap)
-            previousHeap->becomeCurrentHeap();
-        return nullptr;
-    }
 
     // SMSCoop pattern: mount this network slot's character archive before
     // initValues so BMD/BTK resolve from the correct pack, then restore local.
     // Soft-fail: if remount fails, keep retail mounted and still spawn a body.
-    if (bindPack) {
+    bool mountedCustom = false;
+    char mountedModelId[MARIO_MODEL_ID_SIZE] = {};
+    if (explicitCachedModelId) {
+        memcpy(mountedModelId, explicitCachedModelId, MARIO_MODEL_ID_SIZE);
+        const bool mounted = smso::mountCachedMarioModelPack(explicitCachedModelId);
+        mountedCustom = mounted && !marioModelIdIsEmpty(explicitCachedModelId);
+        if (!mounted) {
+            OSReport("[SMSO] Ready-body cached archive remount failed — prewarm skipped\n");
+            return nullptr;
+        }
+    } else if (bindPack) {
+        // syncRemoteMarioArchiveSlot above snapshots the live id into this slot.
+        // Capture that identity before initValues: the bridge may publish a new
+        // intent while construction runs, but the completed graph still belongs
+        // to the archive that was actually mounted here.
+        smso::readMarioModelIdForSlot(archiveSlot, mountedModelId);
         if (!smso::setActiveMarioArchive(archiveSlot)) {
             OSReport("[SMSO] Remote body slot=%u archive remount failed — spawning with retail\n",
                      archiveSlot);
-        }
+            memset(mountedModelId, 0, MARIO_MODEL_ID_SIZE);
+        } else
+            mountedCustom = smso::marioSlotHasCustomPack(archiveSlot);
     } else {
         // Force retail for pool prewarm so body count is deterministic and pack
         // loads cannot starve later slots. First-residency applies custom packs.
@@ -3616,12 +4423,53 @@ static TMario *spawnRemoteBody(u32 archiveSlot, bool bindPack) {
         }
     }
 
+    // Allocate only after every fallible archive bind. Previously a failed
+    // ready-pack remount returned after allocating TMario and silently leaked
+    // that object from the body heap.
+    JKRExpHeap *bodyArena = nullptr;
+    JKRHeap *allocHeap = gRemoteActorHeap;
+    if (outVariant && explicitCachedModelId) {
+        // Replacement / ready graphs allocate into child arenas so live
+        // gBodyPool pointers stay allocation-stable. Arenas are never freeAll'd
+        // mid-stage — only stage-boundary recycle returns their RAM.
+        bodyArena = acquireRemoteBodyArena();
+        if (!bodyArena) {
+            gRemoteHeapRecycleOnStageExit = true;
+            OSReport("[SMSO] Soft-defer ready body: body heap cannot allocate arena "
+                     "(keep visible model; stage recycle recovers RAM)\n");
+            smso::restoreLocalMarioArchiveGuarded();
+            return nullptr;
+        }
+        allocHeap = bodyArena;
+    }
+
+    JKRHeap *previousHeap = JKRHeap::sCurrentHeap;
+    allocHeap->becomeCurrentHeap();
+    auto *body = new (allocHeap, 4) TMario();
+    if (!body) {
+        if (bodyArena)
+            destroyRemoteBodyArena(bodyArena);
+        if (previousHeap)
+            previousHeap->becomeCurrentHeap();
+        smso::restoreLocalMarioArchiveGuarded();
+        return nullptr;
+    }
+
     // TMario::initValues fully builds the puppet: it internally calls
     // initModel() and creates the cap, FLUDD, Yoshi, effects, and shadow
     // body (see decomp MarioInit.cpp). Do NOT call initModel separately.
     // initMirrorModel() duplicates a reflection rig and can leave a second FLUDD
     // pack visible on network puppets — skip it for remotes.
+    // Mark the shared heavy-work budget before initValues: even a soft failure
+    // after this point has paid the expensive construction cost.
+    gBodyConstructedSinceActorUpdate = true;
+    gHeavyPreparationCooldown = kHeavyPreparationSpacingFrames;
+    const OSTime constructionStart = OSGetTime();
     body->initValues();
+    const u32 constructionMs =
+        static_cast<u32>(OSTicksToMilliseconds(OSGetTime() - constructionStart));
+    ++gModelBuildCount;
+    gModelBuildMilliseconds += constructionMs;
 
     // Bind custom BTKs while this slot's pack is still mounted — getGlbResource
     // resolves /mario/btk/* from the active volume. Remounting local first would
@@ -3630,17 +4478,16 @@ static TMario *spawnRemoteBody(u32 archiveSlot, bool bindPack) {
     // or system heap — NEVER the stage heap. Stage teardown frees stage allocs
     // while keep-alive pool bodies retain J3D MaterialAnm pointers → UAF crash
     // when more remotes draw after the next stage enter.
-    JKRHeap *texHeap = gRemoteActorHeap;
-    if (!texHeap || texHeap->getTotalFreeSize() < 0x10000u)
-        texHeap = JKRHeap::sSystemHeap;
+    // Texture-animation actors are part of the body graph and must share the
+    // body heap lifetime. Never spill them into system/stage memory.
+    JKRHeap *texHeap = allocHeap;
     if (texHeap)
         texHeap->becomeCurrentHeap();
     else if (previousHeap)
         previousHeap->becomeCurrentHeap();
-    else if (JKRHeap::sSystemHeap)
-        JKRHeap::sSystemHeap->becomeCurrentHeap();
 
-    smso::rebindMarioTexAnimsForSlot(body, static_cast<u8>(archiveSlot));
+    smso::rebindMarioTexAnimsForSlot(
+        body, explicitCachedModelId ? static_cast<u8>(0xFF) : static_cast<u8>(archiveSlot));
 
     if (!smso::restoreLocalMarioArchiveGuarded()) {
         OSReport("[SMSO] Remote body slot=%u post-spawn local restore failed\n", archiveSlot);
@@ -3676,23 +4523,28 @@ static TMario *spawnRemoteBody(u32 archiveSlot, bool bindPack) {
         applyRemoteShirtVisibility(body);
     setBodyVisible(body, false);
 
-    bool hideCaps = false;
-    if (bindPack && archiveSlot < MAX_REMOTE_SLOTS) {
-        char modelId[MARIO_MODEL_ID_SIZE] = {};
-        smso::readMarioModelIdForSlot(archiveSlot, modelId);
-        hideCaps = smso::marioModelIdWantsHiddenCaps(modelId);
-    }
+    const bool hideCaps = mountedCustom &&
+                          smso::marioModelIdWantsHiddenCaps(mountedModelId);
 
-    if (archiveSlot < MAX_REMOTE_SLOTS) {
+    if (outVariant && explicitCachedModelId) {
+        outVariant->body = body;
+        outVariant->arena = bodyArena;
+        memcpy(outVariant->modelId, mountedModelId, MARIO_MODEL_ID_SIZE);
+        outVariant->isCustom = mountedCustom;
+        outVariant->hideCaps = hideCaps;
+        outVariant->ownerSlot = 0xFF;
+        outVariant->generation = 0;
+    } else if (archiveSlot < MAX_REMOTE_SLOTS) {
         if (bindPack) {
-            smso::readMarioModelIdForSlot(archiveSlot, gBodyPoolModelIds[archiveSlot]);
-            gBodyPoolIsCustom[archiveSlot] = smso::marioSlotHasCustomPack(archiveSlot);
-            // Soft-fail mounts retail but CommBuffer still has the custom id — stamp
-            // empty so first-residency keeps retrying instead of "model ok" forever.
-            if (!gBodyPoolIsCustom[archiveSlot]) {
-                memset(gBodyPoolModelIds[archiveSlot], 0, sizeof(gBodyPoolModelIds[archiveSlot]));
-                hideCaps = false;
-            }
+            gBodyPoolIsCustom[archiveSlot] = mountedCustom;
+            // Stamp the archive used for construction, not a potentially newer
+            // mailbox id observed after initValues.
+            if (mountedCustom)
+                memcpy(gBodyPoolModelIds[archiveSlot], mountedModelId,
+                       MARIO_MODEL_ID_SIZE);
+            else
+                memset(gBodyPoolModelIds[archiveSlot], 0,
+                       sizeof(gBodyPoolModelIds[archiveSlot]));
             gBodyPoolHideCaps[archiveSlot] = hideCaps;
         } else {
             memset(gBodyPoolModelIds[archiveSlot], 0, sizeof(gBodyPoolModelIds[archiveSlot]));
@@ -3702,10 +4554,15 @@ static TMario *spawnRemoteBody(u32 archiveSlot, bool bindPack) {
     }
 
     char idStr[9] = {};
-    if (archiveSlot < MAX_REMOTE_SLOTS)
+    if (explicitCachedModelId)
+        formatModelIdStr(idStr, explicitCachedModelId);
+    else if (archiveSlot < MAX_REMOTE_SLOTS)
         formatModelIdStr(idStr, gBodyPoolModelIds[archiveSlot]);
-    OSReport("[SMSO] Remote Mario body spawned @ %p slot=%u model='%s' remoteHeapFree=%u totalFree=%u\n",
-             body, archiveSlot, idStr, static_cast<u32>(gRemoteActorHeap->getFreeSize()),
+    OSReport("[SMSO] Remote Mario body spawned @ %p slot=%u model='%s' ready=%d "
+             "buildMs=%u bodyHeapFree=%u totalFree=%u\n",
+             body, archiveSlot, idStr, explicitCachedModelId ? 1 : 0,
+             constructionMs,
+             static_cast<u32>(gRemoteActorHeap->getFreeSize()),
              static_cast<u32>(gRemoteActorHeap->getTotalFreeSize()));
     return body;
 }
@@ -3747,7 +4604,84 @@ static TMario *acquirePoolBodyForSlot(u32 slotId) {
     TMario *body = gBodyPool[slotId];
     if (body && !isPoolBodyAssigned(body))
         return body;
+
+    // Baseline bodies are prewarmed into whichever network slots are available
+    // before the roster is known. Move an unused retail spare to the joining
+    // slot instead of paying TMario::initValues on first appearance.
+    CommBuffer *buf = getCommBuffer();
+    for (u32 source = 0; source < MAX_REMOTE_SLOTS; ++source) {
+        if (source == slotId || !gBodyPool[source] ||
+            isPoolBodyAssigned(gBodyPool[source]) || gBodyPoolIsCustom[source])
+            continue;
+
+        char announced[MARIO_MODEL_ID_SIZE] = {};
+        smso::readMarioModelIdForSlot(source, announced);
+        const bool sourceLikelyNeeded =
+            buf && (buf->remoteSnapshots[source].connected != 0 ||
+                    !marioModelIdIsEmpty(announced));
+        if (sourceLikelyNeeded)
+            continue;
+
+        body = gBodyPool[source];
+        gBodyPool[slotId] = body;
+        memcpy(gBodyPoolModelIds[slotId], gBodyPoolModelIds[source],
+               MARIO_MODEL_ID_SIZE);
+        gBodyPoolIsCustom[slotId] = gBodyPoolIsCustom[source];
+        gBodyPoolHideCaps[slotId] = gBodyPoolHideCaps[source];
+        gBodyPoolArenas[slotId] = gBodyPoolArenas[source];
+
+        gBodyPool[source] = nullptr;
+        memset(gBodyPoolModelIds[source], 0, MARIO_MODEL_ID_SIZE);
+        gBodyPoolIsCustom[source] = false;
+        gBodyPoolHideCaps[source] = false;
+        gBodyPoolArenas[source] = nullptr;
+        return body;
+    }
     return nullptr;
+}
+
+static bool hasPendingActiveModelUpgrade() {
+    for (u32 i = 0; i < MAX_REMOTE_SLOTS; ++i) {
+        if (!gActors[i].spawned || !gActors[i].body || gBodyModelApplied[i])
+            continue;
+
+        char desired[MARIO_MODEL_ID_SIZE] = {};
+        smso::readMarioModelIdForSlot(i, desired);
+        if (!modelIdsMatch(gBodyPoolModelIds[i], desired))
+            return true;
+        if (!marioModelIdIsEmpty(desired) && !gBodyPoolIsCustom[i])
+            return true;
+    }
+    return false;
+}
+
+static bool isSafeModelPreparationIdleFrame(TMarDirector *director) {
+    // Loading/file-select frames are ideal preparation windows. During normal
+    // play, wait for the local player to settle so synchronous DVD/J3D work is
+    // not inserted into active movement.
+    if (!isStageReady(director) || !gpMarioAddress)
+        return true;
+    const f32 speedSq = gpMarioAddress->mSpeed.x * gpMarioAddress->mSpeed.x +
+                        gpMarioAddress->mSpeed.y * gpMarioAddress->mSpeed.y +
+                        gpMarioAddress->mSpeed.z * gpMarioAddress->mSpeed.z;
+    return speedSq <= kPreparationIdleSpeedSq &&
+           fabsf(gpMarioAddress->mForwardSpeed) <= 4.0f;
+}
+
+static bool hasValidRemoteWaitingForBody(const CommBuffer *buf) {
+    if (!buf)
+        return false;
+    for (u32 i = 0; i < MAX_REMOTE_SLOTS; ++i) {
+        if (i == buf->localSlot || gActors[i].spawned)
+            continue;
+        const PlayerSnapshot &snap = buf->remoteSnapshots[i];
+        if (!isValidSnapshot(snap) || !isSameStage(buf, snap))
+            continue;
+        if (acquirePoolBodyForSlot(i))
+            continue;
+        return true;
+    }
+    return false;
 }
 
 // Allocate at most one remote puppet body per call. Prefer spawning under an
@@ -3777,10 +4711,10 @@ static void prewarmRemoteBodyPoolStep() {
             continue;
         }
 
-        if (gBodyPoolCount >= kSessionMaxRemotes) {
+        if (gBodyPoolCount >= kBaselinePrewarmBodies) {
             gBodyPoolPrewarmComplete = true;
             OSReport("[SMSO] Remote body pool prewarm complete: %u/%u bodies heapFree=%u owned=%d\n",
-                     gBodyPoolCount, kSessionMaxRemotes,
+                     gBodyPoolCount, kBaselinePrewarmBodies,
                      gRemoteActorHeap ? static_cast<u32>(gRemoteActorHeap->getTotalFreeSize()) : 0,
                      gRemoteActorHeapOwned ? 1 : 0);
             return;
@@ -3790,8 +4724,15 @@ static void prewarmRemoteBodyPoolStep() {
         bool bindPack = false;
         char desired[8] = {};
         smso::readMarioModelIdForSlot(i, desired);
-        if (!marioModelIdIsEmpty(desired) && smso::isMarioModelPackCached(desired))
-            bindPack = true;
+        if (!marioModelIdIsEmpty(desired)) {
+            if (smso::isMarioModelPackReadyForBodyInit(desired)) {
+                bindPack = true;
+            } else if (smso::isMarioModelPackCached(desired)) {
+                // The DVD read just completed. Wait for the body-ready delay
+                // instead of constructing retail now and custom again next frame.
+                return;
+            }
+        }
 
         TMario *body = spawnRemoteBody(i, bindPack);
         if (!body) {
@@ -3808,13 +4749,14 @@ static void prewarmRemoteBodyPoolStep() {
 
         OSReport("[SMSO] Remote body pool prewarm step: slot=%u bindPack=%d pool=%u/%u "
                  "heapFree=%u\n",
-                 i, bindPack ? 1 : 0, gBodyPoolCount, kSessionMaxRemotes,
+                 i, bindPack ? 1 : 0, gBodyPoolCount, kBaselinePrewarmBodies,
                  gRemoteActorHeap ? static_cast<u32>(gRemoteActorHeap->getTotalFreeSize()) : 0);
 
-        if (gBodyPoolCount >= kSessionMaxRemotes || gBodyPoolPrewarmIndex >= MAX_REMOTE_SLOTS) {
+        if (gBodyPoolCount >= kBaselinePrewarmBodies ||
+            gBodyPoolPrewarmIndex >= MAX_REMOTE_SLOTS) {
             gBodyPoolPrewarmComplete = true;
             OSReport("[SMSO] Remote body pool prewarm complete: %u/%u bodies heapFree=%u owned=%d\n",
-                     gBodyPoolCount, kSessionMaxRemotes,
+                     gBodyPoolCount, kBaselinePrewarmBodies,
                      gRemoteActorHeap ? static_cast<u32>(gRemoteActorHeap->getTotalFreeSize()) : 0,
                      gRemoteActorHeapOwned ? 1 : 0);
         }
@@ -3824,23 +4766,127 @@ static void prewarmRemoteBodyPoolStep() {
 
     gBodyPoolPrewarmComplete = true;
     OSReport("[SMSO] Remote body pool prewarm complete: %u/%u bodies heapFree=%u owned=%d\n",
-             gBodyPoolCount, kSessionMaxRemotes,
+             gBodyPoolCount, kBaselinePrewarmBodies,
              gRemoteActorHeap ? static_cast<u32>(gRemoteActorHeap->getTotalFreeSize()) : 0,
              gRemoteActorHeapOwned ? 1 : 0);
+}
+
+static bool hasBodyForModelId(const char id[MARIO_MODEL_ID_SIZE]) {
+    for (u32 slot = 0; slot < MAX_REMOTE_SLOTS; ++slot) {
+        if (gBodyPool[slot] && modelIdsMatch(gBodyPoolModelIds[slot], id) &&
+            (marioModelIdIsEmpty(id) || gBodyPoolIsCustom[slot]))
+            return true;
+        const RemoteBodyVariant &variant = gBodyVariants[slot];
+        if (variant.body && modelIdsMatch(variant.modelId, id) &&
+            (marioModelIdIsEmpty(id) || variant.isCustom))
+            return true;
+    }
+    for (const auto &ready : gReadyCustomBodies) {
+        if (ready.body && modelIdsMatch(ready.modelId, id) &&
+            (marioModelIdIsEmpty(id) || ready.isCustom))
+            return true;
+    }
+    return false;
+}
+
+static bool isModelDesiredByRemote(const char id[MARIO_MODEL_ID_SIZE]) {
+    if (!id || marioModelIdIsEmpty(id))
+        return false;
+    CommBuffer *buf = getCommBuffer();
+    if (!buf)
+        return false;
+    for (u32 slot = 0; slot < MAX_REMOTE_SLOTS; ++slot) {
+        if (slot == buf->localSlot)
+            continue;
+        char desired[MARIO_MODEL_ID_SIZE] = {};
+        smso::readMarioModelIdForSlot(slot, desired);
+        if (modelIdsMatch(id, desired))
+            return true;
+    }
+    return false;
+}
+
+static void prewarmReadyCustomBodyStep() {
+    if (!gBodyPoolPrewarmComplete ||
+        gRemoteActorHeapCapacity <
+            kRemoteActorExpandedHeapSize - kRemotePackHeapSize)
+        return;
+
+    // Background look-ahead may occupy only the primary slot. Preserve the
+    // second entry for an active request that supersedes a just-finished body.
+    RemoteBodyVariant *empty =
+        gReadyCustomBodies[0].body ? nullptr : &gReadyCustomBodies[0];
+    if (!empty || !gRemoteActorHeap ||
+        gRemoteActorHeap->getTotalFreeSize() < kRemoteBodySpawnMinFree)
+        return;
+
+    const u32 cacheCount = smso::marioModelPackCacheCount();
+    for (u32 n = 0; n < cacheCount; ++n) {
+        const u32 index = (gReadyCustomPrewarmCursor + n) % cacheCount;
+        char id[MARIO_MODEL_ID_SIZE] = {};
+        if (!smso::readMarioModelPackCacheId(index, id) ||
+            !smso::isMarioModelPackReadyForBodyInit(id) ||
+            !isModelDesiredByRemote(id) || hasBodyForModelId(id))
+            continue;
+
+        gReadyCustomPrewarmCursor = (index + 1) % cacheCount;
+        RemoteBodyVariant ready{};
+        TMario *body = spawnRemoteBody(0xFF, true, id, &ready);
+        if (!body)
+            return;
+        parkRemoteBody(body);
+        ready.readyDelay = kReadyBodyActivationDelayTicks;
+        *empty = ready;
+        char idStr[MARIO_MODEL_ID_SIZE + 1] = {};
+        formatModelIdStr(idStr, id);
+        OSReport("[SMSO] Ready custom body prewarmed id='%s' body=%p heapFree=%u\n", idStr,
+                 body, static_cast<u32>(gRemoteActorHeap->getTotalFreeSize()));
+        return;
+    }
 }
 
 static void resetBodyPoolForFreshHeap() {
     gBodyPoolCount = 0;
     gBodyPoolPrewarmIndex = 0;
     gBodyPoolPrewarmComplete = false;
+    gRemoteHeapRecycleOnStageExit = false;
+    gReadyCustomPrewarmCursor = 0;
+    destroyMainHeapParkedSpares();
+    for (auto &ready : gReadyCustomBodies) {
+        if (ready.body || ready.arena)
+            destroyRemoteBodyGraph(ready.body, ready.arena);
+        ready = {};
+    }
     for (u32 i = 0; i < MAX_REMOTE_SLOTS; ++i) {
+        // Clear live-owner index before teardown so destroyRemoteBodyGraph does
+        // not refuse freeAll of this slot's arena.
+        TMario *poolBody = gBodyPool[i];
+        JKRExpHeap *poolArena = gBodyPoolArenas[i];
         gBodyPool[i] = nullptr;
+        gBodyPoolArenas[i] = nullptr;
+        if (poolBody || poolArena)
+            destroyRemoteBodyGraph(poolBody, poolArena);
         memset(gBodyPoolModelIds[i], 0, sizeof(gBodyPoolModelIds[i]));
         gBodyPoolIsCustom[i] = false;
         gBodyPoolHideCaps[i] = false;
+        if (gBodyVariants[i].body || gBodyVariants[i].arena)
+            destroyRemoteBodyGraph(gBodyVariants[i].body, gBodyVariants[i].arena);
+        gBodyVariants[i] = {};
         gBodyModelApplied[i] = false;
+        gBodyModelRequestGeneration[i] = 0;
+        memset(gBodyRequestedModelIds[i], 0, MARIO_MODEL_ID_SIZE);
+        clearRemoteModelPreparationState(i);
+        gBodyAppliedGeneration[i] = 0;
         gBodyRetailGraceFrames[i] = 0;
         gBodyModelRetryCooldown[i] = 0;
+    }
+    // Destroy fixed ping-pong ExpHeaps (already freeAll'd above when claimed).
+    for (u32 i = 0; i < kBodyPingPongArenaCount; ++i) {
+        if (!gBodyPingPongArenas[i])
+            continue;
+        gBodyPingPongArenas[i]->freeAll();
+        gBodyPingPongArenas[i]->destroy();
+        gBodyPingPongArenas[i] = nullptr;
     }
 }
 
@@ -3855,8 +4901,14 @@ static void prepareSurvivingBodyPoolForNewStage() {
             // Local slot must not keep a remote pool body.
             if (gBodyPool[i]) {
                 parkRemoteBody(gBodyPool[i]);
-                // Body stays allocated (abandoned) until heap destroy — rare localSlot change.
+                // Arena-backed graphs can be reclaimed; main-heap prewarm bodies
+                // stay allocated (abandoned) until heap destroy — rare localSlot change.
+                TMario *localBody = gBodyPool[i];
+                JKRExpHeap *localArena = gBodyPoolArenas[i];
                 gBodyPool[i] = nullptr;
+                gBodyPoolArenas[i] = nullptr;
+                if (localArena)
+                    destroyRemoteBodyGraph(localBody, localArena);
                 if (gBodyPoolCount > 0)
                     --gBodyPoolCount;
             }
@@ -3866,13 +4918,24 @@ static void prepareSurvivingBodyPoolForNewStage() {
         } else if (gBodyPool[i]) {
             parkRemoteBody(gBodyPool[i]);
         }
+        if (gBodyVariants[i].body)
+            parkRemoteBody(gBodyVariants[i].body);
         gBodyModelApplied[i] = false;
+        ++gBodyModelRequestGeneration[i];
+        memset(gBodyRequestedModelIds[i], 0, MARIO_MODEL_ID_SIZE);
+        clearRemoteModelPreparationState(i);
+        gBodyAppliedGeneration[i] = 0;
         gBodyRetailGraceFrames[i] = 0;
         gBodyModelRetryCooldown[i] = 0;
     }
+    for (auto &ready : gReadyCustomBodies) {
+        if (ready.body)
+            parkRemoteBody(ready.body);
+    }
+    hideMainHeapParkedSpares();
 
     // Resume staggered prewarm if the pool still has holes.
-    if (gBodyPoolCount >= kSessionMaxRemotes) {
+    if (gBodyPoolCount >= kBaselinePrewarmBodies) {
         gBodyPoolPrewarmComplete = true;
         gBodyPoolPrewarmIndex = MAX_REMOTE_SLOTS;
     } else {
@@ -3882,6 +4945,415 @@ static void prepareSurvivingBodyPoolForNewStage() {
 
     OSReport("[SMSO] Remote body pool kept across stage (%u bodies, prewarmComplete=%d)\n",
              gBodyPoolCount, gBodyPoolPrewarmComplete ? 1 : 0);
+}
+
+static bool reuseRemoteBodyVariant(u32 slotId, const char desired[MARIO_MODEL_ID_SIZE],
+                                   u32 generation, TMario *&body,
+                                   bool requireCurrentRequest = true) {
+    if (slotId >= MAX_REMOTE_SLOTS || !body)
+        return false;
+
+    RemoteBodyVariant &variant = gBodyVariants[slotId];
+    if (!variant.body || !modelIdsMatch(variant.modelId, desired))
+        return false;
+    if (requireCurrentRequest &&
+        !remoteModelRequestStillCurrent(slotId, desired, generation))
+        return false;
+
+    TMario *previous = body;
+    char previousId[MARIO_MODEL_ID_SIZE] = {};
+    memcpy(previousId, gBodyPoolModelIds[slotId], sizeof(previousId));
+    const bool previousCustom = gBodyPoolIsCustom[slotId];
+    const bool previousHideCaps = gBodyPoolHideCaps[slotId];
+    JKRExpHeap *previousArena = gBodyPoolArenas[slotId];
+
+    // Detach before clearing the pool entry (see reuseReadyCustomBody).
+    removeBodyFromViewList(previous);
+    removeBodyFromPlayerGroup(previous);
+    parkRemoteBody(previous);
+
+    body = variant.body;
+    gBodyPool[slotId] = body;
+    memcpy(gBodyPoolModelIds[slotId], variant.modelId, sizeof(gBodyPoolModelIds[slotId]));
+    gBodyPoolIsCustom[slotId] = variant.isCustom;
+    gBodyPoolHideCaps[slotId] = variant.hideCaps;
+    gBodyPoolArenas[slotId] = variant.arena;
+    // Close the race where perform still observes slot.body == previous after
+    // the pool pointer has already moved (previous is demoted, not retail).
+    for (auto &actor : gActors) {
+        if (actor.body == previous)
+            actor.body = body;
+    }
+
+    if (previousArena) {
+        variant.body = previous;
+        variant.arena = previousArena;
+        memcpy(variant.modelId, previousId, sizeof(variant.modelId));
+        variant.isCustom = previousCustom;
+        variant.hideCaps = previousHideCaps;
+        variant.readyDelay = 0;
+        variant.generation = 0;
+        stampBodyReclaimDelay(variant);
+    } else {
+        // Main-heap prewarm: never ~TMario mid-stage. Prefer permanent spare;
+        // if the spare table is full, keep as a parked variant for ownership.
+        variant = {};
+        if (!parkMainHeapBodySpare(previous)) {
+            variant.body = previous;
+            variant.arena = nullptr;
+            memcpy(variant.modelId, previousId, sizeof(variant.modelId));
+            variant.isCustom = previousCustom;
+            variant.hideCaps = previousHideCaps;
+            variant.readyDelay = 0;
+            variant.generation = 0;
+            stampBodyReclaimDelay(variant);
+            OSReport("[SMSO] Main-heap body %p kept as variant (spare full; "
+                     "stage-only reclaim)\n",
+                     previous);
+        }
+    }
+
+    gBodyModelApplied[slotId] = true;
+    gBodyAppliedGeneration[slotId] = generation;
+    clearRemoteModelPreparationState(slotId);
+    gBodyRetailGraceFrames[slotId] = 0;
+    gBodyModelRetryCooldown[slotId] = 0;
+
+    char idStr[MARIO_MODEL_ID_SIZE + 1] = {};
+    formatModelIdStr(idStr, desired);
+    OSReport("[SMSO] Remote body slot=%u reused cached model id='%s' @ %p "
+             "(allocation-stable swap)\n",
+             slotId, idStr, body);
+    ++gModelPointerCommitCount;
+    return true;
+}
+
+// Mid-stage no-op: TMario body graphs are never torn down until stage recycle.
+// Returns false always so callers soft-defer instead of expecting freed RAM.
+static bool reclaimInactiveBodyGraphs(bool forceNonDesired) {
+    (void)forceNonDesired;
+    static bool sLogged = false;
+    if (!sLogged) {
+        sLogged = true;
+        OSReport("[SMSO] reclaimInactiveBodyGraphs: stage-only policy (no mid-stage "
+                 "freeAll/~TMario)\n");
+    }
+    return false;
+}
+
+static bool ensureReadyCustomBodySlot(RemoteBodyVariant *&outTarget) {
+    outTarget = nullptr;
+    for (auto &entry : gReadyCustomBodies) {
+        if (!entry.body) {
+            outTarget = &entry;
+            return true;
+        }
+    }
+    // Never freeAll to vacate a slot — soft-defer until stage recycle or a
+    // pointer-only commit vacates an entry naturally.
+    (void)reclaimInactiveBodyGraphs(/*forceNonDesired=*/true);
+    return false;
+}
+
+static void ensureVariantCapacityForCommit(u32 slotId) {
+    // Per-slot variant is overwritten on commit; soft retention is advisory only.
+    // Mid-stage never frees other slots' parked graphs to make room.
+    (void)slotId;
+    (void)kRecentBodyVariantCapacity;
+}
+
+static bool reuseReadyCustomBody(u32 slotId, const char desired[MARIO_MODEL_ID_SIZE],
+                                 u32 generation, TMario *&body) {
+    if (slotId >= MAX_REMOTE_SLOTS || !body)
+        return false;
+
+    // Exclusive ready claim: prefer this slot's reserved entry, else an unowned
+    // (prewarm) entry. Never steal a body reserved for a different ownerSlot.
+    RemoteBodyVariant *ready = nullptr;
+    RemoteBodyVariant *unowned = nullptr;
+    for (auto &entry : gReadyCustomBodies) {
+        if (!entry.body || entry.readyDelay != 0)
+            continue;
+        if (!modelIdsMatch(entry.modelId, desired) ||
+            (!marioModelIdIsEmpty(desired) && !entry.isCustom))
+            continue;
+        if (entry.ownerSlot == static_cast<u8>(slotId)) {
+            ready = &entry;
+            break;
+        }
+        if (entry.ownerSlot == 0xFF && !unowned)
+            unowned = &entry;
+    }
+    if (!ready)
+        ready = unowned;
+    if (!ready)
+        return false;
+    if (!remoteModelRequestStillCurrent(slotId, desired, generation))
+        return false;
+
+    // Refuse double ownership: a ready entry must never alias a live pool/actor
+    // body. Scrub the stale cache ref without freeAll (live owner keeps arena).
+    if (bodyPointerIsLiveOwner(ready->body)) {
+        OSReport("[SMSO] Ready body claim refused slot=%u: body %p already live\n",
+                 slotId, ready->body);
+        scrubStaleBodyCacheEntry(*ready);
+        return false;
+    }
+
+    ensureVariantCapacityForCommit(slotId);
+
+    // Reclaim may have invalidated the entry — re-resolve exclusively.
+    ready = nullptr;
+    unowned = nullptr;
+    for (auto &entry : gReadyCustomBodies) {
+        if (!entry.body || entry.readyDelay != 0)
+            continue;
+        if (!modelIdsMatch(entry.modelId, desired) ||
+            (!marioModelIdIsEmpty(desired) && !entry.isCustom))
+            continue;
+        if (bodyPointerIsLiveOwner(entry.body)) {
+            scrubStaleBodyCacheEntry(entry);
+            continue;
+        }
+        if (entry.ownerSlot == static_cast<u8>(slotId)) {
+            ready = &entry;
+            break;
+        }
+        if (entry.ownerSlot == 0xFF && !unowned)
+            unowned = &entry;
+    }
+    if (!ready)
+        ready = unowned;
+    if (!ready)
+        return false;
+
+    // A prepared graph is immutable for its model identity. If a rapid A→B→A→B
+    // sequence made its original request generation stale, re-admit it only
+    // after matching the current desired identity and restamp readiness.
+    ready->ownerSlot = static_cast<u8>(slotId);
+    ready->generation = generation;
+    gBodyReadyGeneration[slotId] = generation;
+    memcpy(gBodyReadyModelIds[slotId], desired, MARIO_MODEL_ID_SIZE);
+    if (!modelGenerationCanCommit(gBodyModelRequestGeneration[slotId],
+                                  gBodyReadyGeneration[slotId], ready->body != nullptr))
+        return false;
+
+    // Take exclusive ownership: remove from global ready BEFORE installing into
+    // the pool so no other slot can claim the same pointer.
+    const RemoteBodyVariant prepared = *ready;
+    *ready = {};
+
+    // Scrub any duplicate ready refs to the claimed pointer (no freeAll).
+    for (auto &entry : gReadyCustomBodies) {
+        if (entry.body == prepared.body)
+            scrubStaleBodyCacheEntry(entry);
+    }
+
+    RemoteBodyVariant &variant = gBodyVariants[slotId];
+    const RemoteBodyVariant displaced = variant;
+
+    TMario *previous = body;
+    JKRExpHeap *previousArena = gBodyPoolArenas[slotId];
+
+    // Hard-detach the demoted live body BEFORE clearing gBodyPool so the hooked
+    // perform path cannot observe a non-owned pointer still on the view list.
+    removeBodyFromViewList(previous);
+    removeBodyFromPlayerGroup(previous);
+    parkRemoteBody(previous);
+
+    if (previousArena) {
+        variant.body = previous;
+        variant.arena = previousArena;
+        memcpy(variant.modelId, gBodyPoolModelIds[slotId], MARIO_MODEL_ID_SIZE);
+        variant.isCustom = gBodyPoolIsCustom[slotId];
+        variant.hideCaps = gBodyPoolHideCaps[slotId];
+        variant.ownerSlot = static_cast<u8>(slotId);
+        variant.generation = 0;
+        variant.readyDelay = 0;
+        stampBodyReclaimDelay(variant);
+    } else {
+        // Main-heap prewarm: permanent spare — never reclaimable mid-stage.
+        variant = {};
+        if (!parkMainHeapBodySpare(previous)) {
+            variant.body = previous;
+            variant.arena = nullptr;
+            memcpy(variant.modelId, gBodyPoolModelIds[slotId], MARIO_MODEL_ID_SIZE);
+            variant.isCustom = gBodyPoolIsCustom[slotId];
+            variant.hideCaps = gBodyPoolHideCaps[slotId];
+            variant.ownerSlot = static_cast<u8>(slotId);
+            variant.generation = 0;
+            variant.readyDelay = 0;
+            stampBodyReclaimDelay(variant);
+            OSReport("[SMSO] Main-heap body %p kept as variant on ready claim "
+                     "(spare full; stage-only reclaim)\n",
+                     previous);
+        }
+    }
+
+    body = prepared.body;
+    gBodyPool[slotId] = body;
+    gBodyPoolArenas[slotId] = prepared.arena;
+    memcpy(gBodyPoolModelIds[slotId], prepared.modelId, MARIO_MODEL_ID_SIZE);
+    gBodyPoolIsCustom[slotId] = prepared.isCustom;
+    gBodyPoolHideCaps[slotId] = prepared.hideCaps;
+    // Atomic with pool install: demoted previous must not remain the actor body
+    // while isRemoteBody(previous) is only true via the variant table.
+    for (auto &actor : gActors) {
+        if (actor.body == previous)
+            actor.body = body;
+    }
+    smso::retargetMarioTexAnimsForSlot(body, static_cast<u8>(slotId));
+
+    // Offer the displaced per-slot variant into the vacated ready slot only when
+    // it is a distinct arena-backed parked graph (not already live elsewhere).
+    // Main-heap displaced graphs go to the permanent spare table instead.
+    if (displaced.body && displaced.body != previous && displaced.body != body &&
+        !bodyPointerIsLiveOwner(displaced.body)) {
+        if (displaced.arena) {
+            *ready = displaced;
+            ready->ownerSlot = 0xFF;
+            ready->generation = 0;
+            ready->readyDelay = 0;
+            smso::retargetMarioTexAnimsForSlot(ready->body, 0xFF);
+            removeBodyFromViewList(ready->body);
+            parkRemoteBody(ready->body);
+        } else if (parkMainHeapBodySpare(displaced.body)) {
+            // parked in spare table
+        } else {
+            // Spare full: park in the vacated ready slot (never ~TMario mid-stage).
+            *ready = displaced;
+            ready->ownerSlot = 0xFF;
+            ready->generation = 0;
+            ready->readyDelay = 0;
+            smso::retargetMarioTexAnimsForSlot(ready->body, 0xFF);
+            removeBodyFromViewList(ready->body);
+            parkRemoteBody(ready->body);
+            OSReport("[SMSO] Main-heap displaced body %p parked in ready "
+                     "(spare full; stage-only reclaim)\n",
+                     displaced.body);
+        }
+    } else if (displaced.body && displaced.body != previous && displaced.body != body) {
+        OSReport("[SMSO] Dropped displaced variant alias body=%p on claim slot=%u\n",
+                 displaced.body, slotId);
+    }
+    parkRemoteBody(body);
+
+    gBodyModelApplied[slotId] = true;
+    gBodyAppliedGeneration[slotId] = generation;
+    clearRemoteModelPreparationState(slotId);
+    gBodyRetailGraceFrames[slotId] = 0;
+    gBodyModelRetryCooldown[slotId] = 0;
+    char idStr[MARIO_MODEL_ID_SIZE + 1] = {};
+    formatModelIdStr(idStr, desired);
+    OSReport("[SMSO] Remote body slot=%u claimed ready model id='%s' @ %p "
+             "(pointer-only commit; no mount/init/allocation)\n",
+             slotId, idStr, body);
+    ++gModelPointerCommitCount;
+    return true;
+}
+
+static bool readyCustomBodyPendingForSlot(u32 slotId,
+                                          const char desired[MARIO_MODEL_ID_SIZE]) {
+    for (const auto &entry : gReadyCustomBodies) {
+        if (!entry.body || !modelIdsMatch(entry.modelId, desired) ||
+            (!marioModelIdIsEmpty(desired) && !entry.isCustom))
+            continue;
+        // Unowned prewarm or this slot's reserved entry satisfies the request.
+        // Another slot's reserved ready is exclusive — do not treat it as ours.
+        if (entry.ownerSlot == 0xFF || entry.ownerSlot == static_cast<u8>(slotId))
+            return true;
+    }
+    return false;
+}
+
+static void queueRequestedReadyBody(u32 slotId,
+                                    const char desired[MARIO_MODEL_ID_SIZE],
+                                    u32 generation) {
+    if (readyCustomBodyPendingForSlot(slotId, desired) ||
+        !canConstructRemoteBodyThisUpdate() || !gRemoteActorHeap)
+        return;
+
+    // Soft RAM limit: never freeAll mid-stage to make room. Keep the live model
+    // visible and retry when a pointer-only commit frees a cache slot or the
+    // player warps (stage recycle recovers all body-heap arenas).
+    if (gRemoteActorHeap->getTotalFreeSize() < kRemoteBodySpawnMinFree ||
+        gRemoteActorHeap->getFreeSize() < kRemoteBodyArenaBytes) {
+        gRemoteHeapRecycleOnStageExit = true;
+        ++gModelBuildDeferredCount;
+        OSReport("[SMSO] Soft-defer ready body queue slot=%u (body heap low; "
+                 "stage-only reclaim)\n",
+                 slotId);
+        return;
+    }
+
+    // Committing a staged replacement parks the current active body. Soft
+    // retention never permanently blocks — OOM soft-defer is the only stop.
+    ensureVariantCapacityForCommit(slotId);
+
+    RemoteBodyVariant *target = nullptr;
+    if (!ensureReadyCustomBodySlot(target) || !target) {
+        // Ready-cache full of parked graphs: keep live model, retry later.
+        gRemoteHeapRecycleOnStageExit = true;
+        ++gModelBuildDeferredCount;
+        OSReport("[SMSO] Soft-defer ready body queue slot=%u (ready cache full; "
+                 "no mid-stage freeAll)\n",
+                 slotId);
+        return;
+    }
+
+    gBodyPreparingGeneration[slotId] = generation;
+    memcpy(gBodyPreparingModelIds[slotId], desired, MARIO_MODEL_ID_SIZE);
+    RemoteBodyVariant ready{};
+    TMario *prewarmed = spawnRemoteBody(0xFF, true, desired, &ready);
+    if (!prewarmed) {
+        gBodyPreparingGeneration[slotId] = 0;
+        memset(gBodyPreparingModelIds[slotId], 0, MARIO_MODEL_ID_SIZE);
+        ++gModelBuildDeferredCount;
+        return;
+    }
+    parkRemoteBody(prewarmed);
+    ready.readyDelay = kReadyBodyActivationDelayTicks;
+    ready.ownerSlot = static_cast<u8>(slotId);
+    ready.generation = generation;
+    *target = ready;
+    gBodyPreparingGeneration[slotId] = 0;
+    memset(gBodyPreparingModelIds[slotId], 0, MARIO_MODEL_ID_SIZE);
+    gBodyReadyGeneration[slotId] = generation;
+    memcpy(gBodyReadyModelIds[slotId], desired, MARIO_MODEL_ID_SIZE);
+    char idStr[MARIO_MODEL_ID_SIZE + 1] = {};
+    formatModelIdStr(idStr, desired);
+    OSReport("[SMSO] Requested ready body queued slot=%u gen=%u id='%s' body=%p "
+             "(activation delayed%s)\n",
+             slotId, generation, idStr, prewarmed,
+             remoteModelRequestStillCurrent(slotId, desired, generation) ? "" : ", stale-cancelled");
+}
+
+static void prewarmRequestedCustomBodyStep() {
+    for (u32 slot = 0; slot < MAX_REMOTE_SLOTS; ++slot) {
+        if (!gActors[slot].spawned || !gActors[slot].body)
+            continue;
+        const u32 generation = refreshRemoteModelRequest(slot);
+        if (gBodyModelApplied[slot])
+            continue;
+        char desired[MARIO_MODEL_ID_SIZE] = {};
+        smso::readMarioModelIdForSlot(slot, desired);
+        // Pointer-only commit paths already cover these identities — do not burn
+        // the shared initValues budget rebuilding a graph that applyRemoteBody*
+        // will freeze or swap without allocation (A↔B variant reuse, or an
+        // already-correct pool body waiting to freeze).
+        if (modelIdsMatch(gBodyPoolModelIds[slot], desired) &&
+            (marioModelIdIsEmpty(desired) || gBodyPoolIsCustom[slot]))
+            continue;
+        const RemoteBodyVariant &variant = gBodyVariants[slot];
+        if (variant.body && modelIdsMatch(variant.modelId, desired) &&
+            (marioModelIdIsEmpty(desired) || variant.isCustom))
+            continue;
+        if (readyCustomBodyPendingForSlot(slot, desired) ||
+            !smso::isMarioModelPackReadyForBodyInit(desired))
+            continue;
+        queueRequestedReadyBody(slot, desired, generation);
+        return; // one TMario::initValues budget per update
+    }
 }
 
 // First stage residency for a remote: ensure the pool body matches the live
@@ -3897,6 +5369,7 @@ static void prepareSurvivingBodyPoolForNewStage() {
 static bool applyRemoteBodyModelOnFirstResidency(u32 slotId, TMario *&body) {
     if (slotId >= MAX_REMOTE_SLOTS || !body)
         return false;
+    const u32 generation = refreshRemoteModelRequest(slotId);
     if (gBodyModelApplied[slotId])
         return true;
 
@@ -3916,26 +5389,18 @@ static bool applyRemoteBodyModelOnFirstResidency(u32 slotId, TMario *&body) {
     if (modelIdsMatch(gBodyPoolModelIds[slotId], desired)) {
         if (!marioModelIdIsEmpty(desired)) {
             // Never SMSLoadArchive on the visibility path — wait for prefetch.
-            if (!smso::isMarioModelPackCached(desired)) {
-                OSReport("[SMSO] Remote body slot=%u first-residency id='%s' pack not cached — "
-                         "keep retail, prefetch will load (retry in %u frames)\n",
-                         slotId, wantStr, kRemoteModelRetryCooldownFrames);
-                gBodyModelRetryCooldown[slotId] = kRemoteModelRetryCooldownFrames;
+            if (!smso::isMarioModelPackReadyForBodyInit(desired)) {
+                gBodyModelRetryCooldown[slotId] = kRemoteModelPendingRetryFrames;
                 return true;
             }
             smso::syncRemoteMarioArchiveSlot(slotId);
             const bool packReady = smso::marioSlotHasCustomPack(slotId);
             if (packReady && gBodyPoolIsCustom[slotId]) {
                 gBodyModelApplied[slotId] = true;
+                gBodyAppliedGeneration[slotId] = generation;
+                clearRemoteModelPreparationState(slotId);
                 gBodyRetailGraceFrames[slotId] = 0;
                 gBodyModelRetryCooldown[slotId] = 0;
-                // Keep-alive stage exit used to wipe TexAnim while bodies survived.
-                // Safety net: rebind if this body lost its Shadow/BTK binding.
-                if (!smso::marioHasTexAnimBinding(body)) {
-                    smso::setActiveMarioArchive(slotId);
-                    smso::rebindMarioTexAnimsForSlot(body, static_cast<u8>(slotId));
-                    smso::restoreLocalMarioArchiveGuarded();
-                }
                 OSReport("[SMSO] Remote body slot=%u first-residency model ok id='%s' (no rebuild)\n",
                          slotId, wantStr);
                 return true;
@@ -3958,6 +5423,8 @@ static bool applyRemoteBodyModelOnFirstResidency(u32 slotId, TMario *&body) {
                 ++gBodyRetailGraceFrames[slotId];
             if (gBodyRetailGraceFrames[slotId] >= kRemoteModelRetailGraceFrames) {
                 gBodyModelApplied[slotId] = true;
+                gBodyAppliedGeneration[slotId] = generation;
+                clearRemoteModelPreparationState(slotId);
                 OSReport("[SMSO] Remote body slot=%u first-residency retail frozen "
                          "(grace=%u, no custom id)\n",
                          slotId, gBodyRetailGraceFrames[slotId]);
@@ -3966,69 +5433,16 @@ static bool applyRemoteBodyModelOnFirstResidency(u32 slotId, TMario *&body) {
         }
     }
 
-    OSReport("[SMSO] Remote body slot=%u first-residency rebuild '%s' -> '%s'\n", slotId, haveStr,
-             wantStr);
-
-    // Need headroom for a fresh body. Keep the existing visible body and retry
-    // when free space returns (e.g. after another slot dismisses).
-    if (!gRemoteActorHeap ||
-        gRemoteActorHeap->getTotalFreeSize() < kRemoteBodySpawnMinFree) {
-        OSReport("[SMSO] Remote body slot=%u first-residency rebuild deferred "
-                 "(heap free=%u < %u) — keeping visible id='%s', retry in %u frames\n",
-                 slotId,
-                 gRemoteActorHeap ? static_cast<u32>(gRemoteActorHeap->getTotalFreeSize()) : 0u,
-                 static_cast<u32>(kRemoteBodySpawnMinFree), haveStr,
-                 kRemoteModelRetryCooldownFrames);
-        gBodyModelRetryCooldown[slotId] = kRemoteModelRetryCooldownFrames;
+    // Repeated toggles should not consume more heap. A superseded body retains
+    // its complete model/FLUDD/cap graph and can be swapped back safely.
+    if (reuseRemoteBodyVariant(slotId, desired, generation, body))
         return true;
-    }
-
-    // Pack must already be cached — never SMSLoadArchive + initValues same frame.
-    if (!marioModelIdIsEmpty(desired) && !smso::isMarioModelPackCached(desired)) {
-        OSReport("[SMSO] Remote body slot=%u first-residency rebuild deferred "
-                 "(pack '%s' not cached yet) — keeping visible id='%s'\n",
-                 slotId, wantStr, haveStr);
-        gBodyModelRetryCooldown[slotId] = kRemoteModelRetryCooldownFrames;
+    if (reuseReadyCustomBody(slotId, desired, generation, body))
         return true;
-    }
-
-    // Remount the joiner's pack (cache hit), then construct a fresh body under it.
-    // The retail-prewarmed body is abandoned in the remote heap until heap destroy
-    // (freed on disconnect) — re-initValues on a live TMario is unsafe.
-    smso::syncRemoteMarioArchiveSlot(slotId);
-    if (!marioModelIdIsEmpty(desired) && !smso::marioSlotHasCustomPack(slotId)) {
-        OSReport("[SMSO] Remote body slot=%u first-residency pack unavailable for '%s' — "
-                 "keeping visible retail, retry in %u frames\n",
-                 slotId, wantStr, kRemoteModelRetryCooldownFrames);
-        gBodyModelRetryCooldown[slotId] = kRemoteModelRetryCooldownFrames;
-        return true;
-    }
-
-    // Desired retail (empty): only rebuild if the pool body is currently custom.
-    // spawnRemoteBody with empty id mounts retail.
-    TMario *fresh = spawnRemoteBody(slotId);
-    if (!fresh) {
-        OSReport("[SMSO] Remote body slot=%u first-residency rebuild failed — keeping "
-                 "visible id='%s', retry in %u frames\n",
-                 slotId, haveStr, kRemoteModelRetryCooldownFrames);
-        gBodyModelRetryCooldown[slotId] = kRemoteModelRetryCooldownFrames;
-        return true;
-    }
-
-    parkRemoteBody(fresh);
-    // Old retail/wrong-id body stays allocated until remote-heap destroy.
-    // Drop its TexAnim binding so rebuilds cannot fill the table with orphans
-    // (Shadow MActors tied to the abandoned TMario* would never draw again).
-    smso::releaseMarioTexAnims(body);
-    if (!gBodyPool[slotId])
-        ++gBodyPoolCount;
-    gBodyPool[slotId] = fresh;
-    body = fresh;
-    gBodyModelApplied[slotId] = true;
-    gBodyRetailGraceFrames[slotId] = 0;
-    gBodyModelRetryCooldown[slotId] = 0;
-    OSReport("[SMSO] Remote body slot=%u first-residency applied id='%s' @ %p\n", slotId, wantStr,
-             body);
+    // All model changes, including custom->retail, prepare off the activation
+    // path. Keep the old body fully visible until a generation-matching body is
+    // complete; this path performs no archive I/O, initValues, or allocation.
+    gBodyModelRetryCooldown[slotId] = kRemoteModelPendingRetryFrames;
     return true;
 }
 
@@ -4041,14 +5455,17 @@ static bool ensureRemoteBody(RemoteActorSlot &slot, u32 slotId) {
             applyRemoteBodyModelOnFirstResidency(slotId, body);
             if (body != prev) {
                 // Swap the live view-list entry so the rebuilt body is drawn.
+                // Demotion paths already remove `prev`; always push the new body.
                 if (slot.inViewList && gRemotePerformGroup) {
                     removeBodyFromViewList(prev);
-                    gRemotePerformGroup->mViewObjList.push_back(body);
+                    if (!bodyIsOnRemoteViewList(body)) {
+                        gRemotePerformGroup->mViewObjList.push_back(body);
+                        ++gRemotePerformBodyCount;
+                    }
                 }
                 parkRemoteBody(prev);
-                smso::releaseMarioTexAnims(prev);
                 slot.body = body;
-                resetRemoteRuntimeState(slot, true);
+                resetRemoteRuntimeState(slot);
                 OSReport("[SMSO] Remote Mario body slot %u swapped to rebuilt @ %p\n", slotId,
                          body);
             }
@@ -4062,11 +5479,14 @@ static bool ensureRemoteBody(RemoteActorSlot &slot, u32 slotId) {
         // if the custom pack is not cached yet, spawn retail and let prefetch +
         // first-residency upgrade on a later frame (never load+init same frame).
         char desired[8] = {};
-        smso::readMarioModelIdForSlot(slotId, desired);
+        const u32 requestedGeneration = refreshRemoteModelRequest(slotId);
+        memcpy(desired, gBodyRequestedModelIds[slotId], MARIO_MODEL_ID_SIZE);
         const bool packCached =
-            marioModelIdIsEmpty(desired) || smso::isMarioModelPackCached(desired);
+            marioModelIdIsEmpty(desired) || smso::isMarioModelPackReadyForBodyInit(desired);
         if (packCached && !marioModelIdIsEmpty(desired))
             smso::syncRemoteMarioArchiveSlot(slotId);
+        if (!canConstructRemoteBodyThisUpdate())
+            return false;
         body = spawnRemoteBody(slotId, packCached && !marioModelIdIsEmpty(desired));
         if (body) {
             parkRemoteBody(body);
@@ -4075,10 +5495,16 @@ static bool ensureRemoteBody(RemoteActorSlot &slot, u32 slotId) {
                 ++gBodyPoolCount;
             }
             if (slotId < MAX_REMOTE_SLOTS) {
+                const u32 currentGeneration = refreshRemoteModelRequest(slotId);
                 // Freeze immediately when we spawned under a known custom pack;
                 // empty / retail-pending stays in grace so a late write can rebuild.
-                if (!marioModelIdIsEmpty(desired) && gBodyPoolIsCustom[slotId]) {
+                if (currentGeneration == requestedGeneration &&
+                    modelIdsMatch(gBodyPoolModelIds[slotId], desired) &&
+                    !marioModelIdIsEmpty(desired) &&
+                    gBodyPoolIsCustom[slotId]) {
                     gBodyModelApplied[slotId] = true;
+                    gBodyAppliedGeneration[slotId] = currentGeneration;
+                    clearRemoteModelPreparationState(slotId);
                     gBodyRetailGraceFrames[slotId] = 0;
                 } else {
                     gBodyModelApplied[slotId] = false;
@@ -4087,7 +5513,31 @@ static bool ensureRemoteBody(RemoteActorSlot &slot, u32 slotId) {
             }
         }
     } else if (slotId < MAX_REMOTE_SLOTS) {
-        applyRemoteBodyModelOnFirstResidency(slotId, body);
+        char desired[MARIO_MODEL_ID_SIZE] = {};
+        smso::readMarioModelIdForSlot(slotId, desired);
+        if (modelIdsMatch(gBodyPoolModelIds[slotId], desired)) {
+            applyRemoteBodyModelOnFirstResidency(slotId, body);
+        } else if (!gBodyPoolIsCustom[slotId]) {
+            // First-visible priority: assign the already-constructed retail
+            // body now. The active-slot path upgrades it atomically on a later
+            // budgeted frame instead of blocking first draw on custom init.
+            gBodyModelApplied[slotId] = false;
+            gBodyModelRetryCooldown[slotId] = 0;
+        } else {
+            // Never flash another player's stale custom model. A cached retail
+            // variant is safe to activate immediately when available.
+            const char retailId[MARIO_MODEL_ID_SIZE] = {};
+            const u32 generation = refreshRemoteModelRequest(slotId);
+            if (reuseRemoteBodyVariant(slotId, retailId, generation, body, false)) {
+                gBodyModelApplied[slotId] = false;
+                gBodyAppliedGeneration[slotId] = 0;
+                gBodyModelRetryCooldown[slotId] = 0;
+            } else {
+                applyRemoteBodyModelOnFirstResidency(slotId, body);
+                if (!modelIdsMatch(gBodyPoolModelIds[slotId], desired))
+                    return false;
+            }
+        }
     }
 
     if (!body) {
@@ -4101,7 +5551,7 @@ static bool ensureRemoteBody(RemoteActorSlot &slot, u32 slotId) {
     slot = {};
     slot.spawned = true;
     slot.body = body;
-    resetRemoteRuntimeState(slot, true);
+    resetRemoteRuntimeState(slot);
     gReportedHeapShortage = false;
     return true;
 }
@@ -4114,6 +5564,8 @@ static void removeBodyFromViewList(TMario *body) {
          it != gRemotePerformGroup->mViewObjList.end(); ++it) {
         if (*it == body) {
             gRemotePerformGroup->mViewObjList.erase(it);
+            if (gRemotePerformBodyCount > 0)
+                --gRemotePerformBodyCount;
             return;
         }
     }
@@ -4149,6 +5601,8 @@ static void dismissRemoteBody(u8 slotIndex, RemoteActorSlot &slot) {
     }
     if (slotIndex < MAX_REMOTE_SLOTS) {
         gBodyModelApplied[slotIndex] = false;
+        ++gBodyModelRequestGeneration[slotIndex];
+        memset(gBodyRequestedModelIds[slotIndex], 0, MARIO_MODEL_ID_SIZE);
         gBodyRetailGraceFrames[slotIndex] = 0;
         gBodyModelRetryCooldown[slotIndex] = 0;
     }
@@ -4156,7 +5610,7 @@ static void dismissRemoteBody(u8 slotIndex, RemoteActorSlot &slot) {
     slot.spawned = false;
     slot.body = nullptr;
     smso::clearRemoteCarriedFruit(slotIndex);
-    resetRemoteRuntimeState(slot, false);
+    resetRemoteRuntimeState(slot);
     resetRemoteMarioVoiceSlot(slotIndex);
 }
 
@@ -4184,6 +5638,7 @@ static void applySnapshotToBody(RemoteActorSlot &slot, const PlayerSnapshot &sna
     const bool tongueTipOffset =
         hostOnYoshi && yoshiTongueIsActive(unpackYoshiTongueState(snap.health));
     const bool heavyDirty = snapshotHeavyDirty(slot, snap);
+    slot.visualStateDirty = slot.visualStateDirty || heavyDirty;
 
     if (!incomingWarp) {
         slot.targetPos = snap.position;
@@ -4283,24 +5738,32 @@ static void applySnapshotToBody(RemoteActorSlot &slot, const PlayerSnapshot &sna
             slot.lastHealth = snap.health;
         }
 
-        if (!(snap.vfxFlags & VFX_Y_CAM)) {
-            const bool sprayingWater = (snap.vfxFlags & VFX_WATER_SPRAY) != 0;
-            const bool drySpray = (snap.vfxFlags & VFX_FLUDD_EMPTY) != 0;
+        // Spray pressure must sync whenever VFX_WATER_SPRAY is set — including
+        // Y-cam (C-up). Previously Y-cam skipped this block so syncedSprayPressure
+        // stayed 0 → nozzle->_378 stayed 0 → visualEmitNozzleDeform emitted nothing.
+        const bool sprayingWater = (snap.vfxFlags & VFX_WATER_SPRAY) != 0;
+        const bool drySpray = (snap.vfxFlags & VFX_FLUDD_EMPTY) != 0;
+        const bool yCam = (snap.vfxFlags & VFX_Y_CAM) != 0;
 
-            if (sprayingWater) {
-                slot.syncedSprayPressure = snap.water;
-                if (slot.lastWaterTank > 0)
-                    body->mFludd->mCurrentWater = slot.lastWaterTank;
-            } else if (drySpray) {
-                slot.lastWaterTank = 0;
-                slot.syncedSprayPressure = 0;
-                body->mFludd->mCurrentWater = 0;
-            } else if (!surfing && netUpper > kUpperStateHoldingPump) {
-                slot.lastWaterTank = snap.water;
-                body->mFludd->mCurrentWater = snap.water;
-            } else {
+        if (sprayingWater) {
+            slot.syncedSprayPressure = snap.water;
+            if (slot.lastWaterTank > 0)
                 body->mFludd->mCurrentWater = slot.lastWaterTank;
+            else if (body->mFludd->mCurrentWater <= 0) {
+                // Mid-spray join / never saw a tank byte — keep emit path alive.
+                TNozzleBase *n = body->mFludd->mNozzleList[body->mFludd->mCurrentNozzle];
+                if (n)
+                    body->mFludd->mCurrentWater = n->mEmitParams.mAmountMax.get();
             }
+        } else if (drySpray) {
+            slot.lastWaterTank = 0;
+            slot.syncedSprayPressure = 0;
+            body->mFludd->mCurrentWater = 0;
+        } else if (yCam) {
+            body->mFludd->mCurrentWater = slot.lastWaterTank;
+        } else if (!surfing && netUpper > kUpperStateHoldingPump) {
+            slot.lastWaterTank = snap.water;
+            body->mFludd->mCurrentWater = snap.water;
         } else {
             body->mFludd->mCurrentWater = slot.lastWaterTank;
         }
@@ -4435,9 +5898,10 @@ static int TMario_perform_remote(TMario *mario, u32 flags, JDrama::TGraphics *gr
     }
 
     RemoteActorSlot *slot = findRemoteSlot(mario);
-    // A pooled body with no slot is parked/idle (only assigned bodies are added
-    // to the remote perform group), and an assigned-but-hidden body must not draw.
-    if (!slot || !slot->visible)
+    // Module-owned but demoted / parked / not the slot's current body: never
+    // fall through to retail perform (BetterSMS player data / gamepad). Active
+    // visible slot bodies keep the remote visual path below.
+    if (!slot || !slot->visible || slot->body != mario)
         return 0;
 
     // Start Tag grace: seekers must not calc/draw/hear remote hiders at all
@@ -4456,20 +5920,51 @@ static int TMario_perform_remote(TMario *mario, u32 flags, JDrama::TGraphics *gr
 
     const bool showFluddOnMarioBack = slot && (slot->vfxFlags & VFX_NO_FLUDD) == 0;
 
-    if (flags & 0x205) {
+    // Local Mario can dispatch separate calc/view/entry passes whose masks all
+    // intersect 0x205. Run remote visual work at most once per game update;
+    // previously the full J3D skeleton path could execute again on later passes.
+    if ((flags & 0x205) && slot->lastVisualWorkFrame != gRemoteVisualFrame) {
+        slot->lastVisualWorkFrame = gRemoteVisualFrame;
         tickRemoteAppearReveal(slot);
-        remoteCalcAnim(mario, slot, graphics);
 
-        emitPendingRemoteWarpVfx(mario, slot);
+        const u16 vfx = slot->vfxFlags;
+        const bool sprayingFludd =
+            (vfx & (VFX_WATER_SPRAY | VFX_FLUDD_EMPTY)) != 0 &&
+            !snapshotHostOnYoshi(slot->nozzleId, vfx);
+        const bool yoshiJuice =
+            snapshotHostOnYoshi(slot->nozzleId, vfx) && smso::remoteBodyRidingYoshi(mario);
+        bool ranBodyVisual = false;
 
-        syncRemoteContinuousParticles(mario, slot);
+        // Body / anim LOD path — distance + on-screen interval only.
+        if (slot->renderVisible) {
+            if (slot->visualUpdateThisFrame) {
+                remoteCalcAnim(mario, slot, graphics);
+                captureRemotePoseRoot(mario, slot);
+                slot->visualStateDirty = false;
+                ranBodyVisual = true;
 
-        if (snapshotHostOnYoshi(slot->nozzleId, slot->vfxFlags) &&
-            smso::remoteBodyRidingYoshi(mario)) {
-            emitRemoteYoshiJuiceSpray(mario, slot, slot->vfxFlags);
-        } else if (showFluddOnMarioBack && mario->mFludd &&
-                   remoteFluddPerformSafe(mario, mario->mFludd)) {
-            const u16 vfx = slot ? slot->vfxFlags : static_cast<u16>(0);
+                emitPendingRemoteWarpVfx(mario, slot);
+                syncRemoteContinuousParticles(mario, slot);
+
+                if (yoshiJuice)
+                    emitRemoteYoshiJuiceSpray(mario, slot, slot->vfxFlags);
+            } else {
+                updateRemoteRootTransform(mario, slot);
+            }
+        } else if (sprayingFludd) {
+            // Offscreen spraying remotes still need a fresh chest/root for emit mtx.
+            updateRemoteRootTransform(mario, slot);
+        }
+
+        // Dedicated 60 Hz FLUDD spray tick — fully exempt from body LOD /
+        // renderVisible / stagger. Nearby and far remotes both emit every frame
+        // while VFX_WATER_SPRAY (or dry pump) is set and the body exists.
+        if (sprayingFludd && showFluddOnMarioBack && mario->mFludd &&
+            remoteFluddPerformSafe(mario, mario->mFludd)) {
+            bindRemoteFludd(mario, slot, vfx, graphics);
+        } else if (ranBodyVisual && showFluddOnMarioBack && mario->mFludd &&
+                   remoteFluddPerformSafe(mario, mario->mFludd) && !yoshiJuice) {
+            // Non-spray FLUDD pose/nozzle follow body visual cadence only.
             bindRemoteFludd(mario, slot, vfx, graphics);
         }
     }
@@ -4478,9 +5973,11 @@ static int TMario_perform_remote(TMario *mario, u32 flags, JDrama::TGraphics *gr
 
     u32 savedSurfState = 0;
     bool strippedSurfDraw = false;
-    // Remote mSurfGesso is an MActor mesh clone, not a live TSurfGesso. Retail calcView /
-    // entryModels would dispatch TSurfGesso::perform through the wrong vtable and crash.
-    if (smso::isBlooperSurfState(mario->mState)) {
+    // Surf draw flag (0x10000) makes retail calcView/entryModels call
+    // MActor::perform(mSurfGesso, 4/0x200). Safe when mSurfGesso is a real SDLModel
+    // clone from SMS_MakeMActorFromSDLModelData. If bind failed (templates not ready /
+    // heap), strip the flag so a null mSurfGesso cannot null-deref in calcView.
+    if (smso::isBlooperSurfState(mario->mState) && !mario->mSurfGesso) {
         savedSurfState = mario->mState;
         mario->mState = stripSurfDrawFlag(savedSurfState);
         strippedSurfDraw = true;
@@ -4527,7 +6024,8 @@ static int TMario_perform_remote(TMario *mario, u32 flags, JDrama::TGraphics *gr
                 mario->mModelData->mModel->lock();
             performRemoteYoshiDraw(mario, flags, graphics, drawBody);
             const u16 vfx = slot ? slot->vfxFlags : static_cast<u16>(0);
-            drawRemoteMarioShadow(mario, vfx);
+            if (slot->drawShadowThisFrame)
+                drawRemoteMarioShadow(mario, vfx);
         }
     }
 
@@ -4608,6 +6106,13 @@ namespace smso {
 
 void initRemoteActors() {
     initBlooperSurfSync();
+    gRemoteVisualFrame = 0;
+    gArchiveLoadAttemptedSinceActorUpdate = false;
+    gBodyConstructedSinceActorUpdate = false;
+    gFirstVisibleBodyPendingThisUpdate = false;
+    gBodyConstructionWindowOpen = false;
+    gHeavyPreparationCooldown = 0;
+    gPreparationIdleWaitFrames = 0;
     gPlayerGroup = nullptr;
     gRemotePerformGroupRegistered = false;
     gRemotePerformDrawDiag = 0;
@@ -4647,7 +6152,15 @@ void initRemoteActors() {
 }
 
 void updateRemoteModelPreload(TMarDirector *director) {
-    (void)director;
+    gBodyConstructionWindowOpen = false;
+    // stageUpdate invokes preload before updateRemoteActors, so this is the
+    // per-video-frame body budget reset even on loading/file-select paths where
+    // actor update is intentionally skipped.
+    gBodyConstructedSinceActorUpdate = false;
+    // Advance reclaim tick every preload so demoted graphs age out even when
+    // construction is deferred (idle wait / heavy cooldown / first-visible).
+    if (++gBodyReclaimTick == 0)
+        gBodyReclaimTick = 1;
     CommBuffer *buf = getCommBuffer();
     if (!buf || buf->magic != COMM_MAGIC)
         return;
@@ -4661,9 +6174,60 @@ void updateRemoteModelPreload(TMarDirector *director) {
     if (!gRemoteActorHeap)
         return;
 
-    // Budget: at most one SMSLoadArchive, then at most one body initValues.
-    smso::prefetchRemoteMarioPacks();
-    prewarmRemoteBodyPoolStep();
+    for (auto &ready : gReadyCustomBodies) {
+        if (ready.body && ready.readyDelay > 0)
+            --ready.readyDelay;
+    }
+
+    // The archive state machine must advance every frame, including active
+    // gameplay. DVD DMA is asynchronous; publication/validation occurs here on
+    // the main thread and never constructs or mounts a body.
+    bool archiveLoadStarted = false;
+    smso::prefetchRemoteMarioPacks(&archiveLoadStarted);
+    gArchiveLoadAttemptedSinceActorUpdate =
+        gArchiveLoadAttemptedSinceActorUpdate || archiveLoadStarted;
+
+    // Body/J3D construction is the remaining indivisible expensive phase.
+    // Loading screens may build immediately; active gameplay requires several
+    // consecutive genuinely idle frames. There is no forced deadline.
+    const bool loadingWindow = !isStageReady(director) || !gpMarioAddress;
+    if (loadingWindow) {
+        gPreparationIdleWaitFrames = kSafePreparationIdleFrames;
+    } else if (isSafeModelPreparationIdleFrame(director)) {
+        if (gPreparationIdleWaitFrames < kSafePreparationIdleFrames)
+            ++gPreparationIdleWaitFrames;
+    } else {
+        gPreparationIdleWaitFrames = 0;
+        ++gModelBuildDeferredCount;
+        return;
+    }
+    if (!loadingWindow && gPreparationIdleWaitFrames < kSafePreparationIdleFrames) {
+        ++gModelBuildDeferredCount;
+        return;
+    }
+    if (gHeavyPreparationCooldown > 0) {
+        --gHeavyPreparationCooldown;
+        return;
+    }
+    gBodyConstructionWindowOpen = true;
+
+    // When a valid live remote has no prebuilt body, first-visible latency wins:
+    // leave this safe window's body budget to updateRemoteActors, which
+    // constructs a retail fallback (or cache-ready custom body).
+    gFirstVisibleBodyPendingThisUpdate =
+        isStageReady(director) && gpMarioAddress && hasValidRemoteWaitingForBody(buf);
+    if (gFirstVisibleBodyPendingThisUpdate)
+        return;
+
+    // A visible retail fallback waiting for its custom body owns the next
+    // construction budget. Do not let unrelated background pool fill delay it.
+    if (hasPendingActiveModelUpgrade()) {
+        prewarmRequestedCustomBodyStep();
+    } else if (!gBodyPoolPrewarmComplete) {
+        prewarmRemoteBodyPoolStep();
+    } else {
+        prewarmReadyCustomBodyStep();
+    }
 }
 
 void updateRemoteActors(TMarDirector *director) {
@@ -4694,6 +6258,10 @@ void updateRemoteActors(TMarDirector *director) {
     if ((buf->bridgeFlags & BF_CONNECTED) == 0) {
         for (u32 i = 0; i < MAX_REMOTE_SLOTS; ++i)
             dismissRemoteBody(static_cast<u8>(i), gActors[i]);
+        gArchiveLoadAttemptedSinceActorUpdate = false;
+        gBodyConstructedSinceActorUpdate = false;
+        gFirstVisibleBodyPendingThisUpdate = false;
+        gBodyConstructionWindowOpen = false;
         return;
     }
 
@@ -4705,6 +6273,7 @@ void updateRemoteActors(TMarDirector *director) {
     // Pack prefetch + staggered body prewarm run from updateRemoteModelPreload
     // (hub / loading / stageUpdate) so this path stays cache-hit / assign-only.
 
+    ++gRemoteVisualFrame;
     for (u32 i = 0; i < MAX_REMOTE_SLOTS; ++i) {
         const PlayerSnapshot &snap = buf->remoteSnapshots[i];
         RemoteActorSlot &slot = gActors[i];
@@ -4729,13 +6298,14 @@ void updateRemoteActors(TMarDirector *director) {
         gReportedBodyCap = false;
 
         if (!slot.visible && !slot.inViewList) {
-            resetRemoteRuntimeState(slot, true);
+            resetRemoteRuntimeState(slot);
             if (kRemoteHotPathOsReport)
                 OSReport("[SMSO] Remote Mario body slot %u activated @ %p\n", i, slot.body);
         }
 
         if (!slot.inViewList) {
             gRemotePerformGroup->mViewObjList.push_back(slot.body);
+            ++gRemotePerformBodyCount;
             slot.inViewList = true;
             if (kRemoteHotPathOsReport)
                 OSReport("[SMSO] Remote Mario body slot %u registered in remote perform group\n", i);
@@ -4749,7 +6319,10 @@ void updateRemoteActors(TMarDirector *director) {
         if (!slot.inWarpTransition)
             advanceRemoteDisplayMotion(slot, slot.body);
 
-        if (slot.appearRevealFrames == 0 && !slot.pendingStageAppear && !slot.pendingWarpInVfx &&
+        updateRemoteVisualSchedule(slot, static_cast<u8>(i));
+        emitPendingRemoteContactVfx(slot.body, slot);
+
+        if (slot.renderVisible && slot.appearRevealFrames == 0 && !slot.pendingWarpInVfx &&
             !shouldSuppressRemoteHiderFromSeekerGrace(static_cast<u8>(i)))
             setBodyVisible(slot.body, true);
         else
@@ -4802,9 +6375,38 @@ void updateRemoteActors(TMarDirector *director) {
                  localSlot, connected, spawned, visible, inView,
                  gBodyPoolCount, kSessionMaxRemotes, heapFree, gRemoteActorHeapOwned ? 1 : 0);
     }
+
+    if (++gModelDiagnosticsFrame >= 600) {
+        gModelDiagnosticsFrame = 0;
+        OSReport("[SMSO] Model body diag builds=%u buildMs=%u deferred=%u commits=%u "
+                 "desired/preparing/ready/applied tracked; bodyFree=%u/%u packFree=%u/%u\n",
+                 gModelBuildCount, gModelBuildMilliseconds, gModelBuildDeferredCount,
+                 gModelPointerCommitCount,
+                 gRemoteActorHeap
+                     ? static_cast<u32>(gRemoteActorHeap->getTotalFreeSize())
+                     : 0,
+                 gRemoteActorHeapCapacity,
+                 gRemoteActorPackHeap
+                     ? static_cast<u32>(gRemoteActorPackHeap->getTotalFreeSize())
+                     : 0,
+                 gRemoteActorPackHeapCapacity);
+    }
+
+    // Consume the cross-phase heavy-work budget. The next preload/actor update
+    // may perform one archive load OR one body construction.
+    gArchiveLoadAttemptedSinceActorUpdate = false;
+    gBodyConstructedSinceActorUpdate = false;
+    gFirstVisibleBodyPendingThisUpdate = false;
+    gBodyConstructionWindowOpen = false;
 }
 
 void clearRemoteActors(bool keepHeapAndPool) {
+    gArchiveLoadAttemptedSinceActorUpdate = false;
+    gBodyConstructedSinceActorUpdate = false;
+    gFirstVisibleBodyPendingThisUpdate = false;
+    gBodyConstructionWindowOpen = false;
+    gHeavyPreparationCooldown = 0;
+    gPreparationIdleWaitFrames = 0;
     gPlayerGroup = nullptr;
     gRemotePerformGroupRegistered = false;
     gRemotePerformDrawDiag = 0;
@@ -4823,10 +6425,17 @@ void clearRemoteActors(bool keepHeapAndPool) {
         for (u32 i = 0; i < MAX_REMOTE_SLOTS; ++i) {
             if (gBodyPool[i])
                 parkRemoteBody(gBodyPool[i]);
+            if (gBodyVariants[i].body)
+                parkRemoteBody(gBodyVariants[i].body);
             gBodyModelApplied[i] = false;
             gBodyRetailGraceFrames[i] = 0;
             gBodyModelRetryCooldown[i] = 0;
         }
+        for (auto &ready : gReadyCustomBodies) {
+            if (ready.body)
+                parkRemoteBody(ready.body);
+        }
+        hideMainHeapParkedSpares();
         gRemoteHeapReserved = true;
         OSReport("[SMSO] Remote actors cleared (heap+pool kept: %u bodies @ %p free=%u)\n",
                  gBodyPoolCount, gRemoteActorHeap,
@@ -4839,6 +6448,10 @@ void clearRemoteActors(bool keepHeapAndPool) {
     destroyRemoteActorHeap();
 }
 
+bool remoteActorHeapNeedsRecycleOnStageExit() {
+    return gRemoteHeapRecycleOnStageExit;
+}
+
 bool isRemoteMarioModelFrozen(u8 slot) {
     return slot < MAX_REMOTE_SLOTS && gBodyModelApplied[slot];
 }
@@ -4846,9 +6459,15 @@ bool isRemoteMarioModelFrozen(u8 slot) {
 void requestRemoteMarioModelReapply(u8 slot) {
     if (slot >= MAX_REMOTE_SLOTS)
         return;
-    gBodyModelApplied[slot] = false;
-    gBodyRetailGraceFrames[slot] = 0;
-    gBodyModelRetryCooldown[slot] = 0;
+    beginRemoteModelRequest(slot);
+}
+
+bool remoteActorReferencesModelId(const char id[8]) {
+    if (!id || marioModelIdIsEmpty(id))
+        return false;
+    if (hasBodyForModelId(id))
+        return true;
+    return modelIdHasOutstandingRequest(id) || isModelDesiredByRemote(id);
 }
 
 bool hasRemoteBodyForSlot(u8 slot) {
@@ -4884,25 +6503,30 @@ bool getRemoteBodyPosition(u8 slot, f32 &x, f32 &y, f32 &z) {
     return true;
 }
 
-static constexpr f32 kHeadCrownWorldOffset = 18.0f;
-static constexpr f32 kHeadFallbackWorldOffset = 232.0f;
-
 bool getRemoteHeadAnchorPosition(u8 slot, f32 &x, f32 &y, f32 &z) {
     if (!hasRemoteBodyForSlotLoose(slot))
         return false;
 
     const TMario *body = gActors[slot].body;
-    if (body->mModelData && body->mModelData->mModel &&
-        body->mModelData->mModel->mJointArray) {
+    if (body->mModelData && body->mModelData->mModel && body->mModelData->mModel->mJointArray &&
+        body->mModelData->mModel->mModelData) {
         const u8 headJoint = body->mBindBoneIDArray[10];
-        const Mtx &headMtx = body->mModelData->mModel->mJointArray[headJoint];
-        const Vec localCrown = {0.0f, kHeadCrownWorldOffset, 0.0f};
-        Vec worldCrown{};
-        MTXMultVec(headMtx, &localCrown, &worldCrown);
-        x = worldCrown.x;
-        y = worldCrown.y;
-        z = worldCrown.z;
-        return x == x && y == y && z == z;
+        if (headJoint < body->mModelData->mModel->mModelData->mJointNum) {
+            const Mtx &headMtx = body->mModelData->mModel->mJointArray[headJoint];
+            const Vec localCrown = {0.0f, kHeadCrownWorldOffset, 0.0f};
+            Vec worldCrown{};
+            MTXMultVec(headMtx, &localCrown, &worldCrown);
+            // Temporal LOD can leave an airborne crown briefly after landing while
+            // the mesh is already rooted to the ground. Cap how far above the body
+            // the tag may sit so it never floats a second Mario-height overhead.
+            const f32 maxY = body->mTranslation.y + kHeadAnchorMaxAboveBody;
+            if (worldCrown.y > maxY)
+                worldCrown.y = maxY;
+            x = worldCrown.x;
+            y = worldCrown.y;
+            z = worldCrown.z;
+            return x == x && y == y && z == z;
+        }
     }
 
     x = body->mTranslation.x;
@@ -4919,8 +6543,32 @@ JKRHeap *borrowRemoteActorHeap() {
     return gRemoteActorHeap;
 }
 
+JKRHeap *borrowRemoteActorPackHeap() {
+    if (!gRemoteHeapReserved) {
+        gRemoteHeapReserved = true;
+        ensureRemoteActorHeap();
+    }
+    return gRemoteActorPackHeap;
+}
+
+u32 remoteActorBodyHeapCapacityBytes() { return gRemoteActorHeapCapacity; }
+u32 remoteActorPackHeapCapacityBytes() { return gRemoteActorPackHeapCapacity; }
+
 bool isRemoteMarioBody(const TMario *mario) {
     return isRemoteBody(mario);
+}
+
+bool shouldUpdateRemoteMarioCosmetics(const TMario *mario) {
+    if (!mario)
+        return false;
+    if (mario == gpMarioAddress)
+        return true;
+    for (u32 i = 0; i < MAX_REMOTE_SLOTS; ++i) {
+        const RemoteActorSlot &slot = gActors[i];
+        if (slot.spawned && slot.body == mario)
+            return slot.cosmeticUpdateThisFrame;
+    }
+    return false;
 }
 
 } // namespace smso
@@ -4933,6 +6581,7 @@ void initRemoteActors() {}
 void updateRemoteActors(TMarDirector *) {}
 void clearRemoteActors(bool) {}
 void updateRemoteModelPreload(TMarDirector *) {}
+bool remoteActorHeapNeedsRecycleOnStageExit() { return false; }
 
 bool hasRemoteBodyForSlot(u8 slot) {
     (void)slot;
@@ -4974,9 +6623,22 @@ JKRHeap *borrowRemoteActorHeap() {
     return nullptr;
 }
 
+JKRHeap *borrowRemoteActorPackHeap() { return nullptr; }
+u32 remoteActorBodyHeapCapacityBytes() { return 0; }
+u32 remoteActorPackHeapCapacityBytes() { return 0; }
+
+bool isRemoteMarioModelFrozen(u8) { return false; }
+void requestRemoteMarioModelReapply(u8) {}
+bool remoteActorReferencesModelId(const char *) { return false; }
+
 bool isRemoteMarioBody(const TMario *mario) {
     (void)mario;
     return false;
+}
+
+bool shouldUpdateRemoteMarioCosmetics(const TMario *mario) {
+    (void)mario;
+    return true;
 }
 
 } // namespace smso

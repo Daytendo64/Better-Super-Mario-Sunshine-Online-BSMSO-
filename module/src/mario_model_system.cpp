@@ -14,6 +14,7 @@
 #include <JSystem/JKernel/JKRFileLoader.hxx>
 #include <JSystem/JKernel/JKRHeap.hxx>
 #include <JSystem/JKernel/JKRMemArchive.hxx>
+#include <JSystem/JSupport/JSUMemoryStream.hxx>
 #include <SMS/M3DUtil/MActor.hxx>
 #include <SMS/MSound/MSound.hxx>
 #include <SMS/Player/Mario.hxx>
@@ -44,18 +45,29 @@ public:
 namespace smso {
 namespace {
 
-// Cache one pack per player slot (local + remotes) so a 10-player lobby with
-// unique models keeps all archives resident for remount-per-spawn.
+// Cache only packs named by the live roster/local selection while preserving
+// body-construction headroom. Buffers cannot be individually freed:
+// live J3D graphs keep pointers into them, so this is a session-lifetime cache.
 constexpr u32 kMaxSlots = MAX_PLAYERS;
+// Ten simultaneous player identities plus two same-stage swap identities. The
+// heap gate normally binds first; this hard cap prevents untracked allocations.
+constexpr u32 kMaxPackCacheEntries = MAX_PLAYERS + 2;
 constexpr const char *kRetailPathArc = "/data/mario.arc";
 constexpr const char *kRetailPathSzs = "/data/mario.szs";
 constexpr const char *kPackDir = "/data/bsmso_models/";
-// Pack RARC is ~1.4–1.9 MiB after in-place BMD/BTK patch. Soft-fail only when
-// the expanded MEM1 arena cannot hold another pack; body headroom is reserved
-// by the ~24 MiB dual-BAT arena budget (as many unique packs as fit + bodies),
-// not per-load gating that would soft-fail the last few models needlessly.
+// Pack RARC is ~1.4–1.9 MiB after in-place BMD/BTK patch. The dedicated pack
+// heap prevents archive blocks from fragmenting body/J3D allocations.
 constexpr u32 kMaxPackBytes = 0x00200000u; // 2 MiB upper bound
-constexpr u32 kMinPackHeapFree = kMaxPackBytes + 0x00010000u; // pack + 64 KiB margin
+constexpr u32 kPackAllocationMargin = 0x00000100u; // heap block/header/alignment
+
+constexpr bool archiveAdmissionFits(u32 totalFree, u32 largestFree,
+                                    u32 archiveBytes) {
+    const u32 archiveNeed = archiveBytes + kPackAllocationMargin;
+    return largestFree >= archiveNeed && totalFree >= archiveNeed;
+}
+static_assert(archiveAdmissionFits(0x00300000u, 0x00200000u, 0x00180000u));
+static_assert(!archiveAdmissionFits(0x00300000u, 0x00100000u, 0x00180000u));
+static_assert(!archiveAdmissionFits(0x00100000u, 0x00100000u, 0x00180000u));
 
 struct SlotArchive {
     char modelId[MARIO_MODEL_ID_SIZE];
@@ -74,13 +86,24 @@ static SlotArchive sSlots[kMaxSlots];
 // disconnect / offline exit destroys the heap and must drop the cache first
 // (clearMarioModelSystem(keepPackCache=false) before clearRemoteActors(false)).
 static void *sRetailBuffer = nullptr;
-static void *sPackCacheBuffers[kMaxSlots];
-static char sPackCacheIds[kMaxSlots][MARIO_MODEL_ID_SIZE];
+static void *sPackCacheBuffers[kMaxPackCacheEntries];
+static u32 sPackCacheSizes[kMaxPackCacheEntries];
+static char sPackCacheIds[kMaxPackCacheEntries][MARIO_MODEL_ID_SIZE];
+// Newly loaded archives are cache-visible immediately for remount bookkeeping,
+// but body construction waits for this countdown to expire. Stage init and the
+// first stage update can occur in one video frame, so two ticks guarantee at
+// least one complete frame between DVD I/O and TMario::initValues.
+static u8 sPackCacheBodyReadyDelay[kMaxPackCacheEntries];
+constexpr u8 kPackBodyReadyDelayTicks = 2;
 static u32 sPackCacheCount = 0;
+static bool sPackCacheFullLogged = false;
+static bool sPackCacheRecycleRequested = false;
 static bool sBootstrapped = false;
 static bool sInitialized = false;
 static bool sLocalRebuildBusy = false;
 static u32 sActiveSlot = 0xFFFFFFFFu;
+// Once per Mario instance: pack-local BodyAngleFree.prm → mBodyAngleFreeParams.
+static TMario *sBodyAngleAppliedMario = nullptr;
 // Last CommBuffer ids observed this stage (desired). Applied archives live in sSlots
 // and are frozen at stage init / remote spawn — never remounted mid-stage.
 static char sLastLocalId[MARIO_MODEL_ID_SIZE] = {};
@@ -91,6 +114,75 @@ static u32 sDeferLogCooldown = 0;
 static u32 sPrefetchCursor = 0;
 static u8 sPackPrefetchCooldown[kMaxSlots] = {};
 constexpr u8 kPackPrefetchFailCooldownFrames = 120; // 2s @ 60 Hz
+
+enum class PackLoadState : u8 {
+    Idle,
+    OpenAndSize,
+    Allocate,
+    SubmitRead,
+    Reading,
+    Complete,
+    Validate,
+    Publish,
+};
+
+struct PackLoadJob {
+    PackLoadState state;
+    char id[MARIO_MODEL_ID_SIZE];
+    char path[96];
+    u8 slot;
+    u8 priority;
+    DVDFileInfo file;
+    JKRHeap *heap;
+    void *buffer;
+    u32 fileBytes;
+    u32 allocationBytes;
+    OSTime startedAt;
+    volatile bool callbackDone;
+    volatile s32 callbackResult;
+    bool fileOpen;
+    bool valid;
+};
+
+static PackLoadJob sPackLoadJob{};
+static u32 sAsyncReadCount = 0;
+static u32 sAsyncReadFailureCount = 0;
+static u32 sAsyncReadMilliseconds = 0;
+static u32 sPackValidationCount = 0;
+static u32 sPackValidationMilliseconds = 0;
+static u32 sPackCacheHits = 0;
+static u32 sPackCacheMisses = 0;
+static u32 sPackDeferredCount = 0;
+static u32 sPackDiagnosticsFrame = 0;
+
+static void packReadCallback(u32 result, DVDFileInfo *info) {
+    // DVD callback context: publish only the scalar completion result. The
+    // static DVDFileInfo and destination remain alive until the main thread
+    // observes this flag, closes the file, validates, and publishes the cache.
+    if (info != &sPackLoadJob.file)
+        return;
+    sPackLoadJob.callbackResult = static_cast<s32>(result);
+    sPackLoadJob.callbackDone = true;
+}
+
+constexpr bool modelPreparePriorityMatches(u32 priority, bool local,
+                                           bool activeRequest, bool newlyConnected,
+                                           bool activeRoster) {
+    if (local)
+        return priority == 3;
+    if (priority == 0)
+        return activeRequest;
+    if (priority == 1)
+        return !activeRequest && newlyConnected;
+    if (priority == 2)
+        return !activeRequest && !newlyConnected && activeRoster;
+    return false;
+}
+static_assert(modelPreparePriorityMatches(0, false, true, false, true));
+static_assert(modelPreparePriorityMatches(1, false, false, true, true));
+static_assert(modelPreparePriorityMatches(2, false, false, false, true));
+static_assert(modelPreparePriorityMatches(3, true, false, false, false));
+static_assert(!modelPreparePriorityMatches(2, false, true, false, true));
 
 static bool idsEqual(const char a[MARIO_MODEL_ID_SIZE], const char b[MARIO_MODEL_ID_SIZE]) {
     return memcmp(a, b, MARIO_MODEL_ID_SIZE) == 0;
@@ -122,24 +214,22 @@ static void formatId(char out[MARIO_MODEL_ID_SIZE + 1], const char id[MARIO_MODE
     out[len] = '\0';
 }
 
-// Heap for SMSLoadArchive:
-// - NEVER sSystemHeap: observed free space cannot hold ~1.4–1.9 MiB packs; load
-//   returns nullptr and remount never runs (always retail Mario).
-// - Prefer borrowRemoteActorHeap() (expanded MEM1 above arenaHi, ~24 MiB dual-BAT
-//   or 7.5 MiB DBAT2 fallback) when free >= one more pack. Soft-fail to retail
-//   otherwise — never load packs into the stage/system heap.
-// - nullptr here means "do not load" (soft-fail to retail), NOT "use current heap".
-static JKRHeap *archiveHeap() {
-    JKRHeap *remote = borrowRemoteActorHeap();
-    if (remote) {
-        const u32 free = static_cast<u32>(remote->getTotalFreeSize());
-        if (free >= kMinPackHeapFree)
-            return remote;
-        OSReport("[BSMSO] Remote pack heap low (free=%u need=%u); soft-fail retail\n", free,
-                 kMinPackHeapFree);
+// Immutable pack allocations use their own expanded-MEM1 heap. nullptr means
+// "defer/retail fallback", never "use current stage/system heap".
+static JKRHeap *archiveHeap(u32 archiveBytes) {
+    JKRHeap *pack = borrowRemoteActorPackHeap();
+    if (pack) {
+        const u32 totalFree = static_cast<u32>(pack->getTotalFreeSize());
+        const u32 largestFree = static_cast<u32>(pack->getFreeSize());
+        if (archiveAdmissionFits(totalFree, largestFree, archiveBytes))
+            return pack;
+        OSReport("[BSMSO] Pack admission deferred (total=%u largest=%u "
+                 "archive=%u margin=%u capacity=%u)\n",
+                 totalFree, largestFree, archiveBytes, kPackAllocationMargin,
+                 remoteActorPackHeapCapacityBytes());
         return nullptr;
     }
-    OSReport("[BSMSO] No remote pack heap yet — soft-fail retail (avoid stage/system OOM)\n");
+    OSReport("[BSMSO] No dedicated pack heap yet — soft-fail retail\n");
     return nullptr;
 }
 
@@ -152,12 +242,27 @@ static void *loadArchivePath(const char *path, bool allowCurrentHeapFallback) {
     char pathBuf[96];
     snprintf(pathBuf, sizeof(pathBuf), "%s", path);
     const s32 entry = DVDConvertPathToEntrynum(pathBuf);
-    JKRHeap *heap = archiveHeap();
-
     if (entry < 0) {
         OSReport("[BSMSO] SMSLoadArchive FST miss: %s (file not on disc/DirectoryBlob)\n", path);
         return nullptr;
     }
+
+    // Use the actual RARC length instead of a fixed 2 MiB upper bound. This
+    // admits smaller packs late in a session while still checking the largest
+    // contiguous block, so fragmented total-free space cannot masquerade as a
+    // usable reservation.
+    u32 archiveBytes = kMaxPackBytes;
+    DVDFileInfo info{};
+    if (DVDFastOpen(entry, &info)) {
+        archiveBytes = info.mLen;
+        DVDClose(&info);
+    }
+    if (!allowCurrentHeapFallback && archiveBytes > kMaxPackBytes) {
+        OSReport("[BSMSO] Model pack exceeds bounded archive limit: %s bytes=%u max=%u\n",
+                 path, archiveBytes, kMaxPackBytes);
+        return nullptr;
+    }
+    JKRHeap *heap = archiveHeap(archiveBytes);
 
     if (!heap && !allowCurrentHeapFallback) {
         OSReport("[BSMSO] SMSLoadArchive skipped (no safe pack heap): %s — retail fallback\n",
@@ -190,28 +295,110 @@ static void *findCachedPack(const char id[MARIO_MODEL_ID_SIZE]) {
     return nullptr;
 }
 
-static void cachePack(const char id[MARIO_MODEL_ID_SIZE], void *buffer) {
-    if (!buffer || marioModelIdIsEmpty(id) || sPackCacheCount >= kMaxSlots)
+static u32 findCachedPackSize(const char id[MARIO_MODEL_ID_SIZE]) {
+    if (marioModelIdIsEmpty(id))
+        return 0;
+    for (u32 i = 0; i < sPackCacheCount; ++i) {
+        if (idsEqual(sPackCacheIds[i], id))
+            return sPackCacheSizes[i];
+    }
+    return 0;
+}
+
+static bool tryUnpinUnreferencedPack();
+
+static void cachePack(const char id[MARIO_MODEL_ID_SIZE], void *buffer, u32 size) {
+    if (!buffer || marioModelIdIsEmpty(id))
         return;
     if (findCachedPack(id))
         return;
+    if (sPackCacheCount >= kMaxPackCacheEntries) {
+        while (sPackCacheCount >= kMaxPackCacheEntries && tryUnpinUnreferencedPack()) {
+        }
+    }
+    if (sPackCacheCount >= kMaxPackCacheEntries)
+        return;
     copyId(sPackCacheIds[sPackCacheCount], id);
     sPackCacheBuffers[sPackCacheCount] = buffer;
+    sPackCacheSizes[sPackCacheCount] = size;
+    sPackCacheBodyReadyDelay[sPackCacheCount] = kPackBodyReadyDelayTicks;
     ++sPackCacheCount;
 }
 
-static bool marioPackBufferIsInitSafe(void *buffer);
+static bool marioPackBufferIsInitSafe(void *buffer, u32 bufferSize);
 
 static void dropPackCache() {
-    for (u32 i = 0; i < kMaxSlots; ++i) {
+    for (u32 i = 0; i < kMaxPackCacheEntries; ++i) {
         sPackCacheBuffers[i] = nullptr;
+        sPackCacheSizes[i] = 0;
         clearId(sPackCacheIds[i]);
+        sPackCacheBodyReadyDelay[i] = 0;
     }
     sPackCacheCount = 0;
+    sPackCacheFullLogged = false;
+    sPackCacheRecycleRequested = false;
+}
+
+static bool packBufferIsMounted(void *buffer) {
+    return buffer && (buffer == arcBufMario || buffer == sRetailBuffer);
+}
+
+static bool packIdPinnedBySlotMount(const char id[MARIO_MODEL_ID_SIZE]) {
+    if (marioModelIdIsEmpty(id))
+        return false;
+    for (u32 i = 0; i < kMaxSlots; ++i) {
+        if (idsEqual(sSlots[i].modelId, id) && sSlots[i].buffer)
+            return true;
+    }
+    return false;
+}
+
+// LRU-ish: drop the oldest cache entry that is not referenced by any live/ready
+// body graph, outstanding request, or mounted slot. Frees the pack heap block
+// so a new identity can admit mid-stage instead of waiting for a warp recycle.
+static bool tryUnpinUnreferencedPack() {
+    JKRHeap *packHeap = borrowRemoteActorPackHeap();
+    for (u32 i = 0; i < sPackCacheCount; ++i) {
+        if (marioModelIdIsEmpty(sPackCacheIds[i]) || !sPackCacheBuffers[i])
+            continue;
+        if (packBufferIsMounted(sPackCacheBuffers[i]))
+            continue;
+        if (packIdPinnedBySlotMount(sPackCacheIds[i]))
+            continue;
+        if (remoteActorReferencesModelId(sPackCacheIds[i]))
+            continue;
+
+        void *buf = sPackCacheBuffers[i];
+        char idStr[MARIO_MODEL_ID_SIZE + 1] = {};
+        for (u32 c = 0; c < MARIO_MODEL_ID_SIZE; ++c)
+            idStr[c] = sPackCacheIds[i][c] ? sPackCacheIds[i][c] : '\0';
+
+        for (u32 j = i; j + 1 < sPackCacheCount; ++j) {
+            sPackCacheBuffers[j] = sPackCacheBuffers[j + 1];
+            sPackCacheSizes[j] = sPackCacheSizes[j + 1];
+            copyId(sPackCacheIds[j], sPackCacheIds[j + 1]);
+            sPackCacheBodyReadyDelay[j] = sPackCacheBodyReadyDelay[j + 1];
+        }
+        --sPackCacheCount;
+        sPackCacheBuffers[sPackCacheCount] = nullptr;
+        sPackCacheSizes[sPackCacheCount] = 0;
+        clearId(sPackCacheIds[sPackCacheCount]);
+        sPackCacheBodyReadyDelay[sPackCacheCount] = 0;
+
+        if (packHeap && buf)
+            packHeap->free(buf);
+
+        sPackCacheFullLogged = false;
+        sPackCacheRecycleRequested = false;
+        OSReport("[BSMSO] Pack cache unpinned unreferenced id='%s' (cache=%u/%u)\n", idStr,
+                 sPackCacheCount, kMaxPackCacheEntries);
+        return true;
+    }
+    return false;
 }
 
 static void *resolveBufferForId(const char id[MARIO_MODEL_ID_SIZE], bool *loggedMissing,
-                                bool *outFromCache) {
+                                bool *outFromCache, bool allowSynchronousLoad) {
     if (outFromCache)
         *outFromCache = false;
 
@@ -219,16 +406,48 @@ static void *resolveBufferForId(const char id[MARIO_MODEL_ID_SIZE], bool *logged
         return sRetailBuffer;
 
     if (void *cached = findCachedPack(id)) {
+        ++sPackCacheHits;
         if (outFromCache)
             *outFromCache = true;
         return cached;
     }
+    ++sPackCacheMisses;
+
+    // Every loaded pack must remain discoverable for the lifetime of any body
+    // that retains J3D pointers into its RARC. When the bounded cache is full,
+    // unpin the oldest pack that no live/ready/request still references.
+    if (sPackCacheCount >= kMaxPackCacheEntries) {
+        while (sPackCacheCount >= kMaxPackCacheEntries && tryUnpinUnreferencedPack()) {
+        }
+        if (sPackCacheCount >= kMaxPackCacheEntries) {
+            if (!sPackCacheFullLogged) {
+                OSReport("[BSMSO] Pack cache full (%u entries) — all entries pinned; "
+                         "retail fallback until a body releases a pack or stage recycle\n",
+                         sPackCacheCount);
+                sPackCacheFullLogged = true;
+            }
+            sPackCacheRecycleRequested = true;
+            return sRetailBuffer;
+        }
+    }
+
+    if (!allowSynchronousLoad)
+        return sRetailBuffer;
 
     char path[96];
     buildPackPath(path, sizeof(path), id);
+    OSReport("[BSMSO] Loading-screen synchronous pack fallback: %s\n", path);
     void *buf = loadArchivePath(path);
     if (buf) {
-        if (!marioPackBufferIsInitSafe(buf)) {
+        const u8 *hdr = reinterpret_cast<const u8 *>(buf);
+        const u32 loadedSize =
+            hdr[0] == 'R' && hdr[1] == 'A' && hdr[2] == 'R' && hdr[3] == 'C'
+                ? (static_cast<u32>(hdr[4]) << 24) |
+                      (static_cast<u32>(hdr[5]) << 16) |
+                      (static_cast<u32>(hdr[6]) << 8) |
+                      static_cast<u32>(hdr[7])
+                : 0;
+        if (!marioPackBufferIsInitSafe(buf, loadedSize)) {
             OSReport("[BSMSO] Unsafe model pack %s (bad ma_mdl1/ma_cap joints) — "
                      "retail fallback (avoids remote initValues crash)\n",
                      path);
@@ -239,7 +458,7 @@ static void *resolveBufferForId(const char id[MARIO_MODEL_ID_SIZE], bool *logged
             }
             return sRetailBuffer;
         }
-        cachePack(id, buf);
+        cachePack(id, buf, loadedSize);
         return buf;
     }
 
@@ -250,8 +469,9 @@ static void *resolveBufferForId(const char id[MARIO_MODEL_ID_SIZE], bool *logged
     return sRetailBuffer;
 }
 
-static void *resolveBufferForId(const char id[MARIO_MODEL_ID_SIZE], bool *loggedMissing) {
-    return resolveBufferForId(id, loggedMissing, nullptr);
+static void *resolveBufferForId(const char id[MARIO_MODEL_ID_SIZE], bool *loggedMissing,
+                                bool allowSynchronousLoad = false) {
+    return resolveBufferForId(id, loggedMissing, nullptr, allowSynchronousLoad);
 }
 
 // JKRMemArchive::fetchResource caches absolute pointers in each SDIFileEntry.mData
@@ -318,7 +538,7 @@ static bool rarcCStringEquals(const u8 *base, u32 absOff, u32 bufSize, const cha
 // Locate a file by basename inside an uncompressed RARC buffer. Returns false
 // when the name is missing or the entry looks corrupt.
 static bool findRarcFileByBasename(void *buffer, const char *basename, const u8 **outPtr,
-                                   u32 *outSize) {
+                                   u32 *outSize, u32 bufferSize = 0) {
     if (outPtr)
         *outPtr = nullptr;
     if (outSize)
@@ -334,19 +554,23 @@ static bool findRarcFileByBasename(void *buffer, const char *basename, const u8 
     const u32 headerLength = be32(hdr + 8);
     const u32 fileDataRel = be32(hdr + 0xC);
     if (fileLength < 0x40 || headerLength < 0x20 || headerLength > 0x10000 ||
-        headerLength >= fileLength)
+        headerLength >= fileLength || fileLength - headerLength < 0x20 ||
+        (bufferSize != 0 && fileLength > bufferSize))
         return false;
 
     u8 *info = hdr + headerLength;
     const u32 numEntries = be32(info + 8);
     const u32 entryRel = be32(info + 12);
     const u32 stringRel = be32(info + 0x14);
-    if (numEntries == 0 || numEntries > 4096 || entryRel > 0x100000 || stringRel > 0x100000)
+    if (numEntries == 0 || numEntries > 4096 ||
+        entryRel > fileLength - headerLength ||
+        stringRel > fileLength - headerLength ||
+        numEntries * 0x14u > fileLength - headerLength - entryRel)
         return false;
 
-    const u32 absFileData = headerLength + fileDataRel;
-    if (absFileData >= fileLength)
+    if (fileDataRel > fileLength - headerLength)
         return false;
+    const u32 absFileData = headerLength + fileDataRel;
 
     u8 *entries = info + entryRel;
     const u32 absString = headerLength + stringRel;
@@ -374,8 +598,10 @@ static bool findRarcFileByBasename(void *buffer, const char *basename, const u8 
 
         const u32 dataOff = be32(entry + 8);
         const u32 size = be32(entry + 0xC);
+        if (dataOff > fileLength - absFileData)
+            return false;
         const u32 abs = absFileData + dataOff;
-        if (size == 0 || abs + size > fileLength)
+        if (size == 0 || size > fileLength - abs)
             return false;
         if (outPtr)
             *outPtr = hdr + abs;
@@ -388,13 +614,13 @@ static bool findRarcFileByBasename(void *buffer, const char *basename, const u8 
 
 // Reject packs whose body/cap skeletons cannot survive TMario::initValues.
 // Wrong ma_cap* joint counts (custom 1 vs retail 2/3) hard-crash remotes.
-static bool marioPackBufferIsInitSafe(void *buffer) {
-    if (!buffer)
+static bool marioPackBufferIsInitSafe(void *buffer, u32 bufferSize) {
+    if (!buffer || bufferSize < 0x40 || bufferSize > kMaxPackBytes)
         return false;
 
     const u8 *body = nullptr;
     u32 bodySize = 0;
-    if (!findRarcFileByBasename(buffer, "ma_mdl1.bmd", &body, &bodySize))
+    if (!findRarcFileByBasename(buffer, "ma_mdl1.bmd", &body, &bodySize, bufferSize))
         return false;
     if (readBmdJointCount(body, bodySize) != 29)
         return false;
@@ -402,15 +628,15 @@ static bool marioPackBufferIsInitSafe(void *buffer) {
     // Capless packs keep retail caps and stamp this marker — treat as safe.
     const u8 *hide = nullptr;
     u32 hideSize = 0;
-    if (findRarcFileByBasename(buffer, "bsmso_hide_caps", &hide, &hideSize))
+    if (findRarcFileByBasename(buffer, "bsmso_hide_caps", &hide, &hideSize, bufferSize))
         return true;
 
     const u8 *cap1 = nullptr;
     u32 cap1Size = 0;
     const u8 *cap3 = nullptr;
     u32 cap3Size = 0;
-    if (!findRarcFileByBasename(buffer, "ma_cap1.bmd", &cap1, &cap1Size) ||
-        !findRarcFileByBasename(buffer, "ma_cap3.bmd", &cap3, &cap3Size))
+    if (!findRarcFileByBasename(buffer, "ma_cap1.bmd", &cap1, &cap1Size, bufferSize) ||
+        !findRarcFileByBasename(buffer, "ma_cap3.bmd", &cap3, &cap3Size, bufferSize))
         return false;
     if (readBmdJointCount(cap1, cap1Size) != 2)
         return false;
@@ -419,10 +645,177 @@ static bool marioPackBufferIsInitSafe(void *buffer) {
     return true;
 }
 
-static bool rarcContainsBasename(void *buffer, const char *basename) {
-    const u8 *ptr = nullptr;
-    u32 size = 0;
-    return findRarcFileByBasename(buffer, basename, &ptr, &size);
+static void resetPackLoadJob(bool freeUnpublishedBuffer) {
+    if (sPackLoadJob.fileOpen) {
+        // SDK contract: DVDClose synchronously cancels an unfinished async
+        // transfer before closing. Only reset/free the static job after it
+        // returns, so neither the drive nor its callback can still reference
+        // DVDFileInfo or the destination buffer when the job storage is reused.
+        DVDClose(&sPackLoadJob.file);
+        sPackLoadJob.fileOpen = false;
+    }
+    if (freeUnpublishedBuffer && sPackLoadJob.buffer && sPackLoadJob.heap)
+        sPackLoadJob.heap->free(sPackLoadJob.buffer);
+    sPackLoadJob = {};
+    sPackLoadJob.state = PackLoadState::Idle;
+}
+
+static void failPackLoadJob(const char *reason) {
+    char idStr[MARIO_MODEL_ID_SIZE + 1] = {};
+    formatId(idStr, sPackLoadJob.id);
+    OSReport("[BSMSO] Async pack failed state=%u slot=%u id='%s': %s\n",
+             static_cast<u32>(sPackLoadJob.state), sPackLoadJob.slot, idStr,
+             reason ? reason : "unknown");
+    ++sAsyncReadFailureCount;
+    if (sPackLoadJob.slot < kMaxSlots)
+        sPackPrefetchCooldown[sPackLoadJob.slot] =
+            kPackPrefetchFailCooldownFrames;
+    resetPackLoadJob(true);
+}
+
+static bool beginPackLoadJob(const char id[MARIO_MODEL_ID_SIZE], u8 slot,
+                             u8 priority) {
+    if (sPackLoadJob.state != PackLoadState::Idle || !id ||
+        marioModelIdIsEmpty(id))
+        return false;
+    sPackLoadJob = {};
+    sPackLoadJob.state = PackLoadState::OpenAndSize;
+    copyId(sPackLoadJob.id, id);
+    buildPackPath(sPackLoadJob.path, sizeof(sPackLoadJob.path), id);
+    sPackLoadJob.slot = slot;
+    sPackLoadJob.priority = priority;
+    sPackLoadJob.startedAt = OSGetTime();
+    return true;
+}
+
+static void advancePackLoadJob(bool *outReadStarted) {
+    if (outReadStarted)
+        *outReadStarted = false;
+
+    switch (sPackLoadJob.state) {
+    case PackLoadState::Idle:
+        return;
+    case PackLoadState::OpenAndSize: {
+        char path[96];
+        snprintf(path, sizeof(path), "%s", sPackLoadJob.path);
+        const s32 entry = DVDConvertPathToEntrynum(path);
+        if (entry < 0 || !DVDFastOpen(entry, &sPackLoadJob.file)) {
+            failPackLoadJob("FST/open miss");
+            return;
+        }
+        sPackLoadJob.fileOpen = true;
+        sPackLoadJob.fileBytes = sPackLoadJob.file.mLen;
+        if (sPackLoadJob.fileBytes < 0x40 ||
+            sPackLoadJob.fileBytes > kMaxPackBytes) {
+            failPackLoadJob("archive size outside bounded limit");
+            return;
+        }
+        sPackLoadJob.allocationBytes =
+            (sPackLoadJob.fileBytes + 31u) & ~31u;
+        sPackLoadJob.state = PackLoadState::Allocate;
+        return;
+    }
+    case PackLoadState::Allocate:
+        sPackLoadJob.heap = archiveHeap(sPackLoadJob.allocationBytes);
+        if (!sPackLoadJob.heap) {
+            ++sPackDeferredCount;
+            failPackLoadJob("dedicated pack heap has no contiguous capacity");
+            return;
+        }
+        sPackLoadJob.buffer =
+            sPackLoadJob.heap->alloc(sPackLoadJob.allocationBytes, 0x20);
+        if (!sPackLoadJob.buffer) {
+            failPackLoadJob("aligned pack allocation failed");
+            return;
+        }
+        sPackLoadJob.state = PackLoadState::SubmitRead;
+        return;
+    case PackLoadState::SubmitRead:
+        sPackLoadJob.callbackDone = false;
+        sPackLoadJob.callbackResult = DVD_ERROR_FATAL;
+        DCInvalidateRange(sPackLoadJob.buffer, sPackLoadJob.allocationBytes);
+        if (!DVDReadAsyncPrio(&sPackLoadJob.file, sPackLoadJob.buffer,
+                              // The drive API requires a 32-byte-multiple read;
+                              // the destination was reserved to this rounded size.
+                              static_cast<s32>(sPackLoadJob.allocationBytes), 0,
+                              packReadCallback, 2)) {
+            failPackLoadJob("DVDReadAsyncPrio queue rejected");
+            return;
+        }
+        sPackLoadJob.state = PackLoadState::Reading;
+        ++sAsyncReadCount;
+        if (outReadStarted)
+            *outReadStarted = true;
+        return;
+    case PackLoadState::Reading: {
+        const bool interrupts = OSDisableInterrupts();
+        const bool done = sPackLoadJob.callbackDone;
+        const s32 result = sPackLoadJob.callbackResult;
+        OSRestoreInterrupts(interrupts);
+        if (!done)
+            return;
+        if (result < 0 ||
+            static_cast<u32>(result) != sPackLoadJob.allocationBytes) {
+            failPackLoadJob("short/error async read");
+            return;
+        }
+        // DVD auto-invalidation is enabled in this runtime, but explicitly
+        // invalidate before CPU validation for coherent behavior across builds.
+        DCInvalidateRange(sPackLoadJob.buffer, sPackLoadJob.allocationBytes);
+        DVDClose(&sPackLoadJob.file);
+        sPackLoadJob.fileOpen = false;
+        sPackLoadJob.state = PackLoadState::Complete;
+        sAsyncReadMilliseconds += static_cast<u32>(
+            OSTicksToMilliseconds(OSGetTime() - sPackLoadJob.startedAt));
+        return;
+    }
+    case PackLoadState::Complete:
+        sPackLoadJob.state = PackLoadState::Validate;
+        return;
+    case PackLoadState::Validate: {
+        const OSTime start = OSGetTime();
+        sPackLoadJob.valid = marioPackBufferIsInitSafe(
+            sPackLoadJob.buffer, sPackLoadJob.fileBytes);
+        sPackValidationMilliseconds +=
+            static_cast<u32>(OSTicksToMilliseconds(OSGetTime() - start));
+        ++sPackValidationCount;
+        if (!sPackLoadJob.valid) {
+            failPackLoadJob("RARC/body/cap validation rejected");
+            return;
+        }
+        sPackLoadJob.state = PackLoadState::Publish;
+        return;
+    }
+    case PackLoadState::Publish: {
+        // Rapid intent changes do not invalidate an immutable completed pack;
+        // cache it for bounded reuse, but never mount or build in this phase.
+        if (findCachedPack(sPackLoadJob.id)) {
+            resetPackLoadJob(true);
+            return;
+        }
+        if (sPackCacheCount >= kMaxPackCacheEntries) {
+            while (sPackCacheCount >= kMaxPackCacheEntries && tryUnpinUnreferencedPack()) {
+            }
+        }
+        if (sPackCacheCount >= kMaxPackCacheEntries) {
+            sPackCacheRecycleRequested = true;
+            failPackLoadJob("bounded pack cache full");
+            return;
+        }
+        void *published = sPackLoadJob.buffer;
+        const u32 publishedBytes = sPackLoadJob.fileBytes;
+        char publishedId[MARIO_MODEL_ID_SIZE] = {};
+        copyId(publishedId, sPackLoadJob.id);
+        const u8 slot = sPackLoadJob.slot;
+        sPackLoadJob.buffer = nullptr;
+        cachePack(publishedId, published, publishedBytes);
+        sPackLoadJob = {};
+        sPackLoadJob.state = PackLoadState::Idle;
+        if (slot < kMaxSlots)
+            syncRemoteMarioArchiveSlot(slot);
+        return;
+    }
+    }
 }
 
 static bool mountBuffer(void *buffer) {
@@ -449,15 +842,17 @@ static bool mountBuffer(void *buffer) {
     }
 
     if (arcBufMario == buffer) {
-        // Still clear caches — a prior mount of this buffer may have left mData set.
-        clearArchiveCachedFilePointers(buffer);
-        OSReport("[BSMSO] mario volume already mounted @ %p\n", buffer);
+        // Continuously mounted: SDIFileEntry.mData is live for this buffer.
+        // Clearing/re-reporting here is only needed after a real remountFixed
+        // (below). Matches setActiveMarioArchive's arcBufMario==buffer skip.
         return true;
     }
 
     OSReport("[BSMSO] remountFixed mario %p -> %p\n", arcBufMario, buffer);
     archive->unmountFixed();
     arcBufMario = buffer;
+    // New pack may carry BodyAngleFree.prm — force re-apply on next stage tick.
+    sBodyAngleAppliedMario = nullptr;
     if (!archive->mountFixed(buffer, UNK_0)) {
         OSReport("[BSMSO] mountFixed failed; attempting retail fallback\n");
         if (buffer != sRetailBuffer && sRetailBuffer) {
@@ -494,7 +889,7 @@ static void syncIdsFromCommBuffer(CommBuffer *buf) {
 
 // Prefer the game's already-mounted retail volume. Reloading /data/mario.arc is
 // only a fallback — with early-init nops removed, retail mounts before title.
-static bool ensureRetailLoaded() {
+static bool ensureRetailLoaded(bool allowSynchronousFallback = false) {
     if (sRetailBuffer)
         return true;
 
@@ -504,6 +899,9 @@ static bool ensureRetailLoaded() {
         OSReport("[BSMSO] Adopted retail mario volume @ %p (arcBufMario)\n", sRetailBuffer);
         return true;
     }
+
+    if (!allowSynchronousFallback)
+        return false;
 
     OSReport("[BSMSO] Retail mario volume not mounted yet — loading from disc\n");
     sRetailBuffer = loadArchivePath(kRetailPathArc, true);
@@ -520,7 +918,7 @@ static bool ensureRetailLoaded() {
 // Stage init only needs the local player's pack mounted. Remote packs are
 // resolved lazily in setActiveMarioArchive when a puppet is spawned.
 static void ensureLocalBufferLoaded(CommBuffer *buf) {
-    if (!ensureRetailLoaded())
+    if (!ensureRetailLoaded(/*allowSynchronousFallback=*/true))
         return;
 
     const u8 localSlot = buf ? buf->localSlot : 0;
@@ -530,7 +928,8 @@ static void ensureLocalBufferLoaded(CommBuffer *buf) {
     SlotArchive &slot = sSlots[localSlot];
     if (buf)
         readSlotId(buf, localSlot, slot.modelId);
-    slot.buffer = resolveBufferForId(slot.modelId, &slot.loggedMissing);
+    slot.buffer = resolveBufferForId(slot.modelId, &slot.loggedMissing,
+                                     /*allowSynchronousLoad=*/true);
     if (!slot.buffer)
         slot.buffer = sRetailBuffer;
 }
@@ -683,14 +1082,26 @@ static bool rebuildLocalMarioVisuals(TMario *mario) {
 
 void initMarioModelSystem() {
     bootstrapOnce();
+
+    // Soft same-stage reloads (buggy ep-0xFF moveStage) skip exitStageCallbacks.
+    // Force the same teardown stageExit would have run so Shadow TexAnim bindings
+    // and pack mounts cannot leak into the next Mario construct.
+    if (sInitialized) {
+        OSReport("[BSMSO] initMarioModelSystem: prior stage still live — forcing cleanup "
+                 "(exit callback skipped)\n");
+        clearMarioModelSystem(/*keepPackCache=*/false);
+    }
+
     sInitialized = true;
     sActiveSlot = 0xFFFFFFFFu;
+    sBodyAngleAppliedMario = nullptr;
 
     OSReport("[BSMSO] initMarioModelSystem begin (vol=%p arcBuf=%p retail=%p packs=%u)\n",
              JKRFileLoader::getVolume("mario"), arcBufMario, sRetailBuffer, sPackCacheCount);
 
-    // Keep sRetailBuffer across stages (game-owned). Pack cache may still be
-    // valid if loaded into expanded MEM1 that survived; otherwise reload.
+    // Keep sRetailBuffer across stages (game-owned). Connected transitions also
+    // retain the bounded custom-pack cache with its owning remote heap; slot
+    // bindings are rebuilt below and resolve directly to those warm buffers.
     for (u32 i = 0; i < kMaxSlots; ++i) {
         clearId(sSlots[i].modelId);
         sSlots[i].buffer = nullptr;
@@ -730,7 +1141,14 @@ void initMarioModelSystem() {
              arcBufMario);
 }
 
+bool marioModelSystemIsLive() { return sInitialized; }
+
 void clearMarioModelSystem(bool keepPackCache) {
+    // Quiesce DVD callback ownership before any stage-exit decision can destroy
+    // the pack heap. Pending (unpublished) storage may be individually freed.
+    if (sPackLoadJob.state != PackLoadState::Idle)
+        resetPackLoadJob(true);
+
     // Remount retail BEFORE any remote-heap destroy so the next stage's local
     // Mario init sees a valid volume. Slot bindings are always cleared; pack
     // cache survives only when the remote heap is also kept alive.
@@ -741,6 +1159,7 @@ void clearMarioModelSystem(bool keepPackCache) {
 
     sInitialized = false;
     sLocalRebuildBusy = false;
+    sBodyAngleAppliedMario = nullptr;
     sDeferLogCooldown = 0;
     sActiveSlot = 0xFFFFFFFFu;
     sPrefetchCursor = 0;
@@ -766,6 +1185,37 @@ void ensureMarioTexAnimsBound(TMario *mario) {
     CommBuffer *buf = getCommBuffer();
     const u8 localSlot = buf ? buf->localSlot : 0;
     bindMarioTexAnimsForSlot(mario, localSlot);
+}
+
+void ensureLocalBodyAngleFreeParams(TMario *mario) {
+    if (!mario || sBodyAngleAppliedMario == mario)
+        return;
+
+    // TParams::load("/Mario/BodyAngleFree.prm") reads params.szs only — JKR
+    // getResource on the mario volume does not see pack-root PRMs reliably.
+    // Scan the mounted RARC buffer by basename (same path as hide-caps).
+    if (!arcBufMario) {
+        // Remount may still be pending; retry next frame.
+        return;
+    }
+
+    const u8 *prm = nullptr;
+    u32 prmSize = 0;
+    if (!findRarcFileByBasename(arcBufMario, "BodyAngleFree.prm", &prm, &prmSize))
+        findRarcFileByBasename(arcBufMario, "bodyanglefree.prm", &prm, &prmSize);
+
+    if (!prm || prmSize == 0) {
+        // Retail / packs without override keep construction-time params.szs values.
+        sBodyAngleAppliedMario = mario;
+        OSReport("[BSMSO] No pack BodyAngleFree.prm in mario RARC — keeping params.szs lean\n");
+        return;
+    }
+
+    JSUMemoryInputStream stream(const_cast<u8 *>(prm), prmSize);
+    mario->mBodyAngleFreeParams.load(stream);
+    sBodyAngleAppliedMario = mario;
+    OSReport("[BSMSO] Reloaded mBodyAngleFreeParams from pack BodyAngleFree.prm (%u bytes)\n",
+             static_cast<unsigned>(prmSize));
 }
 
 void updateMarioModelSystem(TMarDirector *director) {
@@ -810,10 +1260,12 @@ void updateMarioModelSystem(TMarDirector *director) {
         formatId(oldStr, sLastRemoteIds[i]);
         formatId(newStr, buf->remoteMarioModelIds[i]);
 
-        // Emptying an id mid-stage (disconnect glitch) keeps the current body.
-        // Non-empty changes request a same-stage rebuild (pack may have just
-        // appeared on disc after EnsurePackPresent).
-        if (!marioModelIdIsEmpty(buf->remoteMarioModelIds[i])) {
+        // Apply explicit changes while the remote snapshot is still connected,
+        // including custom -> retail (empty id). A disconnected/empty slot keeps
+        // its parked body until normal dismiss so a transient roster clear does
+        // not cause pointless rebuild work.
+        const bool remoteConnected = buf->remoteSnapshots[i].connected != 0;
+        if (!marioModelIdIsEmpty(buf->remoteMarioModelIds[i]) || remoteConnected) {
             requestRemoteMarioModelReapply(static_cast<u8>(i));
             OSReport("[BSMSO] Remote model id slot=%u '%s' -> '%s' reapply requested "
                      "(same-stage body rebuild when pack/heap ready)\n",
@@ -857,7 +1309,49 @@ bool isMarioModelPackCached(const char id[MARIO_MODEL_ID_SIZE]) {
     return findCachedPack(id) != nullptr;
 }
 
-bool prefetchRemoteMarioPacks() {
+bool isMarioModelPackReadyForBodyInit(const char id[MARIO_MODEL_ID_SIZE]) {
+    if (!id || marioModelIdIsEmpty(id))
+        return true;
+    for (u32 i = 0; i < sPackCacheCount; ++i) {
+        if (idsEqual(sPackCacheIds[i], id))
+            return sPackCacheBuffers[i] != nullptr && sPackCacheBodyReadyDelay[i] == 0;
+    }
+    return false;
+}
+
+u32 marioModelPackCacheCount() { return sPackCacheCount; }
+
+bool readMarioModelPackCacheId(u32 index, char out[MARIO_MODEL_ID_SIZE]) {
+    if (!out || index >= sPackCacheCount || !sPackCacheBuffers[index])
+        return false;
+    copyId(out, sPackCacheIds[index]);
+    return true;
+}
+
+bool mountCachedMarioModelPack(const char id[MARIO_MODEL_ID_SIZE]) {
+    if (!sInitialized || !id || marioModelIdIsEmpty(id))
+        return mountRetailMarioArchive();
+    void *buffer = findCachedPack(id);
+    if (!buffer || !marioPackBufferIsInitSafe(buffer, findCachedPackSize(id)))
+        return false;
+    if (!mountBuffer(buffer))
+        return false;
+    sActiveSlot = 0xFFFFFFFFu;
+    return true;
+}
+
+bool marioModelPackCacheNeedsRecycleOnStageExit() {
+    // The cache and every J3D graph that references it share the remote-heap
+    // lifetime. Keeping both across a connected stage transition is safe and
+    // removes repeated 1.4–1.9 MiB DVD reads. On-disk replacement while Dolphin
+    // is running is intentionally adopted only after disconnect/relaunch, when
+    // clearMarioModelSystem(false) drops pointers before heap destruction.
+    return sPackCacheRecycleRequested;
+}
+
+bool prefetchRemoteMarioPacks(bool *outLoadStarted) {
+    if (outLoadStarted)
+        *outLoadStarted = false;
     if (!sInitialized)
         return false;
 
@@ -867,61 +1361,98 @@ bool prefetchRemoteMarioPacks() {
     if ((buf->bridgeFlags & BF_CONNECTED) == 0)
         return false;
 
-    // Ensure remote heap exists so archiveHeap() can accept a pack load.
-    if (!borrowRemoteActorHeap())
-        return true; // retry next frame once heap is ready
+    // Ensure the dedicated archive heap exists before opening a DVD job.
+    if (!borrowRemoteActorPackHeap())
+        return true;
+
+    for (u32 i = 0; i < sPackCacheCount; ++i) {
+        if (sPackCacheBodyReadyDelay[i] > 0)
+            --sPackCacheBodyReadyDelay[i];
+    }
 
     for (u32 i = 0; i < kMaxSlots; ++i) {
         if (sPackPrefetchCooldown[i] > 0)
             --sPackPrefetchCooldown[i];
     }
 
+    if (++sPackDiagnosticsFrame >= 600) {
+        sPackDiagnosticsFrame = 0;
+        OSReport("[BSMSO] Pack async diag reads=%u failures=%u readMs=%u "
+                 "validations=%u validationMs=%u hits=%u misses=%u deferred=%u "
+                 "cache=%u/%u job=%u packFree=%u/%u\n",
+                 sAsyncReadCount, sAsyncReadFailureCount,
+                 sAsyncReadMilliseconds, sPackValidationCount,
+                 sPackValidationMilliseconds, sPackCacheHits,
+                 sPackCacheMisses, sPackDeferredCount, sPackCacheCount,
+                 kMaxPackCacheEntries, static_cast<u32>(sPackLoadJob.state),
+                 static_cast<u32>(borrowRemoteActorPackHeap()->getTotalFreeSize()),
+                 remoteActorPackHeapCapacityBytes());
+    }
+
+    if (sPackLoadJob.state != PackLoadState::Idle) {
+        advancePackLoadJob(outLoadStarted);
+        return true;
+    }
+
     bool anyPending = false;
-    for (u32 n = 0; n < kMaxSlots; ++n) {
-        const u32 slot = (sPrefetchCursor + n) % kMaxSlots;
-        if (slot == buf->localSlot)
-            continue;
+    // Four bounded priority passes:
+    //   0 live body waiting for a model change/first custom apply
+    //   1 connected snapshot (join/first appearance)
+    //   2 announced roster id without a snapshot yet
+    //   3 imminent local selection (warms the next-stage local mount)
+    // There is deliberately no installed-library speculation.
+    for (u32 priority = 0; priority < 4; ++priority) {
+        for (u32 n = 0; n < kMaxSlots; ++n) {
+            const u32 slot = (sPrefetchCursor + n) % kMaxSlots;
+            const bool local = slot == buf->localSlot;
 
-        char desired[MARIO_MODEL_ID_SIZE] = {};
-        readSlotId(buf, slot, desired);
-        if (marioModelIdIsEmpty(desired))
-            continue;
-
-        if (findCachedPack(desired)) {
-            // Bind slot from cache without DVD so first-residency sees custom.
-            if (!marioSlotHasCustomPack(slot) || !idsEqual(sSlots[slot].modelId, desired))
-                syncRemoteMarioArchiveSlot(slot);
-            continue;
-        }
-
-        if (sPackPrefetchCooldown[slot] > 0) {
-            anyPending = true;
-            continue;
-        }
-
-        // Budget: one SMSLoadArchive attempt per call.
-        sPrefetchCursor = (slot + 1) % kMaxSlots;
-        char idStr[MARIO_MODEL_ID_SIZE + 1] = {};
-        formatId(idStr, desired);
-        OSReport("[BSMSO] prefetchRemoteMarioPacks slot=%u id='%s' (1 load budget)\n", slot,
-                 idStr);
-        syncRemoteMarioArchiveSlot(slot);
-        if (!marioSlotHasCustomPack(slot)) {
-            sPackPrefetchCooldown[slot] = kPackPrefetchFailCooldownFrames;
-            anyPending = true;
-        }
-        // More slots may still need work even if this one succeeded.
-        for (u32 j = 0; j < kMaxSlots; ++j) {
-            if (j == buf->localSlot)
+            char desired[MARIO_MODEL_ID_SIZE] = {};
+            readSlotId(buf, slot, desired);
+            if (marioModelIdIsEmpty(desired))
                 continue;
-            char id[MARIO_MODEL_ID_SIZE] = {};
-            readSlotId(buf, j, id);
-            if (!marioModelIdIsEmpty(id) && !findCachedPack(id)) {
-                anyPending = true;
-                break;
+
+            if (!local) {
+                const bool hasBody =
+                    hasRemoteBodyForSlotLoose(static_cast<u8>(slot));
+                const bool activeRequest =
+                    hasBody && !isRemoteMarioModelFrozen(static_cast<u8>(slot));
+                const bool connected = buf->remoteSnapshots[slot].connected != 0;
+                const bool newlyConnected = connected && !hasBody;
+                const bool activeRoster = connected ||
+                                          !marioModelIdIsEmpty(desired);
+                if (!modelPreparePriorityMatches(priority, false, activeRequest,
+                                                 newlyConnected, activeRoster))
+                    continue;
+            } else if (!modelPreparePriorityMatches(priority, true, false, false,
+                                                    false)) {
+                continue;
             }
+
+            if (findCachedPack(desired)) {
+                ++sPackCacheHits;
+                if (!local &&
+                    (!marioSlotHasCustomPack(slot) || !idsEqual(sSlots[slot].modelId, desired)))
+                    syncRemoteMarioArchiveSlot(slot);
+                continue;
+            }
+
+            anyPending = true;
+            if (sPackPrefetchCooldown[slot] > 0)
+                continue;
+
+            ++sPackCacheMisses;
+            // Exactly one demand job may be active. Open/size, allocation,
+            // submission, completion, validation, and publication advance on
+            // separate main-thread updates.
+            sPrefetchCursor = (slot + 1) % kMaxSlots;
+            char idStr[MARIO_MODEL_ID_SIZE + 1] = {};
+            formatId(idStr, desired);
+            OSReport("[BSMSO] Demand async pack priority=%u slot=%u id='%s'\n",
+                     priority, slot, idStr);
+            beginPackLoadJob(desired, static_cast<u8>(slot),
+                             static_cast<u8>(priority));
+            return true;
         }
-        return anyPending;
     }
 
     return anyPending;
@@ -953,8 +1484,9 @@ bool setActiveMarioArchive(u32 slot) {
         if (buf)
             readSlotId(buf, slot, sSlots[slot].modelId);
         bool fromCache = false;
-        sSlots[slot].buffer = resolveBufferForId(sSlots[slot].modelId,
-                                                 &sSlots[slot].loggedMissing, &fromCache);
+        sSlots[slot].buffer = resolveBufferForId(
+            sSlots[slot].modelId, &sSlots[slot].loggedMissing, &fromCache,
+            /*allowSynchronousLoad=*/false);
         // Cache hits are the common path — do not OSReport every remount.
         (void)fromCache;
     }
@@ -966,7 +1498,8 @@ bool setActiveMarioArchive(u32 slot) {
         return false;
 
     // Defense in depth: never remount a pack that would crash initValues.
-    if (buffer != sRetailBuffer && !marioPackBufferIsInitSafe(buffer)) {
+    if (buffer != sRetailBuffer &&
+        !marioPackBufferIsInitSafe(buffer, findCachedPackSize(sSlots[slot].modelId))) {
         OSReport("[BSMSO] setActiveMarioArchive(%u) rejecting unsafe pack — retail fallback\n",
                  slot);
         buffer = sRetailBuffer;
@@ -1042,7 +1575,9 @@ void syncRemoteMarioArchiveSlot(u32 slot) {
         sSlots[slot].loggedMissing = false;
 
     bool fromCache = false;
-    void *buffer = resolveBufferForId(desired, &sSlots[slot].loggedMissing, &fromCache);
+    void *buffer = resolveBufferForId(
+        desired, &sSlots[slot].loggedMissing, &fromCache,
+        /*allowSynchronousLoad=*/false);
     if (!buffer)
         buffer = sRetailBuffer;
     sSlots[slot].buffer = buffer;
@@ -1114,7 +1649,10 @@ bool marioModelIdWantsHiddenCaps(const char id[MARIO_MODEL_ID_SIZE]) {
 
     // Prefer the live pack marker (any import that kept retail caps).
     if (void *cached = findCachedPack(id)) {
-        if (rarcContainsBasename(cached, "bsmso_hide_caps"))
+        const u8 *marker = nullptr;
+        u32 markerSize = 0;
+        if (findRarcFileByBasename(cached, "bsmso_hide_caps", &marker, &markerSize,
+                                   findCachedPackSize(id)))
             return true;
     }
 

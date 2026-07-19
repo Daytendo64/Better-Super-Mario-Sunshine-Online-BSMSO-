@@ -27,6 +27,13 @@ internal static class DolphinConfigService
     private const string TargetMem2Size = "0x04000000";
     private const string BackupRootFolderName = "dolphin-settings-backup";
     private const string BackupMarkerName = ".backed-up";
+    /// <summary>
+    /// Present after the recommended performance profile has been written once for this
+    /// Dolphin User directory. Later launches with the toggle on only enforce required
+    /// Core keys so manual Dolphin graphics/settings tweaks survive Launch Dolphin.
+    /// Cleared when the Connection toggle is turned off (so the next ON re-applies).
+    /// </summary>
+    private const string RecommendedAppliedMarkerName = ".recommended-applied";
 
     // Always applied for GMSE90 (even when the recommended performance profile is off).
     // FastDiscSpeed=False ⇒ Dolphin UI "Emulate Disc Speed" ON (INI key is inverted).
@@ -302,8 +309,10 @@ internal static class DolphinConfigService
 
     /// <summary>
     /// Launch-time Dolphin settings: always keeps Emulate Disc Speed (FastDiscSpeed=False),
-    /// Emulated CPU Clock Override at 200%, and MEM1/MEM2. Optionally applies or restores the
-    /// recommended performance profile.
+    /// Emulated CPU Clock Override at 200%, and MEM1/MEM2. Optionally applies the recommended
+    /// performance profile once (later launches keep your Dolphin tweaks). When the recommended
+    /// toggle is off: restore the pre-profile backup only when leaving the recommended profile,
+    /// otherwise keep live settings and refresh the pre-profile backup so Dolphin edits stick.
     /// </summary>
     public static bool ApplyLaunchDolphinSettings(
         string dolphinPath,
@@ -314,24 +323,109 @@ internal static class DolphinConfigService
         if (applyRecommended)
         {
             TryBackupOriginalSettings(dolphinPath, log);
-            // Performance profile already includes CPU 200% / disc / MEM; re-apply CoreRequired
-            // afterward so those always-forced keys win even if the profile list drifts.
-            if (!EnsurePerformanceStabilityConfig(dolphinPath, log, out error))
-                return false;
+            if (!IsRecommendedProfileApplied(dolphinPath))
+            {
+                // Performance profile already includes CPU 200% / disc / MEM; re-apply CoreRequired
+                // afterward so those always-forced keys win even if the profile list drifts.
+                if (!EnsurePerformanceStabilityConfig(dolphinPath, log, out error))
+                    return false;
+                MarkRecommendedProfileApplied(dolphinPath, log);
+            }
+            else
+            {
+                log?.Invoke(
+                    "Keeping your current Dolphin settings (recommended profile already applied). " +
+                    "Emulate Disc Speed, CPU clock 200%, and MEM1/MEM2 still enforced. " +
+                    "Turn the Connection toggle off and on to re-apply the full recommended profile.");
+            }
+
             return EnsureMultiplayerMemoryConfig(dolphinPath, log, out error);
         }
 
-        if (!TryRestoreOriginalSettings(dolphinPath, log, out var hadBackup, out error))
-            return false;
+        // Leaving recommended (or already off): only restore when the profile was active so we
+        // do not clobber settings the user just changed in Dolphin.
+        var wasRecommendedApplied = IsRecommendedProfileApplied(dolphinPath);
+        ClearRecommendedProfileApplied(dolphinPath);
 
-        if (!hadBackup)
+        if (wasRecommendedApplied)
+        {
+            if (!TryRestoreOriginalSettings(dolphinPath, log, out var hadBackup, out error))
+                return false;
+
+            if (!hadBackup)
+            {
+                log?.Invoke(
+                    "No backed-up Dolphin settings to restore — keeping current files " +
+                    "(Emulate Disc Speed + CPU clock 200% + MEM1/MEM2 still applied).");
+            }
+        }
+        else
         {
             log?.Invoke(
-                "No backed-up Dolphin settings to restore — keeping current files " +
-                "(Emulate Disc Speed + CPU clock 200% + MEM1/MEM2 still applied).");
+                "Recommended profile off — keeping your current Dolphin settings " +
+                "and updating the pre-profile backup.");
         }
 
-        return EnsureMultiplayerMemoryConfig(dolphinPath, log, out error);
+        if (!EnsureMultiplayerMemoryConfig(dolphinPath, log, out error))
+            return false;
+
+        // Track live personal settings so a later ON→OFF restore uses what you last used.
+        RefreshPreProfileBackup(dolphinPath, log);
+        return true;
+    }
+
+    /// <summary>
+    /// Clears the once-applied marker so the next Launch with recommended on writes the
+    /// full performance profile again. Call when the Connection toggle is turned off.
+    /// </summary>
+    public static void ClearRecommendedProfileApplied(string dolphinPath)
+    {
+        try
+        {
+            var marker = ResolveRecommendedAppliedMarkerPath(dolphinPath);
+            if (marker is not null && File.Exists(marker))
+                File.Delete(marker);
+        }
+        catch
+        {
+            // Best-effort — next Launch still enforces required Core keys.
+        }
+    }
+
+    internal static bool IsRecommendedProfileApplied(string dolphinPath)
+    {
+        var marker = ResolveRecommendedAppliedMarkerPath(dolphinPath);
+        return marker is not null && File.Exists(marker);
+    }
+
+    private static void MarkRecommendedProfileApplied(string dolphinPath, Action<string>? log)
+    {
+        try
+        {
+            var marker = ResolveRecommendedAppliedMarkerPath(dolphinPath);
+            if (marker is null)
+                return;
+
+            Directory.CreateDirectory(Path.GetDirectoryName(marker)!);
+            File.WriteAllText(marker, DateTime.UtcNow.ToString("o"));
+            log?.Invoke(
+                "Recommended Dolphin profile marked applied — later launches will keep your " +
+                "manual Dolphin setting changes (required Core keys still enforced).");
+        }
+        catch (Exception ex)
+        {
+            log?.Invoke($"Could not mark recommended Dolphin profile as applied: {ex.Message}");
+        }
+    }
+
+    private static string? ResolveRecommendedAppliedMarkerPath(string dolphinPath)
+    {
+        var exePath = dolphinPath.Trim().Trim('"');
+        if (string.IsNullOrWhiteSpace(exePath) || !File.Exists(exePath))
+            return null;
+
+        var backupDirectory = ResolveBackupDirectory(ResolveUserDirectory(exePath));
+        return Path.Combine(backupDirectory, RecommendedAppliedMarkerName);
     }
 
     /// <summary>
@@ -491,6 +585,7 @@ internal static class DolphinConfigService
 
     /// <summary>
     /// Copies Dolphin.ini / GFX.ini / GMSE90.ini once before the first recommended-profile apply.
+    /// Skips if a backup marker already exists (including backups refreshed while recommended is off).
     /// </summary>
     internal static void TryBackupOriginalSettings(string dolphinPath, Action<string>? log)
     {
@@ -507,19 +602,7 @@ internal static class DolphinConfigService
                 return;
 
             Directory.CreateDirectory(backupDirectory);
-            var copied = 0;
-            foreach (var relativePath in EnumerateBackupRelativePaths())
-            {
-                var source = Path.Combine(userDirectory, relativePath);
-                if (!File.Exists(source))
-                    continue;
-
-                var destination = Path.Combine(backupDirectory, relativePath);
-                Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
-                File.Copy(source, destination, overwrite: false);
-                copied++;
-            }
-
+            var copied = CopySettingsToBackup(userDirectory, backupDirectory);
             File.WriteAllText(markerPath, userDirectory);
             log?.Invoke(
                 copied > 0
@@ -530,6 +613,52 @@ internal static class DolphinConfigService
         {
             log?.Invoke($"Could not back up original Dolphin settings: {ex.Message}");
         }
+    }
+
+    /// <summary>
+    /// Overwrites the pre-profile backup from the live Dolphin User INIs. Used while the
+    /// recommended toggle is off so Launch Dolphin keeps tracking manual Dolphin edits.
+    /// </summary>
+    internal static void RefreshPreProfileBackup(string dolphinPath, Action<string>? log)
+    {
+        try
+        {
+            var exePath = dolphinPath.Trim().Trim('"');
+            if (string.IsNullOrWhiteSpace(exePath) || !File.Exists(exePath))
+                return;
+
+            var userDirectory = ResolveUserDirectory(exePath);
+            var backupDirectory = ResolveBackupDirectory(userDirectory);
+            Directory.CreateDirectory(backupDirectory);
+            var copied = CopySettingsToBackup(userDirectory, backupDirectory);
+            File.WriteAllText(Path.Combine(backupDirectory, BackupMarkerName), userDirectory);
+            log?.Invoke(
+                copied > 0
+                    ? $"Updated pre-profile Dolphin settings backup ({copied} files)"
+                    : "Pre-profile Dolphin settings backup refreshed (no INI files present yet)");
+        }
+        catch (Exception ex)
+        {
+            log?.Invoke($"Could not update pre-profile Dolphin settings backup: {ex.Message}");
+        }
+    }
+
+    private static int CopySettingsToBackup(string userDirectory, string backupDirectory)
+    {
+        var copied = 0;
+        foreach (var relativePath in EnumerateBackupRelativePaths())
+        {
+            var source = Path.Combine(userDirectory, relativePath);
+            if (!File.Exists(source))
+                continue;
+
+            var destination = Path.Combine(backupDirectory, relativePath);
+            Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+            File.Copy(source, destination, overwrite: true);
+            copied++;
+        }
+
+        return copied;
     }
 
     /// <summary>

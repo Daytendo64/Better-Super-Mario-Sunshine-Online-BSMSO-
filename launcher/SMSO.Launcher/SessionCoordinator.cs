@@ -89,6 +89,7 @@ public sealed class SessionCoordinator : IDisposable
         _monitor.DolphinStarted += OnDolphinStarted;
 
         _bridgeWorker.LocalSnapshotReady += OnLocalSnapshot;
+        _bridgeWorker.ModuleProgressResyncRequested += OnModuleProgressResyncRequested;
         _bridgeWorker.LocalMarioVoiceReady += OnLocalMarioVoice;
         _bridgeWorker.LocalWorldEventReady += OnLocalWorldEvent;
         UpdateSyncSettingsState(_config.Config.SyncFlags, _config.Config.SyncObjects, _config.Config.SyncProgress);
@@ -130,6 +131,7 @@ public sealed class SessionCoordinator : IDisposable
                 _server.Start(port);
                 _config.Config.AllowClientTeleporting = false;
                 _server.SetAllowClientTeleport(false);
+                _server.SetHideSeekGraceDurationMs(_config.Config.HideSeekGraceSeconds * 1000);
                 ApplyConfiguredSyncSettings();
             }).ConfigureAwait(true);
 
@@ -183,6 +185,8 @@ public sealed class SessionCoordinator : IDisposable
                     Log?.Invoke($"Join rejected: username '{_config.Config.Username}' is already in use — set a unique name in Settings (e.g. Player{InstanceIndex + 1})");
                 else if (reason == JoinRejectReason.InvalidName)
                     Log?.Invoke($"Join rejected: {PlayerNameValidator.InvalidNameHint}");
+                else if (reason == JoinRejectReason.VersionMismatch)
+                    Log?.Invoke(NetJoinRejectedException.GetUserMessage(reason));
                 else
                     Log?.Invoke($"Join rejected: {reason}");
             };
@@ -744,11 +748,25 @@ public sealed class SessionCoordinator : IDisposable
             return false;
         }
 
+        _server.SetHideSeekGraceDurationMs(_config.Config.HideSeekGraceSeconds * 1000);
         if (!_server.TryStartHideSeekTag(out error))
             return false;
 
         ApplyGameModeState(_server.GetGameModeState());
         return true;
+    }
+
+    public void SetHideSeekGraceSeconds(int seconds)
+    {
+        _config.Config.HideSeekGraceSeconds = Math.Clamp(seconds, 15, 60) switch
+        {
+            <= 22 => 15,
+            <= 37 => 30,
+            <= 52 => 45,
+            _ => 60,
+        };
+        if (IsHosting && _server != null)
+            _server.SetHideSeekGraceDurationMs(_config.Config.HideSeekGraceSeconds * 1000);
     }
 
     public void StopHideSeekTag()
@@ -980,7 +998,7 @@ public sealed class SessionCoordinator : IDisposable
     private void ResetRemotePlayerForSlot(byte slot)
     {
         _remoteSnapshots.Remove(slot);
-        _bridgeWorker.RemoveRemoteSnapshot(slot);
+        _bridgeWorker.PrepareRemoteSlotForJoin(slot);
         Log?.Invoke($"Player rejoined slot {slot} — reset remote sync state");
     }
 
@@ -1027,13 +1045,45 @@ public sealed class SessionCoordinator : IDisposable
                 if (NameTagColorCodec.TryDecodeAppearance(snap.Name, out var decoded))
                     appearance = decoded;
 
+                // Strip any legacy color overlay from the wire name before it reaches
+                // Dolphin. copyPurePlayerName truncates overlay names to 5 characters.
+                // Install into a fresh Name[] so NetClient's next UDP decode cannot
+                // overwrite the stripped display name held by the bridge.
                 var rosterName = slot < _rosterNamesBySlot.Length
                     ? _rosterNamesBySlot[slot]
                     : null;
+                string displayName;
                 if (!string.IsNullOrWhiteSpace(rosterName))
-                    snap.SetName(rosterName);
-                else if (string.IsNullOrWhiteSpace(snap.GetPureName()))
-                    snap.SetName($"Player{slot + 1}");
+                {
+                    displayName = rosterName;
+                }
+                else if (snap.Name != null &&
+                         snap.Name.Length >= 16 &&
+                         NameTagColorCodec.HasAppearanceMarker(snap.Name[15]))
+                {
+                    // Overlay-packed wire irrevocably truncates gradient text.
+                    // Keep the last stripped name for this slot; never bake "Playe".
+                    if (_remoteSnapshots.TryGetValue(slot, out var previous) &&
+                        previous.Name != null &&
+                        previous.Name.Length >= 16 &&
+                        !NameTagColorCodec.HasAppearanceMarker(previous.Name[15]))
+                    {
+                        displayName = previous.GetName();
+                    }
+                    else
+                    {
+                        displayName = $"Player{slot + 1}";
+                    }
+                }
+                else
+                {
+                    displayName = snap.GetPureName();
+                    if (string.IsNullOrWhiteSpace(displayName))
+                        displayName = $"Player{slot + 1}";
+                }
+
+                snap.Name = new byte[16];
+                snap.SetName(displayName);
 
                 _remoteSnapshots[slot] = snap;
                 _bridgeWorker.PushRemoteSnapshot(slot, snap, appearance);
@@ -1102,8 +1152,10 @@ public sealed class SessionCoordinator : IDisposable
     {
         _config.Config.SelectedMarioModelId = CharacterPack.NormalizeModelId(modelId);
         ApplySelectedMarioModelToBridge();
+        // Dedicated TCP intent updates the authoritative roster immediately.
+        // Each receiving client prepares/commits independently; the heartbeat
+        // still re-advertises this id as a compatibility fallback.
         _client?.SetMarioModelId(_config.Config.SelectedMarioModelId);
-        // CommBuffer + heartbeat/roster carry the id; module remounts on next stage reload.
         Log?.Invoke(string.IsNullOrEmpty(_config.Config.SelectedMarioModelId)
             ? "Mario model set to Retail (applies after stage reload)."
             : $"Mario model set to {_config.Config.SelectedMarioModelId} (applies after stage reload).");
@@ -1123,6 +1175,16 @@ public sealed class SessionCoordinator : IDisposable
 
         var stageChanged = _hasLastLocalSnapshot &&
                            (logicalStage != lastLogicalStage || logicalEpisode != lastLogicalEpisode);
+
+        // Same-stage death reload does not change course/episode, so stageChanged is false —
+        // but the module clears its red-coin mask on stageInit. Detect revive (Dead vfx
+        // clearing) and force an immediate progress catch-up instead of waiting ~45s.
+        var wasDead = _hasLastLocalSnapshot &&
+                      (_lastLocalSnapshot.VfxFlags & (ushort)VfxFlags.Dead) != 0;
+        var isDead = (snap.VfxFlags & (ushort)VfxFlags.Dead) != 0;
+        var sameStageRevive = _hasLastLocalSnapshot && !stageChanged && !firstSnapshot &&
+                              wasDead && !isDead && logicalStage != 0;
+
         _lastLocalSnapshot = snap;
         _hasLastLocalSnapshot = true;
         if (firstSnapshot || stageChanged)
@@ -1131,8 +1193,14 @@ public sealed class SessionCoordinator : IDisposable
             RequestWorldProgressResync(
                 $"{(firstSnapshot ? "initial-stage" : "stage-enter")} {logicalStage}/{logicalEpisode}");
         }
+        else if (sameStageRevive)
+        {
+            RequestWorldProgressResync($"same-stage-revive {logicalStage}/{logicalEpisode}");
+        }
         SendLocalSnapshot(snap);
-        _bridgeWorker.FlushRemoteSnapshotsToDolphin();
+        // BridgeWorker's poll loop flushes immediately after this callback with
+        // the already-read mailbox. Forcing here performed a second
+        // ReadProcessMemory plus duplicate serialization every 60 Hz tick.
     }
 
     private void RequestWorldProgressResync(string reason)
@@ -1141,6 +1209,17 @@ public sealed class SessionCoordinator : IDisposable
             return;
         Log?.Invoke($"World sync: requesting progress resync ({reason})");
         _ = _client.SendWorldProgressRequestAsync();
+    }
+
+    private DateTime _lastModuleProgressResyncUtc = DateTime.MinValue;
+
+    private void OnModuleProgressResyncRequested()
+    {
+        // Module holds BF_REQUEST_PROGRESS for several frames — debounce to one TCP request.
+        if ((DateTime.UtcNow - _lastModuleProgressResyncUtc).TotalMilliseconds < 2000)
+            return;
+        _lastModuleProgressResyncUtc = DateTime.UtcNow;
+        RequestWorldProgressResync("module-request-progress");
     }
 
     private void OnLocalMarioVoice(MarioVoiceEvent voiceEvent)
@@ -1161,18 +1240,42 @@ public sealed class SessionCoordinator : IDisposable
         _ = _client.SendWorldEventAsync(worldEvent);
     }
 
-    private static bool IsEpisodeScopedWorldEvent(WorldEventType type) =>
-        type is WorldEventType.GoldCoinCollected
+    /// <summary>
+    /// Plaza hub Type5 allowlist coalesced to episode 0xFF by StoryFlagAuthority.
+    /// Apply live like StoryFlag — module admits overlay off-plaza and writes on plaza.
+    /// </summary>
+    private static bool IsPlazaHubTriggerEvent(WorldEventPacket worldEvent) =>
+        worldEvent.Type == WorldEventType.TriggerFlag &&
+        (worldEvent.EpisodeId == StoryFlagAuthority.PlazaHubEpisode ||
+         StoryFlagAuthority.IsPlazaHubTrigger(worldEvent.CourseId, worldEvent.Payload1));
+
+    private static bool IsEpisodeScopedWorldEvent(WorldEventPacket worldEvent) =>
+        worldEvent.Type is WorldEventType.GoldCoinCollected
             or WorldEventType.RedCoinCollected
             or WorldEventType.NpcCleaned
-            or WorldEventType.TriggerFlag
+            or WorldEventType.GraffitiCleaned
             or WorldEventType.MarioFruitKicked
             or WorldEventType.MarioFruitPicked
             or WorldEventType.MarioFruitThrown
             or WorldEventType.MarioFruitDropped
             or WorldEventType.MarioFruitSync
-            or WorldEventType.HipDropObject
-            or WorldEventType.NpcReact;
+            // HipDropObject is intentionally NOT episode-deferred: it is non-durable, and
+            // flushing a stale pound after casino/stage enter replays THipDropHideObj
+            // touchPlayer on virgin panels (Ep5 purple roulette pad vanishes on spawn).
+            or WorldEventType.NpcReact
+        || (worldEvent.Type == WorldEventType.TriggerFlag && !IsPlazaHubTriggerEvent(worldEvent));
+
+    /// <summary>
+    /// Global / course-keyed ownership flags — never episode-defer. Flag writes + HUD
+    /// must apply on any stage; actor FX may no-op until the matching course loads.
+    /// Plaza hub TriggerFlags (episode 0xFF) are live-applied the same way.
+    /// </summary>
+    private static bool IsLiveOwnershipWorldEvent(WorldEventPacket worldEvent) =>
+        worldEvent.Type is WorldEventType.ShineCollected
+            or WorldEventType.BlueCoinCollected
+            or WorldEventType.StoryFlag
+            or WorldEventType.SecretComplete
+        || IsPlazaHubTriggerEvent(worldEvent);
 
     private void OnWorldEventReceived(WorldEventPacket worldEvent)
     {
@@ -1185,17 +1288,17 @@ public sealed class SessionCoordinator : IDisposable
         if (events.Length == 0)
             return;
 
-        // Full authority replay replaces pending state — clear queues so duplicates
-        // do not pile up under load / overlapping resyncs (Bugbot medium).
+        // Full authority replay replaces pending state — clear queues + Dolphin incoming
+        // so a stuck durable visual retry cannot block live shine/blue ownership applies.
         _bridgeWorker.ClearPendingIncomingWorldEvents();
         lock (_pendingEpisodeWorldEventsLock)
             _pendingEpisodeWorldEvents.Clear();
 
-        // Queue episode-local events when not on that stage; apply immediately when we are.
+        // Apply live ownership flags first (shine/blue/story), then episode-scoped visuals.
         // Avoid forceApply so FlushPendingEpisodeWorldEvents can re-deliver on stage entry
         // after the module resets per-stage red-coin trackers (late join).
-        // Durable shine/blue events always apply (global / course-keyed flags).
-        foreach (var worldEvent in events)
+        foreach (var worldEvent in events.OrderBy(e => IsLiveOwnershipWorldEvent(e) ? 0 : 1)
+                     .ThenBy(e => e.EventId))
             ApplyWorldEventToBridge(worldEvent, forceApply: false);
 
         // Also kick a drained apply for any events that match the current stage so red-coin
@@ -1261,11 +1364,11 @@ public sealed class SessionCoordinator : IDisposable
             return;
 
         if (!forceApply &&
-            IsEpisodeScopedWorldEvent(worldEvent.Type) &&
+            IsEpisodeScopedWorldEvent(worldEvent) &&
             (!_hasLastLocalSnapshot ||
-             worldEvent.CourseId != YoshiSnapshotCodec.LogicalStageId(_lastLocalSnapshot, _lastLocalSnapshot.StageId) ||
-             worldEvent.EpisodeId != YoshiSnapshotCodec.LogicalEpisodeId(_lastLocalSnapshot,
-                 _lastLocalSnapshot.EpisodeId)))
+             !MatchesEpisodeScopedApply(worldEvent,
+                 YoshiSnapshotCodec.LogicalStageId(_lastLocalSnapshot, _lastLocalSnapshot.StageId),
+                 YoshiSnapshotCodec.LogicalEpisodeId(_lastLocalSnapshot, _lastLocalSnapshot.EpisodeId))))
         {
             lock (_pendingEpisodeWorldEventsLock)
             {
@@ -1280,9 +1383,102 @@ public sealed class SessionCoordinator : IDisposable
             return;
         }
 
+        // HipDrop is live-only: never queue for later stage-enter flush (would hide virgin
+        // THipDropHideObj panels, e.g. Sirena Ep5 purple roulette pad).
+        if (!forceApply && worldEvent.Type == WorldEventType.HipDropObject)
+        {
+            if (!_hasLastLocalSnapshot)
+            {
+                Log?.Invoke(
+                    $"World sync: drop HipDropObject eventId={worldEvent.EventId} — local stage not-ready");
+                return;
+            }
+
+            var localStage = YoshiSnapshotCodec.LogicalStageId(_lastLocalSnapshot, _lastLocalSnapshot.StageId);
+            var localEpisode = YoshiSnapshotCodec.LogicalEpisodeId(_lastLocalSnapshot,
+                _lastLocalSnapshot.EpisodeId);
+            var stageOk = worldEvent.CourseId == localStage;
+            var episodeOk = worldEvent.EpisodeId == localEpisode ||
+                            (localStage == SirenaCasinoMapping.AreaId &&
+                             SirenaCasinoMapping.EpisodesEquivalent(worldEvent.EpisodeId, localEpisode));
+            if (!stageOk || !episodeOk)
+            {
+                Log?.Invoke(
+                    $"World sync: drop HipDropObject eventId={worldEvent.EventId} — local stage {localStage}/{localEpisode}, event {worldEvent.CourseId}/{worldEvent.EpisodeId}");
+                return;
+            }
+        }
+
         Log?.Invoke(
             $"World sync: applying eventId={worldEvent.EventId} type={worldEvent.Type} course={worldEvent.CourseId}/{worldEvent.EpisodeId} payload0={worldEvent.Payload0} reserved={worldEvent.Reserved} payload1={worldEvent.Payload1}{(forceApply ? " (forced)" : "")}");
         _bridgeWorker.PushIncomingWorldEvent(worldEvent);
+    }
+
+    /// <summary>
+    /// Live apply gate for episode-scoped events. Exact episode match, plus casino
+    /// catalog↔mission aliases (module sameStage) and graffiti plaza/casino aliases so
+    /// co-op partners on the same physical stage get live red-coin hides — not a queue
+    /// that only flushes on reload.
+    /// </summary>
+    private static bool MatchesEpisodeScopedApply(WorldEventPacket worldEvent, byte stageId,
+        byte episodeId)
+    {
+        if (worldEvent.CourseId != stageId)
+            return false;
+        if (worldEvent.EpisodeId == episodeId)
+            return true;
+
+        if (worldEvent.Type == WorldEventType.GraffitiCleaned)
+            return GraffitiEpisodesEquivalent(stageId, worldEvent.EpisodeId, episodeId);
+
+        // Red coins / gold / NPC clean / fruit / NPC react: same casino episode aliases as
+        // MatchesPendingEpisodeFlush and module red_coin_sync::sameStage.
+        if (stageId == SirenaCasinoMapping.AreaId &&
+            SirenaCasinoMapping.EpisodesEquivalent(worldEvent.EpisodeId, episodeId))
+            return true;
+
+        return false;
+    }
+
+    /// <summary>
+    /// Plaza: all dolpic episodes share one physical pollution canvas (no soft-reload).
+    /// Casino: catalog 0/1 ↔ beach mission 3/4.
+    /// </summary>
+    private static bool GraffitiEpisodesEquivalent(byte courseId, byte a, byte b)
+    {
+        if (a == b)
+            return true;
+        if (courseId == StoryFlagAuthority.PlazaAreaId)
+            return true;
+        if (courseId == SirenaCasinoMapping.AreaId)
+            return SirenaCasinoMapping.EpisodesEquivalent(a, b);
+        return false;
+    }
+
+    private static bool MatchesPendingEpisodeFlush(WorldEventPacket worldEvent, byte stageId,
+        byte episodeId)
+    {
+        if (worldEvent.CourseId != stageId)
+            return false;
+        if (worldEvent.EpisodeId == episodeId)
+            return true;
+
+        // Graffiti: plaza hub episode aliases + casino catalog↔mission (same as module apply).
+        if (worldEvent.Type == WorldEventType.GraffitiCleaned &&
+            GraffitiEpisodesEquivalent(stageId, worldEvent.EpisodeId, episodeId))
+            return true;
+
+        // Sirena casino: module publishes mission 3/4; warp flush uses catalog 0/1.
+        if (stageId == SirenaCasinoMapping.AreaId &&
+            SirenaCasinoMapping.EpisodesEquivalent(worldEvent.EpisodeId, episodeId))
+            return true;
+
+        // StoryFlagAuthority coalesces plaza Type5 to PlazaHubEpisode (0xFF). Drain those
+        // (and any allowlist plaza hub triggers) on any local plaza visit.
+        return stageId == StoryFlagAuthority.PlazaAreaId &&
+               worldEvent.Type == WorldEventType.TriggerFlag &&
+               (worldEvent.EpisodeId == StoryFlagAuthority.PlazaHubEpisode ||
+                StoryFlagAuthority.IsPlazaHubTrigger(worldEvent.CourseId, worldEvent.Payload1));
     }
 
     private void FlushPendingEpisodeWorldEvents(byte stageId, byte episodeId)
@@ -1290,14 +1486,19 @@ public sealed class SessionCoordinator : IDisposable
         WorldEventPacket[] ready;
         lock (_pendingEpisodeWorldEventsLock)
         {
+            // Discard any legacy-queued HipDropObject (pre-fix builds / in-flight sessions).
+            // Never stage-enter replay pounds — virgin HipDropHideObj panels must stay up.
+            _pendingEpisodeWorldEvents.RemoveAll(e => e.Type == WorldEventType.HipDropObject);
+
             if (_pendingEpisodeWorldEvents.Count == 0)
                 return;
 
             // Snapshot matching events but leave them queued until DrainWorldEventReplayAsync
             // pushes each one. Cancelling an in-flight drain (resync / new flush) must not
             // permanently drop events that never reached the bridge.
+            // Plaza hub TriggerFlags use episode 0xFF — drain them on any plaza visit.
             ready = _pendingEpisodeWorldEvents
-                .Where(worldEvent => worldEvent.CourseId == stageId && worldEvent.EpisodeId == episodeId)
+                .Where(worldEvent => MatchesPendingEpisodeFlush(worldEvent, stageId, episodeId))
                 .OrderBy(worldEvent => worldEvent.EventId)
                 .ToArray();
 
@@ -1316,6 +1517,7 @@ public sealed class SessionCoordinator : IDisposable
         try
         {
             NameTagAppearance appearance = NameTagAppearance.CreateDefault();
+            var hasCustomAppearance = false;
             if (TryParseNameTagColor(_config.Config.NameTagColor, out var textR, out var textG, out var textB) &&
                 TryParseNameTagColor(_config.Config.NameTagOutlineColor, out var outlineR, out var outlineG,
                     out var outlineB))
@@ -1330,12 +1532,20 @@ public sealed class SessionCoordinator : IDisposable
 
                 appearance = NameTagColorCodec.ToAppearance(textR, textG, textB, bottomR, bottomG, bottomB,
                     outlineR, outlineG, outlineB, _config.Config.NameTagGradientEnabled);
-                snap.SetNameTagAppearance(textR, textG, textB, bottomR, bottomG, bottomB, outlineR, outlineG,
-                    outlineB, _config.Config.NameTagGradientEnabled);
+                hasCustomAppearance = true;
             }
-            else
+
+            // Pure username first, then legacy wire encoding of colors into Name[].
+            // Receivers decode appearance from the overlay, then SetName() again so
+            // Dolphin never displays the truncated 5-char overlay form.
+            snap.SetName(_config.Config.Username);
+            if (hasCustomAppearance)
             {
-                snap.SetName(_config.Config.Username);
+                snap.SetNameTagAppearance(
+                    appearance.TextTopR, appearance.TextTopG, appearance.TextTopB,
+                    appearance.TextBottomR, appearance.TextBottomG, appearance.TextBottomB,
+                    appearance.OutlineR, appearance.OutlineG, appearance.OutlineB,
+                    appearance.GradientEnabled);
             }
 
             _bridgeWorker.ApplyLocalNameTagAppearance(_config.Config.Username, appearance);

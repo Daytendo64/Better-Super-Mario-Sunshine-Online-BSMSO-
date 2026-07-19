@@ -204,6 +204,20 @@ public sealed class DolphinConfigServiceTests
             Assert.Contains("OverclockEnable = True", recommendedGameIni);
             Assert.Contains("Overclock = 2.0", recommendedGameIni);
 
+            // User raises IR in Dolphin; next Launch with recommended on must keep it.
+            File.WriteAllText(
+                Path.Combine(configDir, "GFX.ini"),
+                "[Settings]\nInternalResolution = 3\nShaderCompilationMode = 2\n");
+
+            logs.Clear();
+            Assert.True(DolphinConfigService.ApplyLaunchDolphinSettings(
+                exePath, applyRecommended: true, logs.Add, out error), error);
+            Assert.Contains(logs, l => l.Contains("Keeping your current Dolphin settings", StringComparison.Ordinal));
+            Assert.Contains("InternalResolution = 3", File.ReadAllText(Path.Combine(configDir, "GFX.ini")));
+            Assert.DoesNotContain("InternalResolution = 1", File.ReadAllText(Path.Combine(configDir, "GFX.ini")));
+            // Required Core keys still enforced.
+            Assert.Contains("Overclock = 2.0", File.ReadAllText(Path.Combine(configDir, "Dolphin.ini")));
+
             logs.Clear();
             Assert.True(DolphinConfigService.ApplyLaunchDolphinSettings(
                 exePath, applyRecommended: false, logs.Add, out error), error);
@@ -226,6 +240,32 @@ public sealed class DolphinConfigServiceTests
             Assert.Contains("Overclock = 2.0", gameIni);
             Assert.Contains("$Keep", gameIni);
             Assert.Contains("RAMOverrideEnable = True", gameIni);
+
+            // While recommended is off, Dolphin edits must survive Launch and update the
+            // pre-profile backup (not get overwritten by the old one-time snapshot).
+            File.WriteAllText(
+                Path.Combine(configDir, "GFX.ini"),
+                "[Settings]\nInternalResolution = 4\n");
+            logs.Clear();
+            Assert.True(DolphinConfigService.ApplyLaunchDolphinSettings(
+                exePath, applyRecommended: false, logs.Add, out error), error);
+            Assert.Contains(logs, l => l.Contains("keeping your current Dolphin settings", StringComparison.OrdinalIgnoreCase));
+            Assert.Contains(logs, l => l.Contains("Updated pre-profile", StringComparison.Ordinal));
+            Assert.DoesNotContain(logs, l => l.Contains("Restored original", StringComparison.Ordinal));
+            Assert.Contains("InternalResolution = 4", File.ReadAllText(Path.Combine(configDir, "GFX.ini")));
+
+            // Toggle off cleared the once-applied marker — ON again re-applies full profile.
+            logs.Clear();
+            Assert.True(DolphinConfigService.ApplyLaunchDolphinSettings(
+                exePath, applyRecommended: true, logs.Add, out error), error);
+            Assert.Contains("InternalResolution = 1", File.ReadAllText(Path.Combine(configDir, "GFX.ini")));
+
+            // OFF again restores the refreshed pre-profile (IR=4), not the ancient first backup.
+            logs.Clear();
+            Assert.True(DolphinConfigService.ApplyLaunchDolphinSettings(
+                exePath, applyRecommended: false, logs.Add, out error), error);
+            Assert.Contains(logs, l => l.Contains("Restored original", StringComparison.Ordinal));
+            Assert.Contains("InternalResolution = 4", File.ReadAllText(Path.Combine(configDir, "GFX.ini")));
         }
         finally
         {

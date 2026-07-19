@@ -6,4 +6,18 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
 
+  <PropertyGroup Condition="'$(BSMSOClientLite)' == 'true'">
+    <DefineConstants>$(DefineConstants);BSMSO_CLIENT_LITE</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Tall-character BodyAngleFree.prm override (Luigi / Nightendo / Waluigi / Wario). -->
+    <EmbeddedResource Include="MarioPack\bodyanglefree2.prm"
+                      LogicalName="SMSO.Net.MarioPack.bodyanglefree2.prm" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="SMSO.Tests" />
+  </ItemGroup>
+
 </Project>

@@ -27,8 +27,15 @@ public sealed class NpcCleanAuthority
     public void ResetStage(byte courseId, byte episodeId)
     {
         lock (_gate)
-            _stages.Remove((courseId, episodeId));
+            _stages.Remove(NormalizeStage(courseId, episodeId));
     }
+
+    /// <summary>
+    /// Coalesce Sirena casino/hotel mission ids onto catalog episodes so cleans
+    /// share one key with roster occupancy and late-join snapshots.
+    /// </summary>
+    public static (byte CourseId, byte EpisodeId) NormalizeStage(byte courseId, byte episodeId)
+        => (courseId, LevelCatalog.NormalizeEpisodeFromGame(courseId, episodeId));
 
     public bool TryAcceptCleaned(in WorldEventRequest request, out byte payload0, out byte reserved,
         out uint payload1)
@@ -60,7 +67,10 @@ public sealed class NpcCleanAuthority
     internal ushort CleanedMask(byte courseId, byte episodeId)
     {
         lock (_gate)
-            return _stages.TryGetValue((courseId, episodeId), out var stage) ? stage.CleanedMask : (ushort)0;
+        {
+            var key = NormalizeStage(courseId, episodeId);
+            return _stages.TryGetValue(key, out var stage) ? stage.CleanedMask : (ushort)0;
+        }
     }
 
     public IReadOnlyDictionary<(byte CourseId, byte EpisodeId), ushort> AllStages
@@ -79,7 +89,7 @@ public sealed class NpcCleanAuthority
 
     private StageState GetStage(byte courseId, byte episodeId)
     {
-        var key = (courseId, episodeId);
+        var key = NormalizeStage(courseId, episodeId);
         if (!_stages.TryGetValue(key, out var stage))
         {
             stage = new StageState();

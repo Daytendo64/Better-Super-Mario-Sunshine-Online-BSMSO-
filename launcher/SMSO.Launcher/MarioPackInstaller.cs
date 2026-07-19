@@ -1,7 +1,9 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Text.Json;
 using System.Threading;
 using GCNTools;
@@ -27,9 +29,19 @@ internal static class MarioPackInstaller
     public const string RetailMarioRelative = @"files\mario\mario.szs";
     public const string RetailMarioBackupRelative = @"files\mario\mario.szs.bsmso-retail";
     public const string RetailDataMarioArcRelative = @"files\data\mario.arc";
+    public const string RuntimePreloadIndexFileName = "preload.idx";
     private const string DiscPackManifestSuffix = ".bsmso-packs.json";
 
     private static readonly object DiscPatchLock = new();
+    private static readonly ConcurrentDictionary<string, object> InstalledPackLocks =
+        new(StringComparer.OrdinalIgnoreCase);
+    private static readonly ConditionalWeakTable<byte[], PackValidationResult> PackValidationCache = new();
+
+    private sealed class PackValidationResult
+    {
+        public required bool Safe { get; init; }
+        public required string Reason { get; init; }
+    }
 
     public static bool TryResolveRetailMarioBytes(string isoPath, out byte[] bytes, out string? error)
     {
@@ -63,6 +75,35 @@ internal static class MarioPackInstaller
 
     public static string GetInstalledPackPath(string gameRoot, string modelId) =>
         Path.Combine(GetModelsDirectory(gameRoot), CharacterPack.NormalizeModelId(modelId) + ModelLibrary.PackExtension);
+
+    internal static string GetRuntimePreloadIndexPath(string gameRoot) =>
+        Path.Combine(GetModelsDirectory(gameRoot), RuntimePreloadIndexFileName);
+
+    /// <summary>
+    /// Removes the legacy all-installed-model prewarm catalog. Current modules
+    /// prepare only roster/selection identities; leaving this catalog behind
+    /// makes older modules flood the game heap and stall joins.
+    /// </summary>
+    internal static void RemoveLegacyRuntimePreloadIndex(string gameRoot)
+    {
+        var modelsDirectory = GetModelsDirectory(gameRoot);
+        Directory.CreateDirectory(modelsDirectory);
+        var destination = GetRuntimePreloadIndexPath(gameRoot);
+        try
+        {
+            if (File.Exists(destination))
+                File.Delete(destination);
+        }
+        catch (IOException)
+        {
+            // Dolphin may have an extracted-tree file open. The current module
+            // ignores the legacy catalog, so cleanup can safely retry later.
+        }
+        catch (UnauthorizedAccessException)
+        {
+            // Best-effort compatibility cleanup.
+        }
+    }
 
     public static void EnsureRetailBackup(string gameRoot)
     {
@@ -146,8 +187,9 @@ internal static class MarioPackInstaller
                 false, false, 0, $"Model pack '{packId}' is not in the AppData library.");
 
         var dest = GetInstalledPackPath(gameRoot, packId);
-        File.WriteAllBytes(dest, packBytes);
-        log?.Invoke($"Installed model pack {packId} → {dest}");
+        if (EnsureInstalledPackFile(dest, ModelLibrary.GetPackPath(packId), packBytes))
+            log?.Invoke($"Installed model pack {packId} → {dest}");
+        RemoveLegacyRuntimePreloadIndex(gameRoot);
 
         // Local convenience: also merge into files/mario/mario.szs so solo play
         // without remount still shows the selected skin. Multiplayer remounts
@@ -179,7 +221,7 @@ internal static class MarioPackInstaller
         if (!ModelLibrary.TryGetPackBytes(id, out var packBytes) || packBytes.Length == 0)
             return;
 
-        if (!CharacterPack.TryValidatePackForInit(packBytes, out var unsafeReason))
+        if (!TryValidatePackCached(packBytes, out var unsafeReason))
         {
             log?.Invoke($"Model pack {id} rejected (unsafe for remotes): {unsafeReason}");
             // Remove a previously-installed crashy pack so SMSLoadArchive misses
@@ -197,26 +239,14 @@ internal static class MarioPackInstaller
                 }
             }
 
+            RemoveLegacyRuntimePreloadIndex(gameRoot);
             return;
         }
 
-        if (File.Exists(dest))
-        {
-            try
-            {
-                var existing = File.ReadAllBytes(dest);
-                if (existing.AsSpan().SequenceEqual(packBytes))
-                    return;
-            }
-            catch
-            {
-                // Fall through and rewrite.
-            }
-        }
-
         Directory.CreateDirectory(GetModelsDirectory(gameRoot));
-        File.WriteAllBytes(dest, packBytes);
-        log?.Invoke($"Auto-copied model pack {id} into game folder.");
+        if (EnsureInstalledPackFile(dest, ModelLibrary.GetPackPath(id), packBytes))
+            log?.Invoke($"Auto-copied model pack {id} into game folder.");
+        RemoveLegacyRuntimePreloadIndex(gameRoot);
     }
 
     /// <summary>
@@ -270,7 +300,7 @@ internal static class MarioPackInstaller
             if (!ModelLibrary.TryGetPackBytes(id, out var packBytes) || packBytes.Length == 0)
                 continue;
 
-            if (!CharacterPack.TryValidatePackForInit(packBytes, out var unsafeReason))
+            if (!TryValidatePackCached(packBytes, out var unsafeReason))
             {
                 log?.Invoke($"Skipped unsafe model pack {id}: {unsafeReason}");
                 if (File.Exists(dest))
@@ -282,20 +312,8 @@ internal static class MarioPackInstaller
                 continue;
             }
 
-            if (File.Exists(dest))
-            {
-                try
-                {
-                    if (File.ReadAllBytes(dest).AsSpan().SequenceEqual(packBytes))
-                        continue;
-                }
-                catch
-                {
-                    // Fall through and rewrite.
-                }
-            }
-
-            File.WriteAllBytes(dest, packBytes);
+            if (!EnsureInstalledPackFile(dest, ModelLibrary.GetPackPath(id), packBytes))
+                continue;
             installed++;
             log?.Invoke($"Installed model pack {id} → {dest}");
 
@@ -305,7 +323,134 @@ internal static class MarioPackInstaller
 
         if (installed > 0)
             log?.Invoke($"Installed {installed} custom model pack(s) into game folder.");
+        RemoveLegacyRuntimePreloadIndex(gameRoot);
         return installed;
+    }
+
+    private static bool TryValidatePackCached(byte[] packBytes, out string reason)
+    {
+        var result = PackValidationCache.GetValue(packBytes, bytes =>
+        {
+            var safe = CharacterPack.TryValidatePackForInit(bytes, out var validationReason);
+            return new PackValidationResult
+            {
+                Safe = safe,
+                Reason = validationReason,
+            };
+        });
+        reason = result.Reason;
+        return result.Safe;
+    }
+
+    /// <summary>
+    /// Copy a validated pack with an atomic same-directory rename. The source
+    /// timestamp is propagated, turning subsequent launch/session syncs into a
+    /// metadata-only check. Older installs get one streaming comparison, without
+    /// allocating another destination-sized byte array.
+    /// </summary>
+    private static bool EnsureInstalledPackFile(string destinationPath, string sourcePath, byte[] bytes)
+    {
+        var fullDestination = Path.GetFullPath(destinationPath);
+        var gate = InstalledPackLocks.GetOrAdd(fullDestination, static _ => new object());
+        lock (gate)
+        {
+            FileInfo? sourceInfo = null;
+            try
+            {
+                sourceInfo = new FileInfo(sourcePath);
+                if (!sourceInfo.Exists)
+                    sourceInfo = null;
+            }
+            catch
+            {
+                sourceInfo = null;
+            }
+
+            if (File.Exists(fullDestination))
+            {
+                try
+                {
+                    var destinationInfo = new FileInfo(fullDestination);
+                    if (destinationInfo.Length == bytes.LongLength &&
+                        sourceInfo != null &&
+                        sourceInfo.Length == destinationInfo.Length &&
+                        sourceInfo.LastWriteTimeUtc == destinationInfo.LastWriteTimeUtc)
+                    {
+                        return false;
+                    }
+
+                    if (destinationInfo.Length == bytes.LongLength &&
+                        FileBytesEqual(fullDestination, bytes))
+                    {
+                        if (sourceInfo != null)
+                            File.SetLastWriteTimeUtc(fullDestination, sourceInfo.LastWriteTimeUtc);
+                        return false;
+                    }
+                }
+                catch
+                {
+                    // Fall through to atomic replacement. The old complete file
+                    // remains available until the final rename succeeds.
+                }
+            }
+
+            var directory = Path.GetDirectoryName(fullDestination)
+                            ?? throw new InvalidOperationException("Model destination has no directory.");
+            Directory.CreateDirectory(directory);
+            var tempPath = Path.Combine(
+                directory, $".{Path.GetFileName(fullDestination)}.{Guid.NewGuid():N}.tmp");
+            try
+            {
+                using (var stream = new FileStream(
+                           tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None,
+                           bufferSize: 128 * 1024, FileOptions.SequentialScan))
+                {
+                    stream.Write(bytes);
+                    stream.Flush(flushToDisk: true);
+                }
+
+                if (sourceInfo != null)
+                    File.SetLastWriteTimeUtc(tempPath, sourceInfo.LastWriteTimeUtc);
+                File.Move(tempPath, fullDestination, overwrite: true);
+                return true;
+            }
+            finally
+            {
+                try
+                {
+                    if (File.Exists(tempPath))
+                        File.Delete(tempPath);
+                }
+                catch
+                {
+                    // Best-effort temp cleanup.
+                }
+            }
+        }
+    }
+
+    private static bool FileBytesEqual(string path, ReadOnlySpan<byte> expected)
+    {
+        const int bufferSize = 128 * 1024;
+        using var stream = new FileStream(
+            path, FileMode.Open, FileAccess.Read,
+            FileShare.Read | FileShare.Delete, bufferSize, FileOptions.SequentialScan);
+        if (stream.Length != expected.Length)
+            return false;
+
+        var buffer = new byte[bufferSize];
+        var offset = 0;
+        while (offset < expected.Length)
+        {
+            var read = stream.Read(buffer, 0, Math.Min(buffer.Length, expected.Length - offset));
+            if (read <= 0)
+                return false;
+            if (!buffer.AsSpan(0, read).SequenceEqual(expected.Slice(offset, read)))
+                return false;
+            offset += read;
+        }
+
+        return stream.ReadByte() == -1;
     }
 
     /// <summary>
@@ -357,7 +502,8 @@ internal static class MarioPackInstaller
             if (missing.Length == 0)
                 return new MarioPackInstallResult(true, false, 0, "Model pack is already installed.");
 
-            var installed = PatchPacksIntoDiscImage(discPath, missing, manifestPath, known, log);
+            var installed = PatchPacksIntoDiscImage(
+                discPath, missing, manifestPath, known, log);
             if (installed > 0)
             {
                 return new MarioPackInstallResult(

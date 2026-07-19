@@ -2,9 +2,9 @@ namespace SMSO.Net;
 
 public static class NameTagColorCodec
 {
-    public const int NameTextBytes = 15;
-    public const int NameTextBytesWithOutline = 15;
-    public const int NameTextBytesWithGradient = 15;
+    public const int NameTextBytes = 12;
+    public const int NameTextBytesWithOutline = 11;
+    public const int NameTextBytesWithGradient = 5;
 
     public const byte TextOnlyMarker = 0x7F;
     public const byte ExtendedMarker = 0x7D;

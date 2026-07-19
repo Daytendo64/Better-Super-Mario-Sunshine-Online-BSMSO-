@@ -14,11 +14,33 @@ namespace SMSO.Net.MarioPack;
 /// Luigi), those BTKs are also written under <c>custom/</c> so deferred
 /// MActorAnmData can init from <c>/mario/custom</c>. <c>better_sms.prm</c> is
 /// never injected — BSE initMario freezes on <c>mHasMActor</c> during load.
+/// Matching <c>.bck</c> replacements are opt-in for packs that ship full custom
+/// animation sets (Waluigi, Wario, Luigi, Nightendo, Shadow, Sonic). When BCK
+/// replacement is enabled, matching <c>.bas</c> files are merged too so animSound
+/// tables stay paired with the clips. Custom packs may ship multiple BCK buffers
+/// under the same basename (Mario-body 16-joint + FLUDD 14-joint
+/// <c>wg_pump.bck</c>); each retail target picks the joint-compatible candidate.
+/// A stem is dropped only when none of its candidates match any retail joint
+/// count for that basename (keeps retail when a pack ships only a mismatched
+/// clip). Paired <c>.bas</c> files follow the same stem gate. Shadow Mario/Luigi
+/// and other packs keep retail animations to avoid BAS/BCK mismatches that crash remotes.
+/// Tall characters (Luigi, Nightendo, Waluigi, Wario) also opt into a pack-local
+/// <c>BodyAngleFree.prm</c> override (<c>bodyanglefree2.prm</c>) so upper-body
+/// lean matches their proportions. This is not <c>better_sms.prm</c>. Note:
+/// <c>TMario</c> constructs <c>TBodyAngleParams</c> from the <c>params</c> volume
+/// (<c>params.szs</c> → <c>mario/bodyanglefree.prm</c>), not the character pack;
+/// the module reloads from this pack-local file after remount via
+/// <c>ensureLocalBodyAngleFreeParams</c>.
 /// </summary>
 public static class CharacterPack
 {
     public const int ModelIdLength = 8;
     public const string BetterSmsPrmName = "better_sms.prm";
+    /// <summary>
+    /// Retail / BSE path basename for free-look body angle params
+    /// (<c>/Mario/BodyAngleFree.prm</c> on the mounted mario volume).
+    /// </summary>
+    public const string BodyAngleFreePrmName = "BodyAngleFree.prm";
     public const string CustomFolderName = "custom";
     /// <summary>
     /// Injected into packs that kept retail caps because the custom SZS shipped
@@ -26,6 +48,77 @@ public static class CharacterPack
     /// look capless while <c>TMarioCap</c> still constructs safely.
     /// </summary>
     public const string HideCapsMarkerName = "bsmso_hide_caps";
+
+    /// <summary>Display names that opt into custom <c>.bck</c> replacement.</summary>
+    public static readonly string[] BckReplacementDisplayNames =
+    {
+        "Waluigi",
+        "Wario",
+        "Luigi",
+        "Nightendo",
+        "Shadow",
+        "Sonic",
+    };
+
+    /// <summary>
+    /// Display names that receive the tall-character <c>BodyAngleFree.prm</c>
+    /// override (<c>bodyanglefree2.prm</c>). Intentionally narrower than the BCK
+    /// allow-list — Shadow keeps retail code defaults.
+    /// </summary>
+    public static readonly string[] BodyAngleFreeReplacementDisplayNames =
+    {
+        "Luigi",
+        "Nightendo",
+        "Sonic",
+        "Waluigi",
+        "Wario",
+    };
+
+    public static bool AllowsBckReplacement(string? displayName)
+    {
+        var name = displayName?.Trim();
+        if (string.IsNullOrEmpty(name))
+            return false;
+
+        foreach (var allowed in BckReplacementDisplayNames)
+        {
+            if (string.Equals(name, allowed, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        return false;
+    }
+
+    public static bool AllowsBodyAngleFreeReplacement(string? displayName)
+    {
+        var name = displayName?.Trim();
+        if (string.IsNullOrEmpty(name))
+            return false;
+
+        foreach (var allowed in BodyAngleFreeReplacementDisplayNames)
+        {
+            if (string.Equals(name, allowed, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Bytes for the tall-character <c>BodyAngleFree.prm</c> override
+    /// (embedded <c>bodyanglefree2.prm</c>).
+    /// </summary>
+    public static byte[] GetBodyAngleFree2PrmBytes()
+    {
+        const string resourceName = "SMSO.Net.MarioPack.bodyanglefree2.prm";
+        var asm = typeof(CharacterPack).Assembly;
+        using var stream = asm.GetManifestResourceStream(resourceName)
+            ?? throw new InvalidOperationException(
+                "Embedded resource missing: " + resourceName);
+        using var ms = new MemoryStream();
+        stream.CopyTo(ms);
+        return ms.ToArray();
+    }
 
     public sealed class MergeResult
     {
@@ -36,6 +129,7 @@ public static class CharacterPack
         public required int InjectedBtkCount { get; init; }
         public required IReadOnlyList<string> InjectedBtkNames { get; init; }
         public bool InjectedBetterSmsPrm { get; init; }
+        public bool InjectedBodyAngleFreePrm { get; init; }
         public int InjectedCustomBtkCount { get; init; }
         public IReadOnlyList<string> SkippedReplacements { get; init; } = Array.Empty<string>();
         public bool InjectedHideCapsMarker { get; init; }
@@ -51,22 +145,105 @@ public static class CharacterPack
     public static RarcArchive OpenArchive(byte[] archiveBytes) =>
         RarcArchive.Open(OpenToRarcBytes(archiveBytes));
 
-    public static Dictionary<string, byte[]> CollectBmdBtkByBasename(RarcArchive archive)
+    public static Dictionary<string, byte[]> CollectBmdBtkByBasename(RarcArchive archive,
+        bool includeBck = false, bool includeBas = false)
     {
+        // Public helper keeps first-wins for callers that expect a flat map.
+        // BuildMergedPack uses CollectReplacementsMulti so duplicate BCK joint
+        // variants (Mario body vs FLUDD) can both participate in per-target merge.
+        var multi = CollectReplacementsMulti(archive, includeBck, includeBas);
         var map = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
+        foreach (var kvp in multi)
+        {
+            if (kvp.Value.Count > 0)
+                map[kvp.Key] = kvp.Value[0];
+        }
+
+        return map;
+    }
+
+    /// <summary>
+    /// Collect replacement payloads keyed by basename. BMD/BTK/BAS keep
+    /// first-wins; BCK keeps every unique buffer so joint-variant duplicates
+    /// (e.g. 16-joint <c>bck/wg_pump.bck</c> + 14-joint
+    /// <c>watergun2/body/wg_pump.bck</c>) both reach per-target merge.
+    /// </summary>
+    internal static Dictionary<string, List<byte[]>> CollectReplacementsMulti(
+        RarcArchive archive, bool includeBck = false, bool includeBas = false)
+    {
+        var map = new Dictionary<string, List<byte[]>>(StringComparer.OrdinalIgnoreCase);
         foreach (var file in archive.EnumerateFiles())
         {
             var ext = Path.GetExtension(file.Name);
+            var isBck = includeBck && ext.Equals(".bck", StringComparison.OrdinalIgnoreCase);
             if (!ext.Equals(".bmd", StringComparison.OrdinalIgnoreCase) &&
-                !ext.Equals(".btk", StringComparison.OrdinalIgnoreCase))
+                !ext.Equals(".btk", StringComparison.OrdinalIgnoreCase) &&
+                !isBck &&
+                !(includeBas && ext.Equals(".bas", StringComparison.OrdinalIgnoreCase)))
             {
                 continue;
             }
 
-            map[file.Name] = file.Data;
+            if (!map.TryGetValue(file.Name, out var list))
+            {
+                list = new List<byte[]>();
+                map[file.Name] = list;
+            }
+
+            if (isBck)
+            {
+                // Keep unique BCK payloads (by exact bytes) for joint variants.
+                var exists = false;
+                foreach (var existing in list)
+                {
+                    if (existing.AsSpan().SequenceEqual(file.Data))
+                    {
+                        exists = true;
+                        break;
+                    }
+                }
+
+                if (!exists)
+                    list.Add(file.Data);
+                continue;
+            }
+
+            // BMD / BTK / BAS: first basename wins.
+            if (list.Count == 0)
+                list.Add(file.Data);
         }
 
         return map;
+    }
+
+    /// <summary>
+    /// Read ANK1 joint-animation entry count from a J3D1bck1 clip.
+    /// Returns false when the file is not a recognizable BCK.
+    /// </summary>
+    public static bool TryReadBckJointCount(ReadOnlySpan<byte> bck, out int jointCount)
+    {
+        jointCount = 0;
+        if (bck.Length < 0x40)
+            return false;
+        if (bck.Length < 8 ||
+            bck[0] != (byte)'J' || bck[1] != (byte)'3' || bck[2] != (byte)'D' || bck[3] != (byte)'1')
+        {
+            return false;
+        }
+
+        for (int i = 0x20; i + 0x10 <= bck.Length; i++)
+        {
+            if (bck[i] != (byte)'A' || bck[i + 1] != (byte)'N' || bck[i + 2] != (byte)'K' ||
+                bck[i + 3] != (byte)'1')
+            {
+                continue;
+            }
+
+            jointCount = BinaryPrimitives.ReadUInt16BigEndian(bck.Slice(i + 0x0C, 2));
+            return jointCount > 0;
+        }
+
+        return false;
     }
 
     /// <summary>
@@ -649,6 +826,45 @@ public static class CharacterPack
         return BmdSkipReason.None;
     }
 
+    /// <summary>
+    /// Per retail target: refuse BCK/BMD replacements whose joint count disagrees
+    /// with that specific node. Protects duplicate basenames such as
+    /// <c>bck/wg_pump.bck</c> (16) vs <c>watergun2/body/wg_pump.bck</c> (14).
+    /// </summary>
+    internal static bool AcceptJointCompatibleReplacement(string basename,
+        byte[] archiveBuffer, int retailOffset, int retailLength, byte[] replacement)
+    {
+        if (replacement == null || archiveBuffer == null || retailLength <= 0 ||
+            retailOffset < 0 || retailOffset + retailLength > archiveBuffer.Length)
+            return true;
+
+        var retailData = archiveBuffer.AsSpan(retailOffset, retailLength);
+
+        if (basename.EndsWith(".bck", StringComparison.OrdinalIgnoreCase))
+        {
+            if (TryReadBckJointCount(replacement, out var customJoints) &&
+                TryReadBckJointCount(retailData, out var retailJoints) &&
+                customJoints != retailJoints)
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+        if (basename.EndsWith(".bmd", StringComparison.OrdinalIgnoreCase))
+        {
+            if (TryReadBmdJointCount(replacement, out var customJoints) &&
+                TryReadBmdJointCount(retailData, out var retailJoints) &&
+                customJoints != retailJoints)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     internal static bool ShouldSkipBmdReplacement(string basename, ReadOnlySpan<byte> custom,
         ReadOnlySpan<byte> retail) =>
         GetBmdSkipReason(basename, custom, retail) != BmdSkipReason.None;
@@ -662,17 +878,125 @@ public static class CharacterPack
         IReadOnlyDictionary<string, byte[]> replacements, RarcArchive retail,
         out List<string> skipped, out List<BmdSkipReason> skipReasons)
     {
+        var multi = new Dictionary<string, List<byte[]>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var kvp in replacements)
+            multi[kvp.Key] = new List<byte[]> { kvp.Value };
+
+        var filteredMulti = FilterUnsafeReplacements(multi, retail, out skipped, out skipReasons);
+        var filtered = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
+        foreach (var kvp in filteredMulti)
+        {
+            if (kvp.Value.Count > 0)
+                filtered[kvp.Key] = kvp.Value[0];
+        }
+
+        return filtered;
+    }
+
+    internal static Dictionary<string, List<byte[]>> FilterUnsafeReplacements(
+        Dictionary<string, List<byte[]>> replacements, RarcArchive retail,
+        out List<string> skipped, out List<BmdSkipReason> skipReasons)
+    {
         var retailByName = retail.EnumerateFiles()
-            .Where(f => f.Name.EndsWith(".bmd", StringComparison.OrdinalIgnoreCase))
-            .ToDictionary(f => f.Name, f => f.Data, StringComparer.OrdinalIgnoreCase);
+            .GroupBy(f => f.Name, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(g => g.Key, g => g.First().Data, StringComparer.OrdinalIgnoreCase);
+
+        // All retail joint counts per BCK basename (bck/ 16 + watergun2/body 14).
+        var retailBckJoints = new Dictionary<string, HashSet<int>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var file in retail.EnumerateFiles())
+        {
+            if (!file.Name.EndsWith(".bck", StringComparison.OrdinalIgnoreCase))
+                continue;
+            if (!TryReadBckJointCount(file.Data, out var joints))
+                continue;
+            if (!retailBckJoints.TryGetValue(file.Name, out var set))
+            {
+                set = new HashSet<int>();
+                retailBckJoints[file.Name] = set;
+            }
+
+            set.Add(joints);
+        }
 
         skipped = new List<string>();
         skipReasons = new List<BmdSkipReason>();
-        var filtered = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
+
+        // Pre-scan BCK stems that have zero joint-compatible candidates so paired
+        // BAS can be dropped even when dictionary order visits .bas before .bck.
+        var skippedBckStems = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var kvp in replacements)
+        {
+            if (!kvp.Key.EndsWith(".bck", StringComparison.OrdinalIgnoreCase))
+                continue;
+            if (!retailBckJoints.TryGetValue(kvp.Key, out var retailJoints) || retailJoints.Count == 0)
+                continue;
+
+            var anyCompatible = false;
+            foreach (var candidate in kvp.Value)
+            {
+                if (!TryReadBckJointCount(candidate, out var customJoints) ||
+                    retailJoints.Contains(customJoints))
+                {
+                    anyCompatible = true;
+                    break;
+                }
+            }
+
+            if (!anyCompatible)
+                skippedBckStems.Add(Path.GetFileNameWithoutExtension(kvp.Key));
+        }
+
+        var filtered = new Dictionary<string, List<byte[]>>(StringComparer.OrdinalIgnoreCase);
         foreach (var kvp in replacements)
         {
             retailByName.TryGetValue(kvp.Key, out var retailData);
-            var data = kvp.Value;
+
+            // Drop the whole stem when no candidate matches any retail joint count
+            // for that basename. Compatible candidates still reach per-target merge
+            // (Mario-body 16 vs FLUDD 14 picked independently).
+            if (kvp.Key.EndsWith(".bck", StringComparison.OrdinalIgnoreCase) &&
+                skippedBckStems.Contains(Path.GetFileNameWithoutExtension(kvp.Key)))
+            {
+                skipped.Add(kvp.Key);
+                skipReasons.Add(BmdSkipReason.JointMismatch);
+                continue;
+            }
+
+            // Keep BAS with the retail BCK when every custom clip was rejected.
+            if (kvp.Key.EndsWith(".bas", StringComparison.OrdinalIgnoreCase) &&
+                skippedBckStems.Contains(Path.GetFileNameWithoutExtension(kvp.Key)))
+            {
+                skipped.Add(kvp.Key);
+                skipReasons.Add(BmdSkipReason.JointMismatch);
+                continue;
+            }
+
+            if (kvp.Key.EndsWith(".bck", StringComparison.OrdinalIgnoreCase))
+            {
+                retailBckJoints.TryGetValue(kvp.Key, out var retailJoints);
+                var kept = new List<byte[]>();
+                foreach (var candidate in kvp.Value)
+                {
+                    if (retailJoints == null || retailJoints.Count == 0 ||
+                        !TryReadBckJointCount(candidate, out var customJoints) ||
+                        retailJoints.Contains(customJoints))
+                    {
+                        kept.Add(candidate);
+                    }
+                }
+
+                if (kept.Count == 0)
+                {
+                    skipped.Add(kvp.Key);
+                    skipReasons.Add(BmdSkipReason.JointMismatch);
+                    continue;
+                }
+
+                filtered[kvp.Key] = kept;
+                continue;
+            }
+
+            var data = kvp.Value.Count > 0 ? kvp.Value[0] : Array.Empty<byte>();
 
             // Waluigi-style caps: real mesh but 1 joint vs retail 2/3. Pad JNT1 so
             // TMarioCap bone-1 access survives and the custom hat geometry is kept.
@@ -690,18 +1014,57 @@ public static class CharacterPack
                 continue;
             }
 
-            filtered[kvp.Key] = data;
+            filtered[kvp.Key] = new List<byte[]> { data };
         }
 
         return filtered;
     }
 
-    public static MergeResult BuildMergedPack(byte[] retailArchiveBytes, byte[] customSzsBytes)
+    /// <summary>
+    /// Ensure a pack .arc on disk has the tall-character <c>BodyAngleFree.prm</c>
+    /// override. Used by zip seed so AppData packs always receive the current
+    /// embedded PRM even when an older bundled .arc omitted it.
+    /// </summary>
+    /// <returns><c>true</c> when the file was rewritten.</returns>
+    public static bool EnsureBodyAngleFreePrmInPackFile(string packPath)
+    {
+        if (string.IsNullOrWhiteSpace(packPath) || !File.Exists(packPath))
+            return false;
+
+        try
+        {
+            var expected = GetBodyAngleFree2PrmBytes();
+            var bytes = File.ReadAllBytes(packPath);
+            var arc = RarcArchive.Open(OpenToRarcBytes(bytes));
+            var existing = arc.EnumerateFiles()
+                .FirstOrDefault(f => f.Name.Equals(BodyAngleFreePrmName, StringComparison.OrdinalIgnoreCase));
+            if (existing != null && existing.Data.AsSpan().SequenceEqual(expected))
+                return false;
+
+            UpsertRootFile(arc.Root, BodyAngleFreePrmName, expected);
+            var saved = new RarcArchive { RootName = arc.RootName, Root = arc.Root }.Save();
+            File.WriteAllBytes(packPath, saved);
+            return true;
+        }
+        catch
+        {
+            // Corrupt / non-RARC packs are left alone; seed still copied the file.
+            return false;
+        }
+    }
+
+    public static MergeResult BuildMergedPack(byte[] retailArchiveBytes, byte[] customSzsBytes,
+        bool replaceMatchingBcks = false, bool injectBodyAngleFreePrm = false)
     {
         var retailRarc = OpenToRarcBytes(retailArchiveBytes);
         var retail = RarcArchive.Open(retailRarc);
         var custom = OpenArchive(customSzsBytes);
-        var replacements = CollectBmdBtkByBasename(custom);
+        // When BCK replacement is on, also pull matching BAS so animSound tables
+        // stay paired with the clips (even when BAS bytes happen to match retail).
+        // BCK duplicates keep every unique buffer (joint variants); other types
+        // stay first-wins.
+        var replacements = CollectReplacementsMulti(custom, includeBck: replaceMatchingBcks,
+            includeBas: replaceMatchingBcks);
         if (replacements.Count == 0)
         {
             throw new InvalidDataException(
@@ -717,9 +1080,26 @@ public static class CharacterPack
                 "Custom SZS has no usable .bmd or .btk files after filtering unsafe replacements.");
         }
 
-        // Patch matching BMD/BTK into the retail RARC buffer in place first.
-        // Unmatched custom BTKs (e.g. custom/ma_mdl1.btk) are injected afterward.
-        var packArc = RarcArchive.ReplaceFilesByBasename(retailRarc, replacements, out var replaced);
+        // Patch matching BMD/BTK (and opt-in BCK/BAS) into the retail RARC buffer in
+        // place first. Unmatched custom BTKs are injected afterward.
+        // Missing custom BCKs keep retail clips so packs missing e.g. ma_tree_stand.bck
+        // still resolve during initValues.
+        // Per-target joint gate: basename maps are 1→N (bck/wg_pump + watergun2/body/
+        // wg_pump). Each retail node picks a joint-compatible candidate so a
+        // 16-joint Mario spray clip cannot overwrite the 14-joint FLUDD pump, while
+        // a pack that ships both variants can patch both targets.
+        var perTargetSkipped = new List<string>();
+        var multiMap = new Dictionary<string, IReadOnlyList<byte[]>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var kvp in replacements)
+            multiMap[kvp.Key] = kvp.Value;
+        var packArc = RarcArchive.ReplaceFilesByBasename(retailRarc, multiMap, out var replaced,
+            AcceptJointCompatibleReplacement, perTargetSkipped);
+        foreach (var name in perTargetSkipped)
+        {
+            skipped.Add(name);
+            skipReasons.Add(BmdSkipReason.JointMismatch);
+        }
+
         if (replaced.Count == 0)
         {
             throw new InvalidDataException(
@@ -732,6 +1112,8 @@ public static class CharacterPack
         // Inject custom/ BTKs for deferred MActorAnmData ("mario/custom") used by
         // post-init Shadow setup. Do NOT inject better_sms.prm — BSE initMario's
         // mHasMActor / mHasScreenTexture paths freeze during level load.
+        // Save() preserves original file IDs (see RarcFileEntry.FileId) so this
+        // rebuild does not renumber retail BAS/BCK nodes.
         var customFolderBtks = CollectCustomFolderBtks(custom);
         // Also mirror unmatched BTKs into custom/ so packs that only have btk/
         // inject still expose the BetterSMS folder layout after remount.
@@ -770,17 +1152,44 @@ public static class CharacterPack
             packArc = new RarcArchive { RootName = arc.RootName, Root = arc.Root }.Save();
         }
 
-        // Model id hashes only the in-place replacements so re-importing the same
-        // SZS (now with BTK inject) keeps the existing 8-char id (bb698f9c / 82c7a737).
+        // Tall-character BodyAngleFree.prm (bodyanglefree2). Safe TBodyAngleParams
+        // payload — not better_sms.prm. Injected at mario RARC root for the
+        // module to reload after TMario construction (params.szs is authoritative
+        // at construct; pack file is the override source).
+        var injectedBodyAngle = false;
+        if (injectBodyAngleFreePrm)
+        {
+            var arc = RarcArchive.Open(packArc);
+            UpsertRootFile(arc.Root, BodyAngleFreePrmName, GetBodyAngleFree2PrmBytes());
+            packArc = new RarcArchive { RootName = arc.RootName, Root = arc.Root }.Save();
+            injectedBodyAngle = true;
+        }
+
+        // Model id hashes visual/anim replacements (BMD/BTK/BCK) so re-importing
+        // the same SZS keeps a stable 8-char id. BAS is paired for animSound but
+        // excluded from the id — identical retail BAS would otherwise churn ids
+        // every time BCK allow-list packs are reimported. PRM overrides are also
+        // excluded so BodyAngleFree injection does not churn multiplayer ids.
+        // Walk replaced names in RARC order; emit each basename once. Single-candidate
+        // stems match the legacy hash. Multi-candidate BCK stems include every
+        // unique buffer so Mario-body + FLUDD variants get distinct ids.
         var hashMaterial = new MemoryStream();
+        var hashedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var name in replaced)
         {
-            if (!replacements.TryGetValue(name, out var replacement))
+            if (name.EndsWith(".bas", StringComparison.OrdinalIgnoreCase))
+                continue;
+            if (!hashedNames.Add(name))
+                continue;
+            if (!replacements.TryGetValue(name, out var candidates) || candidates.Count == 0)
                 continue;
             var nameBytes = Encoding.ASCII.GetBytes(name.ToLowerInvariant());
-            hashMaterial.Write(nameBytes, 0, nameBytes.Length);
-            hashMaterial.WriteByte(0);
-            hashMaterial.Write(replacement, 0, replacement.Length);
+            foreach (var replacement in candidates)
+            {
+                hashMaterial.Write(nameBytes, 0, nameBytes.Length);
+                hashMaterial.WriteByte(0);
+                hashMaterial.Write(replacement, 0, replacement.Length);
+            }
         }
 
         var modelId = ComputeModelId(hashMaterial.ToArray());
@@ -793,6 +1202,7 @@ public static class CharacterPack
             InjectedBtkCount = injected.Count,
             InjectedBtkNames = injected,
             InjectedBetterSmsPrm = false,
+            InjectedBodyAngleFreePrm = injectedBodyAngle,
             InjectedCustomBtkCount = injectedCustom,
             SkippedReplacements = skipped,
             InjectedHideCapsMarker = hideCaps,

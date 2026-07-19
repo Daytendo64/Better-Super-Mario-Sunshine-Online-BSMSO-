@@ -32,11 +32,13 @@ BSE enables bloopers on every stage via `generic.cpp` (“Global surfing bloopie
 ## Remote reconstruction (`blooper_surf_sync.cpp`)
 
 1. **Detect** surfing from snapshot `mState`, not puppet-local collision.
-2. **Bind gesso** — per-remote `MActor`+`J3DModel` clone (templates are singletons; sharing crashes with multiple riders).
-3. **Retry bind** — if templates are not loaded yet (`bindPending`), retry every perform frame.
-4. **Water context** — set `mWaterHeight`, `mIsWater` for FX and retail anim helpers.
-5. **Per-frame** — speed-based gesso BCK rate, base-matrix copy, `MActor::perform` from `remoteCalcAnim`.
-6. **Draw safety** — strip surf draw flag before `calcView`/`entryModels` (clone is not a real `TSurfGesso`).
+2. **Bind gesso** — per-remote clone via retail `SMS_MakeMActorFromSDLModelData(sdlModelData, anm, 3)` on the remote actor heap. Stage `mRed/Yellow/GreenGesso` templates are singletons; sharing them across riders crashes. Clones must be **`SDLModel` (0xAC)**, not plain `J3DModel(modelData, 0, 0)` — the latter crashes in `MActor::perform` on other clients.
+3. **Color** — `TMapObjBase::initPacketMatColor` with MapObjManager `unkA8/unkB0/unkB8` so red/yellow/green match.
+4. **Retry bind** — if templates are not loaded yet (`bindPending`), retry every perform frame.
+5. **Water context** — set `mWaterHeight`, `mIsWater` for FX and retail anim helpers.
+6. **Per-frame** — speed-based gesso BCK rate, base-matrix copy, `MActor::perform(2)` from `remoteCalcAnim`.
+7. **Draw** — keep surf draw flag when `mSurfGesso` is bound so retail `calcView`/`entryModels` call `perform(4/0x200)`. Strip the flag only when surfing with a null gesso (bind pending) to avoid null-deref.
+8. **10 players** — one `BlooperSurfSlot` per `RemoteActorSlot` (`MAX_REMOTE_SLOTS == 10`); up to 9 simultaneous remote clones plus the local rider on the stage templates.
 
 ## Files
 
@@ -51,4 +53,5 @@ BSE enables bloopers on every stage via `generic.cpp` (“Global surfing bloopie
 2. Two clients, Ricco Ep 8 or any stage with bloopers.
 3. Host mounts red/yellow/green blooper — remotes show matching color mesh, ride-shell pose, lean, spray trail.
 4. Jump off (X) — remotes drop mesh within one snapshot.
-5. Three players same color — no crash (per-slot clones).
+5. Three players same color — no crash (per-slot SDLModel clones).
+6. Stress: as many remotes as practical (up to 9) surfing at once — no remote-client crash; heap bind failures only skip mesh (draw flag stripped when `mSurfGesso` is null).

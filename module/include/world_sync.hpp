@@ -7,6 +7,8 @@ namespace smso {
 void initWorldSync();
 void ensureHipDropObjectHooks();
 void processWorldEvents();
+/// One-shot OSReport of live THipDropHideObj / casinorulet counts after setupObjects.
+void reportCasinoHipDropSpawnDiag(u8 areaId);
 
 // Enqueue an outbound world event into the shared local queue. Validates sync flags for
 // the event type and drops it if the relevant sync category is disabled or the queue is

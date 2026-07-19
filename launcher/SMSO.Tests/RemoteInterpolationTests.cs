@@ -140,6 +140,76 @@ public class RemoteInterpolationTests
         Assert.NotEqual(0f, display.Position.X);
     }
 
+    [Fact]
+    public void Advance_NormalMovementDoesNotTriggerTeleportSnap()
+    {
+        double now = 0;
+        var interp = new RemoteInterpolation(() => now);
+        var first = MakeSnapshot(animId: 0x48, animFrame: 0);
+        first.Position = new Vec3 { X = 0f, Y = 0f, Z = 0f };
+        first.Velocity = new Vec3 { X = 1000f, Y = 0f, Z = 0f };
+        interp.PushPacket(1, first);
+
+        now = 16;
+        var second = MakeSnapshot(animId: 0x48, animFrame: 256);
+        second.Position = new Vec3 { X = 100f, Y = 0f, Z = 0f };
+        second.Velocity = first.Velocity;
+        interp.PushPacket(1, second);
+
+        now = 40; // delayed render time = 7 ms, within the 0..16 ms sample span
+        var display = interp.Advance(1);
+
+        Assert.InRange(display.Position.X, 1f, 99f);
+    }
+
+    [Fact]
+    public void Advance_ChangesPositionOnEachRenderTickBetweenSamples()
+    {
+        double now = 0;
+        var interp = new RemoteInterpolation(() => now);
+        var first = MakeSnapshot(animId: 0x48, animFrame: 0);
+        first.Position = new Vec3 { X = 0f, Y = 0f, Z = 0f };
+        first.Velocity = new Vec3 { X = 1000f, Y = 0f, Z = 0f };
+        interp.PushPacket(1, first);
+
+        now = 16;
+        var second = MakeSnapshot(animId: 0x48, animFrame: 256);
+        second.Position = new Vec3 { X = 100f, Y = 0f, Z = 0f };
+        second.Velocity = first.Velocity;
+        interp.PushPacket(1, second);
+
+        now = 38;
+        var frameA = interp.Advance(1);
+        now = 42;
+        var frameB = interp.Advance(1);
+
+        Assert.True(frameB.Position.X > frameA.Position.X);
+        Assert.NotEqual(frameA.Position.X, frameB.Position.X);
+    }
+
+    [Fact]
+    public void Advance_ExtrapolatesAcrossDelayedCoalescedBatch()
+    {
+        double now = 0;
+        var interp = new RemoteInterpolation(() => now);
+        var first = MakeSnapshot(animId: 0x48, animFrame: 0);
+        first.Position = new Vec3 { X = 0f, Y = 0f, Z = 0f };
+        first.Velocity = new Vec3 { X = 1000f, Y = 0f, Z = 0f };
+        interp.PushPacket(1, first);
+
+        now = 16;
+        var second = MakeSnapshot(animId: 0x48, animFrame: 256);
+        second.Position = new Vec3 { X = 16f, Y = 0f, Z = 0f };
+        second.Velocity = first.Velocity;
+        interp.PushPacket(1, second);
+
+        now = 80; // render time 47 ms: 31 ms beyond the latest coalesced sample
+        var display = interp.Advance(1);
+
+        Assert.True(display.Position.X > second.Position.X);
+        Assert.InRange(display.Position.X, 40f, 50f);
+    }
+
     private static PlayerSnapshot MakeSnapshot(ushort animId, ushort animFrame, ushort pingMs = 64)
     {
         return new PlayerSnapshot

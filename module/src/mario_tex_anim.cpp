@@ -93,6 +93,8 @@ struct TexBinding {
 static TexBinding sBindings[kMaxBindings];
 static u32 sBindingCount = 0;
 
+static BetterSMS::Player::TPlayerData *tryGetPlayerData(TMario *mario);
+
 static const char *const kBodyBtkPath = "/mario/btk/ma_mdl1.btk";
 static const char *const kBodyBtkCustomPath = "/mario/custom/ma_mdl1.btk";
 static const char *const kHand2RBtkPath = "/mario/btk/ma_hnd2r.btk";
@@ -112,27 +114,52 @@ static TexBinding *findBinding(TMario *mario) {
 }
 
 // Remote Shadow MActors / TMultiBtk must outlive stage teardown when the body
-// pool is kept. Prefer the remote actor heap (same lifetime as pool bodies);
-// fall back to system/root — never the stage heap (destroyed on warp).
+// pool is kept — always the remote heap. Local Mario dies with the stage, so
+// local TexAnim must use the live stage heap (sCurrentHeap), NOT sSystemHeap.
+//
+// Bug (dolphin.log 06:11 Gelato→plaza): local MActors on sSystemHeap were never
+// freed by clearBinding (memset only). After three successful Shadow binds
+// (05:58 / 06:02 / 06:09) the fourth hung mid-create after ma_hnd4r, before
+// ma_cap1 — identical body/hand pointers to the prior plaza success.
 static JKRHeap *selectTexAnimHeap(TMario *mario) {
-    if (mario && mario != gpMarioAddress) {
-        JKRHeap *remote = borrowRemoteActorHeap();
-        // ~64 KiB covers AnmData + 10 MActors with margin after initValues.
-        if (remote && remote->getTotalFreeSize() >= 0x10000u)
-            return remote;
-    }
-    if (JKRHeap::sSystemHeap)
-        return JKRHeap::sSystemHeap;
+    if (mario && mario != gpMarioAddress)
+        return borrowRemoteActorHeap();
+    // Prefer the stage heap while Mario is live (stageUpdate / construct).
+    if (JKRHeap::sCurrentHeap && JKRHeap::sCurrentHeap != JKRHeap::sSystemHeap)
+        return JKRHeap::sCurrentHeap;
+    if (JKRHeap::sCurrentHeap)
+        return JKRHeap::sCurrentHeap;
     if (JKRHeap::sRootHeap)
         return JKRHeap::sRootHeap;
-    return JKRHeap::sCurrentHeap;
+    return JKRHeap::sSystemHeap;
 }
 
-static void clearBinding(TexBinding &b) {
-    // Drop tracking only. Remote MActors live on the remote/system heap with the
-    // pool body; deleting here without detaching J3D MaterialAnm is unsafe, and
-    // abandoned bodies are never drawn again. Stage keep-alive relies on these
-    // allocations surviving clearMarioTexAnims(keepRemoteBindings=true).
+// Detach BSE draw ownership before dropping a binding. Do NOT delete MActors,
+// MActorAnmData, or TMultiBtk here:
+//   - setBtk installs MaterialAnm on live J3D models; deleting the MActor while
+//     those models still draw leaves dangling MaterialAnm and hard-crashes
+//     (black screen / silent abort, often before OSReport lands in dolphin.log).
+//   - Local allocations live on the stage heap and are reclaimed on stage exit.
+//   - Remote allocations live on the remote heap with the pool body; abandoned
+//     bodies are never drawn again, and heap recycle frees them on disconnect.
+// The previous hard-delete path (stage-heap "leak fix") caused cold-boot /
+// rebind crashes. Stage-heap selection already fixes the sSystemHeap warp leak.
+static void detachBindingDrawOwnership(TexBinding &b) {
+    if (b.bseOwnsMActors && b.mario && b.mario == gpMarioAddress) {
+        BetterSMS::Player::TPlayerData *params = tryGetPlayerData(b.mario);
+        if (params) {
+            params->mMActorAnmData = nullptr;
+            for (u32 i = 0; i < kMaxMActors; ++i)
+                params->mMActor[i] = nullptr;
+        }
+    }
+    b.bseOwnsMActors = false;
+}
+
+static void clearBinding(TexBinding &b, bool detachDrawOwnership = false) {
+    if (detachDrawOwnership)
+        detachBindingDrawOwnership(b);
+    // Drop tracking only — heap lifetime owns the allocations (see above).
     memset(&b, 0, sizeof(b));
     b.archiveSlot = kUnknownArchiveSlot;
 }
@@ -171,7 +198,7 @@ static u8 resolveArchiveSlot(TMario *mario, u8 hint) {
 static TexBinding *allocBinding(TMario *mario) {
     TexBinding *existing = findBinding(mario);
     if (existing) {
-        clearBinding(*existing);
+        clearBinding(*existing, /*detachDrawOwnership=*/true);
         existing->mario = mario;
         return existing;
     }
@@ -202,14 +229,18 @@ static bool addTrack(TexBinding &b, J3DModelData *modelData, const char *path) {
     if (!sMultiBtkCtor || !sMultiBtkSetNth)
         return false;
 
-    J3DAnmTextureSRTKey *anm = loadBtk(path);
-    if (!anm)
-        return false;
-
     JKRHeap *previousHeap = JKRHeap::sCurrentHeap;
     JKRHeap *texHeap = selectTexAnimHeap(b.mario);
-    if (texHeap)
-        texHeap->becomeCurrentHeap();
+    if (!texHeap)
+        return false;
+    texHeap->becomeCurrentHeap();
+
+    J3DAnmTextureSRTKey *anm = loadBtk(path);
+    if (!anm) {
+        if (previousHeap)
+            previousHeap->becomeCurrentHeap();
+        return false;
+    }
 
     void *mem = ::operator new(kMultiBtkBytes);
     if (!mem) {
@@ -345,7 +376,9 @@ static void configureFrameCtrl(MActor *actor, int anmType, f32 framerate) {
 }
 
 static MActor *createMActorForModel(MActorAnmData *anmData, J3DModel *model, f32 configuredFramerate,
-                                    const char *modelName, bool logBtk) {
+                                    const char *modelName, bool logBtk, bool *outHasBtk) {
+    if (outHasBtk)
+        *outHasBtk = false;
     if (!anmData || !model || !modelName)
         return nullptr;
 
@@ -360,34 +393,24 @@ static MActor *createMActorForModel(MActorAnmData *anmData, J3DModel *model, f32
     f32 framerate = configuredFramerate * static_cast<f32>(SMSGetAnmFrameRate__Fv());
     bool hasBtk = false;
 
-    // Shadow packs only need BTK for the reflective goop look. Still probe the
-    // other channels so a fuller BetterSMS custom/ tree keeps working.
-    if (actor->checkAnmFileExist(modelName, MActor::BCK)) {
-        actor->setBck(modelName);
-        configureFrameCtrl(actor, MActor::BCK, framerate);
-    }
-    if (actor->checkAnmFileExist(modelName, MActor::BLK)) {
-        actor->setBlk(modelName);
-        configureFrameCtrl(actor, MActor::BLK, framerate);
-    }
-    if (actor->checkAnmFileExist(modelName, MActor::BRK)) {
-        actor->setBrk(modelName);
-        configureFrameCtrl(actor, MActor::BRK, framerate);
-    }
-    if (actor->checkAnmFileExist(modelName, MActor::BPK)) {
-        actor->setBpk(modelName);
-        configureFrameCtrl(actor, MActor::BPK, framerate);
-    }
-    if (actor->checkAnmFileExist(modelName, MActor::BTP)) {
-        actor->setBtp(modelName);
-        configureFrameCtrl(actor, MActor::BTP, framerate);
-    }
+    // Shadow packs only need BTK for the reflective goop look. Do NOT bind
+    // BCK/BLK/BRK/BPK/BTP on these MActors — those channels belong to the main
+    // TMario animation system. Binding them here can pull mismatched clips into
+    // the BSE draw path (entryIn) and abort before the stage finishes loading.
+    //
+    // Bind only an exact-name BTK (same as BetterSMS). Never alias ma_hnd2r →
+    // ma_hnd2l / ma_hnd3r → ma_hnd3l: Shadow left-hand BMDs ship with TEX1=0
+    // (no textures / no H_kagemario_dummy). setBtk of a right-hand UV clip onto
+    // those models survives bind, then BSE playerDrawHandler→entryIn aborts
+    // (dolphin.log ends at "deferred MActor ready" / "screen texture done").
     if (actor->checkAnmFileExist(modelName, MActor::BTK)) {
         actor->setBtk(modelName);
         configureFrameCtrl(actor, MActor::BTK, framerate);
         hasBtk = true;
     }
 
+    if (outHasBtk)
+        *outHasBtk = hasBtk;
     if (logBtk)
         OSReport("[BSMSO] TexAnim: MActor %s btk=%d model=%p\n", modelName, hasBtk ? 1 : 0, model);
 
@@ -411,9 +434,9 @@ static BetterSMS::Player::TPlayerData *tryGetPlayerData(TMario *mario) {
     return BetterSMS::Player::getData(mario);
 }
 
-// Allocate AnmData/MActors on the remote/system heap (see selectTexAnimHeap).
-// Never the stage heap — pool bodies keep-alive across warps and stage teardown
-// frees stage allocations, leaving dangling MaterialAnm on surviving models.
+// Allocate AnmData/MActors on the remote heap for remotes, or the live stage
+// heap for local (see selectTexAnimHeap). Never sSystemHeap for local — those
+// allocations survived clearBinding and leaked across warps.
 static bool tryCreateShadowMActors(TexBinding &b, TMario *mario) {
     if (b.mActorReady)
         return true;
@@ -426,8 +449,9 @@ static bool tryCreateShadowMActors(TexBinding &b, TMario *mario) {
 
     JKRHeap *previousHeap = JKRHeap::sCurrentHeap;
     JKRHeap *texHeap = selectTexAnimHeap(mario);
-    if (texHeap)
-        texHeap->becomeCurrentHeap();
+    if (!texHeap)
+        return false;
+    texHeap->becomeCurrentHeap();
 
     MActorAnmData *anmData = b.mAnmData;
     if (!anmData) {
@@ -445,25 +469,40 @@ static bool tryCreateShadowMActors(TexBinding &b, TMario *mario) {
     constexpr f32 kFramerate = 1.0f;
     const bool logBtk = !b.logged;
     MActor *actors[kMaxMActors] = {};
+    bool actorHasBtk[kMaxMActors] = {};
     actors[0] =
-        createMActorForModel(anmData, mario->mModelData->mModel, kFramerate, "ma_mdl1", logBtk);
-    actors[1] = createMActorForModel(anmData, mario->mHandModel2R, kFramerate, "ma_hnd2r", logBtk);
-    actors[2] = createMActorForModel(anmData, mario->mHandModel2L, kFramerate, "ma_hnd2l", logBtk);
-    actors[3] = createMActorForModel(anmData, mario->mHandModel3R, kFramerate, "ma_hnd3r", logBtk);
-    actors[4] = createMActorForModel(anmData, mario->mHandModel3L, kFramerate, "ma_hnd3l", logBtk);
-    actors[5] = createMActorForModel(anmData, mario->mHandModel4R, kFramerate, "ma_hnd4r", logBtk);
-    actors[6] = createMActorForModel(anmData, mario->mCap->mCap1, kFramerate, "ma_cap1", logBtk);
-    actors[7] = createMActorForModel(anmData, mario->mCap->mCap3, kFramerate, "ma_cap3", logBtk);
+        createMActorForModel(anmData, mario->mModelData->mModel, kFramerate, "ma_mdl1", logBtk,
+                             &actorHasBtk[0]);
+    actors[1] = createMActorForModel(anmData, mario->mHandModel2R, kFramerate, "ma_hnd2r", logBtk,
+                                     &actorHasBtk[1]);
+    actors[2] = createMActorForModel(anmData, mario->mHandModel2L, kFramerate, "ma_hnd2l", logBtk,
+                                     &actorHasBtk[2]);
+    actors[3] = createMActorForModel(anmData, mario->mHandModel3R, kFramerate, "ma_hnd3r", logBtk,
+                                     &actorHasBtk[3]);
+    actors[4] = createMActorForModel(anmData, mario->mHandModel3L, kFramerate, "ma_hnd3l", logBtk,
+                                     &actorHasBtk[4]);
+    actors[5] = createMActorForModel(anmData, mario->mHandModel4R, kFramerate, "ma_hnd4r", logBtk,
+                                     &actorHasBtk[5]);
+    actors[6] = createMActorForModel(anmData, mario->mCap->mCap1, kFramerate, "ma_cap1", logBtk,
+                                     &actorHasBtk[6]);
+    actors[7] = createMActorForModel(anmData, mario->mCap->mCap3, kFramerate, "ma_cap3", logBtk,
+                                     &actorHasBtk[7]);
     actors[8] =
-        createMActorForModel(anmData, mario->mCap->mDiverHelm, kFramerate, "diver_helm", logBtk);
+        createMActorForModel(anmData, mario->mCap->mDiverHelm, kFramerate, "diver_helm", logBtk,
+                             &actorHasBtk[8]);
     actors[9] =
-        createMActorForModel(anmData, mario->mCap->maGlass1, kFramerate, "ma_glass1", logBtk);
+        createMActorForModel(anmData, mario->mCap->maGlass1, kFramerate, "ma_glass1", logBtk,
+                             &actorHasBtk[9]);
 
     u32 created = 0;
+    u32 btkBound = 0;
     for (u32 i = 0; i < kMaxMActors; ++i) {
         b.mActors[i] = actors[i];
-        if (actors[i])
+        if (actors[i]) {
             ++created;
+            if (actorHasBtk[i])
+                ++btkBound;
+        }
     }
     b.mActorCount = created;
     b.mActorReady = created > 0;
@@ -493,8 +532,8 @@ static bool tryCreateShadowMActors(TexBinding &b, TMario *mario) {
     }
 
     b.logged = true;
-    OSReport("[BSMSO] TexAnim: deferred MActor ready mario=%p folder=%s actors=%u bse=%d slot=%u\n",
-             mario, anmFolder, created, b.bseOwnsMActors ? 1 : 0, b.archiveSlot);
+    OSReport("[BSMSO] TexAnim: deferred MActor ready mario=%p folder=%s actors=%u btk=%u bse=%d slot=%u\n",
+             mario, anmFolder, created, btkBound, b.bseOwnsMActors ? 1 : 0, b.archiveSlot);
     return true;
 }
 
@@ -546,19 +585,22 @@ static bool tryCreateShadowMActorsThunk(TexBinding &b, TMario *mario) {
 
 void clearMarioTexAnims(bool keepRemoteBindings) {
     if (!keepRemoteBindings) {
+        // Full teardown (disconnect / heap recycle): detach BSE and drop tracking.
+        // Remote/stage heaps reclaim the allocations — do not hard-delete.
         for (u32 i = 0; i < sBindingCount; ++i)
-            clearBinding(sBindings[i]);
+            clearBinding(sBindings[i], /*detachDrawOwnership=*/true);
         sBindingCount = 0;
         OSReport("[BSMSO] TexAnim cleared\n");
         return;
     }
 
-    // Connected stage exit: local Mario is rebuilt next stage; remotes keep
-    // pool bodies + MActors on the remote heap.
+    // Connected stage exit: drop local tracking only. Local MActors live on the
+    // stage heap with Mario — stage teardown reclaims them. Remotes keep pool
+    // bodies + MActors on the remote heap (tracking preserved).
     for (u32 i = 0; i < sBindingCount; ++i) {
         TexBinding &b = sBindings[i];
         if (!b.mario || b.mario == gpMarioAddress)
-            clearBinding(b);
+            clearBinding(b, /*detachDrawOwnership=*/true);
     }
     compactBindings();
     OSReport("[BSMSO] TexAnim cleared (kept %u remote binding(s))\n", sBindingCount);
@@ -568,7 +610,8 @@ void releaseMarioTexAnims(TMario *mario) {
     TexBinding *b = findBinding(mario);
     if (!b)
         return;
-    clearBinding(*b);
+    // Body rebuild / abandon — detach BSE draw path; heap owns the allocations.
+    clearBinding(*b, /*detachDrawOwnership=*/true);
     compactBindings();
     OSReport("[BSMSO] TexAnim released mario=%p (bindings=%u)\n", mario, sBindingCount);
 }
@@ -608,7 +651,9 @@ static void bindMarioTexAnimsInternal(TMario *mario, bool force, u8 archiveSlot)
         const u8 keepSlot = resolveArchiveSlot(mario, archiveSlot != kUnknownArchiveSlot
                                                           ? archiveSlot
                                                           : existing->archiveSlot);
-        clearBinding(*existing);
+        // Detach prior BSE draw wiring before rebuild / pack-swap rebind.
+        // Do not delete MActors — MaterialAnm may still be on live models.
+        clearBinding(*existing, /*detachDrawOwnership=*/true);
         existing->mario = mario;
         // Force rebind always reflects the currently mounted pack — do not keep
         // a stale Shadow flag after a retail / non-BTK rebuild on the same TMario*.
@@ -683,6 +728,12 @@ void rebindMarioTexAnimsForSlot(TMario *mario, u8 archiveSlot) {
     bindMarioTexAnimsInternal(mario, true, archiveSlot);
 }
 
+void retargetMarioTexAnimsForSlot(TMario *mario, u8 archiveSlot) {
+    TexBinding *binding = findBinding(mario);
+    if (binding)
+        binding->archiveSlot = archiveSlot;
+}
+
 void updateMarioTexAnims(TMario *mario) {
     TexBinding *b = findBinding(mario);
     if (!b)
@@ -721,19 +772,11 @@ void updateAllMarioTexAnims(TMario *localMario) {
         TMario *mario = sBindings[i].mario;
         if (!mario)
             continue;
-        // Local always updates. Remotes only while assigned — parked pool bodies
-        // keep MActors for reuse but must not remount packs every frame.
-        if (mario != gpMarioAddress && mario != localMario) {
-            bool assigned = false;
-            for (u8 s = 0; s < MAX_REMOTE_SLOTS; ++s) {
-                if (getRemoteBodyForSlotLoose(s) == mario) {
-                    assigned = true;
-                    break;
-                }
-            }
-            if (!assigned)
-                continue;
-        }
+        // Local always updates. Remote BTK/MActor work follows the same
+        // distance/visibility budget as its skeleton; parked bodies return false.
+        if (mario != gpMarioAddress && mario != localMario &&
+            !shouldUpdateRemoteMarioCosmetics(mario))
+            continue;
         updateMarioTexAnims(mario);
     }
     (void)localMario;

@@ -9,16 +9,17 @@ namespace smso {
 
 // Per-slot Mario archive remount (SMSCoop-inspired).
 // Adopts the game-mounted retail "mario" volume; loads custom packs from
-// /data/bsmso_models/<id>.arc via SMSLoadArchive into expanded-MEM1 remote heap
-// only when that heap has pack+body headroom — never sSystemHeap / stage heap
-// (OOM there aborts). Soft-fails to retail when the pack is missing or the heap
-// is too full. Remounts with unmountFixed/mountFixed before local/remote TMario
-// model init.
+// /data/bsmso_models/<id>.arc through a single demand-driven DVD async job into
+// the dedicated expanded-MEM1 pack heap — never sSystemHeap / stage heap (OOM
+// there aborts). Soft-fails to retail when the pack is missing or the pack heap
+// is full. Remounts with unmountFixed/mountFixed before local/remote TMario init.
 //
 // Pack-cache / heap lifetime:
-// - Pack buffers live on the remote actor heap. While that heap is kept alive
-//   across stage exits (connected sessions), pack cache pointers stay valid and
-//   clearMarioModelSystem(keepPackCache=true) must NOT drop them.
+// - Pack buffers live on the remote actor heap and stay resident across connected
+//   stage transitions. This avoids repeating DVD reads for every warp while the
+//   same session is active; imports copied after Dolphin started become visible
+//   after disconnect/relaunch, when the owning heap is safely destroyed.
+// - Buffers are never replaced while live TMario/J3D graphs reference them.
 // - On disconnect / offline stage exit the heap is destroyed; clear with
 //   keepPackCache=false so dangling cache entries are discarded before free.
 //
@@ -28,27 +29,52 @@ namespace smso {
 // body). If a remote pack soft-fails or an id arrives/changes after apply, the
 // remote path retries same-stage (visible retail kept until rebuild succeeds).
 //
-// Hitch avoidance: SMSLoadArchive is sync (~1.4–1.9 MiB + DVD seek). Prefer
-// prefetchRemoteMarioPacks (1 load/call) on hub / stageInit / idle frames —
-// never pack-load + initValues on the same gameplay visibility frame.
+// Gameplay archive reads use DVDReadAsyncPrio. Synchronous SMSLoadArchive is
+// restricted to stage/loading initialization fallback. Body construction is a
+// separate safe-window phase; activation is pointer-only.
 
 void initMarioModelSystem();
+// True when the previous stage never ran clearMarioModelSystem (soft reload /
+// skipped exit). Callers may tear remotes before initMarioModelSystem.
+bool marioModelSystemIsLive();
 // Remount retail and clear per-slot bindings. When keepPackCache is true the
 // pack cache (and its remote-heap buffers) survive for the next stage.
 void clearMarioModelSystem(bool keepPackCache = false);
 void updateMarioModelSystem(TMarDirector *director);
 
-// Budgeted remote pack prefetch: at most one SMSLoadArchive per call.
-// Walks CommBuffer remote model ids and resolve/cache misses. Returns true when
-// more known ids still need work (caller should keep ticking).
-bool prefetchRemoteMarioPacks();
+// Advance/start the one-in-flight archive state machine. Priority is active
+// swap, newly connected remote, active roster, then next-stage local selection.
+// Installed-library speculation is intentionally excluded. This never performs
+// synchronous archive I/O during active gameplay.
+bool prefetchRemoteMarioPacks(bool *outLoadStarted = nullptr);
 
 // True when id is empty (retail) or the pack buffer is already in the cache.
 // Does not touch the DVD.
 bool isMarioModelPackCached(const char id[8]);
 
+// True when the pack has spent at least one complete update frame resident.
+// Body creation/rebuild uses this gate so SMSLoadArchive and initValues never
+// compound on the same visible frame.
+bool isMarioModelPackReadyForBodyInit(const char id[8]);
+
+// Cache-only model access for bounded ready-body prewarm. These functions never
+// touch DVD. Entries remain valid until the owning remote heap is destroyed.
+u32 marioModelPackCacheCount();
+bool readMarioModelPackCacheId(u32 index, char out[8]);
+bool mountCachedMarioModelPack(const char id[8]);
+
+// Requests a stage-exit heap recycle only for cache-specific reasons. Normal
+// connected transitions retain the bounded cache; disconnect still clears it.
+bool marioModelPackCacheNeedsRecycleOnStageExit();
+
 // Bind optional /mario/btk/*.btk UV anims after TMario visuals are ready.
 void ensureMarioTexAnimsBound(TMario *mario);
+
+// TMario::TBodyAngleParams loads from the "params" volume (params.szs), not the
+// remounted character pack. Tall packs inject BodyAngleFree.prm into the mario
+// RARC; after local Mario exists, reload mBodyAngleFreeParams from that file so
+// run lean (mWaistPitch) matches the pack instead of retail params.szs.
+void ensureLocalBodyAngleFreeParams(TMario *mario);
 
 // Call before TMario::initValues / initModel for the given network slot.
 // Slot MAX_REMOTE_SLOTS (or localSlot from CommBuffer) selects the local pack.

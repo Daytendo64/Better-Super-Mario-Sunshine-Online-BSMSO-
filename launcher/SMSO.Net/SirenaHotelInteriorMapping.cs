@@ -5,7 +5,10 @@ namespace SMSO.Net;
 /// scenarios 6 and 7 fall back to the title screen. timenoe/RAScripts: Sirena ep 8
 /// red coins use logical episode 5 (scenario index 4). Shadow Mario (ep 7) loads
 /// delfino0 but runs mission scripts for episode index 6.
-/// King Boo Down Below is course 0x38, not this area.
+/// Sirena ep 4 (casino) and ep 5 (King Boo) both reuse the Mysterious Hotel map
+/// (delfino2): ep4 keeps mission 3, ep5 keeps mission 4 so the hotel→casino door
+/// loads casino0 vs casino1. King Boo's boss arena itself is course 0x38 (area 56),
+/// not this area.
 /// </summary>
 public static class SirenaHotelInteriorMapping
 {
@@ -15,6 +18,8 @@ public static class SirenaHotelInteriorMapping
     {
         (0, 0, 0), // delfino0 — default lobby
         (2, 2, 2), // Sirena ep 3 — Mysterious Hotel Delfino
+        (3, 2, 3), // Sirena ep 4 — Casino path (delfino2 map, ep4 mission)
+        (4, 2, 4), // Sirena ep 5 — King Boo path (delfino2 map, ep5 mission)
         (6, 0, 6), // Sirena ep 7 — Shadow Mario Checks In
         (7, 4, 4), // Sirena ep 8 — Red Coins in the Hotel
     };
@@ -30,6 +35,26 @@ public static class SirenaHotelInteriorMapping
 
     public static bool TryScenarioToCatalog(byte scenarioId, out byte catalogEpisodeId)
     {
+        // Prefer identity load==mission (Red Coins 7→4/4) before catalog==mission
+        // (King Boo 4→2/4). Reverse lookup only sees one scenario id.
+        foreach (var (catalog, load, mission) in Episodes)
+        {
+            if (mission == scenarioId && load == scenarioId)
+            {
+                catalogEpisodeId = catalog;
+                return true;
+            }
+        }
+
+        foreach (var (catalog, _, mission) in Episodes)
+        {
+            if (mission == scenarioId && catalog == scenarioId)
+            {
+                catalogEpisodeId = catalog;
+                return true;
+            }
+        }
+
         foreach (var (catalog, _, mission) in Episodes)
         {
             if (mission == scenarioId)

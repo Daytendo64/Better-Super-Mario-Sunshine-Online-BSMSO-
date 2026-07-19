@@ -9,6 +9,7 @@
 #include "fruit_sync.hpp"
 #include "npc_sync.hpp"
 #include "monte_clean_sync.hpp"
+#include "graffiti_clean_sync.hpp"
 #include "hide_seek.hpp"
 #include "stage_guard.hpp"
 #include "connection_hud.hpp"
@@ -53,13 +54,17 @@ BETTER_SMS_FOR_CALLBACK static void movieLoopCutsceneSkipRefresh(TApplication *a
 }
 
 BETTER_SMS_FOR_CALLBACK static void stageInit(TMarDirector *director) {
+    // Soft same-stage reloads can skip exitStageCallbacks. Tear remotes before
+    // model re-init so dangling Shadow MActors / body graphs cannot outlive the
+    // recycled stage (initMarioModelSystem also forces model/TexAnim cleanup).
+    if (smso::marioModelSystemIsLive())
+        smso::clearRemoteActors(/*keepHeapAndPool=*/false);
+
     // Remount character archives before remote/local Mario bodies init this stage.
     smso::initMarioModelSystem();
     smso::initPuppets();
     smso::initRemoteMarioVisuals();
     smso::initRemoteActors();
-    // Start budgeted pack prefetch during stage load (1 SMSLoadArchive max here).
-    smso::prefetchRemoteMarioPacks();
     smso::initMarioVoiceSync();
     smso::initRemoteWaterSync();
     smso::initHideSeek();
@@ -68,15 +73,20 @@ BETTER_SMS_FOR_CALLBACK static void stageInit(TMarDirector *director) {
     smso::ensureMarioFruitHooks();
     smso::ensureNpcReactHooks();
     smso::applyHotelWarpMissionOverride(director);
+    smso::normalizeSirenaSecretMissionEpisode(director);
     smso::updateCutsceneSkipPatches();
     // Same course/episode reloads must clear red-coin trackers; course/episode IDs alone
     // do not change, so captureLocalRedCoinProgress would otherwise keep stale state.
     smso::notifyRedCoinStageEnter();
     smso::notifyMonteCleanStageEnter();
+    smso::notifyGraffitiCleanStageEnter();
     smso::notifyStoryFlagStageEnter(director->mAreaID, director->mEpisodeID);
     const u8 missionEp = static_cast<u8>(TFlagManager::smInstance->getFlag(0x40003));
-    OSReport("[SMSOBB] Stage init area=%u load=%u mission=%u\n", director->mAreaID,
-             director->mEpisodeID, missionEp);
+    const u8 sceneEp = gpApplication.mCurrentScene.mEpisodeID;
+    OSReport("[SMSOBB] Stage init area=%u director=%u sceneLoad=%u flagMission=%u\n",
+             director->mAreaID, director->mEpisodeID, sceneEp, missionEp);
+    if (director->mAreaID == 14)
+        smso::reportCasinoHipDropSpawnDiag(director->mAreaID);
 }
 
 BETTER_SMS_FOR_CALLBACK static void stageUpdate(TMarDirector *director) {
@@ -106,16 +116,23 @@ BETTER_SMS_FOR_CALLBACK static void stageUpdate(TMarDirector *director) {
     smso::updateMarioModelSystem(director);
     // Local Mario is constructed by the stage after initMarioModelSystem remounts
     // the pack; bind optional BTKs once visuals exist, then tick all bindings.
+    // BodyAngleFree.prm is not loaded from the mario pack at construct time
+    // (TParams uses params.szs) — re-apply pack override after Mario exists.
+    smso::ensureLocalBodyAngleFreeParams(gpMarioAddress);
     smso::ensureMarioTexAnimsBound(gpMarioAddress);
-    smso::updateAllMarioTexAnims(gpMarioAddress);
     smso::exportLocalPlayer(gpMarioAddress, director);
     smso::updatePuppets(director);
     smso::updateRemoteActors(director);
+    // Remote texture animation follows the visual schedule computed above;
+    // local bindings remain full-rate.
+    smso::updateAllMarioTexAnims(gpMarioAddress);
     smso::updateRemoteMarioVisuals(director);
     smso::updateMarioVoiceSync(director);
     smso::updateRemoteWaterSync();
     smso::updateHideSeek(director);
     smso::processWorldEvents();
+    if (director && director->mAreaID == 14)
+        smso::reportCasinoHipDropSpawnDiag(director->mAreaID);
 }
 
 BETTER_SMS_FOR_CALLBACK static void stageDraw2D(TMarDirector *director, const J2DOrthoGraph *graph) {
@@ -129,16 +146,27 @@ BETTER_SMS_FOR_CALLBACK static void stageExit(TApplication *app) {
     (void)app;
     smso::scrubEphemeralSpawnDirectorFlagsOnStageExit();
     smso::updateCutsceneSkipPatches();
+    // Mark loading before clearPuppets so the bridge never observes Active+cleared
+    // remotes and republishes Connected snapshots mid-teardown.
+    smso::CommBuffer *buf = smso::getCommBuffer();
+    if (buf && buf->magic == smso::COMM_MAGIC)
+        buf->dolphinState = smso::DS_LOADING;
     smso::clearPuppets();
     smso::clearRemoteMarioVisuals();
 
-    // Keep remote heap + pack cache across stages while connected so the next
-    // stage does not re-pay SMSLoadArchive + 9× initValues. Full teardown on
-    // disconnect / offline exit. Remount retail first so pack ptrs stay valid
-    // only when the heap also survives.
-    smso::CommBuffer *buf = smso::getCommBuffer();
-    const bool keepAlive =
+    // Remote pools and their bounded custom-pack cache survive connected stage
+    // exits together. This keeps all J3D pointers valid and avoids repeating
+    // synchronous DVD loads on every warp. A body-variant pressure condition
+    // may still request a full recycle; disconnect always tears everything down.
+    // Remount retail before destroying the owning heap.
+    const bool connected =
         buf && buf->magic == smso::COMM_MAGIC && (buf->bridgeFlags & smso::BF_CONNECTED) != 0;
+    const bool recycleRemoteHeap =
+        connected && (smso::remoteActorHeapNeedsRecycleOnStageExit() ||
+                      smso::marioModelPackCacheNeedsRecycleOnStageExit());
+    const bool keepAlive = connected && !recycleRemoteHeap;
+    if (recycleRemoteHeap)
+        OSReport("[SMSOBB] Stage exit recycling remote heap/model pack cache\n");
     smso::clearMarioModelSystem(keepAlive);
     smso::clearRemoteActors(keepAlive);
 
@@ -184,6 +212,7 @@ KURIBO_MODULE_BEGIN("Better Super Mario Sunshine Online", "BSMSO", "v1.0") {
         smso::bootHideSeek();
         smso::updateCutsceneSkipPatches();
         OSReport("[SMSOBB] v1.0 loaded (comm @ %p)\n", smso::getCommBuffer());
+        OSReport("[SMSO] body-reclaim=stage-only\n");
     }
 }
 KURIBO_MODULE_END()

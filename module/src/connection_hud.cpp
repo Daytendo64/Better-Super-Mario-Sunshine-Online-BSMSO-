@@ -20,7 +20,7 @@ namespace {
 
 static constexpr f32 kToastDurationSec = 4.0f;
 static constexpr f32 kToastFadeSec = 0.6f;
-static constexpr int kMaxToasts = 5;
+static constexpr int kMaxToasts = static_cast<int>(MAX_PLAYERS);
 static constexpr int kStatusFontSize = 15;
 static constexpr int kToastFontSize = 14;
 static constexpr int kToastMinFontSize = 8;
@@ -171,7 +171,12 @@ static bool isSessionStableForDetection(const CommBuffer *buf) {
 
 static void formatPlayerLabel(char out[MAX_PLAYER_NAME], const char *name, u8 slot) {
     if (name && name[0] != '\0') {
-        copyPurePlayerName(out, name);
+        // Roster HUD / toast labels are pure usernames, not nametag overlay wires.
+        // copyPurePlayerName truncates when byte 15 looks like an overlay marker.
+        int i = 0;
+        for (; i < static_cast<int>(MAX_PLAYER_NAME) - 1 && name[i] != '\0'; ++i)
+            out[i] = name[i];
+        out[i] = '\0';
         if (out[0] != '\0')
             return;
     }
@@ -491,11 +496,22 @@ static void processRosterHudEvents(const CommBuffer *buf) {
             continue;
 
         char label[MAX_PLAYER_NAME];
-        formatPlayerLabel(label, ev.name, ev.slot);
+        const bool hasEventName = ev.name[0] != '\0';
+        if (hasEventName) {
+            formatPlayerLabel(label, ev.name, ev.slot);
+        } else if (ev.slot < MAX_REMOTE_SLOTS && gLastRemoteNames[ev.slot][0] != '\0') {
+            memcpy(label, gLastRemoteNames[ev.slot], MAX_PLAYER_NAME);
+        } else if (ev.slot < MAX_REMOTE_SLOTS &&
+                   static_cast<u8>(ev.slot) != buf->localSlot &&
+                   buf->remoteSnapshots[ev.slot].connected != 0) {
+            formatPlayerLabel(label, buf->remoteSnapshots[ev.slot].name, ev.slot);
+        } else {
+            formatPlayerLabel(label, nullptr, ev.slot);
+        }
 
         if (ev.kind == RHE_CONNECTED) {
             pushToast(ToastKind::Connected, label);
-            rememberRemoteName(ev.slot, ev.name);
+            rememberRemoteName(ev.slot, label);
             if (ev.slot < MAX_REMOTE_SLOTS)
                 gPrevRemoteConnected[ev.slot] = 1;
         } else if (ev.kind == RHE_DISCONNECTED) {

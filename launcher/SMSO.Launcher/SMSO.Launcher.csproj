@@ -18,6 +18,12 @@
     <ApplicationManifest>app.manifest</ApplicationManifest>
   </PropertyGroup>
 
+  <PropertyGroup Condition="'$(BSMSOClientLite)' == 'true'">
+    <DefineConstants>$(DefineConstants);BSMSO_CLIENT_LITE</DefineConstants>
+    <AssemblyTitle>BSMSO Launcher (Lite)</AssemblyTitle>
+    <Product>BSMSO Lite</Product>
+  </PropertyGroup>
+
   <ItemGroup>
     <InternalsVisibleTo Include="SMSO.Tests" />
   </ItemGroup>

@@ -18,10 +18,13 @@ namespace {
 struct RemoteVisual {
     bool active;
     u8 slot;
+    u8 hideStreak;
     char name[MAX_PLAYER_NAME];
+    nametag::Appearance appearance;
 };
 
 static RemoteVisual gRemotes[MAX_REMOTE_SLOTS];
+static constexpr u8 kNameTagHideDebounceFrames = 3;
 
 static bool isFiniteVec(f32 x, f32 y, f32 z) {
     return x == x && y == y && z == z;
@@ -52,7 +55,8 @@ static JUtility::TColor toTagColor(u8 r, u8 g, u8 b) {
     return JUtility::TColor(r, g, b, 255);
 }
 
-static nametag::Appearance readNameTagAppearance(const CommBuffer *buf, const PlayerSnapshot &snap) {
+static nametag::Appearance readNameTagAppearance(const CommBuffer *buf, u8 playerId,
+                                                 const nametag::Appearance *fallback) {
     nametag::Appearance appearance{};
     appearance.textTopColor = toTagColor(255, 255, 255);
     appearance.textBottomColor = appearance.textTopColor;
@@ -60,8 +64,11 @@ static nametag::Appearance readNameTagAppearance(const CommBuffer *buf, const Pl
     appearance.hasOutlineColor = true;
     appearance.gradientEnabled = false;
 
-    const NameTagAppearance *sidecar = snap.slot < MAX_REMOTE_SLOTS
-                                           ? &buf->remoteNameTagAppearances[snap.slot]
+    // Always index by mailbox slot. Embedded snap.slot is not authoritative and on
+    // clients often matches LocalSlot, whose remote appearance entry is cleared every
+    // flush — that flashed tags between real colors and defaults while moving.
+    const NameTagAppearance *sidecar = playerId < MAX_REMOTE_SLOTS
+                                           ? &buf->remoteNameTagAppearances[playerId]
                                            : &buf->localNameTagAppearance;
 
     u8 textTopR = 255, textTopG = 255, textTopB = 255;
@@ -75,13 +82,40 @@ static nametag::Appearance readNameTagAppearance(const CommBuffer *buf, const Pl
         appearance.textBottomColor = toTagColor(textBottomR, textBottomG, textBottomB);
         appearance.outlineColor = toTagColor(outlineR, outlineG, outlineB);
         appearance.gradientEnabled = gradientEnabled;
+        return appearance;
     }
 
+    // A transient Dolphin mailbox clobber (client poll race) must not flash the
+    // tag to default white — keep the last good colors until a valid sidecar returns.
+    if (fallback)
+        return *fallback;
     return appearance;
 }
 
 static void copyNameTagText(char *name, const PlayerSnapshot &snap) {
     copyPurePlayerName(name, snap.name);
+}
+
+static bool isTruncatedPrefixOf(const char *full, const char *maybeTruncated) {
+    if (!full || !maybeTruncated || full[0] == '\0' || maybeTruncated[0] == '\0')
+        return false;
+
+    u32 fullLen = 0;
+    while (fullLen < MAX_PLAYER_NAME && full[fullLen] != '\0')
+        ++fullLen;
+    u32 truncLen = 0;
+    while (truncLen < MAX_PLAYER_NAME && maybeTruncated[truncLen] != '\0')
+        ++truncLen;
+
+    // Legacy overlay packing truncates "Player" to "Playe" (5 chars). Reject any
+    // shorter non-empty prefix of the already-stable name so tags cannot flicker.
+    if (truncLen == 0 || truncLen >= fullLen || fullLen < 6)
+        return false;
+    for (u32 i = 0; i < truncLen; ++i) {
+        if (full[i] != maybeTruncated[i])
+            return false;
+    }
+    return true;
 }
 
 } // namespace
@@ -108,33 +142,70 @@ void updateRemoteMarioVisuals(TMarDirector *director) {
     for (u32 slot = 0; slot < MAX_REMOTE_SLOTS; ++slot) {
         const PlayerSnapshot &snap = buf->remoteSnapshots[slot];
         RemoteVisual &r = gRemotes[slot];
-        const u8 playerId = snap.connected != 0 ? snap.slot : static_cast<u8>(slot);
+        // The mailbox array index is authoritative. A stale/malformed embedded
+        // slot byte must not make one player's tag sample another body/appearance.
+        const u8 playerId = static_cast<u8>(slot);
 
-        if (!isSameStage(buf, snap) || !isValidSnapshot(snap) ||
-            !hasRemoteBodyForSlotLoose(playerId) || !shouldDrawHideSeekNameTag(playerId) ||
-            shouldSuppressRemoteHiderFromSeekerGrace(playerId)) {
+        const bool validSnapshot = isValidSnapshot(snap);
+        const bool sameStage = !validSnapshot || isSameStage(buf, snap);
+        const bool bodyReady = hasRemoteBodyForSlotLoose(playerId);
+        const bool hideSeekOk = shouldDrawHideSeekNameTag(playerId) &&
+                                !shouldSuppressRemoteHiderFromSeekerGrace(playerId);
+        const bool wantHide =
+            (validSnapshot && !sameStage) || !bodyReady || !hideSeekOk;
+
+        if (wantHide) {
+            if (r.active && r.hideStreak < kNameTagHideDebounceFrames) {
+                ++r.hideStreak;
+                // Leave the last nametag draw state untouched for a few frames.
+                continue;
+            }
+
             r.active = false;
+            r.hideStreak = 0;
             nametag::updateSlot(playerId, false, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, {}, nullptr);
             continue;
         }
-
-        r.active = true;
-        r.slot = playerId;
-        copyNameTagText(r.name, snap);
-        if (r.name[0] == '\0')
-            setFallbackName(r.name, playerId);
 
         f32 bodyX, bodyY, bodyZ;
         f32 anchorX, anchorY, anchorZ;
         if (!getRemoteBodyPosition(playerId, bodyX, bodyY, bodyZ) ||
             !getRemoteHeadAnchorPosition(playerId, anchorX, anchorY, anchorZ)) {
+            if (r.active && r.hideStreak < kNameTagHideDebounceFrames) {
+                ++r.hideStreak;
+                continue;
+            }
             r.active = false;
+            r.hideStreak = 0;
             nametag::updateSlot(playerId, false, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, {}, nullptr);
             continue;
         }
 
-        const nametag::Appearance appearance = readNameTagAppearance(buf, snap);
-        nametag::updateSlot(playerId, true, anchorX, anchorY, anchorZ, bodyX, bodyY, bodyZ, appearance,
+        r.hideStreak = 0;
+
+        if (validSnapshot) {
+            const bool wasActive = r.active;
+            r.active = true;
+            r.slot = playerId;
+            char nextName[MAX_PLAYER_NAME];
+            copyNameTagText(nextName, snap);
+            if (nextName[0] == '\0')
+                setFallbackName(nextName, playerId);
+            // Keep the longer stable name when a legacy overlay briefly shrinks it.
+            if (!(wasActive && isTruncatedPrefixOf(r.name, nextName))) {
+                memcpy(r.name, nextName, MAX_PLAYER_NAME);
+            }
+            r.appearance =
+                readNameTagAppearance(buf, playerId, wasActive ? &r.appearance : nullptr);
+        } else if (!r.active) {
+            nametag::updateSlot(playerId, false, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, {}, nullptr);
+            continue;
+        }
+
+        // Remote actors already debounce invalid snapshots for three updates.
+        // Keep the tag anchored to that still-live body for exactly the same
+        // interval instead of resetting alpha on a one-packet mailbox gap.
+        nametag::updateSlot(playerId, true, anchorX, anchorY, anchorZ, bodyX, bodyY, bodyZ, r.appearance,
                             r.name);
     }
 }

@@ -36,6 +36,41 @@ public class CommBufferTests
     }
 
     [Fact]
+    public void BlooperSurf_WaterByte_EncodesGessoTypeForAllRemoteSlots()
+    {
+        // Module packs mSurfGessoID & 0x03 into snap.water while surfing.
+        // Remotes must have a slot for every non-local player (MaxPlayers-1) and the
+        // array itself is MaxRemoteSlots wide so slot index == network slot is safe.
+        Assert.Equal(10, ProtocolConstants.MaxRemoteSlots);
+        Assert.Equal(ProtocolConstants.MaxPlayers, ProtocolConstants.MaxRemoteSlots);
+
+        var buf = CommBuffer.CreateDefault();
+        // Simulate remotes surfing different gesso colors (0/1/2) across all remote slots.
+        for (byte slot = 0; slot < ProtocolConstants.MaxRemoteSlots; slot++)
+        {
+            buf.RemoteSnapshots[slot].Connected = 1;
+            buf.RemoteSnapshots[slot].Slot = slot;
+            buf.RemoteSnapshots[slot].Name ??= new byte[16];
+            // Surf ride state 0x810446 — low u16 + high u16.
+            buf.RemoteSnapshots[slot].ActionId = 0x0446;
+            buf.RemoteSnapshots[slot].ActionIdHi = 0x0081;
+            buf.RemoteSnapshots[slot].Water = (byte)(slot % 3);
+            buf.RemoteSnapshots[slot].AnimId = 0x6D; // ride shell
+        }
+
+        var dolphinBytes = CommBufferEndian.ToDolphinBytes(buf);
+        var restored = CommBufferEndian.FromDolphinBytes(dolphinBytes);
+        for (byte slot = 0; slot < ProtocolConstants.MaxRemoteSlots; slot++)
+        {
+            Assert.Equal(1, restored.RemoteSnapshots[slot].Connected);
+            Assert.Equal((byte)(slot % 3), restored.RemoteSnapshots[slot].Water);
+            Assert.Equal(0x0446, restored.RemoteSnapshots[slot].ActionId);
+            Assert.Equal(0x0081, restored.RemoteSnapshots[slot].ActionIdHi);
+            Assert.Equal(0x6D, restored.RemoteSnapshots[slot].AnimId);
+        }
+    }
+
+    [Fact]
     public void RoundTrip_PreservesMagic()
     {
         var buf = CommBuffer.CreateDefault();
@@ -155,6 +190,35 @@ public class CommBufferTests
         Assert.Equal(RosterHudEventKind.Disconnected, restored.RosterHud.Events[1].Kind);
         Assert.Equal(3, restored.RosterHud.Events[1].Slot);
         Assert.Equal("Luigi", restored.RosterHud.Events[1].GetPlayerName());
+    }
+
+    [Fact]
+    public void DolphinEndian_RosterHudOnly_RoundTrip_PreservesHighSlotJoin()
+    {
+        var sync = CommRosterHudSync.CreateDefault();
+        sync.LatestSequence = 9;
+        sync.Events[8] = new CommRosterHudEvent
+        {
+            Sequence = 9,
+            Kind = RosterHudEventKind.Connected,
+            Slot = 8,
+            Name = new byte[16],
+        };
+        sync.Events[8].SetPlayerName("Player9");
+
+        var bytes = CommBufferEndian.ToRosterHudSyncDolphinBytes(sync);
+        Assert.Equal(ProtocolConstants.CommRosterHudSyncSize, bytes.Length);
+
+        var buf = CommBuffer.CreateDefault();
+        // Reconstruct via full buffer write path at the roster offset.
+        var full = CommBufferEndian.ToDolphinBytes(buf);
+        bytes.CopyTo(full.AsSpan(ProtocolConstants.CommRosterHudOffset));
+        var restored = CommBufferEndian.FromDolphinBytes(full);
+
+        Assert.Equal(9, restored.RosterHud.LatestSequence);
+        Assert.Equal(RosterHudEventKind.Connected, restored.RosterHud.Events[8].Kind);
+        Assert.Equal(8, restored.RosterHud.Events[8].Slot);
+        Assert.Equal("Player9", restored.RosterHud.Events[8].GetPlayerName());
     }
 
     [Fact]

@@ -20,6 +20,7 @@ public sealed class NetClient : IDisposable
     private volatile bool _isDisconnecting;
     private readonly object _snapshotLock = new();
     private readonly object _udpScratchLock = new();
+    private readonly SemaphoreSlim _tcpSendLock = new(1, 1);
     private readonly byte[] _udpSendScratch =
         new byte[ProtocolConstants.UdpSnapshotPayloadOffset + ProtocolConstants.PlayerSnapshotSize];
     private readonly byte[] _udpPingScratch =
@@ -33,6 +34,7 @@ public sealed class NetClient : IDisposable
     private PlayerSnapshot _pendingSnapshot;
     private bool _hasPendingSnapshot;
     private string? _pendingMarioModelId;
+    private int _marioModelIntentSequence;
 
     public event Action<PlayerRosterEntry[]>? RosterUpdated;
     public event Action<byte, byte, byte, byte>? WarpCommandReceived;
@@ -52,9 +54,58 @@ public sealed class NetClient : IDisposable
     public bool IsConnected => _tcp?.Connected == true && !_isDisconnecting;
     public ushort MeasuredPingMs { get; private set; }
 
-    /// <summary>Model id included on subsequent heartbeats so the server can refresh roster.</summary>
-    public void SetMarioModelId(string? modelId) =>
-        _pendingMarioModelId = MarioPack.CharacterPack.NormalizeModelId(modelId);
+    /// <summary>
+    /// Announce desired model immediately over TCP. Heartbeats continue carrying
+    /// the same id as compatibility/recovery fallback.
+    /// </summary>
+    public void SetMarioModelId(string? modelId)
+    {
+        var normalized = MarioPack.CharacterPack.NormalizeModelId(modelId);
+        var sequence = PublishMarioModelIntent(normalized);
+        if (IsConnected)
+            _ = SendMarioModelIntentSafelyAsync(normalized, sequence);
+    }
+
+    public async Task SendMarioModelIntentAsync(string? modelId)
+    {
+        var normalized = MarioPack.CharacterPack.NormalizeModelId(modelId);
+        var sequence = PublishMarioModelIntent(normalized);
+        if (!IsConnected)
+            return;
+        await SendTcpAsync(PacketSerializer.BuildMarioModelIntent(normalized, sequence),
+            _cts?.Token ?? default).ConfigureAwait(false);
+    }
+
+    private uint PublishMarioModelIntent(string modelId)
+    {
+        Volatile.Write(ref _pendingMarioModelId, modelId);
+        var sequence = Interlocked.Increment(ref _marioModelIntentSequence);
+        if (sequence == 0)
+            sequence = Interlocked.Increment(ref _marioModelIntentSequence);
+        return unchecked((uint)sequence);
+    }
+
+    private async Task SendMarioModelIntentSafelyAsync(string modelId, uint sequence)
+    {
+        try
+        {
+            // Coalesce a send that has not started yet. If two already entered
+            // the TCP writer out of scheduler order, the server sequence still
+            // rejects the older frame.
+            if (sequence != unchecked((uint)Volatile.Read(ref _marioModelIntentSequence)))
+                return;
+            await SendTcpAsync(PacketSerializer.BuildMarioModelIntent(modelId, sequence),
+                _cts?.Token ?? default).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (_isDisconnecting || _cts?.IsCancellationRequested == true)
+        {
+            // Session teardown superseded the UI selection.
+        }
+        catch (Exception ex) when (!_isDisconnecting)
+        {
+            Log?.Invoke($"Mario model intent send failed: {ex.Message}; heartbeat fallback remains active");
+        }
+    }
 
     public async Task ConnectAsync(string host, int port, string username, CancellationToken ct = default,
         string? marioModelId = null)
@@ -69,7 +120,9 @@ public sealed class NetClient : IDisposable
         // Always track the join-time model so heartbeats re-advertise it. Leaving this null
         // used to send 8 zero bytes every 2s, which the server treated as "switch to retail"
         // and wiped the roster model id — remotes then always spawned as retail Mario.
-        _pendingMarioModelId = MarioPack.CharacterPack.NormalizeModelId(marioModelId);
+        Volatile.Write(ref _pendingMarioModelId,
+            MarioPack.CharacterPack.NormalizeModelId(marioModelId));
+        Volatile.Write(ref _marioModelIntentSequence, 0);
         Array.Clear(_lastReceivedSnapshotSeq);
         Array.Clear(_hasReceivedSnapshotSeq);
         _knownRosterSlots.Clear();
@@ -106,6 +159,20 @@ public sealed class NetClient : IDisposable
             using var joinCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             joinCts.CancelAfter(TimeSpan.FromMilliseconds(ProtocolConstants.ConnectTimeoutMs));
             await joinTcs.Task.WaitAsync(joinCts.Token).ConfigureAwait(false);
+
+            // A UI selection can occur after TCP connects but before JoinAccepted.
+            // The server correctly rejects pre-join intent, so replay the latest
+            // sequenced value now that this session is authorized.
+            var pendingIntentSequence =
+                unchecked((uint)Volatile.Read(ref _marioModelIntentSequence));
+            if (pendingIntentSequence != 0)
+            {
+                var pendingModel = Volatile.Read(ref _pendingMarioModelId);
+                await SendTcpAsync(
+                    PacketSerializer.BuildMarioModelIntent(
+                        pendingModel, pendingIntentSequence),
+                    _cts.Token).ConfigureAwait(false);
+            }
 
             var udpPort = (ushort)((IPEndPoint)_udp.Client.LocalEndPoint!).Port;
             await SendTcpAsync(PacketSerializer.BuildUdpRegister(udpPort), _cts.Token);
@@ -437,8 +504,18 @@ public sealed class NetClient : IDisposable
 
     private async Task SendTcpAsync(byte[] data, CancellationToken ct)
     {
-        if (_tcpStream == null) return;
-        await _tcpStream.WriteAsync(data, ct).ConfigureAwait(false);
+        await _tcpSendLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            var stream = _tcpStream;
+            if (stream == null)
+                return;
+            await stream.WriteAsync(data, ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _tcpSendLock.Release();
+        }
     }
 
     private async Task TcpReadLoop(CancellationToken ct)
@@ -617,7 +694,7 @@ public sealed class NetClient : IDisposable
                 var result = await _udp.ReceiveAsync(ct).ConfigureAwait(false);
                 if (_udpServerEndpoint != null && !result.RemoteEndPoint.Equals(_udpServerEndpoint))
                     continue;
-                if (result.Buffer.Length < ProtocolConstants.UdpSnapshotPayloadOffset)
+                if (result.Buffer.Length < ProtocolConstants.UdpSnapshotBatchHeaderSize)
                     continue;
                 if (BinaryPrimitives.ReadUInt32LittleEndian(result.Buffer.AsSpan(0, 4)) != ProtocolConstants.Magic)
                     continue;
@@ -629,6 +706,12 @@ public sealed class NetClient : IDisposable
                     continue;
                 }
 
+                if (packetId == UdpPacketId.SnapshotBatch)
+                {
+                    HandleUdpSnapshotBatch(result.Buffer);
+                    continue;
+                }
+
                 if (packetId != UdpPacketId.PlayerSnapshot ||
                     result.Buffer.Length <
                     ProtocolConstants.UdpSnapshotPayloadOffset + ProtocolConstants.PlayerSnapshotSize)
@@ -637,7 +720,7 @@ public sealed class NetClient : IDisposable
                 }
 
                 var slot = result.Buffer[5];
-                if (slot >= ProtocolConstants.MaxRemoteSlots)
+                if (slot >= ProtocolConstants.MaxRemoteSlots || slot == _assignedSlot)
                     continue;
 
                 var seq = BinaryPrimitives.ReadUInt32LittleEndian(result.Buffer.AsSpan(6, 4));
@@ -649,9 +732,13 @@ public sealed class NetClient : IDisposable
 
                 _lastReceivedSnapshotSeq[slot] = seq;
                 _hasReceivedSnapshotSeq[slot] = true;
+                // Own a fresh Name[] per packet. A reused per-slot buffer was shared with
+                // BridgeWorker/_remoteRaw; the next UDP CopyTo re-poisoned stripped names
+                // with legacy color overlay bytes ("Player" → flickering "Playe").
                 var snap = PacketSerializer.SnapshotFromBytes(
                     result.Buffer.AsSpan(ProtocolConstants.UdpSnapshotPayloadOffset,
-                        ProtocolConstants.PlayerSnapshotSize));
+                        ProtocolConstants.PlayerSnapshotSize),
+                    new byte[16]);
                 SnapshotReceived?.Invoke(slot, snap);
             }
         }
@@ -662,6 +749,58 @@ public sealed class NetClient : IDisposable
         catch (Exception ex) when (!_isDisconnecting)
         {
             Log?.Invoke($"UDP read error: {ex.Message}");
+        }
+    }
+
+    internal void HandleUdpSnapshotBatch(ReadOnlySpan<byte> packet)
+    {
+        if (packet.Length < ProtocolConstants.UdpSnapshotBatchHeaderSize)
+            return;
+        if (BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(0, 4)) != ProtocolConstants.Magic ||
+            (UdpPacketId)packet[4] != UdpPacketId.SnapshotBatch)
+            return;
+
+        var count = packet[5];
+        if (count > ProtocolConstants.StableMaxPlayers)
+            return;
+        var requiredLength = ProtocolConstants.UdpSnapshotBatchHeaderSize +
+                             count * ProtocolConstants.UdpSnapshotBatchEntrySize;
+        // A truncated fixed-entry batch has no recoverable later boundary.
+        if (packet.Length < requiredLength)
+            return;
+
+        for (var index = 0; index < count; index++)
+        {
+            var entryOffset = ProtocolConstants.UdpSnapshotBatchHeaderSize +
+                              index * ProtocolConstants.UdpSnapshotBatchEntrySize;
+
+            var slot = packet[entryOffset];
+            if (slot >= ProtocolConstants.MaxRemoteSlots)
+                continue; // fixed-size boundary makes the next entry recoverable
+            if (slot == _assignedSlot)
+                continue;
+
+            if (!PacketSerializer.TryReadUdpSnapshotBatchEntry(
+                    packet,
+                    index,
+                    new byte[16],
+                    out var decodedSlot,
+                    out var seq,
+                    out var snap) ||
+                decodedSlot != slot)
+            {
+                continue;
+            }
+
+            if (_hasReceivedSnapshotSeq[slot] &&
+                !SequenceIsNewer(seq, _lastReceivedSnapshotSeq[slot]))
+            {
+                continue;
+            }
+
+            _lastReceivedSnapshotSeq[slot] = seq;
+            _hasReceivedSnapshotSeq[slot] = true;
+            SnapshotReceived?.Invoke(slot, snap);
         }
     }
 
@@ -687,7 +826,8 @@ public sealed class NetClient : IDisposable
                 var sentMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
                 BinaryPrimitives.WriteInt64LittleEndian(payload.AsSpan(0, 8), sentMs);
                 BinaryPrimitives.WriteUInt16LittleEndian(payload.AsSpan(8, 2), MeasuredPingMs);
-                MarioPack.CharacterPack.EncodeModelId(_pendingMarioModelId ?? string.Empty)
+                MarioPack.CharacterPack.EncodeModelId(
+                        Volatile.Read(ref _pendingMarioModelId) ?? string.Empty)
                     .CopyTo(payload, 10);
                 await SendTcpAsync(PacketSerializer.BuildHeartbeat(payload), ct).ConfigureAwait(false);
             }

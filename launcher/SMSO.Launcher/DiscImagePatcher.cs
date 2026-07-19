@@ -106,6 +106,7 @@ internal static class DiscImagePatcher
             ReplaceFileAtomically(rebuiltPath, fullDiscPath, log);
 
             MarioPackInstaller.RecordAllLibraryPacksOnDisc(fullDiscPath);
+            ModuleInstaller.WriteDiscImageModBuildIdMarker(fullDiscPath, log);
 
             progress?.Invoke("Patching game ID…");
             if (GameIdentity.TryPatchGameId(fullDiscPath, GameIdentity.BsmsGameId, out var patchError))

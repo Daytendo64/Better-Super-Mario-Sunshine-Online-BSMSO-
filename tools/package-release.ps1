@@ -3,6 +3,8 @@ param(
     [string]$LauncherDir = "",
     [string]$ServerDir = "",
     [string]$BseKxePath = "",
+    [string]$ModulePath = "",
+    [string]$Variant = "",
     [switch]$RefreshBse
 )
 
@@ -12,19 +14,30 @@ $Root = Split-Path -Parent $PSScriptRoot
 $DistDir = Join-Path $Root "dist"
 $ProductName = "Better Super Mario Sunshine"
 $ProductShort = "BSMSO"
-$PackageName = "${ProductShort}_$Version"
+$variantSuffix = if ([string]::IsNullOrWhiteSpace($Variant)) { "" } else { "_$Variant" }
+$PackageName = "${ProductShort}_$Version$variantSuffix"
 $PackageDir = Join-Path $DistDir $PackageName
 $ZipPath = Join-Path $DistDir "$PackageName.zip"
 $ZipRoot = "$PackageName/"
 $LauncherExeName = "$ProductShort.Launcher.exe"
 $ServerExeName = "$ProductShort.ServerHost.exe"
 if ([string]::IsNullOrWhiteSpace($LauncherDir)) {
-    $LauncherDir = Join-Path $DistDir "launcher"
+    $LauncherDir = if ($Variant -eq "lite") {
+        Join-Path $DistDir "launcher-lite"
+    } else {
+        Join-Path $DistDir "launcher"
+    }
 }
 if ([string]::IsNullOrWhiteSpace($ServerDir)) {
     $ServerDir = Join-Path $DistDir "server"
 }
-$ModulePath = Join-Path $DistDir "_BSMSO.kxe"
+if ([string]::IsNullOrWhiteSpace($ModulePath)) {
+    $ModulePath = if ($Variant -eq "lite") {
+        Join-Path $DistDir "_BSMSO.lite.kxe"
+    } else {
+        Join-Path $DistDir "_BSMSO.kxe"
+    }
+}
 $ReleaseBseCache = Join-Path $DistDir "BetterSunshineEngine.release.kxe"
 $MovesetPath = Join-Path $DistDir "BetterSunshineMoveset.kxe"
 $BseReleaseZipUrl = "https://github.com/DotKuribo/BetterSunshineEngine/releases/download/v4.0.0/BetterSunshineEngine_RELEASE.zip"
@@ -65,7 +78,7 @@ if ([string]::IsNullOrWhiteSpace($BseKxePath)) {
 }
 
 if (-not (Test-Path $ModulePath)) {
-    Write-Error "Missing dist\_BSMSO.kxe. Run .\tools\build.ps1 first."
+    Write-Error "Missing module at $ModulePath. Run .\tools\build.ps1 first (use -HideNameTags for lite)."
 }
 if (-not (Test-Path $BseKxePath)) {
     Write-Error "Missing release BetterSunshineEngine.kxe at $BseKxePath"
@@ -86,12 +99,25 @@ if (Test-Path $ZipPath) {
 
 New-Item -ItemType Directory -Force -Path $PackageDir | Out-Null
 
+$liteNotes = ""
+if ($Variant -eq "lite") {
+    $liteNotes = @"
+
+Lite client variant:
+- Client Actions hides Game Modes and Connected Players (Model + Teleport remain).
+- In-game player nametags are disabled in this module build.
+- Same network build id as the full release — can join the same lobbies.
+- Hosts that need game-mode controls should use the full BSMSO zip.
+
+"@
+}
+
 $readme = @"
-$ProductName ($ProductShort) v$Version
+$ProductName ($ProductShort) v$Version$(if ($Variant -eq "lite") { " (Lite)" } else { "" })
 
 Better Super Mario Sunshine (BSMSO) is online multiplayer for Super Mario Sunshine
 via Dolphin Emulator and Better Sunshine Engine (BSE).
-
+$liteNotes
 Quick start:
 1. Run $LauncherExeName.
 2. In Settings, set your username, Dolphin path, and game ISO path (extracted folder or .iso/.gcm).
@@ -103,9 +129,10 @@ Quick start:
 4. Launch Dolphin, enter a stage, then Host Server or Connect.
 
 Custom models:
-- CustomModels\ ships with this zip. The launcher copies them into your AppData
-  library on first run and into the game folder when modules are installed /
-  when a game path is set, so the Mario model dropdown works out of the box.
+- CustomModels\ ships with this zip. The launcher syncs them into your AppData
+  library on launch (overwriting older bundled packs) and into the game folder
+  when modules are installed / when a game path is set, so the Mario model
+  dropdown matches this release.
 
 Important files:
 - $LauncherExeName - main BSMSO launcher app

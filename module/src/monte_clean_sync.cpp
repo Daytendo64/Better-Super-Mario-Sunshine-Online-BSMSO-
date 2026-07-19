@@ -219,15 +219,22 @@ static void captureStageMonteSnapshot() {
 
     sortStageMonteSnapshot();
 
-    // Seed mask from already-clear locals (rare mid-mission soft-reload) without publishing.
-    for (u8 i = 0; i < sStageMonteCount; ++i) {
-        if (sStageMontes[i].wasClear)
-            sCleanedMask |= static_cast<u16>(1u << i);
-    }
+    // Do NOT seed sCleanedMask from already-clear locals. wasClear alone tracks
+    // clear→dirty→clear transitions for publish. Seeding the ownership mask made
+    // reconcilePendingMonteCleans treat a later walk-into-goop sink as "must
+    // force-unsink": it wiped pollution under the Pianta (radius 220) and freed
+    // them without any player spray (dolphin.log: alreadyClear=0xFFFF then goop
+    // vanishes under stuck Piantas). Mid-mission soft-reload keeps correct local
+    // actor state; remote WE_NPC_CLEANED still sets mask bits for true rescues.
 
     sSnapshotReady = true;
-    OSReport("[SMSOBB] monte-clean snapshot count=%u alreadyClear=0x%X\n", sStageMonteCount,
-             sCleanedMask);
+    u16 alreadyClearBits = 0;
+    for (u8 i = 0; i < sStageMonteCount; ++i) {
+        if (sStageMontes[i].wasClear)
+            alreadyClearBits |= static_cast<u16>(1u << i);
+    }
+    OSReport("[SMSOBB] monte-clean snapshot count=%u alreadyClear=0x%X mask=0x%X\n",
+             sStageMonteCount, alreadyClearBits, sCleanedMask);
 }
 
 static u8 popCountMask(u16 mask) {
@@ -311,7 +318,18 @@ static void scanLocalMonteCleans() {
             continue;
 
         const bool clear = npcIsMonteClear(entry.npc);
+        const u16 bit = static_cast<u16>(1u << entry.stableIndex);
         if (!clear) {
+            // Pianta (re)sank or got dirty — drop ownership so reconcile cannot
+            // force-clean pollution / unsink them. Legitimate rescues re-publish
+            // on the next clear transition.
+            if ((sCleanedMask & bit) != 0) {
+                sCleanedMask &= static_cast<u16>(~bit);
+                if (kMonteCleanHotPathOsReport) {
+                    OSReport("[SMSOBB] monte-clean resink drop idx=%u mask=0x%X\n",
+                             entry.stableIndex, sCleanedMask);
+                }
+            }
             entry.wasClear = false;
             continue;
         }
@@ -320,12 +338,38 @@ static void scanLocalMonteCleans() {
             continue;
         entry.wasClear = true;
 
-        const u16 bit = static_cast<u16>(1u << entry.stableIndex);
         if ((sCleanedMask & bit) != 0)
             continue;
 
         sCleanedMask |= bit;
         publishLocalMonteClean(entry.stableIndex, entry.initialPos);
+    }
+}
+
+// Apply ownership mask to live actors when they exist. Never blocks the durable
+ // mailbox — mask is recorded immediately on apply; visuals catch up here.
+static void reconcilePendingMonteCleans() {
+    if (!sSnapshotReady || sCleanedMask == 0 || sApplyingRemote)
+        return;
+
+    for (u8 i = 0; i < sStageMonteCount; ++i) {
+        StageMonteEntry &entry = sStageMontes[i];
+        if (!entry.active || !isLiveNpc(entry.npc))
+            continue;
+        const u16 bit = static_cast<u16>(1u << entry.stableIndex);
+        if ((sCleanedMask & bit) == 0)
+            continue;
+        if (entry.wasClear && npcIsMonteClear(entry.npc))
+            continue;
+
+        sApplyingRemote = true;
+        forceMonteNpcCleared(entry.npc);
+        sApplyingRemote = false;
+        entry.wasClear = true;
+        if (kMonteCleanHotPathOsReport) {
+            OSReport("[SMSOBB] monte-clean reconcile idx=%u mask=0x%X\n", entry.stableIndex,
+                     sCleanedMask);
+        }
     }
 }
 
@@ -375,6 +419,7 @@ void updateMonteCleanSync() {
         captureStageMonteSnapshot();
 
     scanLocalMonteCleans();
+    reconcilePendingMonteCleans();
 }
 
 bool applyMonteCleanWorldEvent(const CommWorldEvent &event) {
@@ -385,21 +430,19 @@ bool applyMonteCleanWorldEvent(const CommWorldEvent &event) {
     if (event.courseId != currentCourseId() || event.episodeId != currentEpisodeId())
         return true;
 
-    // Wait for stage settle so NPC actors exist (same pattern as red-coin apply).
-    if (!objectSyncGameplayReady() && sStageSettleFrames < kStageSettleFrames)
-        return false;
-
-    if (!sSnapshotReady && gpStrategy && gpStrategy->mNPCGroup)
-        captureStageMonteSnapshot();
-
     const u8 stableIndex = event.reserved < kMaxStageMonteCleans
                                ? event.reserved
                                : static_cast<u8>(event.payload0 & 0xFu);
     if (stableIndex >= kMaxStageMonteCleans)
         return true; // drop malformed; do not block durable queue forever
 
+    // Ownership first: always record the cleaned bit and free the mailbox. Actor
+    // hide/unsink is reconciled when NPCs exist (never hold shine/blue behind settle).
     const u16 bit = static_cast<u16>(1u << stableIndex);
     sCleanedMask |= bit;
+
+    if (!sSnapshotReady && gpStrategy && gpStrategy->mNPCGroup)
+        captureStageMonteSnapshot();
 
     f32 x = 0.0f, y = 0.0f, z = 0.0f;
     TBaseNPC *npc = nullptr;
@@ -412,11 +455,8 @@ bool applyMonteCleanWorldEvent(const CommWorldEvent &event) {
         npc = sStageMontes[stableIndex].npc;
 
     if (!npc || !isLiveNpc(npc)) {
-        // Actors not ready yet — keep retrying (durable).
-        if (!sSnapshotReady || sStageMonteCount == 0)
-            return false;
-        OSReport("[SMSOBB] monte-clean apply miss idx=%u packed=0x%08X\n", stableIndex,
-                 event.payload1);
+        OSReport("[SMSOBB] monte-clean apply-mask idx=%u defer-visual packed=0x%08X\n",
+                 stableIndex, event.payload1);
         return true;
     }
 
@@ -432,10 +472,8 @@ bool applyMonteCleanWorldEvent(const CommWorldEvent &event) {
     }
 
     const u8 authCount = static_cast<u8>((event.payload0 >> 4) & 0xFu);
-    if (kMonteCleanHotPathOsReport) {
-        OSReport("[SMSOBB] monte-clean apply idx=%u authCount=%u mask=0x%X\n", stableIndex,
-                 authCount, sCleanedMask);
-    }
+    OSReport("[SMSOBB] monte-clean apply idx=%u authCount=%u mask=0x%X\n", stableIndex, authCount,
+             sCleanedMask);
     return true;
 }
 

@@ -1,3 +1,4 @@
+using SMSO.Launcher;
 using SMSO.Net.MarioPack;
 
 namespace SMSO.Tests;
@@ -45,6 +46,385 @@ public class MarioPackTests
         Assert.Equal(new byte[] { 8, 8, 8 }, files["ma_tex.btk"]);
         Assert.Equal(new byte[] { 3, 3, 3 }, files["ma_wait.bck"]);
         Assert.Equal(new byte[] { 4, 4, 4 }, files["extra.bin"]);
+    }
+
+    [Fact]
+    public void Merge_ReplacesMatchingBcksOnlyWhenEnabled()
+    {
+        var retail = BuildArchive(new[]
+        {
+            ("ma_mdl1.bmd", new byte[] { 1, 1, 1 }),
+            ("ma_wait.bck", new byte[] { 3, 3, 3 }),
+            ("ma_run1.bck", new byte[] { 4, 4, 4 }),
+        });
+        var custom = BuildArchive(new[]
+        {
+            ("ma_mdl1.bmd", new byte[] { 9, 9, 9 }),
+            ("ma_wait.bck", new byte[] { 7, 7, 7 }),
+            ("ma_run1.bck", new byte[] { 8, 8, 8 }),
+        });
+
+        var withoutBck = CharacterPack.BuildMergedPack(retail, custom, replaceMatchingBcks: false);
+        var withBck = CharacterPack.BuildMergedPack(retail, custom, replaceMatchingBcks: true);
+
+        Assert.Equal(1, withoutBck.ReplacedCount);
+        Assert.Equal(3, withBck.ReplacedCount);
+        Assert.True(CharacterPack.AllowsBckReplacement("Waluigi"));
+        Assert.True(CharacterPack.AllowsBckReplacement("Wario"));
+        Assert.True(CharacterPack.AllowsBckReplacement("Shadow"));
+        Assert.True(CharacterPack.AllowsBckReplacement("Sonic"));
+        Assert.False(CharacterPack.AllowsBckReplacement("Shadow Mario"));
+        Assert.False(CharacterPack.AllowsBckReplacement("Shadow Luigi"));
+        Assert.False(CharacterPack.AllowsBckReplacement("Yoshi"));
+        Assert.False(CharacterPack.AllowsBckReplacement("Daytendo"));
+
+        Assert.True(CharacterPack.AllowsBodyAngleFreeReplacement("Luigi"));
+        Assert.True(CharacterPack.AllowsBodyAngleFreeReplacement("Nightendo"));
+        Assert.True(CharacterPack.AllowsBodyAngleFreeReplacement("Waluigi"));
+        Assert.True(CharacterPack.AllowsBodyAngleFreeReplacement("Wario"));
+        Assert.True(CharacterPack.AllowsBodyAngleFreeReplacement("Sonic"));
+        Assert.False(CharacterPack.AllowsBodyAngleFreeReplacement("Shadow"));
+        Assert.False(CharacterPack.AllowsBodyAngleFreeReplacement("Yoshi"));
+        Assert.False(CharacterPack.AllowsBodyAngleFreeReplacement("Daytendo"));
+
+        var files = CharacterPack.OpenArchive(withBck.PackArc).EnumerateFiles()
+            .ToDictionary(f => f.Name, f => f.Data, StringComparer.OrdinalIgnoreCase);
+        Assert.Equal(new byte[] { 9, 9, 9 }, files["ma_mdl1.bmd"]);
+        Assert.Equal(new byte[] { 7, 7, 7 }, files["ma_wait.bck"]);
+        Assert.Equal(new byte[] { 8, 8, 8 }, files["ma_run1.bck"]);
+    }
+
+    [Fact]
+    public void Merge_InjectsBodyAngleFreePrmWhenRequested()
+    {
+        var retail = BuildArchive(new[]
+        {
+            ("ma_mdl1.bmd", new byte[] { 1, 1, 1 }),
+        });
+        var custom = BuildArchive(new[]
+        {
+            ("ma_mdl1.bmd", new byte[] { 9, 9, 9 }),
+        });
+
+        var without = CharacterPack.BuildMergedPack(retail, custom, injectBodyAngleFreePrm: false);
+        var with = CharacterPack.BuildMergedPack(retail, custom, injectBodyAngleFreePrm: true);
+
+        Assert.False(without.InjectedBodyAngleFreePrm);
+        Assert.True(with.InjectedBodyAngleFreePrm);
+        Assert.Equal(without.ModelId, with.ModelId); // PRM must not churn model id
+
+        var withoutFiles = CharacterPack.OpenArchive(without.PackArc).EnumerateFiles()
+            .Select(f => f.Name).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var withFiles = CharacterPack.OpenArchive(with.PackArc).EnumerateFiles()
+            .ToDictionary(f => f.Name, f => f.Data, StringComparer.OrdinalIgnoreCase);
+
+        Assert.DoesNotContain(CharacterPack.BodyAngleFreePrmName, withoutFiles);
+        Assert.True(withFiles.ContainsKey(CharacterPack.BodyAngleFreePrmName));
+        Assert.Equal(CharacterPack.GetBodyAngleFree2PrmBytes(), withFiles[CharacterPack.BodyAngleFreePrmName]);
+        // Must not confuse with the BSE-freezing better_sms.prm path.
+        Assert.False(withFiles.ContainsKey(CharacterPack.BetterSmsPrmName));
+    }
+
+    [Fact]
+    public void GetBodyAngleFree2Prm_IsValidSmsPrmLayout()
+    {
+        var prm = CharacterPack.GetBodyAngleFree2PrmBytes();
+        Assert.True(prm.Length >= 8);
+        var count = System.Buffers.Binary.BinaryPrimitives.ReadInt32BigEndian(prm.AsSpan(0, 4));
+        Assert.Equal(6, count);
+        var text = System.Text.Encoding.ASCII.GetString(prm);
+        Assert.Contains("mHeadRot", text, StringComparison.Ordinal);
+        Assert.Contains("mWaistRoll", text, StringComparison.Ordinal);
+        Assert.Contains("mWaistPitch", text, StringComparison.Ordinal);
+        Assert.Contains("mWaistAngleChangeRate", text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Merge_WithBckAlsoReplacesMatchingBas()
+    {
+        var retail = BuildArchive(new[]
+        {
+            ("ma_mdl1.bmd", new byte[] { 1, 1, 1 }),
+            ("ma_wait.bck", new byte[] { 3, 3, 3 }),
+            ("ma_wait.bas", new byte[] { 4, 4, 4 }),
+        });
+        var custom = BuildArchive(new[]
+        {
+            ("ma_mdl1.bmd", new byte[] { 9, 9, 9 }),
+            ("ma_wait.bck", new byte[] { 7, 7, 7 }),
+            ("ma_wait.bas", new byte[] { 5, 5, 5, 5 }),
+        });
+
+        var withBck = CharacterPack.BuildMergedPack(retail, custom, replaceMatchingBcks: true);
+        Assert.Contains("ma_wait.bas", withBck.ReplacedNames, StringComparer.OrdinalIgnoreCase);
+        Assert.Contains("ma_wait.bck", withBck.ReplacedNames, StringComparer.OrdinalIgnoreCase);
+
+        var files = CharacterPack.OpenArchive(withBck.PackArc).EnumerateFiles()
+            .ToDictionary(f => f.Name, f => f.Data, StringComparer.OrdinalIgnoreCase);
+        Assert.Equal(new byte[] { 5, 5, 5, 5 }, files["ma_wait.bas"]);
+        Assert.Equal(new byte[] { 7, 7, 7 }, files["ma_wait.bck"]);
+    }
+
+    [Fact]
+    public void Merge_SkipsBcksWithJointCountMismatch()
+    {
+        // Minimal J3D1bck1 + ANK1 with configurable joint count at +0x0C.
+        static byte[] MakeBck(int joints)
+        {
+            var data = new byte[0x60];
+            System.Text.Encoding.ASCII.GetBytes("J3D1bck1").CopyTo(data, 0);
+            System.Buffers.Binary.BinaryPrimitives.WriteInt32BigEndian(data.AsSpan(8, 4), data.Length);
+            System.Buffers.Binary.BinaryPrimitives.WriteInt32BigEndian(data.AsSpan(12, 4), 1);
+            System.Text.Encoding.ASCII.GetBytes("ANK1").CopyTo(data, 0x20);
+            System.Buffers.Binary.BinaryPrimitives.WriteInt32BigEndian(data.AsSpan(0x24, 4), data.Length - 0x20);
+            data[0x28] = 0; // loop
+            data[0x29] = 0; // rot frac
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(data.AsSpan(0x2A, 2), 10); // duration
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(data.AsSpan(0x2C, 2), (ushort)joints);
+            return data;
+        }
+
+        var retailPumpBas = new byte[] { 1, 1, 1 };
+        var retailWaitBas = new byte[] { 2, 2, 2 };
+        var customPumpBas = new byte[] { 8, 8, 8 };
+        var customWaitBas = new byte[] { 9, 9, 9 };
+        var retail = BuildArchive(new[]
+        {
+            ("ma_mdl1.bmd", new byte[] { 1, 1, 1 }),
+            ("wg_pump.bck", MakeBck(16)),
+            ("wg_pump.bas", retailPumpBas),
+            ("ma_wait.bck", MakeBck(29)),
+            ("ma_wait.bas", retailWaitBas),
+        });
+        var custom = BuildArchive(new[]
+        {
+            ("ma_mdl1.bmd", new byte[] { 9, 9, 9 }),
+            ("wg_pump.bck", MakeBck(14)), // mismatched — must keep retail
+            ("wg_pump.bas", customPumpBas), // paired BAS must stay with retail BCK
+            ("ma_wait.bck", MakeBck(29)), // matching joints — replace OK
+            ("ma_wait.bas", customWaitBas),
+        });
+
+        var merge = CharacterPack.BuildMergedPack(retail, custom, replaceMatchingBcks: true);
+        Assert.Contains("wg_pump.bck", merge.SkippedReplacements, StringComparer.OrdinalIgnoreCase);
+        Assert.Contains("wg_pump.bas", merge.SkippedReplacements, StringComparer.OrdinalIgnoreCase);
+        Assert.Contains("ma_wait.bck", merge.ReplacedNames, StringComparer.OrdinalIgnoreCase);
+        Assert.Contains("ma_wait.bas", merge.ReplacedNames, StringComparer.OrdinalIgnoreCase);
+        Assert.DoesNotContain("wg_pump.bck", merge.ReplacedNames, StringComparer.OrdinalIgnoreCase);
+        Assert.DoesNotContain("wg_pump.bas", merge.ReplacedNames, StringComparer.OrdinalIgnoreCase);
+
+        var files = CharacterPack.OpenArchive(merge.PackArc).EnumerateFiles()
+            .ToDictionary(f => f.Name, f => f.Data, StringComparer.OrdinalIgnoreCase);
+        Assert.Equal(MakeBck(16), files["wg_pump.bck"]);
+        Assert.Equal(retailPumpBas, files["wg_pump.bas"]);
+        Assert.Equal(MakeBck(29), files["ma_wait.bck"]);
+        Assert.Equal(customWaitBas, files["ma_wait.bas"]);
+    }
+
+    [Fact]
+    public void Merge_DuplicateBasenameBcks_OnlyPatchesJointCompatibleTargets()
+    {
+        // Minimal J3D1bck1 + ANK1 with configurable joint count at +0x0C.
+        static byte[] MakeBck(int joints)
+        {
+            var data = new byte[0x60];
+            System.Text.Encoding.ASCII.GetBytes("J3D1bck1").CopyTo(data, 0);
+            System.Buffers.Binary.BinaryPrimitives.WriteInt32BigEndian(data.AsSpan(8, 4), data.Length);
+            System.Buffers.Binary.BinaryPrimitives.WriteInt32BigEndian(data.AsSpan(12, 4), 1);
+            System.Text.Encoding.ASCII.GetBytes("ANK1").CopyTo(data, 0x20);
+            System.Buffers.Binary.BinaryPrimitives.WriteInt32BigEndian(data.AsSpan(0x24, 4), data.Length - 0x20);
+            data[0x28] = 0;
+            data[0x29] = 0;
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(data.AsSpan(0x2A, 2), 10);
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(data.AsSpan(0x2C, 2), (ushort)joints);
+            // Tag payload so we can tell which clip landed where.
+            data[0x50] = (byte)joints;
+            return data;
+        }
+
+        // Mirror retail layout: Mario-body spray clip (16) + FLUDD body pump (14)
+        // share the basename wg_pump.bck. Custom only ships the 16-joint Mario clip
+        // — must not stomp the FLUDD node.
+        var retailRoot = new RarcDirectory { Name = "mario" };
+        var bckDir = new RarcDirectory { Name = "bck" };
+        var wgBody = new RarcDirectory { Name = "body" };
+        var watergun2 = new RarcDirectory { Name = "watergun2" };
+        bckDir.Files.Add(new RarcFileEntry { Name = "wg_pump.bck", Data = MakeBck(16) });
+        bckDir.Files.Add(new RarcFileEntry { Name = "ma_mdl1.bmd", Data = new byte[] { 1, 1, 1 } });
+        wgBody.Files.Add(new RarcFileEntry { Name = "wg_pump.bck", Data = MakeBck(14) });
+        watergun2.Directories.Add(wgBody);
+        retailRoot.Directories.Add(bckDir);
+        retailRoot.Directories.Add(watergun2);
+        var retail = new RarcArchive { RootName = "mario", Root = retailRoot }.Save();
+
+        var customRoot = new RarcDirectory { Name = "mario" };
+        var customBck = new RarcDirectory { Name = "bck" };
+        customBck.Files.Add(new RarcFileEntry { Name = "wg_pump.bck", Data = MakeBck(16) });
+        customBck.Files.Add(new RarcFileEntry { Name = "ma_mdl1.bmd", Data = new byte[] { 9, 9, 9 } });
+        customRoot.Directories.Add(customBck);
+        var custom = new RarcArchive { RootName = "mario", Root = customRoot }.Save();
+
+        var merge = CharacterPack.BuildMergedPack(retail, custom, replaceMatchingBcks: true);
+        Assert.Contains("wg_pump.bck", merge.ReplacedNames, StringComparer.OrdinalIgnoreCase);
+        Assert.Contains("wg_pump.bck", merge.SkippedReplacements, StringComparer.OrdinalIgnoreCase);
+
+        var files = CharacterPack.OpenArchive(merge.PackArc).EnumerateFiles()
+            .ToDictionary(f => f.FullPath.Replace('\\', '/'), f => f.Data,
+                StringComparer.OrdinalIgnoreCase);
+        Assert.Equal(16, files["bck/wg_pump.bck"][0x50]); // Mario body still patched
+        Assert.Equal(14, files["watergun2/body/wg_pump.bck"][0x50]); // FLUDD body kept retail
+        Assert.Equal(new byte[] { 9, 9, 9 }, files["bck/ma_mdl1.bmd"]);
+    }
+
+    [Fact]
+    public void Merge_DuplicateBasenameBcks_AppliesBothJointMatchedCandidates()
+    {
+        static byte[] MakeBck(int joints, byte tag)
+        {
+            var data = new byte[0x60];
+            System.Text.Encoding.ASCII.GetBytes("J3D1bck1").CopyTo(data, 0);
+            System.Buffers.Binary.BinaryPrimitives.WriteInt32BigEndian(data.AsSpan(8, 4), data.Length);
+            System.Buffers.Binary.BinaryPrimitives.WriteInt32BigEndian(data.AsSpan(12, 4), 1);
+            System.Text.Encoding.ASCII.GetBytes("ANK1").CopyTo(data, 0x20);
+            System.Buffers.Binary.BinaryPrimitives.WriteInt32BigEndian(data.AsSpan(0x24, 4), data.Length - 0x20);
+            data[0x28] = 0;
+            data[0x29] = 0;
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(data.AsSpan(0x2A, 2), 10);
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(data.AsSpan(0x2C, 2), (ushort)joints);
+            data[0x50] = tag;
+            return data;
+        }
+
+        var retailRoot = new RarcDirectory { Name = "mario" };
+        var bckDir = new RarcDirectory { Name = "bck" };
+        var wgBody = new RarcDirectory { Name = "body" };
+        var watergun2 = new RarcDirectory { Name = "watergun2" };
+        bckDir.Files.Add(new RarcFileEntry { Name = "wg_pump.bck", Data = MakeBck(16, 1) });
+        bckDir.Files.Add(new RarcFileEntry { Name = "ma_mdl1.bmd", Data = new byte[] { 1, 1, 1 } });
+        wgBody.Files.Add(new RarcFileEntry { Name = "wg_pump.bck", Data = MakeBck(14, 2) });
+        watergun2.Directories.Add(wgBody);
+        retailRoot.Directories.Add(bckDir);
+        retailRoot.Directories.Add(watergun2);
+        var retail = new RarcArchive { RootName = "mario", Root = retailRoot }.Save();
+
+        // Custom ships BOTH joint variants under the same basename (Mario body path
+        // + FLUDD body path). Both retail targets must be patched.
+        var customRoot = new RarcDirectory { Name = "mario" };
+        var customBck = new RarcDirectory { Name = "bck" };
+        var customWgBody = new RarcDirectory { Name = "body" };
+        var customWatergun2 = new RarcDirectory { Name = "watergun2" };
+        customBck.Files.Add(new RarcFileEntry { Name = "wg_pump.bck", Data = MakeBck(16, 0xA6) });
+        customBck.Files.Add(new RarcFileEntry { Name = "ma_mdl1.bmd", Data = new byte[] { 9, 9, 9 } });
+        customWgBody.Files.Add(new RarcFileEntry { Name = "wg_pump.bck", Data = MakeBck(14, 0xAE) });
+        customWatergun2.Directories.Add(customWgBody);
+        customRoot.Directories.Add(customBck);
+        customRoot.Directories.Add(customWatergun2);
+        var custom = new RarcArchive { RootName = "mario", Root = customRoot }.Save();
+
+        var merge = CharacterPack.BuildMergedPack(retail, custom, replaceMatchingBcks: true);
+        Assert.Contains("wg_pump.bck", merge.ReplacedNames, StringComparer.OrdinalIgnoreCase);
+        Assert.DoesNotContain("wg_pump.bck", merge.SkippedReplacements, StringComparer.OrdinalIgnoreCase);
+
+        var files = CharacterPack.OpenArchive(merge.PackArc).EnumerateFiles()
+            .ToDictionary(f => f.FullPath.Replace('\\', '/'), f => f.Data,
+                StringComparer.OrdinalIgnoreCase);
+        Assert.Equal(0xA6, files["bck/wg_pump.bck"][0x50]);
+        Assert.Equal(0xAE, files["watergun2/body/wg_pump.bck"][0x50]);
+    }
+
+    [Fact]
+    public void Merge_FluddOnlyPumpCandidate_DoesNotDropAgainstMarioBodyRetail()
+    {
+        static byte[] MakeBck(int joints, byte tag)
+        {
+            var data = new byte[0x60];
+            System.Text.Encoding.ASCII.GetBytes("J3D1bck1").CopyTo(data, 0);
+            System.Buffers.Binary.BinaryPrimitives.WriteInt32BigEndian(data.AsSpan(8, 4), data.Length);
+            System.Buffers.Binary.BinaryPrimitives.WriteInt32BigEndian(data.AsSpan(12, 4), 1);
+            System.Text.Encoding.ASCII.GetBytes("ANK1").CopyTo(data, 0x20);
+            System.Buffers.Binary.BinaryPrimitives.WriteInt32BigEndian(data.AsSpan(0x24, 4), data.Length - 0x20);
+            data[0x28] = 0;
+            data[0x29] = 0;
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(data.AsSpan(0x2A, 2), 10);
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(data.AsSpan(0x2C, 2), (ushort)joints);
+            data[0x50] = tag;
+            return data;
+        }
+
+        var retailRoot = new RarcDirectory { Name = "mario" };
+        var bckDir = new RarcDirectory { Name = "bck" };
+        var wgBody = new RarcDirectory { Name = "body" };
+        var watergun2 = new RarcDirectory { Name = "watergun2" };
+        bckDir.Files.Add(new RarcFileEntry { Name = "wg_pump.bck", Data = MakeBck(16, 1) });
+        bckDir.Files.Add(new RarcFileEntry { Name = "ma_mdl1.bmd", Data = new byte[] { 1, 1, 1 } });
+        wgBody.Files.Add(new RarcFileEntry { Name = "wg_pump.bck", Data = MakeBck(14, 2) });
+        watergun2.Directories.Add(wgBody);
+        retailRoot.Directories.Add(bckDir);
+        retailRoot.Directories.Add(watergun2);
+        var retail = new RarcArchive { RootName = "mario", Root = retailRoot }.Save();
+
+        // Custom only ships the 14-joint FLUDD pump. Old first-retail pre-filter
+        // compared against bck/ (16) and dropped the whole stem — must keep FLUDD.
+        var customRoot = new RarcDirectory { Name = "mario" };
+        var customWgBody = new RarcDirectory { Name = "body" };
+        var customWatergun2 = new RarcDirectory { Name = "watergun2" };
+        var customBmd = new RarcDirectory { Name = "bmd" };
+        customBmd.Files.Add(new RarcFileEntry { Name = "ma_mdl1.bmd", Data = new byte[] { 9, 9, 9 } });
+        customWgBody.Files.Add(new RarcFileEntry { Name = "wg_pump.bck", Data = MakeBck(14, 0xAE) });
+        customWatergun2.Directories.Add(customWgBody);
+        customRoot.Directories.Add(customBmd);
+        customRoot.Directories.Add(customWatergun2);
+        var custom = new RarcArchive { RootName = "mario", Root = customRoot }.Save();
+
+        var merge = CharacterPack.BuildMergedPack(retail, custom, replaceMatchingBcks: true);
+        Assert.Contains("wg_pump.bck", merge.ReplacedNames, StringComparer.OrdinalIgnoreCase);
+
+        var files = CharacterPack.OpenArchive(merge.PackArc).EnumerateFiles()
+            .ToDictionary(f => f.FullPath.Replace('\\', '/'), f => f.Data,
+                StringComparer.OrdinalIgnoreCase);
+        Assert.Equal(1, files["bck/wg_pump.bck"][0x50]); // Mario body stayed retail
+        Assert.Equal(0xAE, files["watergun2/body/wg_pump.bck"][0x50]); // FLUDD patched
+    }
+
+    [Fact]
+    public void InjectBtks_PreservesRetailFileIds()
+    {
+        var retailRoot = new RarcDirectory { Name = "mario" };
+        var basDir = new RarcDirectory { Name = "bas" };
+        var bckDir = new RarcDirectory { Name = "bck" };
+        var bmdDir = new RarcDirectory { Name = "bmd" };
+        var btkDir = new RarcDirectory { Name = "btk" };
+        basDir.Files.Add(new RarcFileEntry { Name = "ma_wait.bas", Data = new byte[] { 1, 2, 3 } });
+        bckDir.Files.Add(new RarcFileEntry { Name = "ma_wait.bck", Data = new byte[] { 4, 5, 6 } });
+        bmdDir.Files.Add(new RarcFileEntry { Name = "ma_mdl1.bmd", Data = new byte[] { 7, 7, 7 } });
+        btkDir.Files.Add(new RarcFileEntry { Name = "watergun_water.btk", Data = new byte[] { 8 } });
+        retailRoot.Directories.Add(basDir);
+        retailRoot.Directories.Add(bckDir);
+        retailRoot.Directories.Add(bmdDir);
+        retailRoot.Directories.Add(btkDir);
+        var retail = new RarcArchive { RootName = "mario", Root = retailRoot }.Save();
+
+        var before = CharacterPack.OpenArchive(retail);
+        var basId = before.EnumerateFiles().First(f => f.Name == "ma_wait.bas").FileId;
+        var bckId = before.EnumerateFiles().First(f => f.Name == "ma_wait.bck").FileId;
+        Assert.True(basId.HasValue);
+        Assert.True(bckId.HasValue);
+
+        var customRoot = new RarcDirectory { Name = "mario" };
+        var customBmd = new RarcDirectory { Name = "bmd" };
+        var customFolder = new RarcDirectory { Name = "custom" };
+        customBmd.Files.Add(new RarcFileEntry { Name = "ma_mdl1.bmd", Data = new byte[] { 9, 9, 9 } });
+        customFolder.Files.Add(new RarcFileEntry { Name = "ma_mdl1.btk", Data = new byte[] { 5, 5, 5 } });
+        customRoot.Directories.Add(customBmd);
+        customRoot.Directories.Add(customFolder);
+        var custom = new RarcArchive { RootName = "mario", Root = customRoot }.Save();
+
+        var merge = CharacterPack.BuildMergedPack(retail, custom);
+        Assert.True(merge.InjectedBtkCount >= 1);
+
+        var after = CharacterPack.OpenArchive(merge.PackArc);
+        Assert.Equal(basId, after.EnumerateFiles().First(f => f.Name == "ma_wait.bas").FileId);
+        Assert.Equal(bckId, after.EnumerateFiles().First(f => f.Name == "ma_wait.bck").FileId);
     }
 
     [Fact]
@@ -562,6 +942,201 @@ public class MarioPackTests
             ModelLibrary.LibraryDirectoryOverride = previous;
             try { Directory.Delete(root, recursive: true); } catch { /* best-effort */ }
         }
+    }
+
+    [Fact]
+    public void SeedBundledModels_OverwritesExistingPacksAndStaleIds()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "bsmso-seed-" + Guid.NewGuid().ToString("N"));
+        var bundled = Path.Combine(root, "bundled");
+        var library = Path.Combine(root, "library");
+        Directory.CreateDirectory(bundled);
+        Directory.CreateDirectory(library);
+        var previous = ModelLibrary.LibraryDirectoryOverride;
+        try
+        {
+            ModelLibrary.LibraryDirectoryOverride = library;
+
+            const string newId = "aabbccdd";
+            const string staleId = "11223344";
+            File.WriteAllText(Path.Combine(bundled, "library.json"),
+                """{"aabbccdd":"Waluigi"}""");
+            var freshArc = new byte[] { 1, 2, 3, 4, 5 };
+            var freshSzs = new byte[] { 9, 9, 9 };
+            File.WriteAllBytes(Path.Combine(bundled, "Waluigi.arc"), freshArc);
+            File.WriteAllBytes(Path.Combine(bundled, "Waluigi.szs"), freshSzs);
+
+            // Stale AppData: same display name under an old id, plus outdated bytes.
+            File.WriteAllText(Path.Combine(library, "library.json"),
+                """{"11223344":"Waluigi"}""");
+            File.WriteAllBytes(Path.Combine(library, "Waluigi.arc"), new byte[] { 7, 7, 7 });
+            File.WriteAllBytes(Path.Combine(library, "Waluigi.szs"), new byte[] { 8, 8 });
+            File.WriteAllBytes(Path.Combine(library, staleId + ".arc"), new byte[] { 6 });
+
+            var updated = ModelLibrary.SeedBundledModelsFrom(bundled);
+            Assert.True(updated >= 2);
+
+            Assert.Equal(freshArc, File.ReadAllBytes(Path.Combine(library, "Waluigi.arc")));
+            Assert.Equal(freshSzs, File.ReadAllBytes(Path.Combine(library, "Waluigi.szs")));
+            Assert.False(File.Exists(Path.Combine(library, staleId + ".arc")));
+
+            var map = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, string>>(
+                File.ReadAllText(Path.Combine(library, "library.json")));
+            Assert.NotNull(map);
+            Assert.True(map!.ContainsKey(newId));
+            Assert.Equal("Waluigi", map[newId]);
+            Assert.False(map.ContainsKey(staleId));
+
+            // Second seed with identical bytes reports no file updates.
+            Assert.Equal(0, ModelLibrary.SeedBundledModelsFrom(bundled));
+
+            // Tall-pack seed stamps BodyAngleFree.prm even when the bundled arc omitted it.
+            const string tallId = "aabb0011";
+            var emptyMario = new RarcArchive
+            {
+                RootName = "mario",
+                Root = new RarcDirectory { Name = "mario" },
+            }.Save();
+            File.WriteAllText(Path.Combine(bundled, "library.json"),
+                """{"aabbccdd":"Waluigi","aabb0011":"Luigi"}""");
+            File.WriteAllBytes(Path.Combine(bundled, "Luigi.arc"), emptyMario);
+            File.WriteAllBytes(Path.Combine(bundled, "Luigi.szs"), freshSzs);
+            Assert.True(ModelLibrary.SeedBundledModelsFrom(bundled) >= 1);
+            var luigiArc = Path.Combine(library, "Luigi.arc");
+            Assert.True(File.Exists(luigiArc));
+            var luigiFiles = CharacterPack.OpenArchive(File.ReadAllBytes(luigiArc)).EnumerateFiles()
+                .ToDictionary(f => f.Name, f => f.Data, StringComparer.OrdinalIgnoreCase);
+            Assert.True(luigiFiles.ContainsKey("BodyAngleFree.prm"));
+            Assert.Equal(CharacterPack.GetBodyAngleFree2PrmBytes(), luigiFiles["BodyAngleFree.prm"]);
+            var map2 = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, string>>(
+                File.ReadAllText(Path.Combine(library, "library.json")));
+            Assert.NotNull(map2);
+            Assert.Equal("Luigi", map2![tallId]);
+        }
+        finally
+        {
+            ModelLibrary.LibraryDirectoryOverride = previous;
+            try { Directory.Delete(root, recursive: true); } catch { /* best-effort */ }
+        }
+    }
+
+    [Fact]
+    public void PackByteCache_ReusesBufferAndInvalidatesOnAtomicRevision()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "bsmso-pack-cache-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var previous = ModelLibrary.LibraryDirectoryOverride;
+        try
+        {
+            ModelLibrary.LibraryDirectoryOverride = root;
+            const string id = "aabbccdd";
+            File.WriteAllText(Path.Combine(root, ModelLibrary.LibraryFileName),
+                """{"aabbccdd":"Cache Test"}""");
+            var path = Path.Combine(root, "Cache Test.arc");
+            File.WriteAllBytes(path, new byte[] { 1, 2, 3, 4 });
+            File.SetLastWriteTimeUtc(path, DateTime.UtcNow.AddMinutes(-2));
+
+            Assert.True(ModelLibrary.TryGetPackBytes(id, out var first));
+            Assert.True(ModelLibrary.TryGetPackBytes(id, out var second));
+            Assert.Same(first, second);
+
+            var replacement = Path.Combine(root, ".replacement.tmp");
+            File.WriteAllBytes(replacement, new byte[] { 9, 8, 7, 6, 5 });
+            File.Move(replacement, path, overwrite: true);
+            File.SetLastWriteTimeUtc(path, DateTime.UtcNow.AddMinutes(-1));
+
+            Assert.True(ModelLibrary.TryGetPackBytes(id, out var revised));
+            Assert.NotSame(first, revised);
+            Assert.Equal(new byte[] { 9, 8, 7, 6, 5 }, revised);
+        }
+        finally
+        {
+            ModelLibrary.LibraryDirectoryOverride = previous;
+            try { Directory.Delete(root, recursive: true); } catch { /* best-effort */ }
+        }
+    }
+
+    [Fact]
+    public void InstallPacksIntoGameRoot_UsesRevisionStampAndAtomicReplacement()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "bsmso-install-cache-" + Guid.NewGuid().ToString("N"));
+        var library = Path.Combine(root, "library");
+        var game = Path.Combine(root, "game");
+        Directory.CreateDirectory(library);
+        Directory.CreateDirectory(game);
+        var previous = ModelLibrary.LibraryDirectoryOverride;
+        try
+        {
+            ModelLibrary.LibraryDirectoryOverride = library;
+            const string id = "11223344";
+            File.WriteAllText(Path.Combine(library, ModelLibrary.LibraryFileName),
+                """{"11223344":"Install Test"}""");
+            var sourcePath = Path.Combine(library, "Install Test.arc");
+            var firstPack = BuildInitSafePack(1);
+            File.WriteAllBytes(sourcePath, firstPack);
+            var firstStamp = DateTime.UtcNow.AddMinutes(-5);
+            File.SetLastWriteTimeUtc(sourcePath, firstStamp);
+            var legacyPreload = MarioPackInstaller.GetRuntimePreloadIndexPath(game);
+            Directory.CreateDirectory(Path.GetDirectoryName(legacyPreload)!);
+            File.WriteAllBytes(legacyPreload, new byte[288]);
+
+            Assert.Equal(1, MarioPackInstaller.InstallPacksIntoGameRoot(
+                game, new[] { id }, patchLocalSzs: false));
+            var destination = MarioPackInstaller.GetInstalledPackPath(game, id);
+            Assert.Equal(firstPack, File.ReadAllBytes(destination));
+            Assert.Equal(firstStamp, File.GetLastWriteTimeUtc(destination));
+            Assert.False(File.Exists(legacyPreload));
+
+            // Same source revision is an O(1) metadata hit and does not rewrite.
+            Assert.Equal(0, MarioPackInstaller.InstallPacksIntoGameRoot(
+                game, new[] { id }, patchLocalSzs: false));
+            Assert.Empty(Directory.EnumerateFiles(
+                Path.GetDirectoryName(destination)!, "*.tmp", SearchOption.TopDirectoryOnly));
+
+            var revisedPack = BuildInitSafePack(2);
+            File.WriteAllBytes(sourcePath, revisedPack);
+            var revisedStamp = DateTime.UtcNow.AddMinutes(-4);
+            File.SetLastWriteTimeUtc(sourcePath, revisedStamp);
+
+            Assert.Equal(1, MarioPackInstaller.InstallPacksIntoGameRoot(
+                game, new[] { id }, patchLocalSzs: false));
+            Assert.Equal(revisedPack, File.ReadAllBytes(destination));
+            Assert.Equal(revisedStamp, File.GetLastWriteTimeUtc(destination));
+        }
+        finally
+        {
+            ModelLibrary.LibraryDirectoryOverride = previous;
+            try { Directory.Delete(root, recursive: true); } catch { /* best-effort */ }
+        }
+    }
+
+    private static byte[] BuildInitSafePack(byte revision)
+    {
+        static byte[] FakeBmd(int joints)
+        {
+            var data = new byte[64];
+            data[0] = (byte)'J';
+            data[1] = (byte)'3';
+            data[2] = (byte)'D';
+            data[3] = (byte)'2';
+            const int offset = 16;
+            data[offset] = (byte)'J';
+            data[offset + 1] = (byte)'N';
+            data[offset + 2] = (byte)'T';
+            data[offset + 3] = (byte)'1';
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(
+                data.AsSpan(offset + 8, 2), (ushort)joints);
+            return data;
+        }
+
+        var root = new RarcDirectory { Name = "mario" };
+        var bmd = new RarcDirectory { Name = "bmd" };
+        bmd.Files.Add(new RarcFileEntry { Name = "ma_mdl1.bmd", Data = FakeBmd(29) });
+        bmd.Files.Add(new RarcFileEntry { Name = "ma_cap1.bmd", Data = FakeBmd(2) });
+        bmd.Files.Add(new RarcFileEntry { Name = "ma_cap3.bmd", Data = FakeBmd(3) });
+        root.Directories.Add(bmd);
+        root.Files.Add(new RarcFileEntry { Name = "revision.bin", Data = new[] { revision } });
+        return new RarcArchive { RootName = "mario", Root = root }.Save();
     }
 
     private static byte[] BuildArchive(IEnumerable<(string Name, byte[] Data)> files)

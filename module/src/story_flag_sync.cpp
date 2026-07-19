@@ -1,11 +1,14 @@
 #include "story_flag_sync.hpp"
 
+#include "collectible_scan.hpp"
 #include "comm_buffer.hpp"
 #include "world_sync.hpp"
 
 #include <SMS/Manager/FlagManager.hxx>
+#include <SMS/MapObj/MapObjBase.hxx>
 #include <SMS/System/Application.hxx>
 #include <SMS/System/MarDirector.hxx>
+#include <SMS/macros.h>
 #include <Dolphin/OS.h>
 #include <string.h>
 
@@ -22,39 +25,40 @@ constexpr u32 kShineFlagCount = 120u;
 constexpr u32 kBlueCoinFlagBase = 0x10078u;
 constexpr u32 kBlueCoinFlagEnd = 0x10078u + 9u * 50u; // stages 1..9 × 50
 
-// Stage bools: 0x50000 .. 0x50063 (100 bits). Drive plaza gates / boats / flood props.
-// These map onto TFlagManager::Type5Flag (reset by resetStage each stage enter).
+// Stage bools: 0x50000 .. 0x50063 (100 bits).
 constexpr u32 kStageBoolBase = 0x50000u;
 constexpr u32 kStageBoolEnd = 0x50064u; // exclusive
 
-// Type5Flag.mRedCoinSwitchPressed — bit 9 of the Type5 bank (0xE4 + bit index).
-// Ephemeral per stage/episode: vanilla clears it on resetStage. Durable global sync of this
-// bit re-arms EVERY red-coin switch mission on stage enter (timer + empty→red spawn).
 constexpr u32 kRedCoinSwitchPressedFlagId = 0x50009u;
 
-// Game bools: 0x30000 .. 0x3001C — small runtime bank used by a few story gates.
+// Game bools: 0x30000 .. 0x3001C — runtime bank; never durable.
 constexpr u32 kGameBoolBase = 0x30000u;
 constexpr u32 kGameBoolEnd = 0x3001Du;
 
-// One-shot spawn directors consumed by TMarDirector::decideMarioPosIdx (NTSC-U 0x802B97A8):
-//   0x30001 — cleared on some plaza entry paths
-//   0x30004 — Pinna unlock FMV sets this; decideMarioPosIdx clears it and forces MarioPosIdx
-//             for the cannon reveal. Durable sync re-applied it on every plaza enter
-//             (authority snapshot / story-flag apply after stageInit), so returns from
-//             Ricco/Bianco/etc. always spawned at the Pinna cannon. Durable Pinna unlock
-//             progress is card bool 0x10389 (decideNextScenario → dolpic8), not 0x30004.
 constexpr u32 kSpawnDirectorFlag30001 = 0x30001u;
 constexpr u32 kSpawnDirectorFlag30004 = 0x30004u;
+
+// Verified plaza MapEvent / loadAfter latches. These are hub-global on Delfino
+// (area 1): dolpic scenario indices differ (8/7/6/…) while the Type5 meaning is
+// shared. Keying by raw mEpisodeID made live apply miss across hub scenarios and
+// deferred healing until a matching re-enter.
+constexpr u8 kPlazaAreaId = 1u;
+constexpr u8 kPlazaHubEpisode = 0xFFu;
+constexpr u32 kPlazaTriggerFlags[] = {0x50001u, 0x50002u, 0x50004u};
+constexpr u32 kPlazaTriggerCount = sizeof(kPlazaTriggerFlags) / sizeof(kPlazaTriggerFlags[0]);
 
 constexpr u32 kCardBitCount = kCardBoolEnd - kCardBoolBase;   // 948
 constexpr u32 kStageBitCount = kStageBoolEnd - kStageBoolBase; // 100
 constexpr u32 kGameBitCount = kGameBoolEnd - kGameBoolBase;    // 29
-constexpr u32 kCardScanSlice = 256u; // Full persistent bank in at most four frames.
-constexpr bool kStoryFlagHotPathOsReport = false;
+constexpr u32 kCardScanSlice = 256u;
+constexpr bool kStoryFlagHotPathOsReport = true;
 
 constexpr u32 kCardByteCount = (kCardBitCount + 7u) / 8u;
 constexpr u32 kStageByteCount = (kStageBitCount + 7u) / 8u;
 constexpr u32 kGameByteCount = (kGameBitCount + 7u) / 8u;
+
+// NTSC-U TMareGate vtable — loadAfter kills the actor when 0x50004 is clear.
+constexpr u32 kVtMareGate = SMS_PORT_REGION(0x803D3480, 0x803CAC70, 0, 0x803D3480);
 
 static bool isShineOrBlueCoinCardFlag(u32 flagId) {
     if (flagId < kCardBoolBase || flagId >= kCardBoolEnd)
@@ -67,7 +71,6 @@ static bool isShineOrBlueCoinCardFlag(u32 flagId) {
     return false;
 }
 
-// Stage-session bits that must never be durable-synced across course/episode boundaries.
 static bool isEphemeralStageSessionBool(u32 flagId) {
     return flagId == kRedCoinSwitchPressedFlagId;
 }
@@ -77,20 +80,42 @@ static bool isEphemeralSpawnDirectorBool(u32 flagId) {
 }
 
 static bool isNonDurableBoolFlag(u32 flagId) {
-    // Type3 is reset by resetGame and includes one-shot directors and other runtime
-    // latches. It has no stable cross-stage identity, so none of it belongs in the
-    // durable grow-only session set.
     return isEphemeralStageSessionBool(flagId) || isEphemeralSpawnDirectorBool(flagId) ||
            (flagId >= kGameBoolBase && flagId < kGameBoolEnd);
+}
+
+static bool isDurableCardBool(u32 flagId) {
+    return flagId >= kCardBoolBase && flagId < kCardBoolEnd &&
+           !isShineOrBlueCoinCardFlag(flagId);
+}
+
+static bool isDurablePlazaTrigger(u32 flagId) {
+    for (u32 i = 0; i < kPlazaTriggerCount; ++i) {
+        if (flagId == kPlazaTriggerFlags[i])
+            return true;
+    }
+    return false;
+}
+
+static s32 plazaTriggerIndex(u32 flagId) {
+    for (u32 i = 0; i < kPlazaTriggerCount; ++i) {
+        if (flagId == kPlazaTriggerFlags[i])
+            return static_cast<s32>(i);
+    }
+    return -1;
 }
 
 static u8 sCardBits[kCardByteCount] = {};
 static u8 sStageBits[kStageByteCount] = {};
 static u8 sGameBits[kGameByteCount] = {};
 static u8 sAuthorityCardBits[kCardByteCount] = {};
-static u8 sAuthorityStageBits[kStageByteCount] = {};
 static u8 sBootstrapCardBits[kCardByteCount] = {};
 static u8 sBootstrapStageBits[kStageByteCount] = {};
+
+// Grow-only plaza hub overlay — survives leaving Delfino so the next plaza
+// stageInit can write bits before setupObjects/loadAfter.
+static bool sPlazaTriggerOverlay[kPlazaTriggerCount] = {};
+
 static bool sTrackersReady = false;
 static bool sApplyingRemote = false;
 static bool sConnectionObserved = false;
@@ -100,9 +125,8 @@ static bool sStageBootstrapPending = false;
 static u32 sCardBootstrapCursor = 0;
 static u32 sStageBootstrapCursor = 0;
 static u32 sCardScanCursor = 0;
-static u8 sAuthorityStageCourse = 0xFF;
-static u8 sAuthorityStageEpisode = 0xFF;
-static bool sStageReconcilePending = false;
+static u32 sCardBankHash = 0;
+static u32 sStageAllowlistHash = 0;
 
 static bool bitGet(const u8 *bits, u32 index) {
     return (bits[index >> 3] & static_cast<u8>(1u << (index & 7))) != 0;
@@ -116,88 +140,53 @@ static void bitSet(u8 *bits, u32 index, bool value) {
         bits[index >> 3] &= static_cast<u8>(~mask);
 }
 
+static u32 fnv1aBytes(const u8 *data, u32 len) {
+    u32 hash = 2166136261u;
+    for (u32 i = 0; i < len; ++i) {
+        hash ^= data[i];
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
 static void snapshotBank(TFlagManager *fm, u32 base, u32 count, u8 *outBits) {
     for (u32 i = 0; i < count; ++i)
         bitSet(outBits, i, fm->getBool(base + i));
 }
 
-static bool isDurableCardBool(u32 flagId) {
-    return flagId >= kCardBoolBase && flagId < kCardBoolEnd &&
-           !isShineOrBlueCoinCardFlag(flagId);
+static u32 snapshotPlazaAllowlistHash(TFlagManager *fm) {
+    u8 bits = 0;
+    for (u32 i = 0; i < kPlazaTriggerCount; ++i) {
+        if (fm->getBool(kPlazaTriggerFlags[i]))
+            bits = static_cast<u8>(bits | static_cast<u8>(1u << i));
+    }
+    return bits;
 }
 
-static bool isDurableStageBool(u32 flagId) {
-    // Type5 is resetStage scratch space and most bits are reused for graffiti,
-    // timers, switches, and other episode-local one-shots. Only these verified
-    // MapEvent progression latches have durable shared meaning.
-    return flagId == 0x50001u || flagId == 0x50002u || flagId == 0x50004u;
-}
-
-static void publishFlagEvent(smso::WorldEventType type, u32 flagId, u8 value) {
-    if (!gpMarDirector)
-        return;
-    const u8 courseId = gpMarDirector->mAreaID;
-    const u8 episodeId = gpMarDirector->mEpisodeID;
+static void publishFlagEvent(smso::WorldEventType type, u8 courseId, u8 episodeId, u32 flagId,
+                             u8 value) {
     smso::enqueueLocalWorldEvent(static_cast<u8>(type), courseId, episodeId, value, 0, flagId);
 }
 
-// Publish at most one baseline set per frame. Initial/local progress is merged into the
-// server's grow-only set without bursting ~1,000 flags into the 32-entry module queue.
-static void publishNextBootstrapSet(TFlagManager *fm, bool syncStory, bool syncSecret) {
-    if (!fm)
+static void publishCardOrSecret(smso::WorldEventType type, u32 flagId) {
+    if (!gpMarDirector)
         return;
-
-    while (sCardBootstrapPending && sCardBootstrapCursor < kCardBitCount) {
-        const u32 flagId = kCardBoolBase + sCardBootstrapCursor++;
-        if (!isDurableCardBool(flagId) || !bitGet(sBootstrapCardBits, sCardBootstrapCursor - 1) ||
-            (!syncStory && (!syncSecret || flagId < 0x10366u)))
-            continue;
-        bitSet(sAuthorityCardBits, flagId - kCardBoolBase, true);
-        publishFlagEvent(syncStory ? smso::WE_STORY_FLAG : smso::WE_SECRET_COMPLETE,
-                         flagId, 1);
-        return;
-    }
-    if (sCardBootstrapCursor >= kCardBitCount)
-        sCardBootstrapPending = false;
-
-    while (sStageBootstrapPending && sStageBootstrapCursor < kStageBitCount) {
-        const u32 flagId = kStageBoolBase + sStageBootstrapCursor++;
-        if (!isDurableStageBool(flagId) ||
-            !bitGet(sBootstrapStageBits, sStageBootstrapCursor - 1))
-            continue;
-        bitSet(sAuthorityStageBits, flagId - kStageBoolBase, true);
-        publishFlagEvent(smso::WE_TRIGGER_FLAG, flagId, 1);
-        return;
-    }
-    if (sStageBootstrapCursor >= kStageBitCount)
-        sStageBootstrapPending = false;
+    publishFlagEvent(type, gpMarDirector->mAreaID, gpMarDirector->mEpisodeID, flagId, 1);
 }
 
-static void reconcileAuthorityStageBits(TFlagManager *fm) {
-    if (!sStageReconcilePending || !fm || !gpMarDirector)
-        return;
-    if (gpMarDirector->mAreaID != sAuthorityStageCourse ||
-        gpMarDirector->mEpisodeID != sAuthorityStageEpisode) {
-        sStageReconcilePending = false;
-        return;
-    }
+static void publishPlazaTrigger(u32 flagId) {
+    // Hub-global wire key: course=plaza, episode=wildcard. Server coalesces any
+    // legacy plaza episode into the same authority slot.
+    publishFlagEvent(smso::WE_TRIGGER_FLAG, kPlazaAreaId, kPlazaHubEpisode, flagId, 1);
+}
 
-    u32 changed = 0;
-    sApplyingRemote = true;
-    for (u32 i = 0; i < kStageBitCount; ++i) {
-        if (!bitGet(sAuthorityStageBits, i))
-            continue;
-        const u32 flagId = kStageBoolBase + i;
-        if (!fm->getBool(flagId)) {
-            fm->setBool(true, flagId);
-            ++changed;
-        }
-    }
-    sApplyingRemote = false;
-    sStageReconcilePending = false;
-    if (changed != 0)
-        OSReport("[SMSOBB] story-flag stage reconcile restored=%u course=%u/%u\n",
-                 changed, sAuthorityStageCourse, sAuthorityStageEpisode);
+static void markLocalTracker(u32 flagId, bool value) {
+    if (flagId >= kCardBoolBase && flagId < kCardBoolEnd)
+        bitSet(sCardBits, flagId - kCardBoolBase, value);
+    else if (flagId >= kStageBoolBase && flagId < kStageBoolEnd)
+        bitSet(sStageBits, flagId - kStageBoolBase, value);
+    else if (flagId >= kGameBoolBase && flagId < kGameBoolEnd)
+        bitSet(sGameBits, flagId - kGameBoolBase, value);
 }
 
 static bool applyBoolFlag(TFlagManager *fm, u32 flagId, u8 value, bool *changedOut) {
@@ -224,44 +213,155 @@ static bool applyBoolFlag(TFlagManager *fm, u32 flagId, u8 value, bool *changedO
     return true;
 }
 
-static void markLocalTracker(u32 flagId, bool value) {
-    if (flagId >= kCardBoolBase && flagId < kCardBoolEnd)
-        bitSet(sCardBits, flagId - kCardBoolBase, value);
-    else if (flagId >= kStageBoolBase && flagId < kStageBoolEnd)
-        bitSet(sStageBits, flagId - kStageBoolBase, value);
-    else if (flagId >= kGameBoolBase && flagId < kGameBoolEnd)
-        bitSet(sGameBits, flagId - kGameBoolBase, value);
+static bool visitReviveMareGate(TMapObjBase *obj, void *ctx) {
+    (void)ctx;
+    if (!obj)
+        return true;
+    const u32 vt = *reinterpret_cast<const u32 *>(obj);
+    if (vt != kVtMareGate)
+        return true;
+
+    // loadAfter called makeObjDead when 0x50004 was clear. Flag is now set —
+    // revive without plaza soft-reload.
+    obj->makeObjAppeared();
+    *reinterpret_cast<u32 *>(ctx) = 1u;
+    OSReport("[SMSOBB] flag-wake MareGate revived (0x50004 live apply)\n");
+    return false;
 }
 
-static void scanBankForChanges(TFlagManager *fm, u32 base, u32 start, u32 count, u8 *tracked,
-                               smso::WorldEventType type, bool skipShineBlue) {
+static void wakePlazaGeometryForFlag(u32 flagId, bool changed) {
+    if (!gpMarDirector || gpMarDirector->mAreaID != kPlazaAreaId)
+        return;
+
+    if (flagId == 0x50004u && changed) {
+        u32 revived = 0;
+        smso::forEachManagedMapObj(visitReviveMareGate, &revived);
+        if (kStoryFlagHotPathOsReport) {
+            OSReport("[SMSOBB] flag-wake id=0x%08X mareGateRevived=%u\n", flagId, revived);
+        }
+        return;
+    }
+
+    // 0x50001 / 0x50002: MapEvent load/loadAfter bind raised vs sunk. Mid-visit
+    // watch() for RiccoMammaGate triggers a camera demo + Mario warp — unsafe for
+    // remotes. Honest live path is FlagManager write; geometry that already took
+    // the loadAfter "done" path stays correct. Sunk mid-visit actors still need
+    // natural re-enter (documented).
+    if ((flagId == 0x50001u || flagId == 0x50002u) && kStoryFlagHotPathOsReport) {
+        OSReport("[SMSOBB] flag-wake id=0x%08X MapEvent=loadAfter-bound (no demo force)\n",
+                 flagId);
+    }
+
+    // Card-watched gates (e.g. Bianco 0x10384): TMapEvent::perform polls watch()
+    // every MOVE cue while state==1 — setBool is sufficient.
+}
+
+static void writePlazaOverlayToFlagManager(TFlagManager *fm, const char *reason) {
+    if (!fm)
+        return;
+
+    u32 wrote = 0;
+    sApplyingRemote = true;
+    for (u32 i = 0; i < kPlazaTriggerCount; ++i) {
+        if (!sPlazaTriggerOverlay[i])
+            continue;
+        const u32 flagId = kPlazaTriggerFlags[i];
+        if (!fm->getBool(flagId)) {
+            fm->setBool(true, flagId);
+            ++wrote;
+        }
+        markLocalTracker(flagId, true);
+    }
+    sApplyingRemote = false;
+
+    OSReport("[SMSOBB] story-flag plaza overlay apply wrote=%u reason=%s\n", wrote, reason);
+}
+
+static void admitPlazaTrigger(u32 flagId) {
+    const s32 idx = plazaTriggerIndex(flagId);
+    if (idx < 0)
+        return;
+    sPlazaTriggerOverlay[idx] = true;
+}
+
+// Publish at most one baseline set per frame.
+static void publishNextBootstrapSet(TFlagManager *fm, bool syncStory, bool syncSecret) {
+    if (!fm)
+        return;
+
+    while (sCardBootstrapPending && sCardBootstrapCursor < kCardBitCount) {
+        const u32 flagId = kCardBoolBase + sCardBootstrapCursor++;
+        if (!isDurableCardBool(flagId) || !bitGet(sBootstrapCardBits, sCardBootstrapCursor - 1) ||
+            (!syncStory && (!syncSecret || flagId < 0x10366u)))
+            continue;
+        bitSet(sAuthorityCardBits, flagId - kCardBoolBase, true);
+        publishCardOrSecret(syncStory ? smso::WE_STORY_FLAG : smso::WE_SECRET_COMPLETE, flagId);
+        return;
+    }
+    if (sCardBootstrapCursor >= kCardBitCount)
+        sCardBootstrapPending = false;
+
+    while (sStageBootstrapPending && sStageBootstrapCursor < kStageBitCount) {
+        const u32 flagId = kStageBoolBase + sStageBootstrapCursor++;
+        if (!isDurablePlazaTrigger(flagId) ||
+            !bitGet(sBootstrapStageBits, sStageBootstrapCursor - 1))
+            continue;
+        // Only merge plaza allowlist when we are actually on the hub — Type5 on
+        // other courses is resetStage scratch that happens to reuse the same ids.
+        if (!gpMarDirector || gpMarDirector->mAreaID != kPlazaAreaId)
+            continue;
+        admitPlazaTrigger(flagId);
+        publishPlazaTrigger(flagId);
+        return;
+    }
+    if (sStageBootstrapCursor >= kStageBitCount)
+        sStageBootstrapPending = false;
+}
+
+static void scanCardBankForChanges(TFlagManager *fm, u32 start, u32 count, bool syncStory) {
     const u32 end = start + count;
     for (u32 i = start; i < end; ++i) {
-        const u32 flagId = base + i;
-        if (skipShineBlue && isShineOrBlueCoinCardFlag(flagId))
+        const u32 flagId = kCardBoolBase + i;
+        if (isShineOrBlueCoinCardFlag(flagId))
             continue;
 
         const bool now = fm->getBool(flagId);
-        const bool was = bitGet(tracked, i);
+        const bool was = bitGet(sCardBits, i);
         if (now == was)
             continue;
 
-        bitSet(tracked, i, now);
-        if (sApplyingRemote)
-            continue;
-        // Durable shared progress is grow-only. Vanilla stage/reset clears update the
-        // observer baseline but can never erase authority state or produce a clear event.
-        if (!now || isNonDurableBoolFlag(flagId))
+        bitSet(sCardBits, i, now);
+        if (sApplyingRemote || !now || !isDurableCardBool(flagId))
             continue;
 
-        if (flagId >= kCardBoolBase && flagId < kCardBoolEnd)
-            bitSet(sAuthorityCardBits, flagId - kCardBoolBase, true);
-        else if (flagId >= kStageBoolBase && flagId < kStageBoolEnd)
-            bitSet(sAuthorityStageBits, flagId - kStageBoolBase, true);
-        publishFlagEvent(type, flagId, 1);
+        bitSet(sAuthorityCardBits, i, true);
+        publishCardOrSecret(syncStory ? smso::WE_STORY_FLAG : smso::WE_SECRET_COMPLETE, flagId);
         if (kStoryFlagHotPathOsReport) {
-            OSReport("[SMSOBB] story-flag emit-set type=%u id=0x%08X\n",
-                     static_cast<u32>(type), flagId);
+            OSReport("[SMSOBB] story-flag emit-set id=0x%08X live=1\n", flagId);
+        }
+    }
+}
+
+static void scanPlazaTriggersForChanges(TFlagManager *fm) {
+    if (!gpMarDirector || gpMarDirector->mAreaID != kPlazaAreaId)
+        return;
+
+    for (u32 i = 0; i < kPlazaTriggerCount; ++i) {
+        const u32 flagId = kPlazaTriggerFlags[i];
+        const u32 bitIndex = flagId - kStageBoolBase;
+        const bool now = fm->getBool(flagId);
+        const bool was = bitGet(sStageBits, bitIndex);
+        if (now == was)
+            continue;
+
+        bitSet(sStageBits, bitIndex, now);
+        if (sApplyingRemote || !now)
+            continue;
+
+        admitPlazaTrigger(flagId);
+        publishPlazaTrigger(flagId);
+        if (kStoryFlagHotPathOsReport) {
+            OSReport("[SMSOBB] trigger-flag emit-set id=0x%08X plazaHub=1\n", flagId);
         }
     }
 }
@@ -272,15 +372,15 @@ namespace smso {
 
 void initStoryFlagSync() {
     memset(sAuthorityCardBits, 0, sizeof(sAuthorityCardBits));
-    memset(sAuthorityStageBits, 0, sizeof(sAuthorityStageBits));
     memset(sBootstrapCardBits, 0, sizeof(sBootstrapCardBits));
     memset(sBootstrapStageBits, 0, sizeof(sBootstrapStageBits));
+    memset(sPlazaTriggerOverlay, 0, sizeof(sPlazaTriggerOverlay));
     sConnectionObserved = false;
     sSyncObserved = false;
-    sAuthorityStageCourse = 0xFF;
-    sAuthorityStageEpisode = 0xFF;
+    sCardBankHash = 0;
+    sStageAllowlistHash = 0;
     resetStoryFlagTrackers();
-    OSReport("[SMSOBB] story/trigger flag sync ready (card+stage+game bools)\n");
+    OSReport("[SMSOBB] story/trigger flag sync ready (card live + plaza-hub Type5)\n");
 }
 
 void resetStoryFlagTrackers() {
@@ -289,20 +389,19 @@ void resetStoryFlagTrackers() {
     memset(sGameBits, 0, sizeof(sGameBits));
     sTrackersReady = false;
     sCardScanCursor = 0;
+    sCardBankHash = 0;
+    sStageAllowlistHash = 0;
 }
 
 void updateStoryFlagSyncConnectionState(bool connected, bool syncEnabled) {
     if (!connected) {
         if (sConnectionObserved) {
             memset(sAuthorityCardBits, 0, sizeof(sAuthorityCardBits));
-            memset(sAuthorityStageBits, 0, sizeof(sAuthorityStageBits));
             memset(sBootstrapCardBits, 0, sizeof(sBootstrapCardBits));
             memset(sBootstrapStageBits, 0, sizeof(sBootstrapStageBits));
-            sAuthorityStageCourse = 0xFF;
-            sAuthorityStageEpisode = 0xFF;
+            memset(sPlazaTriggerOverlay, 0, sizeof(sPlazaTriggerOverlay));
             sCardBootstrapPending = false;
             sStageBootstrapPending = false;
-            sStageReconcilePending = false;
             resetStoryFlagTrackers();
             OSReport("[SMSOBB] story-flag session authority cache cleared\n");
         }
@@ -317,6 +416,13 @@ void updateStoryFlagSyncConnectionState(bool connected, bool syncEnabled) {
         if (fm) {
             snapshotBank(fm, kCardBoolBase, kCardBitCount, sBootstrapCardBits);
             snapshotBank(fm, kStageBoolBase, kStageBitCount, sBootstrapStageBits);
+            // Seed plaza overlay from local hub bits if already on Delfino.
+            if (gpMarDirector && gpMarDirector->mAreaID == kPlazaAreaId) {
+                for (u32 i = 0; i < kPlazaTriggerCount; ++i) {
+                    if (fm->getBool(kPlazaTriggerFlags[i]))
+                        sPlazaTriggerOverlay[i] = true;
+                }
+            }
         } else {
             memset(sBootstrapCardBits, 0, sizeof(sBootstrapCardBits));
             memset(sBootstrapStageBits, 0, sizeof(sBootstrapStageBits));
@@ -332,16 +438,9 @@ void updateStoryFlagSyncConnectionState(bool connected, bool syncEnabled) {
 }
 
 void notifyStoryFlagStageEnter(u8 courseId, u8 episodeId) {
-    const bool sameAuthorityStage =
-        courseId == sAuthorityStageCourse && episodeId == sAuthorityStageEpisode;
-    if (!sameAuthorityStage) {
-        memset(sAuthorityStageBits, 0, sizeof(sAuthorityStageBits));
-        sAuthorityStageCourse = courseId;
-        sAuthorityStageEpisode = episodeId;
-    }
-
-    // Runs even for same-course/same-episode reloads, which ID-change polling cannot see.
+    // Runs even for same-course/same-episode reloads (ID-change polling cannot see those).
     resetStoryFlagTrackers();
+
     TFlagManager *fm = TFlagManager::smInstance;
     if (fm)
         snapshotBank(fm, kStageBoolBase, kStageBitCount, sBootstrapStageBits);
@@ -349,16 +448,21 @@ void notifyStoryFlagStageEnter(u8 courseId, u8 episodeId) {
         memset(sBootstrapStageBits, 0, sizeof(sBootstrapStageBits));
     sStageBootstrapPending = sSyncObserved;
     sStageBootstrapCursor = 0;
-    sStageReconcilePending = sameAuthorityStage;
-    OSReport("[SMSOBB] story-flag stage enter course=%u/%u preserve=%u\n",
-             courseId, episodeId, sameAuthorityStage ? 1u : 0u);
+
+    // CRITICAL: write plaza overlay BEFORE setupObjects/loadAfter (BSE calls this
+    // stageInit callback between resetStage and director->setupObjects()).
+    if (courseId == kPlazaAreaId && fm) {
+        writePlazaOverlayToFlagManager(fm, "stageInit-pre-loadAfter");
+        // Wake actors that already exist is a no-op here (setupObjects not yet);
+        // mid-visit applies call wakePlazaGeometryForFlag separately.
+    }
+
+    OSReport("[SMSOBB] story-flag stage enter course=%u/%u plazaOverlay=%u/%u/%u\n", courseId,
+             episodeId, sPlazaTriggerOverlay[0] ? 1u : 0u, sPlazaTriggerOverlay[1] ? 1u : 0u,
+             sPlazaTriggerOverlay[2] ? 1u : 0u);
 }
 
 void scrubEphemeralSpawnDirectorFlagsOnStageExit() {
-    // Pinna unlock FMV: fireStreamingMovie sets 0x30004 then reloads plaza→plaza;
-    // decideMarioPosIdx must still see the one-shot for the cannon reveal. Scrub only
-    // when leaving a non-plaza stage (or plaza→elsewhere) so sticky sync cannot force
-    // cannon spawn on the next plaza entry.
     if (gpApplication.mCurrentScene.mAreaID == 1 && gpApplication.mNextScene.mAreaID == 1)
         return;
 
@@ -405,39 +509,59 @@ void captureLocalStoryFlagProgress() {
     if (!fm)
         return;
 
-    reconcileAuthorityStageBits(fm);
-
     if (!sTrackersReady) {
         snapshotBank(fm, kCardBoolBase, kCardBitCount, sCardBits);
         snapshotBank(fm, kStageBoolBase, kStageBitCount, sStageBits);
         snapshotBank(fm, kGameBoolBase, kGameBitCount, sGameBits);
+        sCardBankHash = fnv1aBytes(sCardBits, kCardByteCount);
+        sStageAllowlistHash = snapshotPlazaAllowlistHash(fm);
         sTrackersReady = true;
         return;
     }
 
     publishNextBootstrapSet(fm, syncStory, syncSecret);
 
-    // Card story / nozzle / plaza gate bools (excludes shine + blue which have own paths).
+    // Card story / nozzle / plaza gate bools — sliced scan with hash short-circuit.
     if (syncStory) {
+        u8 sliceBits[(kCardScanSlice + 7u) / 8u] = {};
         const u32 remaining = kCardBitCount - sCardScanCursor;
         const u32 scanCount = remaining < kCardScanSlice ? remaining : kCardScanSlice;
-        scanBankForChanges(fm, kCardBoolBase, sCardScanCursor, scanCount, sCardBits,
-                           WE_STORY_FLAG, true);
+        for (u32 i = 0; i < scanCount; ++i)
+            bitSet(sliceBits, i, fm->getBool(kCardBoolBase + sCardScanCursor + i));
+
+        // Cheap dirty check against tracker slice before edge-detect publish.
+        bool dirty = false;
+        for (u32 i = 0; i < scanCount; ++i) {
+            const bool now = bitGet(sliceBits, i);
+            const bool was = bitGet(sCardBits, sCardScanCursor + i);
+            if (now != was) {
+                dirty = true;
+                break;
+            }
+        }
+        if (dirty)
+            scanCardBankForChanges(fm, sCardScanCursor, scanCount, true);
+
         sCardScanCursor += scanCount;
-        if (sCardScanCursor >= kCardBitCount)
+        if (sCardScanCursor >= kCardBitCount) {
             sCardScanCursor = 0;
+            snapshotBank(fm, kCardBoolBase, kCardBitCount, sCardBits);
+            sCardBankHash = fnv1aBytes(sCardBits, kCardByteCount);
+            (void)sCardBankHash;
+        }
     }
 
-    // Stage triggers (Ricco house, lighthouse, MareGate, flood props, etc.).
-    if (syncStory || syncMission)
-        scanBankForChanges(fm, kStageBoolBase, 0, kStageBitCount, sStageBits,
-                           WE_TRIGGER_FLAG, false);
+    // Plaza Type5 allowlist only — O(3) not O(100).
+    if ((syncStory || syncMission) && gpMarDirector &&
+        gpMarDirector->mAreaID == kPlazaAreaId) {
+        const u32 nowHash = snapshotPlazaAllowlistHash(fm);
+        if (nowHash != sStageAllowlistHash) {
+            scanPlazaTriggersForChanges(fm);
+            sStageAllowlistHash = nowHash;
+        }
+    }
 
-    // Type3 game bools are resetGame runtime/one-shot latches, not durable progression.
-    // Their stable story outcomes live in the persistent card bank.
-
-    // Secret-complete uses the same card bank; emit as WE_SECRET_COMPLETE for nozzle /
-    // secret-adjacent high card bits when BF_SYNC_SECRET is on (and story is off).
+    // Secret-complete uses the same card bank when story sync is off.
     if (syncSecret && !syncStory) {
         for (u32 flagId = 0x10366u; flagId < kCardBoolEnd; ++flagId) {
             const u32 idx = flagId - kCardBoolBase;
@@ -449,19 +573,15 @@ void captureLocalStoryFlagProgress() {
             if (!now)
                 continue;
             bitSet(sAuthorityCardBits, idx, true);
-            publishFlagEvent(WE_SECRET_COMPLETE, flagId, 1);
+            publishCardOrSecret(WE_SECRET_COMPLETE, flagId);
         }
     }
 }
 
 bool applyStoryFlagWorldEvent(const CommWorldEvent &event) {
-    // Belt-and-suspenders: shine/blue card bits are owned by Shine/BlueCoinAuthority.
-    // Never apply them via the story path even if a stale/buggy event arrives.
     if (isShineOrBlueCoinCardFlag(event.payload1))
         return true;
 
-    // One-shot spawn directors: consume stale authority history and scrub FlagManager
-    // so a prior sync cannot keep forcing the Pinna cannon spawn on plaza entry.
     if (isEphemeralSpawnDirectorBool(event.payload1)) {
         TFlagManager *fm = TFlagManager::smInstance;
         if (fm && fm->getBool(event.payload1)) {
@@ -474,8 +594,6 @@ bool applyStoryFlagWorldEvent(const CommWorldEvent &event) {
         return true;
     }
 
-    // Authority is a sparse grow-only set. Ignore legacy clear events and all Type3
-    // resetGame latches; neither can represent durable shared progress.
     if (event.payload0 == 0 || !isDurableCardBool(event.payload1))
         return true;
 
@@ -485,35 +603,40 @@ bool applyStoryFlagWorldEvent(const CommWorldEvent &event) {
         return false;
     bitSet(sAuthorityCardBits, event.payload1 - kCardBoolBase, true);
     markLocalTracker(event.payload1, event.payload0 != 0);
-    if (changed)
-        OSReport("[SMSOBB] story-flag apply id=0x%08X val=%u\n", event.payload1, event.payload0);
+    if (changed) {
+        OSReport("[SMSOBB] story-flag apply id=0x%08X val=%u live=1\n", event.payload1,
+                 event.payload0);
+        // Bianco king gate etc. — MapEvent watch() polls getBool each frame.
+        wakePlazaGeometryForFlag(event.payload1, changed);
+    }
     return true;
 }
 
 bool applyTriggerFlagWorldEvent(const CommWorldEvent &event) {
-    // Consume stale durable history that may still carry mRedCoinSwitchPressed from before
-    // this exclusion — never write it into FlagManager on a different stage.
-    if (event.payload0 == 0 || !isDurableStageBool(event.payload1))
-        return true;
-    if (!gpMarDirector || event.courseId != gpMarDirector->mAreaID ||
-        event.episodeId != gpMarDirector->mEpisodeID)
+    if (event.payload0 == 0 || !isDurablePlazaTrigger(event.payload1))
         return true;
 
-    if (sAuthorityStageCourse != event.courseId ||
-        sAuthorityStageEpisode != event.episodeId) {
-        memset(sAuthorityStageBits, 0, sizeof(sAuthorityStageBits));
-        sAuthorityStageCourse = event.courseId;
-        sAuthorityStageEpisode = event.episodeId;
+    // Grow-only plaza hub overlay — admit even when not on Delfino so the next
+    // plaza stageInit writes bits before loadAfter.
+    admitPlazaTrigger(event.payload1);
+
+    const bool onPlaza = gpMarDirector && gpMarDirector->mAreaID == kPlazaAreaId;
+    if (!onPlaza) {
+        if (kStoryFlagHotPathOsReport) {
+            OSReport("[SMSOBB] trigger-flag defer id=0x%08X (pending plaza overlay)\n",
+                     event.payload1);
+        }
+        return true;
     }
 
     TFlagManager *fm = TFlagManager::smInstance;
     bool changed = false;
     if (!applyBoolFlag(fm, event.payload1, event.payload0, &changed))
         return false;
-    bitSet(sAuthorityStageBits, event.payload1 - kStageBoolBase, true);
     markLocalTracker(event.payload1, event.payload0 != 0);
-    if (changed)
-        OSReport("[SMSOBB] trigger-flag apply id=0x%08X val=%u\n", event.payload1, event.payload0);
+    wakePlazaGeometryForFlag(event.payload1, changed);
+    OSReport("[SMSOBB] trigger-flag apply id=0x%08X val=%u live=%u deferred=0\n", event.payload1,
+             event.payload0, changed ? 1u : 0u);
     return true;
 }
 
@@ -528,7 +651,8 @@ bool applySecretCompleteWorldEvent(const CommWorldEvent &event) {
     bitSet(sAuthorityCardBits, event.payload1 - kCardBoolBase, true);
     markLocalTracker(event.payload1, event.payload0 != 0);
     if (changed)
-        OSReport("[SMSOBB] secret-flag apply id=0x%08X val=%u\n", event.payload1, event.payload0);
+        OSReport("[SMSOBB] secret-flag apply id=0x%08X val=%u live=1\n", event.payload1,
+                 event.payload0);
     return true;
 }
 

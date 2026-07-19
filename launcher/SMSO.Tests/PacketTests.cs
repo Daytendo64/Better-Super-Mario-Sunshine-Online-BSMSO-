@@ -93,6 +93,97 @@ public class PacketTests
     }
 
     [Fact]
+    public void UdpSnapshotBatch_RoundTripsIndependentSequencesAndNames()
+    {
+        var first = new PlayerSnapshot { Connected = 1, Slot = 2, Name = new byte[16] };
+        first.SetName("Mario");
+        first.Position = new Vec3 { X = 10, Y = 20, Z = 30 };
+        var second = new PlayerSnapshot { Connected = 1, Slot = 7, Name = new byte[16] };
+        second.SetName("Luigi");
+        second.AnimId = 0x48;
+
+        var batch = new byte[ProtocolConstants.UdpSnapshotBatchMaxSize];
+        PacketSerializer.WriteUdpSnapshotBatchHeader(batch, 2);
+        PacketSerializer.WriteUdpSnapshotBatchEntry(batch, 0, 2, 100, first);
+        PacketSerializer.WriteUdpSnapshotBatchEntry(batch, 1, 7, 205, second);
+        var length = ProtocolConstants.UdpSnapshotBatchHeaderSize +
+                     2 * ProtocolConstants.UdpSnapshotBatchEntrySize;
+
+        Assert.True(PacketSerializer.TryReadUdpSnapshotBatchEntry(
+            batch.AsSpan(0, length), 0, new byte[16],
+            out var firstSlot, out var firstSeq, out var firstRestored));
+        Assert.True(PacketSerializer.TryReadUdpSnapshotBatchEntry(
+            batch.AsSpan(0, length), 1, new byte[16],
+            out var secondSlot, out var secondSeq, out var secondRestored));
+
+        Assert.Equal((byte)2, firstSlot);
+        Assert.Equal(100u, firstSeq);
+        Assert.Equal("Mario", firstRestored.GetName());
+        Assert.Equal(10f, firstRestored.Position.X);
+        Assert.Equal((byte)7, secondSlot);
+        Assert.Equal(205u, secondSeq);
+        Assert.Equal("Luigi", secondRestored.GetName());
+        Assert.Equal((ushort)0x48, secondRestored.AnimId);
+    }
+
+    [Fact]
+    public void UdpSnapshotBatch_RejectsTruncatedPayload()
+    {
+        var batch = new byte[ProtocolConstants.UdpSnapshotBatchHeaderSize];
+        PacketSerializer.WriteUdpSnapshotBatchHeader(batch, 1);
+
+        Assert.False(PacketSerializer.TryReadUdpSnapshotBatchEntry(
+            batch, 0, new byte[16], out _, out _, out _));
+    }
+
+    [Fact]
+    public void UdpSnapshotBatch_InvalidEntryDoesNotDiscardLaterFixedEntry()
+    {
+        var malformed = new PlayerSnapshot { Connected = 1, Slot = byte.MaxValue, Name = new byte[16] };
+        malformed.SetName("Bad");
+        var valid = new PlayerSnapshot { Connected = 1, Slot = 2, Name = new byte[16] };
+        valid.SetName("StillHere");
+        valid.Position = new Vec3 { X = 42, Y = 7, Z = -3 };
+
+        var batch = new byte[ProtocolConstants.UdpSnapshotBatchHeaderSize +
+                             2 * ProtocolConstants.UdpSnapshotBatchEntrySize];
+        PacketSerializer.WriteUdpSnapshotBatchHeader(batch, 2);
+        PacketSerializer.WriteUdpSnapshotBatchEntry(batch, 0, byte.MaxValue, 10, malformed);
+        PacketSerializer.WriteUdpSnapshotBatchEntry(batch, 1, 2, 11, valid);
+
+        using var client = new NetClient();
+        var received = new List<(byte Slot, PlayerSnapshot Snapshot)>();
+        client.SnapshotReceived += (slot, snapshot) => received.Add((slot, snapshot));
+
+        client.HandleUdpSnapshotBatch(batch);
+
+        var item = Assert.Single(received);
+        Assert.Equal((byte)2, item.Slot);
+        Assert.Equal("StillHere", item.Snapshot.GetName());
+        Assert.Equal(42f, item.Snapshot.Position.X);
+    }
+
+    [Fact]
+    public void UdpSnapshotBatch_TruncationDoesNotPublishPartialPrefix()
+    {
+        var snapshot = new PlayerSnapshot { Connected = 1, Slot = 2, Name = new byte[16] };
+        var full = new byte[ProtocolConstants.UdpSnapshotBatchHeaderSize +
+                            2 * ProtocolConstants.UdpSnapshotBatchEntrySize];
+        PacketSerializer.WriteUdpSnapshotBatchHeader(full, 2);
+        PacketSerializer.WriteUdpSnapshotBatchEntry(full, 0, 2, 1, snapshot);
+
+        using var client = new NetClient();
+        var received = 0;
+        client.SnapshotReceived += (_, _) => received++;
+
+        client.HandleUdpSnapshotBatch(
+            full.AsSpan(0, ProtocolConstants.UdpSnapshotBatchHeaderSize +
+                           ProtocolConstants.UdpSnapshotBatchEntrySize));
+
+        Assert.Equal(0, received);
+    }
+
+    [Fact]
     public void MarioVoiceEvent_RoundTrip_PreservesFields()
     {
         var voiceEvent = new MarioVoiceEvent
@@ -298,6 +389,50 @@ public class PacketTests
     }
 
     [Fact]
+    public void WireAppearance_DecodeThenSetName_KeepsColorsAndFullName()
+    {
+        var wire = new PlayerSnapshot { Name = new byte[16] };
+        wire.SetName("Player");
+        wire.SetNameTagAppearance(210, 11, 22, 33, 44, 55, 1, 2, 3, gradientEnabled: true);
+
+        Assert.True(NameTagColorCodec.TryDecodeAppearance(wire.Name, out var appearance));
+        Assert.Equal(210, appearance.TextTopR);
+        Assert.Equal(33, appearance.TextBottomR);
+        Assert.True(appearance.GradientEnabled);
+
+        // Receiver strips overlay for display while keeping decoded sidecar colors.
+        wire.SetName("Player");
+        Assert.Equal("Player", wire.GetName());
+        Assert.False(NameTagColorCodec.HasAppearanceMarker(wire.Name[15]));
+        Assert.Equal(210, appearance.TextTopR);
+    }
+
+    [Fact]
+    public void GetPureName_RespectsLegacyGradientTextLimit()
+    {
+        var snap = new PlayerSnapshot { Name = new byte[16] };
+        snap.SetName("Player");
+        snap.SetNameTagAppearance(10, 20, 30, 40, 50, 60, 1, 2, 3, gradientEnabled: true);
+
+        // Gradient overlay overwrites bytes 5+; pure text must stop at 5 chars.
+        Assert.Equal("Playe", snap.GetPureName());
+        Assert.Equal(NameTagColorCodec.NameTextBytesWithGradient,
+            NameTagColorCodec.GetNameTextByteLimit(NameTagColorCodec.GradientMarker));
+    }
+
+    [Fact]
+    public void SetName_AfterAppearance_RestoresFullDisplayName()
+    {
+        var snap = new PlayerSnapshot { Name = new byte[16] };
+        snap.SetName("Player");
+        snap.SetNameTagAppearance(10, 20, 30, 40, 50, 60, 1, 2, 3, gradientEnabled: true);
+        snap.SetName("Player");
+
+        Assert.Equal("Player", snap.GetName());
+        Assert.False(NameTagColorCodec.HasAppearanceMarker(snap.Name[15]));
+    }
+
+    [Fact]
     public void SetNameTagAppearance_DoesNotDependOnDisplayName()
     {
         var snap = new PlayerSnapshot { Name = new byte[16] };
@@ -314,9 +449,31 @@ public class PacketTests
         var frame = PacketSerializer.BuildJoinRequest("Player1", "4ef21b6e");
         Assert.True(PacketSerializer.TryUnwrapTcp(frame, out var id, out var payload));
         Assert.Equal(TcpPacketId.JoinRequest, id);
-        Assert.True(PacketSerializer.TryReadJoinRequest(payload, out var name, out var modelId));
+        Assert.True(PacketSerializer.TryReadJoinRequest(payload, out var name, out var modelId, out var buildId));
         Assert.Equal("Player1", name);
         Assert.Equal("4ef21b6e", modelId);
+        Assert.Equal(ProtocolConstants.ModBuildId, buildId);
+    }
+
+    [Fact]
+    public void JoinRequest_RoundTrip_PreservesExplicitModBuildId()
+    {
+        var frame = PacketSerializer.BuildJoinRequest("Player1", "4ef21b6e", modBuildId: 99);
+        Assert.True(PacketSerializer.TryUnwrapTcp(frame, out _, out var payload));
+        Assert.True(PacketSerializer.TryReadJoinRequest(payload, out _, out _, out var buildId));
+        Assert.Equal((ushort)99, buildId);
+    }
+
+    [Fact]
+    public void JoinRequest_LegacyPayloadWithoutBuildId_ReadsAsZero()
+    {
+        var legacy = new byte[16 + ProtocolConstants.MarioModelIdSize];
+        System.Text.Encoding.UTF8.GetBytes("Legacy").CopyTo(legacy, 0);
+        CharacterPack.EncodeModelId("4ef21b6e").CopyTo(legacy.AsSpan(16));
+        Assert.True(PacketSerializer.TryReadJoinRequest(legacy, out var name, out var modelId, out var buildId));
+        Assert.Equal("Legacy", name);
+        Assert.Equal("4ef21b6e", modelId);
+        Assert.Equal((ushort)0, buildId);
     }
 
     [Fact]
@@ -333,6 +490,30 @@ public class PacketTests
         Assert.Equal(10 + ProtocolConstants.MarioModelIdSize, restored.Length);
         Assert.Equal("4ef21b6e",
             CharacterPack.DecodeModelId(restored.AsSpan(10, ProtocolConstants.MarioModelIdSize)));
+    }
+
+    [Fact]
+    public void MarioModelIntent_RoundTrip_RequiresExactPayload()
+    {
+        var frame = PacketSerializer.BuildMarioModelIntent("4ef21b6e", 17);
+        Assert.True(PacketSerializer.TryUnwrapTcp(frame, out var id, out var payload));
+        Assert.Equal(TcpPacketId.MarioModelIntent, id);
+        Assert.True(PacketSerializer.TryReadMarioModelIntent(
+            payload, out var sequence, out var modelId));
+        Assert.Equal(17u, sequence);
+        Assert.Equal("4ef21b6e", modelId);
+        Assert.False(PacketSerializer.TryReadMarioModelIntent(payload.AsSpan(0, 11), out _));
+
+        var legacyPayload = CharacterPack.EncodeModelId("aabbccdd");
+        Assert.True(PacketSerializer.TryReadMarioModelIntent(
+            legacyPayload, out var legacySequence, out var legacyId));
+        Assert.Equal(0u, legacySequence);
+        Assert.Equal("aabbccdd", legacyId);
+
+        var retail = PacketSerializer.BuildMarioModelIntent(null);
+        Assert.True(PacketSerializer.TryUnwrapTcp(retail, out _, out var retailPayload));
+        Assert.True(PacketSerializer.TryReadMarioModelIntent(retailPayload, out var retailId));
+        Assert.Equal(string.Empty, retailId);
     }
 
     [Fact]

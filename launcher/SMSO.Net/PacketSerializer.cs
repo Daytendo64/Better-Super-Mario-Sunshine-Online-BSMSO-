@@ -76,28 +76,43 @@ public static class PacketSerializer
 
     public static byte[] BuildHandshake(Guid clientId) => WrapTcp(TcpPacketId.Handshake, clientId.ToByteArray());
 
-    public static byte[] BuildJoinRequest(string username, string? marioModelId = null)
+    public static byte[] BuildJoinRequest(string username, string? marioModelId = null, ushort? modBuildId = null)
     {
         var payload = new byte[ProtocolConstants.JoinRequestSize];
         var bytes = System.Text.Encoding.UTF8.GetBytes(username ?? string.Empty);
         Array.Copy(bytes, payload, Math.Min(bytes.Length, 15));
         var model = MarioPack.CharacterPack.EncodeModelId(marioModelId);
         model.CopyTo(payload, 16);
+        BinaryPrimitives.WriteUInt16LittleEndian(
+            payload.AsSpan(16 + ProtocolConstants.MarioModelIdSize, 2),
+            modBuildId ?? ProtocolConstants.ModBuildId);
         return WrapTcp(TcpPacketId.JoinRequest, payload);
     }
 
-    public static bool TryReadJoinRequest(ReadOnlySpan<byte> payload, out string username, out string marioModelId)
+    public static bool TryReadJoinRequest(
+        ReadOnlySpan<byte> payload,
+        out string username,
+        out string marioModelId,
+        out ushort modBuildId)
     {
         username = string.Empty;
         marioModelId = string.Empty;
+        modBuildId = 0;
         if (payload.Length < 16)
             return false;
 
         username = System.Text.Encoding.UTF8.GetString(payload.Slice(0, 16)).TrimEnd('\0');
-        if (payload.Length >= ProtocolConstants.JoinRequestSize)
+        var modelEnd = 16 + ProtocolConstants.MarioModelIdSize;
+        if (payload.Length >= modelEnd)
             marioModelId = MarioPack.CharacterPack.DecodeModelId(payload.Slice(16, ProtocolConstants.MarioModelIdSize));
+        // Old clients omit ModBuildId; treat as 0 so the server rejects VersionMismatch.
+        if (payload.Length >= modelEnd + 2)
+            modBuildId = BinaryPrimitives.ReadUInt16LittleEndian(payload.Slice(modelEnd, 2));
         return true;
     }
+
+    public static bool TryReadJoinRequest(ReadOnlySpan<byte> payload, out string username, out string marioModelId)
+        => TryReadJoinRequest(payload, out username, out marioModelId, out _);
 
     public static byte[] BuildWarpRequest(byte targetSlot, byte courseId, byte episodeId)
     {
@@ -168,6 +183,38 @@ public static class PacketSerializer
 
     public static byte[] BuildHeartbeat(ReadOnlySpan<byte> payload)
         => WrapTcp(TcpPacketId.Heartbeat, payload);
+
+    public static byte[] BuildMarioModelIntent(string? marioModelId, uint sequence = 0)
+    {
+        var payload = new byte[ProtocolConstants.MarioModelIntentSize];
+        BinaryPrimitives.WriteUInt32LittleEndian(payload, sequence);
+        MarioPack.CharacterPack.EncodeModelId(marioModelId).CopyTo(payload, 4);
+        return WrapTcp(TcpPacketId.MarioModelIntent, payload);
+    }
+
+    public static bool TryReadMarioModelIntent(ReadOnlySpan<byte> payload, out string marioModelId)
+        => TryReadMarioModelIntent(payload, out _, out marioModelId);
+
+    public static bool TryReadMarioModelIntent(
+        ReadOnlySpan<byte> payload, out uint sequence, out string marioModelId)
+    {
+        sequence = 0;
+        marioModelId = string.Empty;
+        // Accept the original id-only payload from clients built before intent
+        // sequencing. New clients include a monotonic sequence so stale queued
+        // sends cannot roll the roster back after a rapid selection.
+        if (payload.Length == ProtocolConstants.MarioModelIdSize)
+        {
+            marioModelId = MarioPack.CharacterPack.DecodeModelId(payload);
+            return true;
+        }
+        if (payload.Length != ProtocolConstants.MarioModelIntentSize)
+            return false;
+        sequence = BinaryPrimitives.ReadUInt32LittleEndian(payload);
+        marioModelId = MarioPack.CharacterPack.DecodeModelId(
+            payload.Slice(4, ProtocolConstants.MarioModelIdSize));
+        return true;
+    }
 
     public static byte[] BuildMarioVoiceEvent(byte slot, in MarioVoiceEvent voiceEvent)
     {
@@ -344,6 +391,74 @@ public static class PacketSerializer
         dest[5] = slot;
         BinaryPrimitives.WriteUInt32LittleEndian(dest.Slice(6, 4), seq);
         SnapshotToBytes(snap, dest.Slice(ProtocolConstants.UdpSnapshotPayloadOffset, ProtocolConstants.PlayerSnapshotSize));
+    }
+
+    public static void WriteUdpSnapshotBatchHeader(Span<byte> dest, byte count)
+    {
+        if (count > ProtocolConstants.StableMaxPlayers ||
+            dest.Length < ProtocolConstants.UdpSnapshotBatchHeaderSize)
+        {
+            throw new ArgumentOutOfRangeException(nameof(count));
+        }
+
+        BinaryPrimitives.WriteUInt32LittleEndian(dest.Slice(0, 4), ProtocolConstants.Magic);
+        dest[4] = (byte)UdpPacketId.SnapshotBatch;
+        dest[5] = count;
+    }
+
+    public static void WriteUdpSnapshotBatchEntry(
+        Span<byte> dest, int index, byte slot, uint seq, in PlayerSnapshot snap)
+    {
+        if ((uint)index >= ProtocolConstants.StableMaxPlayers)
+            throw new ArgumentOutOfRangeException(nameof(index));
+
+        var offset = ProtocolConstants.UdpSnapshotBatchHeaderSize +
+                     index * ProtocolConstants.UdpSnapshotBatchEntrySize;
+        if (dest.Length < offset + ProtocolConstants.UdpSnapshotBatchEntrySize)
+            throw new ArgumentException("UDP snapshot batch buffer is too small.", nameof(dest));
+
+        dest[offset] = slot;
+        BinaryPrimitives.WriteUInt32LittleEndian(dest.Slice(offset + 1, 4), seq);
+        SnapshotToBytes(
+            snap,
+            dest.Slice(offset + 5, ProtocolConstants.PlayerSnapshotSize));
+    }
+
+    public static bool TryReadUdpSnapshotBatchEntry(
+        ReadOnlySpan<byte> packet,
+        int index,
+        byte[] nameBuffer,
+        out byte slot,
+        out uint seq,
+        out PlayerSnapshot snapshot)
+    {
+        slot = 0;
+        seq = 0;
+        snapshot = default;
+        if (packet.Length < ProtocolConstants.UdpSnapshotBatchHeaderSize ||
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(0, 4)) != ProtocolConstants.Magic ||
+            (UdpPacketId)packet[4] != UdpPacketId.SnapshotBatch)
+        {
+            return false;
+        }
+
+        var count = packet[5];
+        if (count > ProtocolConstants.StableMaxPlayers || index < 0 || index >= count)
+            return false;
+
+        var required = ProtocolConstants.UdpSnapshotBatchHeaderSize +
+                       count * ProtocolConstants.UdpSnapshotBatchEntrySize;
+        var offset = ProtocolConstants.UdpSnapshotBatchHeaderSize +
+                     index * ProtocolConstants.UdpSnapshotBatchEntrySize;
+        if (packet.Length < required)
+            return false;
+
+        slot = packet[offset];
+        seq = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(offset + 1, 4));
+        snapshot = SnapshotFromBytes(
+            packet.Slice(offset + 5, ProtocolConstants.PlayerSnapshotSize),
+            nameBuffer);
+        return true;
     }
 
     /// <summary>

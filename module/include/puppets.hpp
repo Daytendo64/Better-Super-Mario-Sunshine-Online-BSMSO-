@@ -13,6 +13,9 @@ void exportLocalPlayer(TMario *mario, TMarDirector *director);
 bool shouldShowFluddPackOnMario(const TMario *mario);
 void consumeWarpIntent();
 void applyHotelWarpMissionOverride(TMarDirector *director);
+void normalizeSirenaSecretMissionEpisode(TMarDirector *director);
+/// Remap hotel/casino next-scene load ids before moveStage (natural doors + warps).
+void normalizeSirenaNextSceneForLoad();
 void syncHotelWarpMissionEpisode(TMarDirector *director);
 void applyPendingWarpPoint(TMarDirector *director);
 void respawnLocalMarioAtStageSpawn(TMarDirector *director, TMario *mario);

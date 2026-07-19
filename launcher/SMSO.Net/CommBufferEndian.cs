@@ -153,6 +153,23 @@ public static class CommBufferEndian
         return data;
     }
 
+    public static byte[] ToRosterHudSyncDolphinBytes(in CommRosterHudSync sync)
+    {
+        var data = new byte[ProtocolConstants.CommRosterHudSyncSize];
+        int o = 0;
+        WriteRosterHudSync(data, ref o, sync);
+        return data;
+    }
+
+    public static void WriteRosterHudSyncInto(Span<byte> dest, in CommRosterHudSync sync)
+    {
+        if (dest.Length < ProtocolConstants.CommRosterHudSyncSize)
+            throw new ArgumentException("Roster HUD buffer is too small.", nameof(dest));
+
+        int o = 0;
+        WriteRosterHudSync(dest, ref o, sync);
+    }
+
     public static byte[] ToGameModeStateDolphinBytes(in CommGameModeState state)
     {
         var data = new byte[ProtocolConstants.CommGameModeStateSize];
@@ -309,6 +326,16 @@ public static class CommBufferEndian
 
         int o = 0;
         WriteWorldEvent(dest, ref o, incoming);
+    }
+
+    /// <summary>Decode a single big-endian CommWorldEvent (e.g. localPending re-read).</summary>
+    public static CommWorldEvent ReadWorldEventFromDolphinBytes(byte[] data)
+    {
+        if (data is null || data.Length < ProtocolConstants.CommWorldEventSize)
+            throw new ArgumentException("World-event buffer is too small.", nameof(data));
+
+        int o = 0;
+        return ReadWorldEvent(data, ref o);
     }
 
     private static CommWorldSyncState ReadWorldSyncState(byte[] data, ref int o)

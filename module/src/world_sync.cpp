@@ -4,6 +4,7 @@
 #include "collectible_scan.hpp"
 #include "comm_buffer.hpp"
 #include "fruit_sync.hpp"
+#include "graffiti_clean_sync.hpp"
 #include "monte_clean_sync.hpp"
 #include "npc_sync.hpp"
 #include "red_coin_sync.hpp"
@@ -23,6 +24,7 @@
 #include <SMS/Strategic/HitActor.hxx>
 #include <SMS/Strategic/LiveActor.hxx>
 #include <SMS/System/MarDirector.hxx>
+#include <SMS/System/Application.hxx>
 #include <SMS/macros.h>
 #include <BetterSMS/memory.hxx>
 #include <sdk.h>
@@ -31,6 +33,7 @@
 extern TMarDirector *gpMarDirector;
 extern TItemManager *gpItemManager;
 extern TMario *gpMarioAddress;
+extern TApplication gpApplication;
 
 struct TMapObjManager;
 extern TMapObjManager *gpMapObjManager;
@@ -90,10 +93,17 @@ static u16 sLocalWorldEventSequence = 0;
 // through smso::enqueueLocalWorldEvent. A single sequence counter + single consumer
 // (the bridge reads one localPending slot) prevents the two-publisher sequence
 // collisions and same-frame slot overwrites that previously dropped red-coin events.
-constexpr u32 kLocalWorldEventQueueCap = 32;
+//
+// Cap 256: wall graffiti spray enters many new 32u XYZ cells per second. Cap 32
+// silently dropped most WE_GRAFFITI_CLEANED under spray spam (dolphin.log showed
+// ~7 remote applies for a full plaza M). Prefer evicting ephemeral events before
+// ever dropping graffiti.
+constexpr u32 kLocalWorldEventQueueCap = 256;
 static smso::CommWorldEvent sLocalWorldEventQueue[kLocalWorldEventQueueCap] = {};
-static u8 sLocalWorldEventQueueHead = 0;
-static u8 sLocalWorldEventQueueCount = 0;
+static u16 sLocalWorldEventQueueHead = 0;
+static u16 sLocalWorldEventQueueCount = 0;
+static u32 sWorldEventQueueDropCount = 0;
+static u32 sWorldEventQueueGraffitiDropCount = 0;
 
 static u32 sLastGoldCoinCount = 0;
 static u8 sLastCourseId = 0xFF;
@@ -124,6 +134,13 @@ constexpr u32 kVtReceiveMessageOffset = 0x24; // __vt__6TMario receiveMessage sl
 
 static bool sLocalHipDropFired = false;
 static u32 gHipDropHideObjVtable = 0;
+// After stage enter, refuse remote THipDropHideObj replays briefly so a deferred /
+// late packet cannot hide virgin Ep5 purple casino panels on spawn.
+static u16 sHipDropHideGraceFrames = 0;
+constexpr u16 kHipDropHideStageEnterGrace = 90; // ~1.5s at 60Hz
+static constexpr u8 kSirenaCasinoAreaId = 14;
+static bool sCasinoHipDropDiagPending = false;
+static u16 sCasinoHipDropDiagDelay = 0;
 static u32 gBreakableBlockVtable = 0;
 
 using ReceiveMessageFn = bool (*)(THitActor *, THitActor *, u32);
@@ -179,10 +196,12 @@ static GetShineStageFn gGetShineStage = nullptr;
 using IncGoldCoinFlagFn = void (*)(TFlagManager *, u8, s32);
 using CountShineFn = void (*)(TGCConsole2 *);
 using CountBlueCoinFn = void (*)(TGCConsole2 *);
+using StartAppearStarFn = void (*)(TGCConsole2 *);
 
 static IncGoldCoinFlagFn gIncGoldCoinFlag = nullptr;
 static CountShineFn gCountShine = nullptr;
 static CountBlueCoinFn gCountBlueCoin = nullptr;
+static StartAppearStarFn gStartAppearStar = nullptr;
 
 static void publishLocalWorldEvent(smso::WorldEventType type, u8 courseId, u8 episodeId, u8 payload0,
                                    u8 reserved, u32 payload1, u32 payload2 = 0);
@@ -215,8 +234,28 @@ static u8 currentEpisodeId() {
     return gpMarDirector->mEpisodeID;
 }
 
+// Sirena casino (14): director/mission uses beach ids 3/4; archive/catalog uses 0/1.
+static bool sameCasinoEpisode(u8 a, u8 b) {
+    if (a == b)
+        return true;
+    const bool aEp4 = (a == 0 || a == 3);
+    const bool bEp4 = (b == 0 || b == 3);
+    if (aEp4 && bEp4)
+        return true;
+    const bool aEp5 = (a == 1 || a == 4);
+    const bool bEp5 = (b == 1 || b == 4);
+    return aEp5 && bEp5;
+}
+
 static bool sameStage(u8 courseId, u8 episodeId) {
-    return courseId == currentCourseId() && episodeId == currentEpisodeId();
+    if (courseId != currentCourseId())
+        return false;
+    if (episodeId == currentEpisodeId())
+        return true;
+    // Module publishes mission 3/4 via 0x40003 / launcher catalog; director uses load 0/1.
+    if (courseId == 14)
+        return sameCasinoEpisode(episodeId, currentEpisodeId());
+    return false;
 }
 
 static bool positionsMatch(const TVec3f &a, const TVec3f &b) {
@@ -1159,6 +1198,8 @@ static void beginRemoteShineCollect(u8 collectorSlot, u8 shineId, u32 packedPos)
 
     TShine *shine = resolveShineForCollect(shineId, packedPos);
     if (!shine) {
+        OSReport("[SMSOBB] shine defer-visual id=%u (no actor on course=%u)\n", shineId,
+                 currentCourseId());
         hideShineByGlobalId(shineId);
         return;
     }
@@ -1236,6 +1277,14 @@ static void resetLocalTrackersForStage(u8 courseId, u8 episodeId) {
     smso::resetNpcSyncForStage();
     smso::resetStoryFlagTrackers();
     sLocalHipDropFired = false;
+    sHipDropHideGraceFrames = kHipDropHideStageEnterGrace;
+    if (courseId == kSirenaCasinoAreaId) {
+        sCasinoHipDropDiagPending = true;
+        sCasinoHipDropDiagDelay = 2; // after setupObjects + a couple of frames
+    } else {
+        sCasinoHipDropDiagPending = false;
+        sCasinoHipDropDiagDelay = 0;
+    }
     for (u32 i = 0; i < sizeof(sShineBits); ++i)
         sShineBits[i] = 0;
 
@@ -1251,6 +1300,155 @@ static void resetLocalTrackersForStage(u8 courseId, u8 episodeId) {
     for (u8 coinIndex = 0; coinIndex < kMaxStageBlueCoins; ++coinIndex) {
         if (fm->getBlueCoinFlag(courseId, coinIndex))
             markBlueCoinSet(coinIndex);
+    }
+}
+
+// Ephemeral live-only traffic — safe to evict under graffiti spray backlog.
+static bool isEphemeralWorldEventType(u8 type) {
+    switch (type) {
+    case smso::WE_NPC_REACT:
+    case smso::WE_HIP_DROP_OBJECT:
+    case smso::WE_YOSHI_FRUIT_TAKEN:
+    case smso::WE_MARIO_FRUIT_KICKED:
+    case smso::WE_MARIO_FRUIT_PICKED:
+    case smso::WE_MARIO_FRUIT_THROWN:
+    case smso::WE_MARIO_FRUIT_DROPPED:
+    case smso::WE_MARIO_FRUIT_SYNC:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool isGraffitiWorldEventType(u8 type) {
+    return type == static_cast<u8>(smso::WE_GRAFFITI_CLEANED);
+}
+
+// Shine / blue / story / secret / red / NPC-clean — never drop these to make room
+// for graffiti. A dropped story publish is permanently lost from session authority
+// (local FlagManager already set → baseline will not re-emit).
+static bool isProgressOwnershipWorldEventType(u8 type) {
+    switch (type) {
+    case smso::WE_SHINE_COLLECTED:
+    case smso::WE_BLUE_COIN_COLLECTED:
+    case smso::WE_RED_COIN_COLLECTED:
+    case smso::WE_NPC_CLEANED:
+    case smso::WE_STORY_FLAG:
+    case smso::WE_TRIGGER_FLAG:
+    case smso::WE_SECRET_COMPLETE:
+    case smso::WE_EPISODE_COMPLETE:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// Remove the oldest queued event matching pred. Compacts the ring toward head.
+static bool dropOldestMatchingWorldEvent(bool (*pred)(u8 type)) {
+    for (u16 i = 0; i < sLocalWorldEventQueueCount; ++i) {
+        const u16 idx = static_cast<u16>(
+            (sLocalWorldEventQueueHead + i) % kLocalWorldEventQueueCap);
+        if (!pred(sLocalWorldEventQueue[idx].type))
+            continue;
+
+        for (u16 j = i; j + 1 < sLocalWorldEventQueueCount; ++j) {
+            const u16 from = static_cast<u16>(
+                (sLocalWorldEventQueueHead + j + 1) % kLocalWorldEventQueueCap);
+            const u16 to = static_cast<u16>(
+                (sLocalWorldEventQueueHead + j) % kLocalWorldEventQueueCap);
+            sLocalWorldEventQueue[to] = sLocalWorldEventQueue[from];
+        }
+        --sLocalWorldEventQueueCount;
+        return true;
+    }
+    return false;
+}
+
+static bool makeRoomInLocalWorldEventQueue(smso::WorldEventType incomingType) {
+    if (sLocalWorldEventQueueCount < kLocalWorldEventQueueCap)
+        return true;
+
+    // Always try ephemeral first — spray spam / NPC react must not starve graffiti.
+    if (dropOldestMatchingWorldEvent(isEphemeralWorldEventType)) {
+        ++sWorldEventQueueDropCount;
+        OSReport("[SMSOBB] world-event queue full — evicted ephemeral (drops=%u) for type=%u\n",
+                 sWorldEventQueueDropCount, static_cast<u32>(incomingType));
+        return true;
+    }
+
+    // Incoming graffiti: only evict other non-progress durables (never shine/blue/story/…).
+    if (isGraffitiWorldEventType(static_cast<u8>(incomingType))) {
+        if (dropOldestMatchingWorldEvent([](u8 type) -> bool {
+                return !isGraffitiWorldEventType(type) &&
+                       !isProgressOwnershipWorldEventType(type);
+            })) {
+            ++sWorldEventQueueDropCount;
+            OSReport(
+                "[SMSOBB] world-event queue full — evicted non-progress (drops=%u) for graffiti\n",
+                sWorldEventQueueDropCount);
+            return true;
+        }
+        // Queue is entirely graffiti / progress-protected — keep oldest cells; drop this new one.
+        ++sWorldEventQueueDropCount;
+        ++sWorldEventQueueGraffitiDropCount;
+        OSReport("[SMSOBB] world-event queue full of graffiti — dropping new cell (graffitiDrops=%u "
+                 "totalDrops=%u)\n",
+                 sWorldEventQueueGraffitiDropCount, sWorldEventQueueDropCount);
+        return false;
+    }
+
+    // Progress ownership must never be dropped to protect graffiti — evict graffiti instead.
+    if (isProgressOwnershipWorldEventType(static_cast<u8>(incomingType))) {
+        if (dropOldestMatchingWorldEvent(isGraffitiWorldEventType) ||
+            dropOldestMatchingWorldEvent(isEphemeralWorldEventType)) {
+            ++sWorldEventQueueDropCount;
+            OSReport("[SMSOBB] world-event queue full — evicted for progress type=%u (drops=%u)\n",
+                     static_cast<u32>(incomingType), sWorldEventQueueDropCount);
+            return true;
+        }
+    }
+
+    // Non-progress, non-graffiti with a graffiti-heavy queue: drop the new event.
+    ++sWorldEventQueueDropCount;
+    OSReport("[SMSOBB] world-event queue full — dropping type=%u (drops=%u, protected graffiti)\n",
+             static_cast<u32>(incomingType), sWorldEventQueueDropCount);
+    return false;
+}
+
+static bool localPendingSlotIsFree(const smso::CommBuffer *buf) {
+    if (!buf)
+        return false;
+    const smso::CommWorldEvent &slot = buf->worldSync.localPending;
+    // The bridge zeroes the slot (sequence + type) once it has published the event, so an
+    // empty slot means the previous event was consumed and we can hand over the next one.
+    return slot.sequence == 0 || slot.type == 0;
+}
+
+// Flush one queued event into localPending when the slot is free. Returns true if flushed.
+static bool flushOneLocalWorldEvent() {
+    if (sLocalWorldEventQueueCount == 0)
+        return false;
+
+    smso::CommBuffer *buf = smso::getCommBuffer();
+    if (!buf || (buf->bridgeFlags & smso::BF_CONNECTED) == 0)
+        return false;
+    if (!localPendingSlotIsFree(buf))
+        return false;
+
+    smso::CommWorldEvent &slot = buf->worldSync.localPending;
+    slot = sLocalWorldEventQueue[sLocalWorldEventQueueHead];
+    slot.sequence = ++sLocalWorldEventSequence;
+    sLocalWorldEventQueueHead =
+        static_cast<u16>((sLocalWorldEventQueueHead + 1) % kLocalWorldEventQueueCap);
+    --sLocalWorldEventQueueCount;
+    return true;
+}
+
+// Drain as many queued events as the single mailbox slot allows this tick. Normally one
+// (slot stays busy until the bridge clears). Looping still helps if the bridge cleared
+// mid-frame between enqueues, and keeps the flush path uniform.
+static void flushLocalWorldEventQueue() {
+    while (flushOneLocalWorldEvent()) {
     }
 }
 
@@ -1281,6 +1479,10 @@ static void publishLocalWorldEvent(smso::WorldEventType type, u8 courseId, u8 ep
             return;
         break;
     case smso::WE_NPC_CLEANED:
+        if ((buf->bridgeFlags & (smso::BF_SYNC_EVENT | smso::BF_SYNC_MISSION)) == 0)
+            return;
+        break;
+    case smso::WE_GRAFFITI_CLEANED:
         if ((buf->bridgeFlags & (smso::BF_SYNC_EVENT | smso::BF_SYNC_MISSION)) == 0)
             return;
         break;
@@ -1324,13 +1526,10 @@ static void publishLocalWorldEvent(smso::WorldEventType type, u8 courseId, u8 ep
         break;
     }
 
-    if (sLocalWorldEventQueueCount >= kLocalWorldEventQueueCap) {
-        OSReport("[SMSOBB] world-event queue full (cap=%u) — dropping type=%u course=%u/%u\n",
-                 kLocalWorldEventQueueCap, static_cast<u32>(type), courseId, episodeId);
+    if (!makeRoomInLocalWorldEventQueue(type))
         return;
-    }
 
-    const u8 writeIndex = static_cast<u8>(
+    const u16 writeIndex = static_cast<u16>(
         (sLocalWorldEventQueueHead + sLocalWorldEventQueueCount) % kLocalWorldEventQueueCap);
     smso::CommWorldEvent &event = sLocalWorldEventQueue[writeIndex];
     event.eventId = 0;
@@ -1343,37 +1542,10 @@ static void publishLocalWorldEvent(smso::WorldEventType type, u8 courseId, u8 ep
     event.payload1 = payload1;
     event.payload2 = payload2;
     ++sLocalWorldEventQueueCount;
-}
 
-static bool localPendingSlotIsFree(const smso::CommBuffer *buf) {
-    if (!buf)
-        return false;
-    const smso::CommWorldEvent &slot = buf->worldSync.localPending;
-    // The bridge zeroes the slot (sequence + type) once it has published the event, so an
-    // empty slot means the previous event was consumed and we can hand over the next one.
-    return slot.sequence == 0 || slot.type == 0;
-}
-
-// Flush at most one queued event into the localPending mailbox slot. The bridge polls the
-// comm buffer and publishes localPending on a sequence change, then clears the slot. By
-// only writing when the slot is free we guarantee no outbound event is overwritten before
-// the bridge relays it to the server.
-static void flushLocalWorldEventQueue() {
-    if (sLocalWorldEventQueueCount == 0)
-        return;
-
-    smso::CommBuffer *buf = smso::getCommBuffer();
-    if (!buf || (buf->bridgeFlags & smso::BF_CONNECTED) == 0)
-        return;
-    if (!localPendingSlotIsFree(buf))
-        return;
-
-    smso::CommWorldEvent &slot = buf->worldSync.localPending;
-    slot = sLocalWorldEventQueue[sLocalWorldEventQueueHead];
-    slot.sequence = ++sLocalWorldEventSequence;
-    sLocalWorldEventQueueHead = static_cast<u8>(
-        (sLocalWorldEventQueueHead + 1) % kLocalWorldEventQueueCap);
-    --sLocalWorldEventQueueCount;
+    // Push immediately if the mailbox is free so graffiti backlog drains mid-spray
+    // instead of waiting for the next processWorldEvents tick.
+    flushOneLocalWorldEvent();
 }
 
 static void refreshHudCounters() {
@@ -1385,6 +1557,170 @@ static void refreshHudCounters() {
         gCountBlueCoin(console);
     if (gCountShine)
         gCountShine(console);
+}
+
+// Retail shine HUD:
+//   startAppearStar arms a one-shot card process (TGCConsole2+0x34). While armed,
+//   perform() drives countShine across ~250 frames; countShine commits the shown
+//   total to +0x64 and advances timer +0x8A.
+// Prior fix called startAppearStar+countShine once per apply. That works for the
+// FIRST remote shine (card arms, later frames finish digits) but the SECOND
+// shine on the same stage early-returns from startAppearStar (0x34 already set /
+// pane already settled) so only one orphan countShine runs and digits stay stale
+// (dolphin.log: shine hud-refresh count=2 while HUD still shows 1).
+static void refreshShineHudLive(bool shineFlagChanged) {
+    if (!shineFlagChanged)
+        return;
+    if (!gpMarDirector || !gpMarDirector->mGCConsole)
+        return;
+    if (!TFlagManager::smInstance)
+        return;
+
+    TGCConsole2 *console = gpMarDirector->mGCConsole;
+    auto *base = reinterpret_cast<u8 *>(console);
+    // Disasm (NTSC-U countShine @ 0x80147A0C): displayed total at +0x64, frame
+    // timer at +0x8A, appear one-shot at +0x34, appear frame at +0x5C.
+    constexpr u32 kOffAppearArmed = 0x34u;
+    constexpr u32 kOffAppearFrame = 0x5Cu;
+    constexpr u32 kOffDisplayed = 0x64u;
+    constexpr u32 kOffCountTimer = 0x8Au;
+
+    s32 *displayed = reinterpret_cast<s32 *>(base + kOffDisplayed);
+    u16 *countTimer = reinterpret_cast<u16 *>(base + kOffCountTimer);
+    u32 *appearFrame = reinterpret_cast<u32 *>(base + kOffAppearFrame);
+
+    const s32 count = TFlagManager::smInstance->getFlag(0x40000u);
+    if (count < 0)
+        return;
+
+    // Re-arm appear so perform keeps pumping countShine after this apply.
+    base[kOffAppearArmed] = 0;
+    *appearFrame = 0;
+    if (gStartAppearStar)
+        gStartAppearStar(console);
+
+    // Force a delta even if the card was already up / cache matched early.
+    if (*displayed >= count)
+        *displayed = count > 0 ? count - 1 : 0;
+    *countTimer = 0;
+
+    // Drive the multi-frame digit animation to completion in this apply so the
+    // HUD bumps on every newly set shine flag, not only the first per stage.
+    if (gCountShine) {
+        for (int i = 0; i < 320; ++i) {
+            gCountShine(console);
+            if (*displayed >= count)
+                break;
+        }
+    }
+
+    OSReport("[SMSOBB] shine hud-refresh count=%d displayed=%d timer=%u armed=%u\n", count,
+             *displayed, static_cast<u32>(*countTimer), static_cast<u32>(base[kOffAppearArmed]));
+}
+
+// Live-first ownership: FlagManager write + HUD always succeed. Stage visuals
+// (actor hide / FX / get-star anim) are best-effort and must never block the
+// durable mailbox — otherwise a stuck visual retry freezes shine/blue behind it.
+static bool applyShineOwnershipFlag(TFlagManager *fm, const smso::CommWorldEvent &event,
+                                    bool *changedOut) {
+    if (changedOut)
+        *changedOut = false;
+    if (!fm)
+        return false;
+
+    const u8 shineId = event.payload0;
+    const bool alreadySet = fm->getShineFlag(shineId);
+    if (!alreadySet) {
+        fm->setShineFlag(shineId);
+        if (changedOut)
+            *changedOut = true;
+    }
+    markShineSet(shineId);
+    if (event.payload1 != 0)
+        rememberShinePosition(shineId, unpackWorldPos(event.payload1));
+
+    OSReport("[SMSOBB] shine apply-flag id=%u changed=%u course=%u/%u collector=%u\n", shineId,
+             alreadySet ? 0u : 1u, event.courseId, event.episodeId, event.reserved);
+    return true;
+}
+
+static void applyShineVisualReconcile(const smso::CommWorldEvent &event) {
+    // Get-star anim / actor hide only when the shine actor exists on this stage.
+    beginRemoteShineCollect(event.reserved, event.payload0, event.payload1);
+}
+
+static bool applyBlueCoinOwnershipFlag(TFlagManager *fm, const smso::CommWorldEvent &event,
+                                       bool *changedOut, bool *alreadySetOut,
+                                       bool *locallyTrackedOut) {
+    if (changedOut)
+        *changedOut = false;
+    if (alreadySetOut)
+        *alreadySetOut = false;
+    if (locallyTrackedOut)
+        *locallyTrackedOut = false;
+    if (!fm)
+        return false;
+
+    const u8 flagIndex = event.payload0;
+    if (flagIndex >= kMaxStageBlueCoins)
+        return true;
+
+    const bool alreadySet = fm->getBlueCoinFlag(event.courseId, flagIndex);
+    // Read tracker before marking so host-echo hide/FX gating stays correct.
+    const bool locallyTracked =
+        event.courseId == currentCourseId() && blueCoinWasSet(flagIndex);
+
+    if (!alreadySet) {
+        fm->setBlueCoinFlag(event.courseId, flagIndex);
+        if (changedOut)
+            *changedOut = true;
+    }
+
+    // Only update the per-stage publish tracker for the course we are on —
+    // marking another course's index would suppress a later local publish.
+    if (event.courseId == currentCourseId())
+        markBlueCoinSet(flagIndex);
+
+    if (alreadySetOut)
+        *alreadySetOut = alreadySet;
+    if (locallyTrackedOut)
+        *locallyTrackedOut = locallyTracked;
+
+    OSReport("[SMSOBB] blue apply-flag course=%u idx=%u changed=%u localCourse=%u\n",
+             event.courseId, flagIndex, alreadySet ? 0u : 1u, currentCourseId());
+    return true;
+}
+
+static void applyBlueCoinVisualReconcile(const smso::CommWorldEvent &event, bool alreadySet,
+                                         bool locallyTracked) {
+    const u8 flagIndex = event.payload0;
+    if (flagIndex >= kMaxStageBlueCoins)
+        return;
+
+    const smso::CommBuffer *buf = smso::getCommBuffer();
+    const u8 localSlot = buf ? buf->localSlot : 0;
+    const bool remoteCollector = event.reserved != localSlot;
+    const bool onCourse = event.courseId == currentCourseId();
+
+    if (!onCourse) {
+        OSReport("[SMSOBB] blue defer-visual course=%u idx=%u (local course=%u)\n", event.courseId,
+                 flagIndex, currentCourseId());
+        return;
+    }
+
+    // Skip hide on host echo after a local pickup — vanilla is still driving the coin actor.
+    if (!alreadySet || !locallyTracked)
+        hideBlueCoinAtIndex(flagIndex);
+
+    TVec3f coinPos{};
+    const bool haveCoinPos = tryResolveBlueCoinWorldPos(flagIndex, &coinPos);
+    // Particles/SFX only for remote collectors on the same course.
+    if (remoteCollector && !locallyTracked && haveCoinPos)
+        smso::playRemoteCoinCollectParticles(coinPos, true);
+    else if (remoteCollector && !locallyTracked && !haveCoinPos) {
+        OSReport("[SMSOBB] blue defer-fx course=%u idx=%u (actor not found)\n", event.courseId,
+                 flagIndex);
+    }
 }
 
 static void applyGoldCoinCount(TFlagManager *fm, u8 courseId, u32 targetCount) {
@@ -1411,46 +1747,27 @@ static bool applyWorldEvent(const smso::CommWorldEvent &event) {
 
     bool applied = true;
     switch (static_cast<smso::WorldEventType>(event.type)) {
-    case smso::WE_SHINE_COLLECTED:
-        if (!fm->getShineFlag(event.payload0)) {
-            fm->setShineFlag(event.payload0);
-            markShineSet(event.payload0);
+    case smso::WE_SHINE_COLLECTED: {
+        bool shineChanged = false;
+        if (!applyShineOwnershipFlag(fm, event, &shineChanged)) {
+            applied = false;
+            break;
         }
-        if (event.payload1 != 0)
-            rememberShinePosition(event.payload0, unpackWorldPos(event.payload1));
-        beginRemoteShineCollect(event.reserved, event.payload0, event.payload1);
+        // FlagManager 0x40000 already incremented by setShineFlag. Force the
+        // on-screen star card + digit refresh on ANY stage (not plaza-only).
+        refreshShineHudLive(shineChanged);
+        applyShineVisualReconcile(event);
         break;
+    }
 
     case smso::WE_BLUE_COIN_COLLECTED: {
-        const u8 flagIndex = event.payload0;
-        if (flagIndex >= kMaxStageBlueCoins)
+        bool alreadySet = false;
+        bool locallyTracked = false;
+        if (!applyBlueCoinOwnershipFlag(fm, event, nullptr, &alreadySet, &locallyTracked)) {
+            applied = false;
             break;
-
-        const bool alreadySet = fm->getBlueCoinFlag(event.courseId, flagIndex);
-        const bool locallyTracked = blueCoinWasSet(flagIndex);
-        const smso::CommBuffer *buf = smso::getCommBuffer();
-        const u8 localSlot = buf ? buf->localSlot : 0;
-        const bool remoteCollector = event.reserved != localSlot;
-
-        TVec3f coinPos{};
-        const bool haveCoinPos = tryResolveBlueCoinWorldPos(flagIndex, &coinPos);
-
-        if (!alreadySet) {
-            fm->setBlueCoinFlag(event.courseId, flagIndex);
-            markBlueCoinSet(flagIndex);
-        } else if (!locallyTracked && event.courseId == sLastCourseId) {
-            markBlueCoinSet(flagIndex);
         }
-
-        // Skip hide on host echo after a local pickup — vanilla is still driving the coin actor.
-        if (event.courseId == currentCourseId() && (!alreadySet || !locallyTracked))
-            hideBlueCoinAtIndex(flagIndex);
-
-        // Particles/SFX only for collectors on the same course — resolving a local blue-coin
-        // actor by index on a different stage would play the pickup jingle at the wrong place.
-        if (remoteCollector && !locallyTracked && haveCoinPos &&
-            event.courseId == currentCourseId())
-            smso::playRemoteCoinCollectParticles(coinPos, true);
+        applyBlueCoinVisualReconcile(event, alreadySet, locallyTracked);
         break;
     }
 
@@ -1469,6 +1786,10 @@ static bool applyWorldEvent(const smso::CommWorldEvent &event) {
 
     case smso::WE_NPC_CLEANED:
         applied = smso::applyMonteCleanWorldEvent(event);
+        break;
+
+    case smso::WE_GRAFFITI_CLEANED:
+        applied = smso::applyGraffitiCleanWorldEvent(event);
         break;
 
     case smso::WE_STORY_FLAG:
@@ -1504,15 +1825,35 @@ static bool applyWorldEvent(const smso::CommWorldEvent &event) {
             break;
         }
 
-        OSReport("[SMSOBB] hip-drop apply hit vt=0x%08X id=%u from slot=%u\n",
-                 *reinterpret_cast<const u32 *>(obj), event.payload0, event.reserved);
-
         const u32 objVt = *reinterpret_cast<const u32 *>(obj);
+        OSReport("[SMSOBB] hip-drop apply hit vt=0x%08X id=%u from slot=%u\n", objVt,
+                 event.payload0, event.reserved);
+
         // Never remotely arm red-coin switches — each player presses their own.
         if (objVt == kVtRedCoinSwitch) {
             OSReport("[SMSOBB] hip-drop skip red-coin switch (local-only)\n");
             break;
         }
+
+        // THipDropHideObj::touchPlayer hides/activates the pad. On Sirena casino (14)
+        // that includes the Ep5 purple roulette panel — never replay during stage-enter
+        // grace, and always log so missing-panel bugs are diagnosable.
+        if (gHipDropHideObjVtable != 0 && objVt == gHipDropHideObjVtable) {
+            if (currentCourseId() == kSirenaCasinoAreaId) {
+                OSReport("[SMSOBB] casino HipDropHideObj apply id=%u slot=%u grace=%u "
+                         "course=%u/%u\n",
+                         event.payload0, event.reserved, sHipDropHideGraceFrames,
+                         event.courseId, event.episodeId);
+                if (sHipDropHideGraceFrames > 0) {
+                    OSReport("[SMSOBB] casino HipDropHideObj skipped (stage-enter grace)\n");
+                    break;
+                }
+            } else if (sHipDropHideGraceFrames > 0) {
+                OSReport("[SMSOBB] hip-drop skip HipDropHideObj during stage-enter grace\n");
+                break;
+            }
+        }
+
         replayRemoteHipDropHit(obj, hipDropPayloadIsSuper(event.payload1));
         break;
     }
@@ -1643,6 +1984,9 @@ static void captureLocalWorldProgress() {
     if (sStageSettleFrames < kStageSettleFrames)
         ++sStageSettleFrames;
 
+    if (sHipDropHideGraceFrames > 0)
+        --sHipDropHideGraceFrames;
+
     if (sStageSettleFrames >= kStageSettleFrames && !sStageShineSnapshotReady)
         captureStageShineSnapshot();
 
@@ -1664,6 +2008,8 @@ static void captureLocalWorldProgress() {
             const u32 packedPos = packShinePublishPayload(shineId);
             publishLocalWorldEvent(smso::WE_SHINE_COLLECTED, courseId, episodeId, shineId, buf->localSlot,
                                    packedPos);
+            OSReport("[SMSOBB] shine publish id=%u course=%u/%u slot=%u pos=0x%08X\n", shineId,
+                     courseId, episodeId, buf->localSlot, packedPos);
 
             if (sPendingShineCapture.hasId && sPendingShineCapture.shineId == shineId)
                 sPendingShineCapture = {};
@@ -1679,6 +2025,8 @@ static void captureLocalWorldProgress() {
             markBlueCoinSet(coinIndex);
             publishLocalWorldEvent(smso::WE_BLUE_COIN_COLLECTED, courseId, episodeId, coinIndex,
                                    buf->localSlot, 0);
+            OSReport("[SMSOBB] blue publish course=%u/%u idx=%u slot=%u\n", courseId, episodeId,
+                     coinIndex, buf->localSlot);
         }
     }
 
@@ -1687,6 +2035,7 @@ static void captureLocalWorldProgress() {
     smso::captureLocalRedCoinProgress();
     smso::captureLocalStoryFlagProgress();
     smso::updateMonteCleanSync();
+    smso::updateGraffitiCleanSync();
     reconcileCollectibleActors(fm, courseId);
 }
 
@@ -1748,6 +2097,7 @@ bool looksLikePackedCollectibleWorldPos(u32 packed) {
 void initWorldSync() {
     initRedCoinSync();
     initMonteCleanSync();
+    initGraffitiCleanSync();
     initStoryFlagSync();
     initFruitSync();
     initNpcSync();
@@ -1759,6 +2109,8 @@ void initWorldSync() {
     gCountShine = reinterpret_cast<CountShineFn>(SMS_PORT_REGION(0x80147A0C, 0x8013C690, 0, 0));
     gCountBlueCoin =
         reinterpret_cast<CountBlueCoinFn>(SMS_PORT_REGION(0x8014757C, 0x8013C200, 0, 0));
+    gStartAppearStar =
+        reinterpret_cast<StartAppearStarFn>(SMS_PORT_REGION(0x80149B00, 0x8013E790, 0, 0));
     gGetShineId = reinterpret_cast<GetShineIdFn>(SMS_PORT_REGION(0x8016FAC0, 0x80165834, 0, 0));
     gGetShineStage =
         reinterpret_cast<GetShineStageFn>(SMS_PORT_REGION(0x802A8AC8, 0x802A0B70, 0, 0));
@@ -1798,6 +2150,8 @@ void processWorldEvents() {
                 resetLocalTrackersForStage(courseId, episodeId);
             if (sStageSettleFrames < kStageSettleFrames)
                 ++sStageSettleFrames;
+            if (sHipDropHideGraceFrames > 0)
+                --sHipDropHideGraceFrames;
         }
     }
 
@@ -1823,6 +2177,7 @@ void processWorldEvents() {
             incoming.type == static_cast<u8>(smso::WE_BLUE_COIN_COLLECTED) ||
             incoming.type == static_cast<u8>(smso::WE_RED_COIN_COLLECTED) ||
             incoming.type == static_cast<u8>(smso::WE_NPC_CLEANED) ||
+            incoming.type == static_cast<u8>(smso::WE_GRAFFITI_CLEANED) ||
             incoming.type == static_cast<u8>(smso::WE_STORY_FLAG) ||
             incoming.type == static_cast<u8>(smso::WE_TRIGGER_FLAG) ||
             incoming.type == static_cast<u8>(smso::WE_SECRET_COMPLETE);
@@ -1837,8 +2192,9 @@ void processWorldEvents() {
                 if (incoming.eventId > buf->worldSync.lastAppliedEventId)
                     buf->worldSync.lastAppliedEventId = incoming.eventId;
             } else if (durableCollectible) {
-                // FlagManager / stage actors not ready yet — keep the slot and retry next frame
-                // instead of silently dropping a shine/blue/red/story flag that would desync.
+                // Only FlagManager-missing should fail now. Ownership flags and
+                // episode visuals never hold the slot for actor settle — that used
+                // to freeze shine/blue until the next plaza WorldProgressRequest.
                 return;
             }
         }
@@ -1859,6 +2215,69 @@ bool objectSyncGameplayReady() {
     if (!gpMarDirector || gpMarDirector->mCurState != TMarDirector::STATE_NORMAL)
         return false;
     return sStageSettleFrames >= kStageSettleFrames;
+}
+
+struct CasinoHipDropDiagCtx {
+    u32 hipDropLive;
+    u32 hipDropDead;
+    u32 roulette;
+};
+
+static bool visitCasinoHipDropDiag(TMapObjBase *obj, void *rawCtx) {
+    auto *ctx = reinterpret_cast<CasinoHipDropDiagCtx *>(rawCtx);
+    if (!obj)
+        return false;
+    const u32 vt = *reinterpret_cast<const u32 *>(obj);
+    if (gHipDropHideObjVtable != 0 && vt == gHipDropHideObjVtable) {
+        if (isLiveCollectible(obj)) {
+            ++ctx->hipDropLive;
+            const TVec3f pos = hipDropObjWorldPos(obj);
+            OSReport("[SMSOBB] casino HipDropHideObj[%u] live pos=(%.0f,%.0f,%.0f)\n",
+                     ctx->hipDropLive - 1, pos.x, pos.y, pos.z);
+        } else {
+            ++ctx->hipDropDead;
+        }
+        return false;
+    }
+    // casinorulet MapObjData actor type 0x4000019A
+    if (reinterpret_cast<const THitActor *>(obj)->mObjectID == 0x4000019Au)
+        ++ctx->roulette;
+    return false;
+}
+
+void reportCasinoHipDropSpawnDiag(u8 areaId) {
+    if (areaId != kSirenaCasinoAreaId) {
+        sCasinoHipDropDiagPending = false;
+        sCasinoHipDropDiagDelay = 0;
+        return;
+    }
+
+    if (!sCasinoHipDropDiagPending) {
+        sCasinoHipDropDiagPending = true;
+        sCasinoHipDropDiagDelay = 2;
+        return;
+    }
+
+    if (sCasinoHipDropDiagDelay > 0) {
+        --sCasinoHipDropDiagDelay;
+        return;
+    }
+
+    sCasinoHipDropDiagPending = false;
+    ensureHipDropObjectHooks();
+
+    CasinoHipDropDiagCtx ctx = {};
+    smso::forEachManagedMapObj(visitCasinoHipDropDiag, &ctx);
+
+    const u8 dirEp = gpMarDirector ? gpMarDirector->mEpisodeID : 0xFF;
+    const u8 sceneEp = gpApplication.mCurrentScene.mEpisodeID;
+    const u8 flagEp =
+        TFlagManager::smInstance
+            ? static_cast<u8>(TFlagManager::smInstance->getFlag(0x40003))
+            : static_cast<u8>(0xFF);
+    OSReport("[SMSOBB] casino HipDrop diag area=%u director=%u sceneLoad=%u flagMission=%u "
+             "HipDropHideObj live=%u dead=%u casinorulet=%u\n",
+             areaId, dirEp, sceneEp, flagEp, ctx.hipDropLive, ctx.hipDropDead, ctx.roulette);
 }
 
 } // namespace smso

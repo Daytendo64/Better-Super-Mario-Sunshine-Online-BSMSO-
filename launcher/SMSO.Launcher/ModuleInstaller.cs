@@ -5,6 +5,7 @@ using System.IO.Compression;
 using System.Linq;
 using System.Net.Http;
 using System.Reflection;
+using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
 using SMSO.Net;
@@ -25,6 +26,9 @@ internal sealed class ModuleInstallStatus
     public bool BseInstalled { get; init; }
     public bool MovesetInstalled { get; init; }
     public bool BsmsInstalled { get; init; }
+    /// <summary>True when runtime files are present but older than this launcher's bundle / ModBuildId.</summary>
+    public bool NeedsUpdate { get; init; }
+    public bool IsComplete { get; init; }
     public string Message { get; init; } = "";
 }
 
@@ -88,15 +92,40 @@ internal static class ModuleInstaller
 
         if (kind == ModuleInstallTargetKind.DiscImage)
         {
+            var fullDisc = Path.GetFullPath(trimmed);
+            var discHasModule = ModuleInstallValidator.DiscImageContainsModuleFile(
+                fullDisc, ModuleVersionMessages.ModuleFileName);
+            var discNeedsUpdate = discHasModule && IsDiscImageModuleStale(fullDisc);
+
+            string discMessage;
+            if (discNeedsUpdate)
+            {
+                discMessage = ModuleVersionMessages.UpdateRequired +
+                              $"\n{fullDisc}\n" +
+                              $"Installed build marker is older than launcher build {ProtocolConstants.ModBuildId}.";
+            }
+            else if (discHasModule)
+            {
+                discMessage =
+                    $"BSE / Kuribo modules present in disc image (build {ProtocolConstants.ModBuildId}):\n{fullDisc}\n" +
+                    "Re-run Install / patch modules to rewrite the image if needed.";
+            }
+            else
+            {
+                discMessage =
+                    $"Ready to patch disc image:\n{fullDisc}\n" +
+                    "Install / patch modules will back up, then install Kuribo System, BSE main.dol/boot.bin, " +
+                    "BetterSunshineEngine.kxe, BetterSunshineMoveset.kxe, and _BSMSO.kxe into the image.";
+            }
+
             return new ModuleInstallStatus
             {
                 CanInstall = true,
                 TargetKind = kind,
-                DiscImagePath = Path.GetFullPath(trimmed),
-                Message =
-                    $"Ready to patch disc image:\n{Path.GetFullPath(trimmed)}\n" +
-                    "Install / patch modules will back up, then install Kuribo System, BSE main.dol/boot.bin, " +
-                    "BetterSunshineEngine.kxe, BetterSunshineMoveset.kxe, and _BSMSO.kxe into the image.",
+                DiscImagePath = fullDisc,
+                IsComplete = discHasModule && !discNeedsUpdate,
+                NeedsUpdate = discNeedsUpdate,
+                Message = discMessage,
             };
         }
 
@@ -115,7 +144,14 @@ internal static class ModuleInstaller
         }
 
         var probe = ModuleInstallValidator.ProbeBseRuntime(gameRoot);
-        var message = BuildExtractedStatusMessage(gameRoot, probe);
+        // Older launchers wrote the ModBuildId sidecar inside Mods; Kuribo tries to load it
+        // as a module and black-screens. Purge on every status check.
+        if (probe.ModsDirectoryExists)
+            RemoveLegacyModsFolderMarker(probe.ModsDirectory);
+        var needsUpdate = probe.IsComplete && IsExtractedModuleStale(probe);
+        var message = needsUpdate
+            ? ModuleVersionMessages.UpdateRequired + "\n" + gameRoot
+            : BuildExtractedStatusMessage(gameRoot, probe);
 
         return new ModuleInstallStatus
         {
@@ -130,6 +166,8 @@ internal static class ModuleInstaller
             BseInstalled = probe.BseInstalled,
             MovesetInstalled = probe.MovesetInstalled,
             BsmsInstalled = probe.BsmsInstalled,
+            IsComplete = probe.IsComplete && !needsUpdate,
+            NeedsUpdate = needsUpdate,
             Message = message,
         };
     }
@@ -324,6 +362,7 @@ internal static class ModuleInstaller
             if (!File.Exists(kernelDest))
                 return (false, $"KuriboKernel.bin missing after install:\n{kernelDest}");
 
+            WriteModBuildIdMarker(modsDest, log);
             return (true, "OK");
         }
         catch (Exception ex)
@@ -393,12 +432,116 @@ internal static class ModuleInstaller
             File.Copy(bsmsSource, bsmsDest, overwrite: true);
             log?.Invoke(
                 $"Installed {ModuleVersionMessages.ModuleFileName} ({new FileInfo(bsmsDest).Length} bytes) → {bsmsDest}");
+            WriteModBuildIdMarker(modsDir, log);
             return (true, "OK");
         }
         catch (Exception ex)
         {
             return (false, $"Failed to copy modules into Mods:\n{ex.Message}");
         }
+    }
+
+    /// <summary>
+    /// Overwrite Kuribo Mods .kxe files from the ones shipped next to the
+    /// launcher/zip (when present and different). Runs on launch so a zip update
+    /// picks up a new <c>_BSMSO.kxe</c> without requiring Install Modules again.
+    /// Does not re-download BSE or rewrite main.dol — only syncs local kxe files.
+    /// </summary>
+    public static BundledModuleSyncResult SyncBundledModulesIntoGame(string isoPath, Action<string>? log = null)
+    {
+        var result = new BundledModuleSyncResult();
+        var trimmed = isoPath?.Trim().Trim('"') ?? string.Empty;
+        if (trimmed.Length == 0)
+            return result;
+
+        if (!ModuleInstallValidator.TryResolveGameRoot(trimmed, out var gameRoot) || gameRoot == null)
+            return result;
+
+        var modsDir = Path.Combine(gameRoot, "files", "Kuribo!", "Mods");
+        Directory.CreateDirectory(modsDir);
+
+        var synced = 0;
+        var bsmsoChanged = false;
+        var bsmsoMatches = false;
+        var hasBundledBsmso = TryFindSourceModule(ModuleVersionMessages.ModuleFileName, out var bundledBsmso)
+                              && bundledBsmso != null;
+
+        foreach (var name in new[]
+                 {
+                     ModuleVersionMessages.ModuleFileName,
+                     ModuleVersionMessages.MovesetModuleFileName,
+                     ModuleVersionMessages.BseModuleFileName,
+                 })
+        {
+            if (!TryFindSourceModule(name, out var source) || source == null)
+                continue;
+
+            var dest = Path.Combine(modsDir, name);
+            try
+            {
+                var changed = true;
+                if (File.Exists(dest))
+                {
+                    if (FilesMatch(source, dest))
+                    {
+                        changed = false;
+                        if (name == ModuleVersionMessages.ModuleFileName)
+                            bsmsoMatches = true;
+                    }
+                }
+
+                if (!changed)
+                    continue;
+
+                File.Copy(source, dest, overwrite: true);
+                synced++;
+                if (name == ModuleVersionMessages.ModuleFileName)
+                {
+                    bsmsoChanged = true;
+                    bsmsoMatches = true;
+                }
+
+                log?.Invoke($"Synced {name} → {dest} ({new FileInfo(dest).Length:N0} bytes)");
+            }
+            catch (Exception ex)
+            {
+                log?.Invoke($"Skipped syncing {name}: {ex.Message}");
+            }
+        }
+
+        if (hasBundledBsmso && !bsmsoMatches)
+        {
+            var dest = Path.Combine(modsDir, ModuleVersionMessages.ModuleFileName);
+            try
+            {
+                if (File.Exists(dest) && bundledBsmso != null)
+                    bsmsoMatches = FilesMatch(bundledBsmso, dest);
+            }
+            catch
+            {
+                bsmsoMatches = false;
+            }
+        }
+        else if (!hasBundledBsmso)
+        {
+            // No bundled module beside the launcher — cannot assert freshness; do not gate.
+            bsmsoMatches = true;
+        }
+
+        // Keep the ModBuildId sidecar in sync only when we verified against a bundled kxe.
+        if (hasBundledBsmso && bsmsoMatches &&
+            File.Exists(Path.Combine(modsDir, ModuleVersionMessages.ModuleFileName)))
+        {
+            WriteModBuildIdMarker(modsDir, log);
+        }
+
+        return new BundledModuleSyncResult
+        {
+            SyncedCount = synced,
+            BsmsoModuleChanged = bsmsoChanged,
+            InstalledMatchesBundled = bsmsoMatches,
+            BundledModuleAvailable = hasBundledBsmso,
+        };
     }
 
     public static bool TryFindSourceModule(string fileName, out string? path)
@@ -415,6 +558,198 @@ internal static class ModuleInstaller
         }
 
         return false;
+    }
+
+    /// <summary>
+    /// Marker path for an extracted install: <c>files/Kuribo!/.bsmso-mod-build-id</c>
+    /// (parent of Mods). Never write into Mods — Kuribo treats every Mods entry as a .kxe.
+    /// </summary>
+    internal static string GetExtractedModBuildIdMarkerPath(string modsDirectory)
+    {
+        var mods = Path.GetFullPath(modsDirectory.Trim());
+        var kuribo = Directory.GetParent(mods)?.FullName;
+        if (string.IsNullOrEmpty(kuribo))
+            return Path.Combine(mods, ModuleVersionMessages.ModBuildIdMarkerFileName);
+        return Path.Combine(kuribo, ModuleVersionMessages.ModBuildIdMarkerFileName);
+    }
+
+    /// <summary>
+    /// Writes the ModBuildId sidecar beside Mods (in Kuribo!), and removes any legacy
+    /// marker that was incorrectly placed inside Mods (broke Kuribo boot).
+    /// </summary>
+    internal static void WriteModBuildIdMarker(string modsDirectory, Action<string>? log = null)
+    {
+        if (string.IsNullOrWhiteSpace(modsDirectory))
+            return;
+
+        try
+        {
+            Directory.CreateDirectory(modsDirectory);
+            RemoveLegacyModsFolderMarker(modsDirectory, log);
+
+            var path = GetExtractedModBuildIdMarkerPath(modsDirectory);
+            var parent = Path.GetDirectoryName(path);
+            if (!string.IsNullOrEmpty(parent))
+                Directory.CreateDirectory(parent);
+            File.WriteAllText(path, ProtocolConstants.ModBuildId.ToString());
+            log?.Invoke(
+                $"Wrote {ModuleVersionMessages.ModBuildIdMarkerFileName} " +
+                $"(build {ProtocolConstants.ModBuildId}) → {path}");
+        }
+        catch (Exception ex)
+        {
+            log?.Invoke($"Could not write mod-build marker: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Deletes a mistaken Mods-folder marker from older launcher builds so Kuribo can boot.
+    /// </summary>
+    internal static void RemoveLegacyModsFolderMarker(string modsDirectory, Action<string>? log = null)
+    {
+        try
+        {
+            var legacy = Path.Combine(modsDirectory, ModuleVersionMessages.ModBuildIdMarkerFileName);
+            if (!File.Exists(legacy))
+                return;
+            File.Delete(legacy);
+            log?.Invoke(
+                $"Removed legacy {ModuleVersionMessages.ModBuildIdMarkerFileName} from Mods " +
+                "(Kuribo was treating it as a module and blocking boot)");
+        }
+        catch (Exception ex)
+        {
+            log?.Invoke($"Could not remove legacy Mods marker: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Sidecar next to a patched .iso/.gcm (not inside the image).
+    /// </summary>
+    internal static string GetDiscImageModBuildIdMarkerPath(string discImagePath) =>
+        Path.GetFullPath(discImagePath.Trim().Trim('"')) + ModuleVersionMessages.ModBuildIdMarkerFileName;
+
+    internal static void WriteDiscImageModBuildIdMarker(string discImagePath, Action<string>? log = null)
+    {
+        try
+        {
+            var path = GetDiscImageModBuildIdMarkerPath(discImagePath);
+            File.WriteAllText(path, ProtocolConstants.ModBuildId.ToString());
+            log?.Invoke(
+                $"Wrote disc mod-build marker (build {ProtocolConstants.ModBuildId}) → {path}");
+        }
+        catch (Exception ex)
+        {
+            log?.Invoke($"Could not write disc mod-build marker: {ex.Message}");
+        }
+    }
+
+    internal static bool TryReadModBuildIdMarker(string markerPath, out ushort buildId)
+    {
+        buildId = 0;
+        if (string.IsNullOrWhiteSpace(markerPath) || !File.Exists(markerPath))
+            return false;
+
+        try
+        {
+            var text = File.ReadAllText(markerPath).Trim();
+            return ushort.TryParse(text, out buildId);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// True when the extracted tree has a complete install that is older than this launcher.
+    /// Uses ModBuildId sidecar and/or byte compare against bundled .kxe files.
+    /// </summary>
+    internal static bool IsExtractedModuleStale(BseRuntimeProbe probe)
+    {
+        if (!probe.IsComplete)
+            return false;
+
+        // Prefer Kuribo!-level marker; also accept a legacy Mods copy until Update migrates it.
+        var markerPath = GetExtractedModBuildIdMarkerPath(probe.ModsDirectory);
+        var hasMarker = TryReadModBuildIdMarker(markerPath, out var installedBuild);
+        if (!hasMarker)
+        {
+            var legacy = Path.Combine(probe.ModsDirectory, ModuleVersionMessages.ModBuildIdMarkerFileName);
+            hasMarker = TryReadModBuildIdMarker(legacy, out installedBuild);
+        }
+
+        if (hasMarker && installedBuild < ProtocolConstants.ModBuildId)
+            return true;
+
+        if (BundledKxeFilesDifferFromInstalled(probe))
+            return true;
+
+        // Complete install with no marker (pre-sidecar installs): treat as stale until
+        // Update / sync rewrites the marker for the current launcher build.
+        if (!hasMarker)
+            return true;
+
+        return false;
+    }
+
+    internal static bool IsDiscImageModuleStale(string discImagePath)
+    {
+        var markerPath = GetDiscImageModBuildIdMarkerPath(discImagePath);
+        if (!TryReadModBuildIdMarker(markerPath, out var installedBuild))
+            return true;
+
+        return installedBuild < ProtocolConstants.ModBuildId;
+    }
+
+    private static bool BundledKxeFilesDifferFromInstalled(BseRuntimeProbe probe)
+    {
+        if (probe.BsmsPath != null &&
+            TryFindSourceModule(ModuleVersionMessages.ModuleFileName, out var bundledBsms) &&
+            bundledBsms != null &&
+            !FilesMatch(bundledBsms, probe.BsmsPath))
+        {
+            return true;
+        }
+
+        if (probe.MovesetPath != null &&
+            TryFindSourceModule(ModuleVersionMessages.MovesetModuleFileName, out var bundledMoveset) &&
+            bundledMoveset != null &&
+            !FilesMatch(bundledMoveset, probe.MovesetPath))
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>Length + SHA-256 compare; avoids loading entire .kxe files into memory twice.</summary>
+    internal static bool FilesMatch(string pathA, string pathB)
+    {
+        try
+        {
+            var a = new FileInfo(pathA);
+            var b = new FileInfo(pathB);
+            if (!a.Exists || !b.Exists || a.Length != b.Length)
+                return false;
+
+            if (string.Equals(Path.GetFullPath(pathA), Path.GetFullPath(pathB), StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            var hashA = ComputeFileSha256(pathA);
+            var hashB = ComputeFileSha256(pathB);
+            return hashA.AsSpan().SequenceEqual(hashB.AsSpan());
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static byte[] ComputeFileSha256(string path)
+    {
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        return SHA256.HashData(stream);
     }
 
     private static string BuildExtractedStatusMessage(string gameRoot, BseRuntimeProbe probe)
@@ -436,7 +771,7 @@ internal static class ModuleInstaller
         if (missing.Count == 0)
         {
             return
-                $"BSE / Kuribo runtime installed:\n{gameRoot}\n" +
+                $"BSE / Kuribo runtime installed (build {ProtocolConstants.ModBuildId}):\n{gameRoot}\n" +
                 $"KuriboKernel.bin, sys\\main.dol, sys\\boot.bin, " +
                 $"{ModuleVersionMessages.BseModuleFileName}, {ModuleVersionMessages.MovesetModuleFileName}, " +
                 $"{ModuleVersionMessages.ModuleFileName}";
@@ -767,4 +1102,12 @@ internal static class ModuleInstaller
             CopyDirectoryMerge(dir, dest);
         }
     }
+}
+
+public readonly struct BundledModuleSyncResult
+{
+    public int SyncedCount { get; init; }
+    public bool BsmsoModuleChanged { get; init; }
+    public bool InstalledMatchesBundled { get; init; }
+    public bool BundledModuleAvailable { get; init; }
 }
