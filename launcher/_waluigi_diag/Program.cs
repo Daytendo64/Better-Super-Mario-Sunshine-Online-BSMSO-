@@ -1,0 +1,13 @@
+﻿using System;
+using System.IO;
+using System.Linq;
+using SMSO.Net.MarioPack;
+var arc = CharacterPack.OpenArchive(File.ReadAllBytes(Path.Combine(ModelLibrary.LibraryDirectory, "Waluigi.arc")));
+var f = arc.EnumerateFiles().First(x => x.FullPath.Replace('\\','/') == "watergun2/body/wg_pump.bck");
+CharacterPack.TryReadBckJointCount(f.Data, out var j);
+Console.WriteLine($"AppData Waluigi.arc watergun2/body/wg_pump.bck joints={j} bytes={f.Data.Length}");
+var game = @"C:\Users\young\OneDrive\Desktop\sms online files\files\data\bsmso_models\931feefb.arc";
+var g = CharacterPack.OpenArchive(File.ReadAllBytes(game));
+var gf = g.EnumerateFiles().First(x => x.FullPath.Replace('\\','/') == "watergun2/body/wg_pump.bck");
+CharacterPack.TryReadBckJointCount(gf.Data, out var gj);
+Console.WriteLine($"Game 931feefb.arc watergun2/body/wg_pump.bck joints={gj} bytes={gf.Data.Length}");

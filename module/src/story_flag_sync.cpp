@@ -47,6 +47,14 @@ constexpr u8 kPlazaHubEpisode = 0xFFu;
 constexpr u32 kPlazaTriggerFlags[] = {0x50001u, 0x50002u, 0x50004u};
 constexpr u32 kPlazaTriggerCount = sizeof(kPlazaTriggerFlags) / sizeof(kPlazaTriggerFlags[0]);
 
+// decideNextScenario (area 1): 0x103AE set → scenario 2 (dolpic10 post-flood).
+// Flooded (scenario 9 / dolpic9) is shine-gated (Shadow Mario episode shines
+// 6/16/26/36/46/56/66) — those already ride ShineAuthority. Vanilla latches
+// 0x103AE during Corona Mountain (area 52) load / flooded→Corona transition;
+// stageInit tracker reseed must not swallow that edge without publishing.
+constexpr u8 kCoronaMountainAreaId = 52u;
+constexpr u32 kCoronaVisitedFlagId = 0x103AEu;
+
 constexpr u32 kCardBitCount = kCardBoolEnd - kCardBoolBase;   // 948
 constexpr u32 kStageBitCount = kStageBoolEnd - kStageBoolBase; // 100
 constexpr u32 kGameBitCount = kGameBoolEnd - kGameBoolBase;    // 29
@@ -109,6 +117,13 @@ static u8 sCardBits[kCardByteCount] = {};
 static u8 sStageBits[kStageByteCount] = {};
 static u8 sGameBits[kGameByteCount] = {};
 static u8 sAuthorityCardBits[kCardByteCount] = {};
+/// Published to the bridge but not yet echoed by the server (story/secret apply or
+/// progress snapshot). Suppresses per-frame re-publish spam while still allowing a
+/// bounded stage-enter retry, so a lost TCP publish cannot strand a card bit that only
+/// this client knows about (peers stuck pre-flood on 0x103AE was exactly this).
+static u8 sPendingConfirmCardBits[kCardByteCount] = {};
+static u8 sCardConfirmRetryPasses = 0;
+constexpr u8 kMaxCardConfirmRetryPasses = 3;
 static u8 sBootstrapCardBits[kCardByteCount] = {};
 static u8 sBootstrapStageBits[kStageByteCount] = {};
 
@@ -163,21 +178,38 @@ static u32 snapshotPlazaAllowlistHash(TFlagManager *fm) {
     return bits;
 }
 
-static void publishFlagEvent(smso::WorldEventType type, u8 courseId, u8 episodeId, u32 flagId,
+static bool publishFlagEvent(smso::WorldEventType type, u8 courseId, u8 episodeId, u32 flagId,
                              u8 value) {
-    smso::enqueueLocalWorldEvent(static_cast<u8>(type), courseId, episodeId, value, 0, flagId);
+    return smso::enqueueLocalWorldEvent(static_cast<u8>(type), courseId, episodeId, value, 0,
+                                        flagId);
 }
 
-static void publishCardOrSecret(smso::WorldEventType type, u32 flagId) {
+static bool publishCardOrSecret(smso::WorldEventType type, u32 flagId) {
     if (!gpMarDirector)
-        return;
-    publishFlagEvent(type, gpMarDirector->mAreaID, gpMarDirector->mEpisodeID, flagId, 1);
+        return false;
+    return publishFlagEvent(type, gpMarDirector->mAreaID, gpMarDirector->mEpisodeID, flagId, 1);
 }
 
-static void publishPlazaTrigger(u32 flagId) {
+static bool publishPlazaTrigger(u32 flagId) {
     // Hub-global wire key: course=plaza, episode=wildcard. Server coalesces any
     // legacy plaza episode into the same authority slot.
-    publishFlagEvent(smso::WE_TRIGGER_FLAG, kPlazaAreaId, kPlazaHubEpisode, flagId, 1);
+    return publishFlagEvent(smso::WE_TRIGGER_FLAG, kPlazaAreaId, kPlazaHubEpisode, flagId, 1);
+}
+
+/// Local publish handed to the bridge — not yet an ack.
+static void markCardPublished(u32 bitIndex) {
+    bitSet(sPendingConfirmCardBits, bitIndex, true);
+}
+
+/// Server confirmed the bit (ownership apply / progress snapshot): stop retrying.
+static void confirmCardPublished(u32 bitIndex) {
+    bitSet(sAuthorityCardBits, bitIndex, true);
+    bitSet(sPendingConfirmCardBits, bitIndex, false);
+}
+
+/// True while a publish is outstanding — suppresses duplicate emits between retries.
+static bool cardPublishInFlight(u32 bitIndex) {
+    return bitGet(sAuthorityCardBits, bitIndex) || bitGet(sPendingConfirmCardBits, bitIndex);
 }
 
 static void markLocalTracker(u32 flagId, bool value) {
@@ -284,6 +316,72 @@ static void admitPlazaTrigger(u32 flagId) {
     sPlazaTriggerOverlay[idx] = true;
 }
 
+/// Queue durable card bits that are set in FlagManager but not yet in the
+/// session authority cache. Used after stageInit tracker resets so load-time
+/// latches (Corona visited 0x103AE, etc.) are not absorbed into the baseline
+/// without ever publishing to the server.
+/// <param name="retryUnconfirmed">
+/// Also re-queue bits that were published locally but never echoed by the server. Server
+/// accepts are grow-only and idempotent, so a duplicate is harmless; the caller bounds how
+/// many times this happens (<see cref="kMaxCardConfirmRetryPasses"/>).
+/// </param>
+/// Returns true when at least one unconfirmed (already published) bit was re-queued.
+static bool queueUnpublishedDurableCardSets(TFlagManager *fm, bool retryUnconfirmed = false) {
+    if (!fm || !sSyncObserved)
+        return false;
+
+    bool any = false;
+    bool retried = false;
+    for (u32 i = 0; i < kCardBitCount; ++i) {
+        const u32 flagId = kCardBoolBase + i;
+        if (!isDurableCardBool(flagId))
+            continue;
+        if (!fm->getBool(flagId))
+            continue;
+        if (bitGet(sAuthorityCardBits, i))
+            continue;
+        if (bitGet(sPendingConfirmCardBits, i)) {
+            if (!retryUnconfirmed)
+                continue;
+            retried = true;
+        }
+
+        bitSet(sBootstrapCardBits, i, true);
+        any = true;
+    }
+
+    if (!any)
+        return false;
+
+    sCardBootstrapPending = true;
+    sCardBootstrapCursor = 0;
+    return retried;
+}
+
+/// Prefer immediate publish for the post-flood latch so peers unlock dolpic10
+/// without waiting on the 948-bit bootstrap scan (bit index 942).
+static bool tryPublishCoronaVisitedFlag(TFlagManager *fm, bool syncStory, bool syncSecret) {
+    if (!fm || (!syncStory && !syncSecret))
+        return false;
+    if (!fm->getBool(kCoronaVisitedFlagId))
+        return false;
+
+    const u32 idx = kCoronaVisitedFlagId - kCardBoolBase;
+    if (cardPublishInFlight(idx))
+        return true;
+
+    const smso::WorldEventType type =
+        syncStory ? smso::WE_STORY_FLAG : smso::WE_SECRET_COMPLETE;
+    if (!publishCardOrSecret(type, kCoronaVisitedFlagId))
+        return false;
+
+    markCardPublished(idx);
+    markLocalTracker(kCoronaVisitedFlagId, true);
+    bitSet(sBootstrapCardBits, idx, false);
+    OSReport("[SMSOBB] story-flag emit-set id=0x%08X coronaVisited=1\n", kCoronaVisitedFlagId);
+    return true;
+}
+
 // Publish at most one baseline set per frame.
 static void publishNextBootstrapSet(TFlagManager *fm, bool syncStory, bool syncSecret) {
     if (!fm)
@@ -291,11 +389,20 @@ static void publishNextBootstrapSet(TFlagManager *fm, bool syncStory, bool syncS
 
     while (sCardBootstrapPending && sCardBootstrapCursor < kCardBitCount) {
         const u32 flagId = kCardBoolBase + sCardBootstrapCursor++;
-        if (!isDurableCardBool(flagId) || !bitGet(sBootstrapCardBits, sCardBootstrapCursor - 1) ||
+        const u32 bitIndex = sCardBootstrapCursor - 1;
+        if (!isDurableCardBool(flagId) || !bitGet(sBootstrapCardBits, bitIndex) ||
             (!syncStory && (!syncSecret || flagId < 0x10366u)))
             continue;
-        bitSet(sAuthorityCardBits, flagId - kCardBoolBase, true);
-        publishCardOrSecret(syncStory ? smso::WE_STORY_FLAG : smso::WE_SECRET_COMPLETE, flagId);
+        if (!publishCardOrSecret(syncStory ? smso::WE_STORY_FLAG : smso::WE_SECRET_COMPLETE,
+                                 flagId)) {
+            // Outbound queue full — retry this bit next frame instead of marking it
+            // published and losing it.
+            --sCardBootstrapCursor;
+            return;
+        }
+
+        markCardPublished(bitIndex);
+        bitSet(sBootstrapCardBits, bitIndex, false);
         return;
     }
     if (sCardBootstrapCursor >= kCardBitCount)
@@ -330,12 +437,19 @@ static void scanCardBankForChanges(TFlagManager *fm, u32 start, u32 count, bool 
         if (now == was)
             continue;
 
-        bitSet(sCardBits, i, now);
-        if (sApplyingRemote || !now || !isDurableCardBool(flagId))
+        if (sApplyingRemote || !now || !isDurableCardBool(flagId)) {
+            bitSet(sCardBits, i, now);
+            continue;
+        }
+
+        // Publish first — only advance the local tracker after enqueue so a queue-full
+        // drop retries next frame instead of permanently silencing the bit.
+        if (!publishCardOrSecret(syncStory ? smso::WE_STORY_FLAG : smso::WE_SECRET_COMPLETE,
+                                 flagId))
             continue;
 
-        bitSet(sAuthorityCardBits, i, true);
-        publishCardOrSecret(syncStory ? smso::WE_STORY_FLAG : smso::WE_SECRET_COMPLETE, flagId);
+        bitSet(sCardBits, i, now);
+        markCardPublished(i);
         if (kStoryFlagHotPathOsReport) {
             OSReport("[SMSOBB] story-flag emit-set id=0x%08X live=1\n", flagId);
         }
@@ -354,12 +468,16 @@ static void scanPlazaTriggersForChanges(TFlagManager *fm) {
         if (now == was)
             continue;
 
-        bitSet(sStageBits, bitIndex, now);
-        if (sApplyingRemote || !now)
+        if (sApplyingRemote || !now) {
+            bitSet(sStageBits, bitIndex, now);
+            continue;
+        }
+
+        if (!publishPlazaTrigger(flagId))
             continue;
 
+        bitSet(sStageBits, bitIndex, now);
         admitPlazaTrigger(flagId);
-        publishPlazaTrigger(flagId);
         if (kStoryFlagHotPathOsReport) {
             OSReport("[SMSOBB] trigger-flag emit-set id=0x%08X plazaHub=1\n", flagId);
         }
@@ -372,6 +490,8 @@ namespace smso {
 
 void initStoryFlagSync() {
     memset(sAuthorityCardBits, 0, sizeof(sAuthorityCardBits));
+    memset(sPendingConfirmCardBits, 0, sizeof(sPendingConfirmCardBits));
+    sCardConfirmRetryPasses = 0;
     memset(sBootstrapCardBits, 0, sizeof(sBootstrapCardBits));
     memset(sBootstrapStageBits, 0, sizeof(sBootstrapStageBits));
     memset(sPlazaTriggerOverlay, 0, sizeof(sPlazaTriggerOverlay));
@@ -393,10 +513,27 @@ void resetStoryFlagTrackers() {
     sStageAllowlistHash = 0;
 }
 
+void clearStoryFlagSessionProgress() {
+    memset(sAuthorityCardBits, 0, sizeof(sAuthorityCardBits));
+    memset(sPendingConfirmCardBits, 0, sizeof(sPendingConfirmCardBits));
+    sCardConfirmRetryPasses = 0;
+    memset(sBootstrapCardBits, 0, sizeof(sBootstrapCardBits));
+    memset(sBootstrapStageBits, 0, sizeof(sBootstrapStageBits));
+    memset(sPlazaTriggerOverlay, 0, sizeof(sPlazaTriggerOverlay));
+    sCardBootstrapPending = false;
+    sStageBootstrapPending = false;
+    sCardBootstrapCursor = 0;
+    sStageBootstrapCursor = 0;
+    resetStoryFlagTrackers();
+    OSReport("[SMSOBB] story-flag session progress cleared\n");
+}
+
 void updateStoryFlagSyncConnectionState(bool connected, bool syncEnabled) {
     if (!connected) {
         if (sConnectionObserved) {
             memset(sAuthorityCardBits, 0, sizeof(sAuthorityCardBits));
+            memset(sPendingConfirmCardBits, 0, sizeof(sPendingConfirmCardBits));
+            sCardConfirmRetryPasses = 0;
             memset(sBootstrapCardBits, 0, sizeof(sBootstrapCardBits));
             memset(sBootstrapStageBits, 0, sizeof(sBootstrapStageBits));
             memset(sPlazaTriggerOverlay, 0, sizeof(sPlazaTriggerOverlay));
@@ -457,16 +594,51 @@ void notifyStoryFlagStageEnter(u8 courseId, u8 episodeId) {
         // mid-visit applies call wakePlazaGeometryForFlag separately.
     }
 
-    OSReport("[SMSOBB] story-flag stage enter course=%u/%u plazaOverlay=%u/%u/%u\n", courseId,
-             episodeId, sPlazaTriggerOverlay[0] ? 1u : 0u, sPlazaTriggerOverlay[1] ? 1u : 0u,
-             sPlazaTriggerOverlay[2] ? 1u : 0u);
+    // Card bits latched during stage load (notably Corona visited 0x103AE) are
+    // already set before the first captureLocal seed. Without a re-queue against
+    // sAuthorityCardBits, the 0→1 edge is never published and peers stay on
+    // flooded plaza forever.
+    if (fm && sSyncObserved) {
+        // Also re-drive bits published earlier that the server never echoed — a lost TCP
+        // publish is otherwise invisible to this client forever.
+        const bool retry = sCardConfirmRetryPasses < kMaxCardConfirmRetryPasses;
+        if (queueUnpublishedDurableCardSets(fm, retry)) {
+            ++sCardConfirmRetryPasses;
+            OSReport("[SMSOBB] story-flag publish unconfirmed — retry pass %u/%u\n",
+                     static_cast<u32>(sCardConfirmRetryPasses),
+                     static_cast<u32>(kMaxCardConfirmRetryPasses));
+        }
+    }
+
+    OSReport("[SMSOBB] story-flag stage enter course=%u/%u plazaOverlay=%u/%u/%u "
+             "coronaVisited=%u\n",
+             courseId, episodeId, sPlazaTriggerOverlay[0] ? 1u : 0u,
+             sPlazaTriggerOverlay[1] ? 1u : 0u, sPlazaTriggerOverlay[2] ? 1u : 0u,
+             (fm && fm->getBool(kCoronaVisitedFlagId)) ? 1u : 0u);
 }
 
 void scrubEphemeralSpawnDirectorFlagsOnStageExit() {
+    TFlagManager *fm = TFlagManager::smInstance;
+
+    // Flooded plaza → Corona (or any leave into Corona): vanilla may latch
+    // 0x103AE during the loading FMV / exit path before Corona stageInit.
+    // Publish immediately so peers unlock post-flood without each visiting.
+    if (fm && sSyncObserved && gpApplication.mNextScene.mAreaID == kCoronaMountainAreaId) {
+        smso::CommBuffer *buf = smso::getCommBuffer();
+        const bool syncStory =
+            buf && (buf->bridgeFlags & smso::BF_SYNC_STORY) != 0;
+        const bool syncSecret =
+            buf && (buf->bridgeFlags & smso::BF_SYNC_SECRET) != 0;
+        if (!tryPublishCoronaVisitedFlag(fm, syncStory, syncSecret) &&
+            fm->getBool(kCoronaVisitedFlagId)) {
+            // Queue-full or flag not set yet — bootstrap / Corona stageInit retry.
+            queueUnpublishedDurableCardSets(fm);
+        }
+    }
+
     if (gpApplication.mCurrentScene.mAreaID == 1 && gpApplication.mNextScene.mAreaID == 1)
         return;
 
-    TFlagManager *fm = TFlagManager::smInstance;
     if (!fm)
         return;
 
@@ -515,9 +687,16 @@ void captureLocalStoryFlagProgress() {
         snapshotBank(fm, kGameBoolBase, kGameBitCount, sGameBits);
         sCardBankHash = fnv1aBytes(sCardBits, kCardByteCount);
         sStageAllowlistHash = snapshotPlazaAllowlistHash(fm);
+        // Seed must not silence load-time latches already present in FlagManager.
+        queueUnpublishedDurableCardSets(fm);
+        tryPublishCoronaVisitedFlag(fm, syncStory, syncSecret);
         sTrackersReady = true;
-        return;
+        // Fall through so bootstrap / corona publish can flush this frame.
     }
+
+    // Corona stage: prefer immediate 0x103AE publish over slow card bootstrap.
+    if (gpMarDirector && gpMarDirector->mAreaID == kCoronaMountainAreaId)
+        tryPublishCoronaVisitedFlag(fm, syncStory, syncSecret);
 
     publishNextBootstrapSet(fm, syncStory, syncSecret);
 
@@ -572,8 +751,8 @@ void captureLocalStoryFlagProgress() {
             bitSet(sCardBits, idx, now);
             if (!now)
                 continue;
-            bitSet(sAuthorityCardBits, idx, true);
-            publishCardOrSecret(WE_SECRET_COMPLETE, flagId);
+            if (publishCardOrSecret(WE_SECRET_COMPLETE, flagId))
+                markCardPublished(idx);
         }
     }
 }
@@ -601,7 +780,7 @@ bool applyStoryFlagWorldEvent(const CommWorldEvent &event) {
     bool changed = false;
     if (!applyBoolFlag(fm, event.payload1, event.payload0, &changed))
         return false;
-    bitSet(sAuthorityCardBits, event.payload1 - kCardBoolBase, true);
+    confirmCardPublished(event.payload1 - kCardBoolBase);
     markLocalTracker(event.payload1, event.payload0 != 0);
     if (changed) {
         OSReport("[SMSOBB] story-flag apply id=0x%08X val=%u live=1\n", event.payload1,
@@ -648,7 +827,7 @@ bool applySecretCompleteWorldEvent(const CommWorldEvent &event) {
     bool changed = false;
     if (!applyBoolFlag(fm, event.payload1, event.payload0, &changed))
         return false;
-    bitSet(sAuthorityCardBits, event.payload1 - kCardBoolBase, true);
+    confirmCardPublished(event.payload1 - kCardBoolBase);
     markLocalTracker(event.payload1, event.payload0 != 0);
     if (changed)
         OSReport("[SMSOBB] secret-flag apply id=0x%08X val=%u live=1\n", event.payload1,

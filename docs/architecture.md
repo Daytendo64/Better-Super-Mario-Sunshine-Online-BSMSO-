@@ -6,7 +6,7 @@ Each player runs an independent Dolphin instance with BSE + `_SMSO.kxe`. This is
 
 ```
 Launcher (WPF) ←→ TCP/UDP Server ←→ Other Launchers
-     ↕ RAM mailbox (672 bytes @ 0x817FC000)
+     ↕ RAM mailbox (5493 bytes @ 0x817FC000)
   Dolphin + _SMSO.kxe
 ```
 
@@ -28,7 +28,7 @@ Launcher (WPF) ←→ TCP/UDP Server ←→ Other Launchers
 
 ## Comm Buffer
 
-672-byte packed struct shared between C++ module and C# bridge. Magic `0x534D534F`, version 1.
+5493-byte packed struct shared between C++ module and C# bridge. Magic `0x534D534F`, CommVersion 14 (dual outbound `localPendingOwnership` / `localPendingMission` + dual inbound + progress snapshot mailbox). ModBuildId 53.
 
 ## Custom Mario model preparation
 
@@ -41,8 +41,14 @@ while preparation is pending.
 
 The expanded MEM1 arena uses separate JKR heaps:
 
-- 23.875 MiB arena: 16.5 MiB pack heap + 7.375 MiB body/J3D heap.
-- 7.5 MiB fallback arena: 2.25 MiB pack heap + 5.25 MiB body/J3D heap.
+- 23.875 MiB arena: 16.5 MiB pack heap + 7.375 MiB body/J3D heap (targets 9 remote
+  retail TMario puppets ≈ 5.4 MiB plus mid-stage custom arena headroom).
+- 7.5 MiB fallback arena: 2.25 MiB pack heap + 5.25 MiB body/J3D heap (honest soft
+  bound ≈ 7–8 remotes; prewarm soft-completes and remaining remotes lazy-spawn).
+
+Baseline body-pool prewarm fills all `MAX_PLAYERS - 1` remote slots during load /
+idle (staggered one construction per window). Heap exhaustion soft-completes the
+prewarm so custom ready-body work is not starved.
 
 The full split fits ten typical 1.6 MiB packs but only eight worst-case 2 MiB
 packs; excess identities remain on the old/retail visual until a safe stage

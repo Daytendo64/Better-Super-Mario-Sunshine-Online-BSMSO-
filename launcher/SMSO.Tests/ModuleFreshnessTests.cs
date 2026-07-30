@@ -39,6 +39,7 @@ public class ModuleFreshnessTests
             var status = ModuleInstaller.GetInstallStatus(root);
             Assert.False(status.NeedsUpdate);
             Assert.True(status.IsComplete);
+            Assert.Contains(ModuleVersionMessages.EverythingUpToDateReadyToPlay, status.Message, StringComparison.Ordinal);
             Assert.Contains($"build {ProtocolConstants.ModBuildId}", status.Message, StringComparison.Ordinal);
             Assert.True(File.Exists(ModuleInstaller.GetExtractedModBuildIdMarkerPath(mods)));
             Assert.False(File.Exists(Path.Combine(mods, ModuleVersionMessages.ModBuildIdMarkerFileName)));
@@ -193,7 +194,9 @@ public class ModuleFreshnessTests
         File.WriteAllBytes(Path.Combine(system, "KuriboKernel.bin"), new byte[32]);
         File.WriteAllBytes(Path.Combine(sys, "main.dol"), new byte[ModuleInstaller.OfficialMainDolSizeBytes]);
         File.WriteAllBytes(Path.Combine(sys, "boot.bin"), new byte[ModuleInstaller.OfficialBootBinSizeBytes]);
-        File.WriteAllBytes(Path.Combine(mods, ModuleVersionMessages.BseModuleFileName), new byte[8]);
+        File.WriteAllBytes(
+            Path.Combine(mods, ModuleVersionMessages.BseModuleFileName),
+            new byte[ModuleInstaller.OfficialBseSizeBytes]);
         File.WriteAllBytes(Path.Combine(mods, ModuleVersionMessages.MovesetModuleFileName), new byte[8]);
         File.WriteAllBytes(Path.Combine(mods, ModuleVersionMessages.ModuleFileName), new byte[8]);
         return root;

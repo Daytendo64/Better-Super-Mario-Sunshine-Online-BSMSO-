@@ -41,6 +41,23 @@ public sealed class RedCoinAuthority
             _stages.Remove(NormalizeStage(courseId, episodeId));
     }
 
+    /// <summary>Clears every episode bucket for one course (plaza hub empty).</summary>
+    public void ResetCourse(byte courseId)
+    {
+        lock (_gate)
+        {
+            var keys = new List<(byte CourseId, byte EpisodeId)>();
+            foreach (var key in _stages.Keys)
+            {
+                if (key.CourseId == courseId)
+                    keys.Add(key);
+            }
+
+            foreach (var key in keys)
+                _stages.Remove(key);
+        }
+    }
+
     /// <summary>
     /// Sentinel <see cref="WorldEventRequest.Reserved"/> for a solo mission reset
     /// (module stage-enter with no same-stage peer). Not a collectible index.

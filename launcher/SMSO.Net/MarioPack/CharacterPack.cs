@@ -37,6 +37,14 @@ public static class CharacterPack
     public const int ModelIdLength = 8;
     public const string BetterSmsPrmName = "better_sms.prm";
     /// <summary>
+    /// Official BetterSunshineMoveset movement-params file. Loaded by Moveset from
+    /// the mounted mario volume (<c>/better_movement.prm</c> /
+    /// <c>/mario/better_movement.prm</c>). Retail SMS and the BSMSO release zip omit it
+    /// so Moveset keeps 1.0 multipliers. Injecting this file (gravity≈1.04× etc.) is what
+    /// made Moveset-ON feel heavier than release — Install must strip, not inject.
+    /// </summary>
+    public const string BetterMovementPrmName = "better_movement.prm";
+    /// <summary>
     /// Retail / BSE path basename for free-look body angle params
     /// (<c>/Mario/BodyAngleFree.prm</c> on the mounted mario volume).
     /// </summary>
@@ -118,6 +126,105 @@ public static class CharacterPack
         using var ms = new MemoryStream();
         stream.CopyTo(ms);
         return ms.ToArray();
+    }
+
+    /// <summary>
+    /// Official Moveset <c>better_movement.prm</c> payload (embedded from assets).
+    /// </summary>
+    public static byte[] GetBetterMovementPrmBytes()
+    {
+        const string resourceName = "SMSO.Net.MarioPack.better_movement.prm";
+        var asm = typeof(CharacterPack).Assembly;
+        using var stream = asm.GetManifestResourceStream(resourceName)
+            ?? throw new InvalidOperationException(
+                "Embedded resource missing: " + resourceName);
+        using var ms = new MemoryStream();
+        stream.CopyTo(ms);
+        return ms.ToArray();
+    }
+
+    /// <summary>
+    /// Inject/replace <c>better_movement.prm</c> at the RARC root of a mario archive
+    /// (raw RARC or Yaz0 SZS). Returns null when the archive already matches.
+    /// </summary>
+    public static byte[]? EnsureBetterMovementPrmInArchiveBytes(byte[] archiveBytes, out bool wasSzs)
+    {
+        wasSzs = Yaz0.IsYaz0(archiveBytes);
+        var expected = GetBetterMovementPrmBytes();
+        var rarcBytes = OpenToRarcBytes(archiveBytes);
+        var arc = RarcArchive.Open(rarcBytes);
+        var existing = arc.EnumerateFiles()
+            .FirstOrDefault(f => f.Name.Equals(BetterMovementPrmName, StringComparison.OrdinalIgnoreCase));
+        if (existing != null && existing.Data.AsSpan().SequenceEqual(expected))
+            return null;
+
+        UpsertRootFile(arc.Root, BetterMovementPrmName, expected);
+        var saved = new RarcArchive { RootName = arc.RootName, Root = arc.Root }.Save();
+        return wasSzs ? Yaz0.Compress(saved.AsSpan()) : saved;
+    }
+
+    /// <summary>
+    /// Remove <c>better_movement.prm</c> from a mario archive so retail/default feel
+    /// is restored when BetterSunshineMoveset is not installed.
+    /// </summary>
+    public static byte[]? RemoveBetterMovementPrmFromArchiveBytes(byte[] archiveBytes, out bool wasSzs)
+    {
+        wasSzs = Yaz0.IsYaz0(archiveBytes);
+        var rarcBytes = OpenToRarcBytes(archiveBytes);
+        var arc = RarcArchive.Open(rarcBytes);
+        var removed = RemoveRootFile(arc.Root, BetterMovementPrmName);
+        if (!removed)
+            return null;
+
+        var saved = new RarcArchive { RootName = arc.RootName, Root = arc.Root }.Save();
+        return wasSzs ? Yaz0.Compress(saved.AsSpan()) : saved;
+    }
+
+    /// <summary>
+    /// Ensure a pack .arc on disk has official <c>better_movement.prm</c>.
+    /// </summary>
+    /// <returns><c>true</c> when the file was rewritten.</returns>
+    public static bool EnsureBetterMovementPrmInPackFile(string packPath)
+    {
+        if (string.IsNullOrWhiteSpace(packPath) || !File.Exists(packPath))
+            return false;
+
+        try
+        {
+            var bytes = File.ReadAllBytes(packPath);
+            var patched = EnsureBetterMovementPrmInArchiveBytes(bytes, out _);
+            if (patched == null)
+                return false;
+            File.WriteAllBytes(packPath, patched);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Strip <c>better_movement.prm</c> from a pack .arc on disk.
+    /// </summary>
+    public static bool RemoveBetterMovementPrmFromPackFile(string packPath)
+    {
+        if (string.IsNullOrWhiteSpace(packPath) || !File.Exists(packPath))
+            return false;
+
+        try
+        {
+            var bytes = File.ReadAllBytes(packPath);
+            var patched = RemoveBetterMovementPrmFromArchiveBytes(bytes, out _);
+            if (patched == null)
+                return false;
+            File.WriteAllBytes(packPath, patched);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     public sealed class MergeResult
@@ -429,6 +536,9 @@ public static class CharacterPack
         else
             root.Files.Add(new RarcFileEntry { Name = fileName, Data = data });
     }
+
+    private static bool RemoveRootFile(RarcDirectory root, string fileName) =>
+        root.Files.RemoveAll(f => f.Name.Equals(fileName, StringComparison.OrdinalIgnoreCase)) > 0;
 
     private static RarcDirectory? FindChildDirectory(RarcDirectory dir, string name)
     {
@@ -1054,7 +1164,8 @@ public static class CharacterPack
     }
 
     public static MergeResult BuildMergedPack(byte[] retailArchiveBytes, byte[] customSzsBytes,
-        bool replaceMatchingBcks = false, bool injectBodyAngleFreePrm = false)
+        bool replaceMatchingBcks = false, bool injectBodyAngleFreePrm = false,
+        bool injectBetterMovementPrm = false)
     {
         var retailRarc = OpenToRarcBytes(retailArchiveBytes);
         var retail = RarcArchive.Open(retailRarc);
@@ -1165,6 +1276,15 @@ public static class CharacterPack
             injectedBodyAngle = true;
         }
 
+        // Official Moveset retune — only when the caller wants it. Always injecting
+        // left custom packs heavier after Moveset.kxe was removed (PRM still mounted).
+        if (injectBetterMovementPrm)
+        {
+            var arc = RarcArchive.Open(packArc);
+            UpsertRootFile(arc.Root, BetterMovementPrmName, GetBetterMovementPrmBytes());
+            packArc = new RarcArchive { RootName = arc.RootName, Root = arc.Root }.Save();
+        }
+
         // Model id hashes visual/anim replacements (BMD/BTK/BCK) so re-importing
         // the same SZS keeps a stable 8-char id. BAS is paired for animSound but
         // excluded from the id — identical retail BAS would otherwise churn ids
@@ -1186,9 +1306,9 @@ public static class CharacterPack
             var nameBytes = Encoding.ASCII.GetBytes(name.ToLowerInvariant());
             foreach (var replacement in candidates)
             {
-                hashMaterial.Write(nameBytes, 0, nameBytes.Length);
-                hashMaterial.WriteByte(0);
-                hashMaterial.Write(replacement, 0, replacement.Length);
+            hashMaterial.Write(nameBytes, 0, nameBytes.Length);
+            hashMaterial.WriteByte(0);
+            hashMaterial.Write(replacement, 0, replacement.Length);
             }
         }
 

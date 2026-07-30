@@ -1,12 +1,14 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Text.Json;
 using System.Threading;
 using GCNTools;
+using SMSO.Net;
 using SMSO.Net.MarioPack;
 
 namespace SMSO.Launcher;
@@ -16,6 +18,29 @@ internal readonly record struct MarioPackInstallResult(
     bool Deferred,
     int InstalledCount,
     string Message);
+
+/// <summary>
+/// Outcome of copying AppData / bundled library packs into the game tree or disc image.
+/// </summary>
+internal readonly record struct LibraryPackSyncResult(
+    int LibraryPackCount,
+    int NewlyInstalled,
+    int AlreadyPresent,
+    int MissingAfterSync,
+    int SkippedUnsafe,
+    bool DeferredBecauseDolphin,
+    bool BundledSourceAvailable,
+    string Summary)
+{
+    /// <summary>True when every library pack is present on disc (or there were none to install).</summary>
+    public bool IsComplete => MissingAfterSync == 0 && !DeferredBecauseDolphin;
+
+    /// <summary>True when packs were expected but Install could not fully place them.</summary>
+    public bool HasWarning =>
+        DeferredBecauseDolphin ||
+        MissingAfterSync > 0 ||
+        (BundledSourceAvailable && LibraryPackCount == 0);
+}
 
 /// <summary>
 /// Installs merged character packs into the extracted game tree under
@@ -41,6 +66,62 @@ internal static class MarioPackInstaller
     {
         public required bool Safe { get; init; }
         public required string Reason { get; init; }
+    }
+
+    /// <summary>
+    /// DirectoryBlob FST sizes are fixed at Dolphin boot. Any replace/shrink of
+    /// <c>data/bsmso_models/*.arc</c> under a live emulator causes DVDRead past EOF
+    /// → retail "The Disc could not be read". Detect any Dolphin process (not just
+    /// the launcher-tracked PID) so background startup sync cannot punch through.
+    /// </summary>
+    /// <summary>
+    /// Test seam: when set, replaces the live process scan so install-path tests
+    /// stay hermetic on machines where a real Dolphin happens to be running.
+    /// </summary>
+    public static Func<bool>? DolphinRunningProbeOverride { get; set; }
+
+    public static bool IsAnyDolphinProcessRunning()
+    {
+        var probe = DolphinRunningProbeOverride;
+        if (probe != null)
+            return probe();
+
+        foreach (var name in new[] { "Dolphin", "DolphinQt2", "DolphinWX" })
+        {
+            Process[]? procs = null;
+            try
+            {
+                procs = Process.GetProcessesByName(name);
+                if (procs.Length > 0)
+                    return true;
+            }
+            catch
+            {
+                // Best-effort; prefer allowing install over false-positive lockout.
+            }
+            finally
+            {
+                if (procs != null)
+                {
+                    foreach (var proc in procs)
+                        proc.Dispose();
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private static bool AllowLivePackReplace(bool replaceExisting, Action<string>? log = null)
+    {
+        if (!replaceExisting)
+            return false;
+        if (!IsAnyDolphinProcessRunning())
+            return true;
+        log?.Invoke(
+            "Dolphin is running — leaving existing model packs unchanged " +
+            "(DirectoryBlob FST size is fixed until restart). Missing packs may still be added.");
+        return false;
     }
 
     public static bool TryResolveRetailMarioBytes(string isoPath, out byte[] bytes, out string? error)
@@ -149,6 +230,348 @@ internal static class MarioPackInstaller
         log?.Invoke($"Created {RetailDataMarioArcRelative} for SMSLoadArchive remount.");
     }
 
+    /// <summary>
+    /// Cross-process gate for Moveset.kxe / better_movement.prm disc writes so
+    /// multi-instance Launch/Install cannot race inject vs strip on the shared tree.
+    /// </summary>
+    private static readonly Mutex BetterMovementDiscMutex =
+        new(false, @"Local\BSMSO.BetterMovementDisc");
+
+    private static bool TryEnterBetterMovementDiscGate(Action<string>? log, out bool locked)
+    {
+        locked = false;
+        try
+        {
+            locked = BetterMovementDiscMutex.WaitOne(TimeSpan.FromSeconds(30));
+            if (!locked)
+            {
+                log?.Invoke(
+                    "Timed out waiting for another BSMSO instance to finish Moveset/PRM disc writes — retry Install.");
+                return false;
+            }
+
+            return true;
+        }
+        catch (AbandonedMutexException)
+        {
+            locked = true;
+            return true;
+        }
+    }
+
+    private static void ExitBetterMovementDiscGate(bool locked)
+    {
+        if (!locked)
+            return;
+        try
+        {
+            BetterMovementDiscMutex.ReleaseMutex();
+        }
+        catch (ApplicationException)
+        {
+            // Not owned — best-effort.
+        }
+    }
+
+    /// <summary>
+    /// Loose <c>better_movement.prm</c> paths BSE Moveset can still load even after
+    /// archive strip (seen under files/, files/mario/, and sys/files/mario/packs).
+    /// </summary>
+    private static IEnumerable<string> EnumerateLooseBetterMovementPrmPaths(string gameRoot)
+    {
+        yield return Path.Combine(gameRoot, "files", CharacterPack.BetterMovementPrmName);
+        yield return Path.Combine(gameRoot, "files", "mario", CharacterPack.BetterMovementPrmName);
+        yield return Path.Combine(gameRoot, "files", "data", CharacterPack.BetterMovementPrmName);
+        yield return Path.Combine(
+            gameRoot, "sys", "files", "mario", "packs", "01", CharacterPack.BetterMovementPrmName);
+
+        var packsRoot = Path.Combine(gameRoot, "sys", "files", "mario", "packs");
+        if (!Directory.Exists(packsRoot))
+            yield break;
+
+        string[] packDirs;
+        try
+        {
+            packDirs = Directory.GetDirectories(packsRoot);
+        }
+        catch
+        {
+            yield break;
+        }
+
+        foreach (var dir in packDirs)
+            yield return Path.Combine(dir, CharacterPack.BetterMovementPrmName);
+    }
+
+    private static int DeleteLooseBetterMovementPrmFiles(string gameRoot, Action<string>? log)
+    {
+        var removed = 0;
+        foreach (var path in EnumerateLooseBetterMovementPrmPaths(gameRoot).Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            if (!File.Exists(path))
+                continue;
+            try
+            {
+                File.Delete(path);
+                removed++;
+                log?.Invoke($"Removed loose {CharacterPack.BetterMovementPrmName} → {path}");
+            }
+            catch (Exception ex)
+            {
+                log?.Invoke($"Could not remove loose {CharacterPack.BetterMovementPrmName} ({path}): {ex.Message}");
+            }
+        }
+
+        return removed;
+    }
+
+    private static bool ArchiveBytesContainBetterMovementPrm(byte[] archiveBytes)
+    {
+        try
+        {
+            var rarc = CharacterPack.OpenToRarcBytes(archiveBytes);
+            var arc = RarcArchive.Open(rarc);
+            return arc.EnumerateFiles().Any(f =>
+                f.Name.Equals(CharacterPack.BetterMovementPrmName, StringComparison.OrdinalIgnoreCase));
+        }
+        catch
+        {
+            // Fall back to ASCII scan when RARC parse fails (corrupt / non-mario).
+            var text = System.Text.Encoding.ASCII.GetString(archiveBytes);
+            return text.Contains(CharacterPack.BetterMovementPrmName, StringComparison.OrdinalIgnoreCase);
+        }
+    }
+
+    /// <summary>
+    /// Read-only scan: Moveset.kxe and/or residual better_movement.prm still on disc.
+    /// Used after Install (proof) and on Launch (warn only — never auto-inject).
+    /// </summary>
+    public readonly record struct BetterMovementPresence(
+        bool MovesetKxePresent,
+        int ArchiveHits,
+        int LooseHits,
+        string Summary);
+
+    public static BetterMovementPresence ProbeBetterMovementPresence(
+        string gameRootOrIso,
+        Action<string>? log = null)
+    {
+        if (!ModuleInstallValidator.TryResolveGameRoot(gameRootOrIso, out var gameRoot) || gameRoot == null)
+            return new BetterMovementPresence(false, 0, 0, "Game root unresolved.");
+
+        var movesetPath = Path.Combine(
+            gameRoot, "files", "Kuribo!", "Mods", ModuleVersionMessages.MovesetModuleFileName);
+        var movesetPresent = File.Exists(movesetPath);
+
+        var archiveHits = 0;
+        foreach (var relative in new[]
+                 {
+                     RetailDataMarioArcRelative,
+                     RetailMarioRelative,
+                     @"files\data\mario.szs",
+                 })
+        {
+            var path = Path.Combine(gameRoot, relative);
+            if (!File.Exists(path))
+                continue;
+            try
+            {
+                if (ArchiveBytesContainBetterMovementPrm(File.ReadAllBytes(path)))
+                {
+                    archiveHits++;
+                    log?.Invoke($"VERIFY: {CharacterPack.BetterMovementPrmName} still in {relative}");
+                }
+            }
+            catch (Exception ex)
+            {
+                log?.Invoke($"VERIFY: could not read {relative}: {ex.Message}");
+            }
+        }
+
+        var modelsDir = GetModelsDirectory(gameRoot);
+        if (Directory.Exists(modelsDir))
+        {
+            foreach (var arc in Directory.EnumerateFiles(modelsDir, "*.arc"))
+            {
+                try
+                {
+                    if (ArchiveBytesContainBetterMovementPrm(File.ReadAllBytes(arc)))
+                    {
+                        archiveHits++;
+                        log?.Invoke($"VERIFY: {CharacterPack.BetterMovementPrmName} still in {Path.GetFileName(arc)}");
+                    }
+                }
+                catch
+                {
+                    // best-effort scan
+                }
+            }
+        }
+
+        var looseHits = EnumerateLooseBetterMovementPrmPaths(gameRoot)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Count(File.Exists);
+
+        foreach (var loose in EnumerateLooseBetterMovementPrmPaths(gameRoot)
+                     .Distinct(StringComparer.OrdinalIgnoreCase)
+                     .Where(File.Exists))
+            log?.Invoke($"VERIFY: loose {CharacterPack.BetterMovementPrmName} at {loose}");
+
+        if (movesetPresent)
+            log?.Invoke($"VERIFY: {ModuleVersionMessages.MovesetModuleFileName} present at {movesetPath}");
+
+        var summary =
+            archiveHits > 0 || looseHits > 0
+                ? $"better_movement.prm leftovers (heavier than release): archives={archiveHits} loose={looseHits}" +
+                  (movesetPresent ? "; Moveset.kxe present" : "")
+                : movesetPresent
+                    ? "Moveset.kxe present, better_movement.prm absent (release-matching)."
+                    : "BSE movement clean (no Moveset.kxe, no better_movement.prm).";
+        log?.Invoke($"VERIFY: {summary}");
+        return new BetterMovementPresence(movesetPresent, archiveHits, looseHits, summary);
+    }
+
+    /// <summary>
+    /// Obsolete path: do not call from Install. Injecting <c>better_movement.prm</c>
+    /// raises gravity/jump multipliers and made Moveset-ON feel heavier than the
+    /// release zip (which only installed <c>BetterSunshineMoveset.kxe</c>). Kept for
+    /// tests / emergency tooling — production Install always <see cref="RemoveBetterMovementPrm"/>.
+    /// </summary>
+    public static int EnsureBetterMovementPrm(string gameRootOrIso, Action<string>? log = null)
+    {
+        if (!ModuleInstallValidator.TryResolveGameRoot(gameRootOrIso, out var gameRoot) || gameRoot == null)
+            return 0;
+        if (!TryEnterBetterMovementDiscGate(log, out var locked))
+            return 0;
+
+        try
+        {
+            var patched = 0;
+            foreach (var relative in new[]
+                     {
+                         RetailDataMarioArcRelative,
+                         RetailMarioRelative,
+                         @"files\data\mario.szs",
+                     })
+            {
+                var path = Path.Combine(gameRoot, relative);
+                if (!File.Exists(path))
+                    continue;
+                try
+                {
+                    var bytes = File.ReadAllBytes(path);
+                    var next = CharacterPack.EnsureBetterMovementPrmInArchiveBytes(bytes, out _);
+                    if (next == null)
+                        continue;
+                    File.WriteAllBytes(path, next);
+                    patched++;
+                    log?.Invoke($"Patched BSE movement ({CharacterPack.BetterMovementPrmName}) → {relative}");
+                }
+                catch (Exception ex)
+                {
+                    log?.Invoke($"BSE movement patch skipped for {relative}: {ex.Message}");
+                }
+            }
+
+            var modelsDir = GetModelsDirectory(gameRoot);
+            if (Directory.Exists(modelsDir))
+            {
+                foreach (var arc in Directory.EnumerateFiles(modelsDir, "*.arc"))
+                {
+                    if (CharacterPack.EnsureBetterMovementPrmInPackFile(arc))
+                    {
+                        patched++;
+                        log?.Invoke($"Patched BSE movement → {Path.GetFileName(arc)}");
+                    }
+                }
+            }
+
+            return patched;
+        }
+        finally
+        {
+            ExitBetterMovementDiscGate(locked);
+        }
+    }
+
+    /// <summary>
+    /// Strip leftover <c>better_movement.prm</c> from retail mario archives,
+    /// model packs, and loose disc paths when Patch BSE moveset is off.
+    /// </summary>
+    public static int RemoveBetterMovementPrm(string gameRootOrIso, Action<string>? log = null)
+    {
+        if (!ModuleInstallValidator.TryResolveGameRoot(gameRootOrIso, out var gameRoot) || gameRoot == null)
+            return 0;
+        if (!TryEnterBetterMovementDiscGate(log, out var locked))
+            return 0;
+
+        try
+        {
+            var removed = 0;
+            foreach (var relative in new[]
+                     {
+                         RetailDataMarioArcRelative,
+                         RetailMarioRelative,
+                         @"files\data\mario.szs",
+                     })
+            {
+                var path = Path.Combine(gameRoot, relative);
+                if (!File.Exists(path))
+                    continue;
+                try
+                {
+                    var bytes = File.ReadAllBytes(path);
+                    var next = CharacterPack.RemoveBetterMovementPrmFromArchiveBytes(bytes, out _);
+                    if (next == null)
+                        continue;
+                    File.WriteAllBytes(path, next);
+                    removed++;
+                    log?.Invoke($"Removed BSE movement ({CharacterPack.BetterMovementPrmName}) → {relative}");
+                }
+                catch (Exception ex)
+                {
+                    log?.Invoke($"BSE movement remove skipped for {relative}: {ex.Message}");
+                }
+            }
+
+            var modelsDir = GetModelsDirectory(gameRoot);
+            if (Directory.Exists(modelsDir))
+            {
+                foreach (var arc in Directory.EnumerateFiles(modelsDir, "*.arc"))
+                {
+                    if (CharacterPack.RemoveBetterMovementPrmFromPackFile(arc))
+                    {
+                        removed++;
+                        log?.Invoke($"Removed BSE movement → {Path.GetFileName(arc)}");
+                    }
+                }
+            }
+
+            removed += DeleteLooseBetterMovementPrmFiles(gameRoot, log);
+
+            // Proof pass — log any survivors so Install leaves a clear audit trail.
+            var presence = ProbeBetterMovementPresence(gameRoot, log);
+            if (presence.ArchiveHits > 0 || presence.LooseHits > 0)
+            {
+                log?.Invoke(
+                    "WARNING: better_movement.prm still present after strip — " +
+                    "close other BSMSO instances and Install again.");
+            }
+            else
+            {
+                log?.Invoke(
+                    "Confirmed retail movement: better_movement.prm absent from mario archives, " +
+                    "CustomModels packs, and loose disc paths.");
+            }
+
+            return removed;
+        }
+        finally
+        {
+            ExitBetterMovementDiscGate(locked);
+        }
+    }
+
     public static MarioPackInstallResult InstallPackToGame(
         string isoPath,
         string modelId,
@@ -198,16 +621,30 @@ internal static class MarioPackInstaller
         return new MarioPackInstallResult(true, false, 1, $"Installed model pack {packId}.");
     }
 
-    public static void EnsurePackPresent(string isoPath, string modelId, Action<string>? log = null)
+    /// <param name="replaceExisting">
+    /// When false, an already-installed pack is left untouched. Live DirectoryBlob
+    /// sessions must pass false: Dolphin's FST records file sizes at boot, and
+    /// shrinking/replacing a pack under a running emulator causes DVDRead past
+    /// EOF → retail "The Disc could not be read".
+    /// </param>
+    public static void EnsurePackPresent(
+        string isoPath,
+        string modelId,
+        Action<string>? log = null,
+        bool replaceExisting = true)
     {
         var id = CharacterPack.NormalizeModelId(modelId);
         if (id.Length == 0)
             return;
 
+        replaceExisting = AllowLivePackReplace(replaceExisting, log);
+
         var trimmed = isoPath.Trim().Trim('"');
         var kind = ModuleInstallValidator.ClassifyInstallTarget(trimmed);
         if (kind == ModuleInstallTargetKind.DiscImage)
         {
+            // Disc images are rebuilt atomically and skipped when Dolphin locks
+            // the file; replaceExisting does not apply the same DirectoryBlob risk.
             EnsurePacksOnDiscImage(trimmed, new[] { id }, log);
             return;
         }
@@ -218,6 +655,14 @@ internal static class MarioPackInstaller
         EnsureRetailDataMarioArc(gameRoot, log);
 
         var dest = GetInstalledPackPath(gameRoot, id);
+        if (!replaceExisting && File.Exists(dest))
+        {
+            log?.Invoke(
+                $"Model pack {id} already on disc folder — left unchanged while Dolphin may be live " +
+                "(DirectoryBlob FST size is fixed until restart).");
+            return;
+        }
+
         if (!ModelLibrary.TryGetPackBytes(id, out var packBytes) || packBytes.Length == 0)
             return;
 
@@ -226,7 +671,8 @@ internal static class MarioPackInstaller
             log?.Invoke($"Model pack {id} rejected (unsafe for remotes): {unsafeReason}");
             // Remove a previously-installed crashy pack so SMSLoadArchive misses
             // and the module soft-falls back to retail instead of initValues faulting.
-            if (File.Exists(dest))
+            // Only when replace is allowed — never delete under a live DirectoryBlob.
+            if (replaceExisting && File.Exists(dest))
             {
                 try
                 {
@@ -244,7 +690,7 @@ internal static class MarioPackInstaller
         }
 
         Directory.CreateDirectory(GetModelsDirectory(gameRoot));
-        if (EnsureInstalledPackFile(dest, ModelLibrary.GetPackPath(id), packBytes))
+        if (EnsureInstalledPackFile(dest, ModelLibrary.GetPackPath(id), packBytes, replaceExisting))
             log?.Invoke($"Auto-copied model pack {id} into game folder.");
         RemoveLegacyRuntimePreloadIndex(gameRoot);
     }
@@ -254,23 +700,102 @@ internal static class MarioPackInstaller
     /// remount can find them without selecting each model first.
     /// Works for extracted trees and .iso/.gcm disc images.
     /// </summary>
-    public static int EnsureAllLibraryPacksPresent(string isoPath, Action<string>? log = null)
+    /// <param name="replaceExisting">
+    /// When false (or when any Dolphin process is running), existing packs are
+    /// left untouched; only missing packs are copied. Live replace under
+    /// DirectoryBlob causes retail disc-read fatals.
+    /// </param>
+    public static int EnsureAllLibraryPacksPresent(
+        string isoPath,
+        Action<string>? log = null,
+        bool replaceExisting = true) =>
+        EnsureAllLibraryPacksPresentDetailed(isoPath, log, replaceExisting).NewlyInstalled;
+
+    /// <summary>
+    /// Same as <see cref="EnsureAllLibraryPacksPresent"/> but returns a full
+    /// sync report so Install can warn instead of silently succeeding with 0 packs.
+    /// </summary>
+    public static LibraryPackSyncResult EnsureAllLibraryPacksPresentDetailed(
+        string isoPath,
+        Action<string>? log = null,
+        bool replaceExisting = true)
     {
         var trimmed = isoPath.Trim().Trim('"');
+        var bundledAvailable = ModelLibrary.BundledModelsDirectoryAvailable();
         var ids = ModelLibrary.ListEntries(includeRetail: false)
             .Select(e => CharacterPack.NormalizeModelId(e.Id))
             .Where(id => id.Length > 0)
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToArray();
 
+        if (ids.Length == 0)
+        {
+            var emptySummary = bundledAvailable
+                ? "Bundled CustomModels/ is present beside the launcher but the AppData library is empty after seed — " +
+                  "packs were not installed into the game. Check library.json next to the .arc files."
+                : "No custom model packs in the AppData library — nothing to install into the game.";
+            log?.Invoke(emptySummary);
+            return new LibraryPackSyncResult(
+                0, 0, 0, 0, 0, false, bundledAvailable, emptySummary);
+        }
+
+        replaceExisting = AllowLivePackReplace(replaceExisting, log);
+
         var kind = ModuleInstallValidator.ClassifyInstallTarget(trimmed);
         if (kind == ModuleInstallTargetKind.DiscImage)
-            return EnsurePacksOnDiscImage(trimmed, ids, log);
+        {
+            // ISO rebuild requires exclusive access; skip entirely while Dolphin holds the image.
+            if (IsAnyDolphinProcessRunning())
+            {
+                var deferred =
+                    $"Skipped disc-image pack sync while Dolphin is running " +
+                    $"({ids.Length} pack(s) still need Install). Close Dolphin and re-run Install / patch modules.";
+                log?.Invoke(deferred);
+                return new LibraryPackSyncResult(
+                    ids.Length, 0, 0, ids.Length, 0, true, bundledAvailable, deferred);
+            }
+
+            var discResult = EnsurePacksOnDiscImageWithResult(trimmed, ids, log);
+            var discPresent = 0;
+            var manifestPath = trimmed + DiscPackManifestSuffix;
+            var known = LoadDiscPackManifest(manifestPath);
+            foreach (var id in ids)
+            {
+                if (known.Contains(id))
+                    discPresent++;
+            }
+
+            var discMissing = Math.Max(0, ids.Length - discPresent);
+            var discSummary = discResult.Succeeded && discMissing == 0
+                ? discResult.InstalledCount > 0
+                    ? $"Installed {discResult.InstalledCount} model pack(s) into the disc image " +
+                      $"({discPresent}/{ids.Length} present)."
+                    : $"Model packs already on disc image ({discPresent}/{ids.Length})."
+                : discResult.Deferred
+                    ? discResult.Message
+                    : $"Model pack disc sync incomplete: {discPresent}/{ids.Length} present. {discResult.Message}";
+            log?.Invoke(discSummary);
+            return new LibraryPackSyncResult(
+                ids.Length,
+                discResult.InstalledCount,
+                Math.Max(0, discPresent - discResult.InstalledCount),
+                discMissing,
+                0,
+                discResult.Deferred,
+                bundledAvailable,
+                discSummary);
+        }
 
         if (!ModuleInstallValidator.TryResolveGameRoot(trimmed, out var gameRoot) || gameRoot == null)
-            return 0;
+        {
+            var unresolved = "Game folder is not an extracted SMS tree — custom model packs were not installed.";
+            log?.Invoke(unresolved);
+            return new LibraryPackSyncResult(
+                ids.Length, 0, 0, ids.Length, 0, false, bundledAvailable, unresolved);
+        }
 
-        return InstallPacksIntoGameRoot(gameRoot, ids, patchLocalSzs: false, log);
+        return InstallPacksIntoGameRootDetailed(
+            gameRoot, ids, patchLocalSzs: false, log, replaceExisting, bundledAvailable);
     }
 
     /// <summary>
@@ -281,39 +806,91 @@ internal static class MarioPackInstaller
         string gameRoot,
         IEnumerable<string> modelIds,
         bool patchLocalSzs,
-        Action<string>? log = null)
+        Action<string>? log = null,
+        bool replaceExisting = true) =>
+        InstallPacksIntoGameRootDetailed(
+                gameRoot,
+                modelIds,
+                patchLocalSzs,
+                log,
+                replaceExisting,
+                ModelLibrary.BundledModelsDirectoryAvailable())
+            .NewlyInstalled;
+
+    private static LibraryPackSyncResult InstallPacksIntoGameRootDetailed(
+        string gameRoot,
+        IEnumerable<string> modelIds,
+        bool patchLocalSzs,
+        Action<string>? log,
+        bool replaceExisting,
+        bool bundledAvailable)
     {
         if (string.IsNullOrWhiteSpace(gameRoot) || !Directory.Exists(gameRoot))
-            return 0;
+        {
+            return new LibraryPackSyncResult(
+                0, 0, 0, 0, 0, false, bundledAvailable,
+                $"Game root not found:\n{gameRoot}");
+        }
+
+        replaceExisting = AllowLivePackReplace(replaceExisting, log);
 
         EnsureRetailDataMarioArc(gameRoot, log);
         Directory.CreateDirectory(GetModelsDirectory(gameRoot));
 
-        var installed = 0;
-        foreach (var rawId in modelIds)
-        {
-            var id = CharacterPack.NormalizeModelId(rawId);
-            if (id.Length == 0)
-                continue;
+        var wanted = modelIds
+            .Select(CharacterPack.NormalizeModelId)
+            .Where(id => id.Length > 0)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
 
+        var installed = 0;
+        var alreadyPresent = 0;
+        var skippedUnsafe = 0;
+        var missing = 0;
+
+        foreach (var id in wanted)
+        {
             var dest = GetInstalledPackPath(gameRoot, id);
             if (!ModelLibrary.TryGetPackBytes(id, out var packBytes) || packBytes.Length == 0)
+            {
+                if (!File.Exists(dest))
+                    missing++;
+                else
+                    alreadyPresent++;
                 continue;
+            }
 
             if (!TryValidatePackCached(packBytes, out var unsafeReason))
             {
+                skippedUnsafe++;
                 log?.Invoke($"Skipped unsafe model pack {id}: {unsafeReason}");
-                if (File.Exists(dest))
+                if (replaceExisting && File.Exists(dest))
                 {
                     try { File.Delete(dest); }
                     catch { /* best-effort quarantine */ }
                 }
 
+                if (!File.Exists(dest))
+                    missing++;
                 continue;
             }
 
-            if (!EnsureInstalledPackFile(dest, ModelLibrary.GetPackPath(id), packBytes))
+            if (!replaceExisting && File.Exists(dest))
+            {
+                alreadyPresent++;
                 continue;
+            }
+
+            if (!EnsureInstalledPackFile(
+                    dest, ModelLibrary.GetPackPath(id), packBytes, replaceExisting))
+            {
+                if (File.Exists(dest))
+                    alreadyPresent++;
+                else
+                    missing++;
+                continue;
+            }
+
             installed++;
             log?.Invoke($"Installed model pack {id} → {dest}");
 
@@ -321,10 +898,39 @@ internal static class MarioPackInstaller
                 PatchLocalMarioSzs(gameRoot, packBytes, log);
         }
 
+        // Recount presence so "already present" / missing reflect the tree after writes.
+        alreadyPresent = 0;
+        missing = 0;
+        foreach (var id in wanted)
+        {
+            if (File.Exists(GetInstalledPackPath(gameRoot, id)))
+                alreadyPresent++;
+            else
+                missing++;
+        }
+
         if (installed > 0)
             log?.Invoke($"Installed {installed} custom model pack(s) into game folder.");
         RemoveLegacyRuntimePreloadIndex(gameRoot);
-        return installed;
+
+        var summary = missing == 0
+            ? $"Custom model packs on disc: {alreadyPresent}/{wanted.Length}" +
+              (installed > 0 ? $" ({installed} newly copied)." : ".")
+            : $"WARNING: Only {alreadyPresent}/{wanted.Length} custom model pack(s) present under " +
+              $"{ModelsFolderRelative} ({missing} missing" +
+              (skippedUnsafe > 0 ? $", {skippedUnsafe} unsafe skipped" : "") + ").";
+        if (missing > 0 || installed > 0)
+            log?.Invoke(summary);
+
+        return new LibraryPackSyncResult(
+            wanted.Length,
+            installed,
+            Math.Max(0, alreadyPresent - installed),
+            missing,
+            skippedUnsafe,
+            false,
+            bundledAvailable,
+            summary);
     }
 
     private static bool TryValidatePackCached(byte[] packBytes, out string reason)
@@ -343,13 +949,25 @@ internal static class MarioPackInstaller
     }
 
     /// <summary>
-    /// Copy a validated pack with an atomic same-directory rename. The source
-    /// timestamp is propagated, turning subsequent launch/session syncs into a
-    /// metadata-only check. Older installs get one streaming comparison, without
+    /// Atomically installs <paramref name="bytes"/> at <paramref name="destinationPath"/>.
+    /// When the destination already matches the source revision (size + mtime) or
+    /// byte content, this is a no-op. When <paramref name="replaceExisting"/> is
+    /// false and the destination exists, the file is left untouched — required for
+    /// live DirectoryBlob sessions where FST sizes are fixed at Dolphin boot.
+    /// Metadata-only check. Older installs get one streaming comparison, without
     /// allocating another destination-sized byte array.
     /// </summary>
-    private static bool EnsureInstalledPackFile(string destinationPath, string sourcePath, byte[] bytes)
+    private static bool EnsureInstalledPackFile(
+        string destinationPath,
+        string sourcePath,
+        byte[] bytes,
+        bool replaceExisting = true)
     {
+        // Last-line defense: even if a caller forgets the live flag, never overwrite
+        // under DirectoryBlob while Dolphin holds boot-time FST sizes.
+        if (replaceExisting && IsAnyDolphinProcessRunning())
+            replaceExisting = false;
+
         var fullDestination = Path.GetFullPath(destinationPath);
         var gate = InstalledPackLocks.GetOrAdd(fullDestination, static _ => new object());
         lock (gate)
@@ -368,6 +986,9 @@ internal static class MarioPackInstaller
 
             if (File.Exists(fullDestination))
             {
+                if (!replaceExisting)
+                    return false;
+
                 try
                 {
                     var destinationInfo = new FileInfo(fullDestination);
@@ -526,8 +1147,38 @@ internal static class MarioPackInstaller
     }
 
     /// <summary>
+    /// Records packs that actually exist under <c>files/data/bsmso_models/</c> on
+    /// an extracted tree (call after embedding packs, before or after ISO rebuild).
+    /// Never marks library ids that were not written — that poisoned the sidecar
+    /// and made later Installs skip missing packs.
+    /// </summary>
+    public static void RecordPacksPresentOnExtract(string discPath, string extractGameRoot)
+    {
+        if (!ModuleInstallValidator.IsPatchableDiscImage(discPath))
+            return;
+        if (string.IsNullOrWhiteSpace(extractGameRoot) || !Directory.Exists(extractGameRoot))
+            return;
+
+        var manifestPath = discPath + DiscPackManifestSuffix;
+        var known = LoadDiscPackManifest(manifestPath);
+        var modelsDir = GetModelsDirectory(extractGameRoot);
+        if (Directory.Exists(modelsDir))
+        {
+            foreach (var arc in Directory.EnumerateFiles(modelsDir, "*.arc"))
+            {
+                var id = CharacterPack.NormalizeModelId(Path.GetFileNameWithoutExtension(arc));
+                if (id.Length > 0)
+                    known.Add(id);
+            }
+        }
+
+        SaveDiscPackManifest(manifestPath, known);
+    }
+
+    /// <summary>
     /// Records that the current AppData library packs are present on a disc image
     /// (call after a successful module/disc rebuild that embedded them).
+    /// Prefer <see cref="RecordPacksPresentOnExtract"/> so only verified files are listed.
     /// </summary>
     public static void RecordAllLibraryPacksOnDisc(string discPath)
     {

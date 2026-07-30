@@ -15,7 +15,7 @@ Canonical identity is a **stable index 0–7** derived from a **sorted initialPo
 3. **Enemy-drop / partial stages** (Red Coin Field): settle may find fewer than 8. New reds expand by **position fingerprint** into matching slots or append. If the snapshot is already full of empties/dead junk, **claim** an uncollected placeholder slot. Never FIFO-bind remote bits to “next unclaimed live coin.” Adopt dead reds at most **one per Type6 tick**, and only true `TCoinRed` (never `TCoinEmpty`).
 4. **Authority state** = course+episode **8-bit collected mask** + optional packed pos per index. Server `RedCoinAuthority`: `payload1` = mask, `payload2` = packed `initialPos`.
 5. **Local collect**: adopt/expand, find dead/taken bound actor; publish `reserved=index`, `payload1=mask`, `payload2=pos`. Never invent “first unset bit.”
-6. **Remote apply**: remember mask + pos; `hideRedCoinByStableIndex` and/or **exact pos match** (`kRebindPosEpsilon`) only on first apply. Collect SFX/particles only when a live coin was actually hidden. Pending slots bind only when a live coin’s `initialPos` matches the stored fingerprint.
+6. **Remote apply**: remember this index + pos; `hideRedCoinByStableIndex` and/or **exact pos match** (`kRebindPosEpsilon`, ≥ pack scale) only on first apply. Collect SFX/particles when a live coin was hidden **or** at the packed fingerprint when hide must defer (Field drops); late bindPending plays pending FX once. **Do not** OR the stage-wide `payload1` mask into `sCollectedMask` during a per-index apply — ownership-push expand sends one event per bit each carrying the full mask; OR-ing on the first index marked siblings `already` and skipped their FX (ModBuildId 62). Packed-pos epsilon was raised in ModBuildId 63 after 4.0 missed scale-16 fingerprints.
 7. **HUD / switch arming / never call taken()** — unchanged from prior rules. Mission-live requires switch / red-coin card / **live `TCoinRed`** — never empty-only settle snapshots.
 8. **Sirena casino / hotel**: `sameStage` treats casino episodes **0↔3** and **1↔4** as equivalent. Server authority + occupancy also coalesce via `LevelCatalog.NormalizeEpisodeFromGame` so mission ids and catalog ids share one red-coin / npc-clean / graffiti key (prevents solo-death wipe and missing catch-up when roster stores catalog 0 while the module publishes mission 3).
 
@@ -33,10 +33,10 @@ On Red Coin Field, settle finds ~2 pre-placed reds. The first Type6 tick called 
 |-------|---------|
 | `reserved` | Stable index 0–7 (identity) |
 | `payload0` | `(authoritativeCount << 4) \| hudSlot` |
-| `payload1` | Authoritative collected **mask** (low 8 bits). Legacy packed XYZ in payload1 is ignored for hide (`looksLikePackedCollectibleWorldPos`). |
+| `payload1` | Authoritative collected **mask** (low 8 bits) for HUD count context / diagnostics. Per-index apply marks only `reserved`; do not OR full mask mid-expand. Legacy packed XYZ in payload1 is ignored for hide. |
 | `payload2` | Packed `initialPos` fingerprint for remote hide / pending-bind (0 = unknown). |
 
-No protocol version bump: older modules ignore `payload2`; mask in `payload1` still drives catch-up.
+No protocol version bump: older modules ignore `payload2`; each set bit still arrives as its own expand event.
 
 ## Stage reload / HUD rule
 

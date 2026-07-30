@@ -1,0 +1,76 @@
+==== 5a8e57e1-0db0-4236-bc47-ed76fc5833b8 lines=43 ====
+  StrReplace: C:\Users\young\OneDrive\Desktop\SMSOBB\module\src\red_coin_sync.cpp
+  StrReplace: C:\Users\young\OneDrive\Desktop\SMSOBB\module\src\red_coin_sync.cpp
+  StrReplace: C:\Users\young\OneDrive\Desktop\SMSOBB\module\src\red_coin_sync.cpp
+  StrReplace: C:\Users\young\OneDrive\Desktop\SMSOBB\module\src\red_coin_sync.cpp
+  StrReplace: C:\Users\young\OneDrive\Desktop\SMSOBB\module\src\red_coin_sync.cpp
+  StrReplace: C:\Users\young\OneDrive\Desktop\SMSOBB\module\src\red_coin_sync.cpp
+  StrReplace: C:\Users\young\OneDrive\Desktop\SMSOBB\module\src\red_coin_sync.cpp
+  StrReplace: C:\Users\young\OneDrive\Desktop\SMSOBB\module\src\red_coin_sync.cpp
+  StrReplace: C:\Users\young\OneDrive\Desktop\SMSOBB\module\src\red_coin_sync.cpp
+  StrReplace: C:\Users\young\OneDrive\Desktop\SMSOBB\module\src\red_coin_sync.cpp
+  StrReplace: C:\Users\young\OneDrive\Desktop\SMSOBB\module\src\red_coin_sync.cpp
+  StrReplace: C:\Users\young\OneDrive\Desktop\SMSOBB\module\src\red_coin_sync.cpp
+  StrReplace: C:\Users\young\OneDrive\Desktop\SMSOBB\module\src\red_coin_sync.cpp
+  StrReplace: C:\Users\young\OneDrive\Desktop\SMSOBB\module\src\red_coin_sync.cpp
+  StrReplace: C:\Users\young\OneDrive\Desktop\SMSOBB\module\src\red_coin_sync.cpp
+  StrReplace: C:\Users\young\OneDrive\Desktop\SMSOBB\launcher\SMSO.Net\WorldProgressSnapshot.cs
+  StrReplace: C:\Users\young\OneDrive\Desktop\SMSOBB\launcher\SMSO.Net\WorldProgressSnapshot.cs
+  StrReplace: C:\Users\young\OneDrive\Desktop\SMSOBB\launcher\SMSO.Server\RedCoinAuthority.cs
+  StrReplace: C:\Users\young\OneDrive\Desktop\SMSOBB\launcher\SMSO.Server\RedCoinAuthority.cs
+  StrReplace: C:\Users\young\OneDrive\Desktop\SMSOBB\launcher\SMSO.Server\RedCoinAuthority.cs
+  StrReplace: C:\Users\young\OneDrive\Desktop\SMSOBB\launcher\SMSO.Server\WorldEventRelay.cs
+  StrReplace: C:\Users\young\OneDrive\Desktop\SMSOBB\launcher\SMSO.Net\WorldProgressSnapshot.cs
+  StrReplace: C:\Users\young\OneDrive\Desktop\SMSOBB\launcher\SMSO.Net\PacketSerializer.cs
+  StrReplace: C:\Users\young\OneDrive\Desktop\SMSOBB\launcher\SMSO.Net\PacketSerializer.cs
+  StrReplace: C:\Users\young\OneDrive\Desktop\SMSOBB\launcher\SMSO.Net\PacketSerializer.cs
+  StrReplace: C:\Users\young\OneDrive\Desktop\SMSOBB\launcher\SMSO.Net\ProtocolConstants.cs
+  StrReplace: C:\Users\young\OneDrive\Desktop\SMSOBB\launcher\SMSO.Tests\CollectibleAuthorityTests.cs
+  StrReplace: C:\Users\young\OneDrive\Desktop\SMSOBB\launcher\SMSO.Net\ProtocolConstants.cs
+  StrReplace: C:\Users\young\OneDrive\Desktop\SMSOBB\launcher\SMSO.Net\ProtocolConstants.cs
+  StrReplace: C:\Users\young\OneDrive\Desktop\SMSOBB\docs\research\07-red-coin-episodes.md
+  StrReplace: C:\Users\young\OneDrive\Desktop\SMSOBB\docs\research\07-red-coin-episodes.md
+  Shell: .\tools\build.ps1
+  StrReplace: C:\Users\young\OneDrive\Desktop\SMSOBB\launcher\SMSO.Tests\PacketTests.cs
+  Shell: dotnet build launcher/SMSO.sln -c Release; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; dotnet test launcher/SMSO.Tests/SMSO.Tests.csproj -c Release --filte
+  Shell: Get-Item "dist\_BSMSO.kxe","dist\launcher\BSMSO.Launcher.exe","dist\latest-build.json","C:\Users\young\OneDrive\Desktop\sms online files\files\Kuribo!\Mods\_BSM
+  StrReplace: C:\Users\young\OneDrive\Desktop\SMSOBB\launcher\SMSO.Tests\RedCoinAuthorityTests.cs
+  StrReplace: C:\Users\young\OneDrive\Desktop\SMSOBB\launcher\SMSO.Tests\RedCoinAuthorityTests.cs
+  FINAL: ## What was broken |  | Hide/FX worked (mask + packed pos), but the **HUD number** did not, because: |  | 1. **Wrong card slot** — ownership-push expand set `payload0 = (count<<4)|stableIndex`, so remotes called `processDownCoin` with the sorted index instead of `TCoin::_154`. | 2. **Card not open yet** — apply wrote Type6 while the red-coin card was still closed (Field / pre-placed); icons never catch-up-filled when `mIsRedCoinCard` later rose. | 3. **`already` / replay** — mask updated, missing `processDownCoin` slots were skipped. |  | SMS has no `countRedCoin`; the card is driven by `processDownCoin`, scripts by `Type6Flag.mRedCoinCount`. |  | ## What changed |  | | Area | Change | | |------|--------| | | `module/src/red_coin_sync.cpp` | Prefer local `_154`; monotonic Type6 from mask popcount; processDown only when switch **or** card live; catch-up on card/switch arm; per-frame sync; local collect marks `sHudAppliedMask` | | | `RedCoinAuthority.cs` / `WorldProgressSnapshot` / `PacketSerializer` | Store HUD slots; **FormatVersion 3** carries 8 slot bytes; expand uses real hudSlot | | | `docs/research/07-red-coin-episodes.md` | HUD count semantics note | | | **ModBuildId** | **64** (CommVersion unchanged) | |  | ## W
+==== 87f106b3-9965-4dab-811d-ca4194e933aa lines=14 ====
+  Shell: cd "C:\Users\young\OneDrive\Desktop\SMSOBB" && powershell -NoProfile -ExecutionPolicy Bypass -File "tools\build.ps1"
+  Shell: Set-Location "C:\Users\young\OneDrive\Desktop\SMSOBB"; powershell -NoProfile -ExecutionPolicy Bypass -File "tools\build.ps1"
+  Shell: Set-Location "C:\Users\young\OneDrive\Desktop\SMSOBB"; dotnet build "SMSO.Launcher\SMSO.Launcher.csproj" -c Release; dotnet build "SMSO.ServerHost\SMSO.ServerHo
+  Shell: Set-Location "C:\Users\young\OneDrive\Desktop\SMSOBB"; dotnet build "launcher\SMSO.Launcher\SMSO.Launcher.csproj" -c Release; dotnet build "launcher\SMSO.Server
+  Shell: Select-String -Path "C:\Users\young\OneDrive\Desktop\SMSOBB\launcher\**\ProtocolConstants*" -Pattern "ModBuildId" -ErrorAction SilentlyContinue; Get-ChildItem -
+  FINAL: ## Build & deploy complete (ModBuildId 64) |  | ### `_BSMSO.kxe` | | Location | Size | LastWriteTime | | |----------|------|---------------| | | `SMSOBB\dist\_BSMSO.kxe` | **402,144 bytes** | **7/26/2026 3:23:43 PM** | | | `sms online files\files\Kuribo!\Mods\_BSMSO.kxe` | 402,144 bytes | 3:23:43 PM | |  | `tools/build.ps1` rebuilt `world_sync.cpp` and deployed to Kuribo Mods. |  | ### `world_sync` FormatVersion 3 | In `module\src\world_sync.cpp` (included in this build): | - Comment: `FormatVersion 3 = v2 shine bitset + red-stage HUD slot bytes` | - Check: `if (version != 3) return false;` |  | ### Launcher Release | - `dotnet build` — `launcher\SMSO.Launcher` + `launcher\SMSO.ServerHost` — **Release**, 0 errors | - `ProtocolConstants.ModBuildId = **64**` |  | **Copied to `dist\launcher` and `sms online files`** (refreshed from stale **3:12 PM** → **3:22 PM**): |  | | File | Size | LastWriteTime | | |------|------|---------------| | | BSMSO.Launcher.exe | 280,064 | 3:22:08 PM | | | BSMSO.Launcher.dll | 581,120 | 3:22:08 PM | | | SMSO.Bridge.dll | 89,088 | 3:22:06 PM | | | SMSO.Net.dll | 193,024 | 3:22:06 PM | | | SMSO.Server.dll | 98,816 | 3:22:06 PM | |  | Both destinations have matching timestamps. |  | ### ServerHost → `dist\server` | - `SM
+==== 5210ee45-8ea8-42cd-aab4-e7f9b306ff9d lines=42 ====
+  Shell: rg -n "processDownCoin|startAppearRedCoin|mRedCoin" --glob "*.hxx" --glob "*.hpp" --glob "*.h" -g "!**/build/**" module/lib/BetterSunshineEngine 2>$null; Get-Ch
+  Shell: rg -n "ModBuildId|BuildId|kBuild" module/include module/src launcher --glob "*.{hpp,cpp,cs,h}" | Select-Object -First 40; rg -n "processAppearRed|processDownCoi
+  StrReplace: C:\Users\young\OneDrive\Desktop\SMSOBB\module\src\red_coin_sync.cpp
+  StrReplace: C:\Users\young\OneDrive\Desktop\SMSOBB\module\src\red_coin_sync.cpp
+  StrReplace: C:\Users\young\OneDrive\Desktop\SMSOBB\module\src\red_coin_sync.cpp
+  StrReplace: C:\Users\young\OneDrive\Desktop\SMSOBB\module\src\red_coin_sync.cpp
+  StrReplace: None
+  StrReplace: None
+  StrReplace: None
+  StrReplace: None
+  StrReplace: None
+  StrReplace: None
+  StrReplace: C:\Users\young\OneDrive\Desktop\SMSOBB\module\src\red_coin_sync.cpp
+  StrReplace: C:\Users\young\OneDrive\Desktop\SMSOBB\module\src\red_coin_sync.cpp
+  StrReplace: C:\Users\young\OneDrive\Desktop\SMSOBB\module\src\red_coin_sync.cpp
+  StrReplace: C:\Users\young\OneDrive\Desktop\SMSOBB\launcher\SMSO.Net\ProtocolConstants.cs
+  StrReplace: C:\Users\young\OneDrive\Desktop\SMSOBB\launcher\SMSO.Tests\CollectibleAuthorityTests.cs
+  StrReplace: C:\Users\young\OneDrive\Desktop\SMSOBB\docs\research\07-red-coin-episodes.md
+  StrReplace: C:\Users\young\OneDrive\Desktop\SMSOBB\module\src\red_coin_sync.cpp
+  StrReplace: C:\Users\young\OneDrive\Desktop\SMSOBB\docs\research\07-red-coin-episodes.md
+  Shell: powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Users\young\OneDrive\Desktop\SMSOBB\tools\build.ps1"
+  Shell: dotnet build "C:\Users\young\OneDrive\Desktop\SMSOBB\launcher\SMSO.sln" -c Release --nologo
+  StrReplace: C:\Users\young\OneDrive\Desktop\SMSOBB\launcher\SMSO.Net\ProtocolConstants.cs
+  Shell: $mods = "C:\Users\young\OneDrive\Desktop\sms online files\files\Kuribo!"
+@(
+  "$mods\.bsmso-mod-build-id",
+  "$mods\Mods\.bsmso-mod-build-id"
+) | ForEach-Object
+  FINAL: ## Return to parent |  | ### What the popup is | Not `processDownCoin` (that’s the **gold** coin digit animator @ `0x801466F0`). |  | Vanilla red floating digit: | 1. `TCoinRed::taken` @ `0x801BE428` → `incFlag(0x60000)` (`mRedCoinCount`) | 2. `TGCConsole2::perform` @ `0x8014083C`: if count ≠ cache @ console+`0x448` → `changeTexture` + particle emitter 508 | 3. If red card pane **not** visible → `startAppearRedCoin` @ `0x8014A9BC` (sets `mIsRedCoinCard`) | 4. While armed → `processAppearRed` @ `0x801455CC` animates the large digit into the card |  | ### Why remotes missed it | They already got **HUD `x N/8`** from writing `mRedCoinCount` (perform’s `changeTexture`). After a local switch arm the card pane stays visible, so perform **skips** `startAppearRedCoin` and never re-arms `processAppearRed`. Old code also called `processDownCoin` (wrong function). |  | ### What changed | In `red_coin_sync.cpp`, first-time apply / HUD catch-up now: | - Stales the `0x448` count cache | - Calls `startAppearRedCoin` (resets `mRedCoinCardTimer`) |  | Still on existing ownership-push / mission snapshot apply — no new events. |  | ### TCP risk | **None.** No per-collect live WorldEvent fanout; same coalesced snapshot path as ModBuildId 63. |  | #

@@ -10,6 +10,12 @@ namespace smso {
 
 void initRemoteActors();
 void updateRemoteActors(TMarDirector *director);
+// Notify remote-actor systems that BF_CONNECTED just rose or fell mid-stage
+// (disconnect / rehost without stageExit). Falling edge parks bodies + clears
+// mailbox remotes; rising edge re-arms heap/pool residency so remotes can spawn
+// again without requiring a Dolphin process restart.
+void notifyRemoteActorsConnectionChanged(bool connected);
+
 // Tear down stage-local remote actor state. When keepHeapAndPool is true (still
 // connected), the expanded-MEM1 remote heap, pack buffers on that heap, and
 // prewarmed body pool survive for the next stage — only perform-group membership

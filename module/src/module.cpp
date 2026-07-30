@@ -17,10 +17,13 @@
 #include "story_flag_sync.hpp"
 #include "mario_model_system.hpp"
 #include "mario_tex_anim.hpp"
+#include "jump_spray_rspmp.hpp"
+#include "music_volume.hpp"
 
 #include <BetterSMS/application.hxx>
 #include <BetterSMS/game.hxx>
 #include <BetterSMS/module.hxx>
+#include <BetterSMS/player.hxx>
 #include <BetterSMS/stage.hxx>
 #include <Dolphin/OS.h>
 #include <JSystem/J2D/J2DOrthoGraph.hxx>
@@ -35,6 +38,8 @@ extern TMario *gpMarioAddress;
 BETTER_SMS_FOR_CALLBACK static bool appContextHeartbeat(TApplication *app) {
     (void)app;
     smso::publishMailboxAnchor();
+    // Title / boot / main-loop contexts have no stageUpdate — still drive BGM volume.
+    smso::updateMusicVolume();
     return true;
 }
 
@@ -51,14 +56,19 @@ BETTER_SMS_FOR_CALLBACK static void movieLoopCutsceneSkipRefresh(TApplication *a
         (buf->bridgeFlags &
          (smso::BF_SYNC_STORY | smso::BF_SYNC_MISSION | smso::BF_SYNC_SECRET)) != 0;
     smso::updateStoryFlagSyncConnectionState(connected, storySync);
+    // Bowser epilogue (movie 14) latches shine 0x77 here — stageUpdate is idle.
+    if (connected)
+        smso::tryPublishBowserEpilogueShine();
 }
 
 BETTER_SMS_FOR_CALLBACK static void stageInit(TMarDirector *director) {
-    // Soft same-stage reloads can skip exitStageCallbacks. Tear remotes before
-    // model re-init so dangling Shadow MActors / body graphs cannot outlive the
-    // recycled stage (initMarioModelSystem also forces model/TexAnim cleanup).
+    // Soft same-stage reloads can skip exitStageCallbacks. Tear perform-group /
+    // actor residency before model re-init, but KEEP the remote heap+pool so
+    // Hide & Seek death reloads (and other soft paths) can reattach remotes
+    // immediately. keepHeapAndPool=false previously destroyed the kept pool when
+    // exit was skipped / raced, leaving remotes missing after control-ready.
     if (smso::marioModelSystemIsLive())
-        smso::clearRemoteActors(/*keepHeapAndPool=*/false);
+        smso::clearRemoteActors(/*keepHeapAndPool=*/true);
 
     // Remount character archives before remote/local Mario bodies init this stage.
     smso::initMarioModelSystem();
@@ -74,6 +84,7 @@ BETTER_SMS_FOR_CALLBACK static void stageInit(TMarDirector *director) {
     smso::ensureNpcReactHooks();
     smso::applyHotelWarpMissionOverride(director);
     smso::normalizeSirenaSecretMissionEpisode(director);
+    smso::ensureJumpSprayRspmpAnimRegistered();
     smso::updateCutsceneSkipPatches();
     // Same course/episode reloads must clear red-coin trackers; course/episode IDs alone
     // do not change, so captureLocalRedCoinProgress would otherwise keep stale state.
@@ -91,11 +102,14 @@ BETTER_SMS_FOR_CALLBACK static void stageInit(TMarDirector *director) {
 
 BETTER_SMS_FOR_CALLBACK static void stageUpdate(TMarDirector *director) {
     smso::publishMailboxAnchor();
+    // Apply before hotel DistFade so slot-3 main volume multiplies with slot-0 mixes.
+    smso::updateMusicVolume();
 
     if (gpMarDirector) {
         smso::guardHideSeekDeathBeforeWarp(director);
         smso::consumeWarpIntent();
         smso::syncHotelWarpMissionEpisode(director);
+        smso::updateHotelShadowMarioBgm(director);
         smso::applyPendingWarpPoint(director);
     }
 
@@ -120,6 +134,7 @@ BETTER_SMS_FOR_CALLBACK static void stageUpdate(TMarDirector *director) {
     // (TParams uses params.szs) — re-apply pack override after Mario exists.
     smso::ensureLocalBodyAngleFreeParams(gpMarioAddress);
     smso::ensureMarioTexAnimsBound(gpMarioAddress);
+    smso::updateJumpSprayRspmpAnim(gpMarioAddress);
     smso::exportLocalPlayer(gpMarioAddress, director);
     smso::updatePuppets(director);
     smso::updateRemoteActors(director);
@@ -145,6 +160,9 @@ BETTER_SMS_FOR_CALLBACK static void stageDraw2D(TMarDirector *director, const J2
 BETTER_SMS_FOR_CALLBACK static void stageExit(TApplication *app) {
     (void)app;
     smso::scrubEphemeralSpawnDirectorFlagsOnStageExit();
+    // Corona boss leave / movie collapse may have latched shine 0x77 just before
+    // exit — flush before trackers reseed on the next stageInit.
+    smso::tryPublishBowserEpilogueShine();
     smso::updateCutsceneSkipPatches();
     // Mark loading before clearPuppets so the bridge never observes Active+cleared
     // remotes and republishes Connected snapshots mid-teardown.
@@ -190,6 +208,12 @@ BETTER_SMS_FOR_CALLBACK static void connectionHudDraw(TApplication *app, const J
     smso::connection_hud::drawSystem(app, ortho);
 }
 
+BETTER_SMS_FOR_CALLBACK static void playerUpdateJumpSprayRspmp(TMario *player, bool isMario) {
+    if (!isMario)
+        return;
+    smso::updateJumpSprayRspmpAnim(player);
+}
+
 static void registerCallbacks() {
     BetterSMS::Application::registerContextCallback(TApplication::CONTEXT_GAME_BOOT, appContextHeartbeat);
     BetterSMS::Application::registerContextCallback(TApplication::CONTEXT_GAME_BOOT_LOGO, appContextHeartbeat);
@@ -198,20 +222,21 @@ static void registerCallbacks() {
     BetterSMS::Game::addLoopCallback(movieLoopCutsceneSkipRefresh);
     BetterSMS::Game::addLoopCallback(connectionHudUpdate);
     BetterSMS::Game::addPostDrawCallback(connectionHudDraw);
+    BetterSMS::Player::addUpdateCallback(playerUpdateJumpSprayRspmp);
     BetterSMS::Stage::addInitCallback(stageInit);
     BetterSMS::Stage::addUpdateCallback(stageUpdate);
     BetterSMS::Stage::addDraw2DCallback(stageDraw2D);
     BetterSMS::Stage::addExitCallback(stageExit);
 }
 
-KURIBO_MODULE_BEGIN("Better Super Mario Sunshine Online", "BSMSO", "v1.0") {
+KURIBO_MODULE_BEGIN("Better Super Mario Sunshine Online", "BSMSO", "v1.1") {
     KURIBO_EXECUTE_ON_LOAD {
         registerCallbacks();
         smso::initCommBuffer();
         smso::initWorldSync();
         smso::bootHideSeek();
         smso::updateCutsceneSkipPatches();
-        OSReport("[SMSOBB] v1.0 loaded (comm @ %p)\n", smso::getCommBuffer());
+        OSReport("[SMSOBB] v1.1 loaded (comm @ %p)\n", smso::getCommBuffer());
         OSReport("[SMSO] body-reclaim=stage-only\n");
     }
 }

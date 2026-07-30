@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "1.0",
+    [string]$Version = "2.0",
     [string]$LauncherDir = "",
     [string]$ServerDir = "",
     [string]$BseKxePath = "",
@@ -90,6 +90,35 @@ if (-not (Test-Path (Join-Path $LauncherDir "BSMSO.Launcher.exe"))) {
     Write-Error "Missing published launcher. Run .\tools\publish.ps1 first."
 }
 
+# Keep assets/latest-build.json in sync so the zip-bundled launcher update check
+# matches this package's ModBuildId (no GitHub fetch — local sidecar only).
+$protocolCs = Join-Path $Root "launcher\SMSO.Net\ProtocolConstants.cs"
+$modBuildId = 0
+if (Test-Path $protocolCs) {
+    $m = Select-String -Path $protocolCs -Pattern 'public const ushort ModBuildId = (\d+);' |
+        Select-Object -First 1
+    if ($m) { $modBuildId = [int]$m.Matches[0].Groups[1].Value }
+}
+$latestBuildPath = Join-Path $Root "assets\latest-build.json"
+if ($modBuildId -le 0) {
+    Write-Warning "Could not parse ModBuildId from ProtocolConstants.cs - skipping latest-build.json"
+} else {
+    $latestDir = Split-Path -Parent $latestBuildPath
+    if (-not (Test-Path $latestDir)) {
+        New-Item -ItemType Directory -Force -Path $latestDir | Out-Null
+    }
+    $latestJson = @"
+{
+  "modBuildId": $modBuildId,
+  "versionLabel": "$Version",
+  "message": "Download the latest BSMSO zip and replace BSMSO.Launcher.exe (then run Update module)."
+}
+"@
+    Set-Content -Path $latestBuildPath -Value $latestJson -Encoding utf8
+    Copy-Item $latestBuildPath (Join-Path $DistDir "latest-build.json") -Force
+    Write-Host "Wrote assets/latest-build.json (ModBuildId $modBuildId)"
+}
+
 if (Test-Path $PackageDir) {
     Remove-Item $PackageDir -Recurse -Force
 }
@@ -106,7 +135,7 @@ if ($Variant -eq "lite") {
 Lite client variant:
 - Client Actions hides Game Modes and Connected Players (Model + Teleport remain).
 - In-game player nametags are disabled in this module build.
-- Same network build id as the full release — can join the same lobbies.
+- Same network build id as the full release - can join the same lobbies.
 - Hosts that need game-mode controls should use the full BSMSO zip.
 
 "@
@@ -121,11 +150,12 @@ $liteNotes
 Quick start:
 1. Run $LauncherExeName.
 2. In Settings, set your username, Dolphin path, and game ISO path (extracted folder or .iso/.gcm).
-3. Settings → Game modules → Install / patch modules.
+3. Settings -> Game modules -> Install / patch modules.
    Requires an original Super Mario Sunshine copy with nothing installed on it.
    This installs the full Better Sunshine Engine / Kuribo runtime:
    Kuribo!\System\ (KuriboKernel.bin), BSE-patched sys\main.dol and sys\boot.bin,
    BetterSunshineEngine.kxe, BetterSunshineMoveset.kxe, and _BSMSO.kxe. (.gcz is not supported.)
+   It also overlays title/UI archives (nintendo.szs, option.szs) into files\data\.
 4. Launch Dolphin, enter a stage, then Host Server or Connect.
 
 Custom models:
@@ -141,7 +171,7 @@ Important files:
 - BetterSunshineMoveset.kxe - Better Sunshine Moveset module (installed with the other .kxe files)
 - _BSMSO.kxe - BSMSO game module (loads after BSE)
 - CustomModels\ - bundled character packs (Shadow Mario, Luigi, Needle, etc.)
-- assets\ - level data used by the launcher and server
+- assets\ - level data + disc UI overlays (assets\data\nintendo.szs, option.szs)
 - server\ - headless dedicated server host
 - docs\ - setup, networking, and troubleshooting guides
 
@@ -158,6 +188,15 @@ Get-ChildItem $LauncherDir -File |
     Where-Object { $_.Name -ne "BSMSO.Launcher.exe" -and $_.Extension -ne ".pdb" } |
     ForEach-Object { Copy-Item $_.FullName (Join-Path $PackageDir $_.Name) -Force }
 Copy-Item (Join-Path $LauncherDir "assets") (Join-Path $PackageDir "assets") -Recurse -Force
+# Sidecar for launcher update check (prefer package root; also under assets/).
+if (Test-Path $latestBuildPath) {
+    Copy-Item $latestBuildPath (Join-Path $PackageDir "latest-build.json") -Force
+    $pkgAssets = Join-Path $PackageDir "assets"
+    if (-not (Test-Path $pkgAssets)) {
+        New-Item -ItemType Directory -Force -Path $pkgAssets | Out-Null
+    }
+    Copy-Item $latestBuildPath (Join-Path $pkgAssets "latest-build.json") -Force
+}
 
 # Bundle custom Mario packs so recipients get the same model list without
 # re-importing SZS files. Prefer AppData library (authoritative labels + arcs);

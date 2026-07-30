@@ -1,0 +1,94 @@
+{
+  "version": 3,
+  "targets": {
+    "net8.0": {
+      "SMSO.Net/1.0.0": {
+        "type": "project",
+        "framework": ".NETCoreApp,Version=v8.0",
+        "compile": {
+          "bin/placeholder/SMSO.Net.dll": {}
+        },
+        "runtime": {
+          "bin/placeholder/SMSO.Net.dll": {}
+        }
+      }
+    }
+  },
+  "libraries": {
+    "SMSO.Net/1.0.0": {
+      "type": "project",
+      "path": "../../launcher/SMSO.Net/SMSO.Net.csproj",
+      "msbuildProject": "../../launcher/SMSO.Net/SMSO.Net.csproj"
+    }
+  },
+  "projectFileDependencyGroups": {
+    "net8.0": [
+      "SMSO.Net >= 1.0.0"
+    ]
+  },
+  "packageFolders": {
+    "C:\\Users\\young\\.nuget\\packages\\": {}
+  },
+  "project": {
+    "version": "1.0.0",
+    "restore": {
+      "projectUniqueName": "C:\\Users\\young\\OneDrive\\Desktop\\SMSOBB\\tools\\_reimport-packs\\ReimportPacks.csproj",
+      "projectName": "ReimportPacks",
+      "projectPath": "C:\\Users\\young\\OneDrive\\Desktop\\SMSOBB\\tools\\_reimport-packs\\ReimportPacks.csproj",
+      "packagesPath": "C:\\Users\\young\\.nuget\\packages\\",
+      "outputPath": "C:\\Users\\young\\OneDrive\\Desktop\\SMSOBB\\tools\\_reimport-packs\\obj\\",
+      "projectStyle": "PackageReference",
+      "configFilePaths": [
+        "C:\\Users\\young\\AppData\\Roaming\\NuGet\\NuGet.Config"
+      ],
+      "originalTargetFrameworks": [
+        "net8.0"
+      ],
+      "sources": {
+        "https://api.nuget.org/v3/index.json": {}
+      },
+      "frameworks": {
+        "net8.0": {
+          "targetAlias": "net8.0",
+          "projectReferences": {
+            "C:\\Users\\young\\OneDrive\\Desktop\\SMSOBB\\launcher\\SMSO.Net\\SMSO.Net.csproj": {
+              "projectPath": "C:\\Users\\young\\OneDrive\\Desktop\\SMSOBB\\launcher\\SMSO.Net\\SMSO.Net.csproj"
+            }
+          }
+        }
+      },
+      "warningProperties": {
+        "warnAsError": [
+          "NU1605"
+        ]
+      },
+      "restoreAuditProperties": {
+        "enableAudit": "true",
+        "auditLevel": "low",
+        "auditMode": "direct"
+      }
+    },
+    "frameworks": {
+      "net8.0": {
+        "targetAlias": "net8.0",
+        "imports": [
+          "net461",
+          "net462",
+          "net47",
+          "net471",
+          "net472",
+          "net48",
+          "net481"
+        ],
+        "assetTargetFallback": true,
+        "warn": true,
+        "frameworkReferences": {
+          "Microsoft.NETCore.App": {
+            "privateAssets": "all"
+          }
+        },
+        "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\8.0.422/PortableRuntimeIdentifierGraph.json"
+      }
+    }
+  }
+}

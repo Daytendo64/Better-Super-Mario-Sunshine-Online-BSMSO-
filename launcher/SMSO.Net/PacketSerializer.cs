@@ -74,9 +74,55 @@ public static class PacketSerializer
         return true;
     }
 
-    public static byte[] BuildHandshake(Guid clientId) => WrapTcp(TcpPacketId.Handshake, clientId.ToByteArray());
+    public static byte[] BuildHandshake(Guid clientId, ushort? modBuildId = null)
+    {
+        var payload = new byte[ProtocolConstants.HandshakePayloadSize];
+        clientId.ToByteArray().CopyTo(payload, 0);
+        BinaryPrimitives.WriteUInt16LittleEndian(
+            payload.AsSpan(16, 2),
+            modBuildId ?? ProtocolConstants.ModBuildId);
+        return WrapTcp(TcpPacketId.Handshake, payload);
+    }
 
-    public static byte[] BuildJoinRequest(string username, string? marioModelId = null, ushort? modBuildId = null)
+    public static bool TryReadHandshakeModBuildId(ReadOnlySpan<byte> payload, out ushort modBuildId)
+    {
+        modBuildId = 0;
+        if (payload.Length < ProtocolConstants.HandshakePayloadSize)
+            return false;
+        modBuildId = BinaryPrimitives.ReadUInt16LittleEndian(payload.Slice(16, 2));
+        return true;
+    }
+
+    public static byte[] BuildHandshakeAck(byte slot, ushort? modBuildId = null)
+    {
+        var ack = new byte[ProtocolConstants.HandshakeAckPayloadSize];
+        ack[16] = slot;
+        BinaryPrimitives.WriteUInt16LittleEndian(
+            ack.AsSpan(17, 2),
+            modBuildId ?? ProtocolConstants.ModBuildId);
+        return WrapTcp(TcpPacketId.HandshakeAck, ack);
+    }
+
+    public static bool TryReadHandshakeAck(
+        ReadOnlySpan<byte> payload,
+        out byte slot,
+        out ushort? serverModBuildId)
+    {
+        slot = 0;
+        serverModBuildId = null;
+        if (payload.Length < 17)
+            return false;
+        slot = payload[16];
+        if (payload.Length >= ProtocolConstants.HandshakeAckPayloadSize)
+            serverModBuildId = BinaryPrimitives.ReadUInt16LittleEndian(payload.Slice(17, 2));
+        return true;
+    }
+
+    public static byte[] BuildJoinRequest(
+        string username,
+        string? marioModelId = null,
+        ushort? modBuildId = null,
+        ushort? gameProfileId = null)
     {
         var payload = new byte[ProtocolConstants.JoinRequestSize];
         var bytes = System.Text.Encoding.UTF8.GetBytes(username ?? string.Empty);
@@ -86,6 +132,9 @@ public static class PacketSerializer
         BinaryPrimitives.WriteUInt16LittleEndian(
             payload.AsSpan(16 + ProtocolConstants.MarioModelIdSize, 2),
             modBuildId ?? ProtocolConstants.ModBuildId);
+        BinaryPrimitives.WriteUInt16LittleEndian(
+            payload.AsSpan(16 + ProtocolConstants.MarioModelIdSize + 2, 2),
+            gameProfileId ?? ProtocolConstants.CurrentGameProfileId);
         return WrapTcp(TcpPacketId.JoinRequest, payload);
     }
 
@@ -93,11 +142,13 @@ public static class PacketSerializer
         ReadOnlySpan<byte> payload,
         out string username,
         out string marioModelId,
-        out ushort modBuildId)
+        out ushort modBuildId,
+        out ushort gameProfileId)
     {
         username = string.Empty;
         marioModelId = string.Empty;
         modBuildId = 0;
+        gameProfileId = 0;
         if (payload.Length < 16)
             return false;
 
@@ -108,8 +159,18 @@ public static class PacketSerializer
         // Old clients omit ModBuildId; treat as 0 so the server rejects VersionMismatch.
         if (payload.Length >= modelEnd + 2)
             modBuildId = BinaryPrimitives.ReadUInt16LittleEndian(payload.Slice(modelEnd, 2));
+        // Pre-profile clients omit the field; 0 fails the server profile gate.
+        if (payload.Length >= modelEnd + 4)
+            gameProfileId = BinaryPrimitives.ReadUInt16LittleEndian(payload.Slice(modelEnd + 2, 2));
         return true;
     }
+
+    public static bool TryReadJoinRequest(
+        ReadOnlySpan<byte> payload,
+        out string username,
+        out string marioModelId,
+        out ushort modBuildId)
+        => TryReadJoinRequest(payload, out username, out marioModelId, out modBuildId, out _);
 
     public static bool TryReadJoinRequest(ReadOnlySpan<byte> payload, out string username, out string marioModelId)
         => TryReadJoinRequest(payload, out username, out marioModelId, out _);
@@ -136,24 +197,24 @@ public static class PacketSerializer
     public static byte[] BuildGameModeState(in GameModeStatePacket state)
     {
         // mode(1)+flags(1)+seq(2)+roundStartMs(4)+tagEventId(1)+roles[N]+lastTaggedSlot(1)+graceRemainingMs(2)
-        var payload = new byte[9 + ProtocolConstants.StableMaxPlayers + 1 + 2];
+        var payload = new byte[9 + ProtocolConstants.MaxPlayers + 1 + 2];
         payload[0] = (byte)state.GameMode;
         payload[1] = (byte)state.Flags;
         BinaryPrimitives.WriteUInt16LittleEndian(payload.AsSpan(2, 2), state.Seq);
         BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(4, 4), state.RoundStartMs);
         payload[8] = state.TagEventId;
-        for (int i = 0; i < ProtocolConstants.StableMaxPlayers; i++)
+        for (int i = 0; i < ProtocolConstants.MaxPlayers; i++)
             payload[9 + i] = state.GetRole((byte)i);
-        payload[9 + ProtocolConstants.StableMaxPlayers] = state.LastTaggedSlot;
+        payload[9 + ProtocolConstants.MaxPlayers] = state.LastTaggedSlot;
         BinaryPrimitives.WriteUInt16LittleEndian(
-            payload.AsSpan(10 + ProtocolConstants.StableMaxPlayers, 2), state.GraceRemainingMs);
+            payload.AsSpan(10 + ProtocolConstants.MaxPlayers, 2), state.GraceRemainingMs);
         return WrapTcp(TcpPacketId.GameModeState, payload);
     }
 
     public static bool TryReadGameModeState(ReadOnlySpan<byte> payload, out GameModeStatePacket state)
     {
         state = GameModeStatePacket.CreateDefault();
-        if (payload.Length < 9 + ProtocolConstants.StableMaxPlayers + 1)
+        if (payload.Length < 9 + ProtocolConstants.MaxPlayers + 1)
             return false;
 
         state.GameMode = (GameMode)payload[0];
@@ -161,13 +222,13 @@ public static class PacketSerializer
         state.Seq = BinaryPrimitives.ReadUInt16LittleEndian(payload.Slice(2, 2));
         state.RoundStartMs = BinaryPrimitives.ReadUInt32LittleEndian(payload.Slice(4, 4));
         state.TagEventId = payload[8];
-        for (int i = 0; i < ProtocolConstants.StableMaxPlayers; i++)
+        for (int i = 0; i < ProtocolConstants.MaxPlayers; i++)
             state.SetRole((byte)i, (HideSeekRole)payload[9 + i]);
-        state.LastTaggedSlot = payload[9 + ProtocolConstants.StableMaxPlayers];
+        state.LastTaggedSlot = payload[9 + ProtocolConstants.MaxPlayers];
         // GraceRemainingMs added with hide grace; older payloads omit it (treat as 0).
-        if (payload.Length >= 11 + ProtocolConstants.StableMaxPlayers)
+        if (payload.Length >= 11 + ProtocolConstants.MaxPlayers)
             state.GraceRemainingMs = BinaryPrimitives.ReadUInt16LittleEndian(
-                payload.Slice(10 + ProtocolConstants.StableMaxPlayers, 2));
+                payload.Slice(10 + ProtocolConstants.MaxPlayers, 2));
         return true;
     }
 
@@ -250,7 +311,301 @@ public static class PacketSerializer
     }
 
     public static byte[] BuildWorldProgressRequest()
-        => WrapTcp(TcpPacketId.WorldProgressRequest, ReadOnlySpan<byte>.Empty);
+        => BuildWorldProgressRequest(0);
+
+    /// <summary>
+    /// Client asks for a progress heal. When <paramref name="clientProgressSeq"/> matches
+    /// the server's current seq, the server replies with an unchanged compact snapshot
+    /// instead of re-shipping all ownership bits.
+    /// </summary>
+    public static byte[] BuildWorldProgressRequest(uint clientProgressSeq)
+    {
+        var payload = new byte[ProtocolConstants.WorldProgressRequestClientSeqSize];
+        BinaryPrimitives.WriteUInt32LittleEndian(payload, clientProgressSeq);
+        return WrapTcp(TcpPacketId.WorldProgressRequest, payload);
+    }
+
+    public static bool TryReadWorldProgressRequestClientSeq(ReadOnlySpan<byte> payload,
+        out uint clientProgressSeq)
+    {
+        clientProgressSeq = 0;
+        if (payload.Length < ProtocolConstants.WorldProgressRequestClientSeqSize)
+            return payload.Length == 0; // legacy empty request
+        clientProgressSeq = BinaryPrimitives.ReadUInt32LittleEndian(
+            payload.Slice(0, ProtocolConstants.WorldProgressRequestClientSeqSize));
+        return true;
+    }
+
+    public static byte[] BuildWorldProgressSnapshot(WorldProgressSnapshot snapshot)
+        => WrapTcp(TcpPacketId.WorldProgressSnapshot, BuildWorldProgressSnapshotPayload(snapshot));
+
+    /// <summary>
+    /// LE payload body (no TCP wrapper) for the Dolphin progress-snapshot mailbox lane.
+    /// </summary>
+    public static byte[] BuildWorldProgressSnapshotPayload(WorldProgressSnapshot snapshot)
+    {
+        ArgumentNullException.ThrowIfNull(snapshot);
+
+        // Worst case still far under MaxTcpPayloadSize; size exactly then copy.
+        var estimated =
+            1 + 1 + 4 + // version, flags, progressSeq
+            WorldProgressSnapshot.ShineBitsByteCount + // shine bits (v2: 32)
+            1 + snapshot.BlueCourses.Count * (1 + 8) +
+            2 + snapshot.StoryFlags.Count * (4 + 1) +
+            2 + snapshot.TriggerFlags.Count * (1 + 1 + 4 + 1) +
+            2 + snapshot.SecretFlags.Count * (4 + 1) +
+            2 + snapshot.RedStages.Count * (1 + 1 + 1 + 8 * 4) +
+            2 + snapshot.NpcCleanStages.Count * (1 + 1 + 2);
+        if (estimated > ProtocolConstants.MaxTcpPayloadSize)
+            throw new InvalidOperationException(
+                $"WorldProgressSnapshot estimated size {estimated} exceeds MaxTcpPayloadSize");
+
+        var payload = new byte[estimated];
+        var offset = 0;
+        payload[offset++] = WorldProgressSnapshot.FormatVersion;
+        payload[offset++] = snapshot.Unchanged ? WorldProgressSnapshot.FlagUnchanged : (byte)0;
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(offset, 4), snapshot.ProgressSeq);
+        offset += 4;
+
+        if (snapshot.Unchanged)
+        {
+            Array.Resize(ref payload, offset);
+            return payload;
+        }
+
+        if (snapshot.ShineBits.Length != WorldProgressSnapshot.ShineBitsByteCount)
+            throw new ArgumentException(
+                $"ShineBits must be {WorldProgressSnapshot.ShineBitsByteCount} bytes",
+                nameof(snapshot));
+        Buffer.BlockCopy(snapshot.ShineBits, 0, payload, offset,
+            WorldProgressSnapshot.ShineBitsByteCount);
+        offset += WorldProgressSnapshot.ShineBitsByteCount;
+
+        payload[offset++] = (byte)Math.Min(byte.MaxValue, snapshot.BlueCourses.Count);
+        var blueCount = payload[offset - 1];
+        for (var i = 0; i < blueCount; i++)
+        {
+            var (courseId, mask) = snapshot.BlueCourses[i];
+            payload[offset++] = courseId;
+            BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(offset, 8), mask);
+            offset += 8;
+        }
+
+        void WriteU16Count(int count)
+        {
+            BinaryPrimitives.WriteUInt16LittleEndian(payload.AsSpan(offset, 2),
+                (ushort)Math.Min(ushort.MaxValue, count));
+            offset += 2;
+        }
+
+        WriteU16Count(snapshot.StoryFlags.Count);
+        var storyCount = Math.Min(ushort.MaxValue, snapshot.StoryFlags.Count);
+        for (var i = 0; i < storyCount; i++)
+        {
+            var (flagId, value) = snapshot.StoryFlags[i];
+            BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(offset, 4), flagId);
+            offset += 4;
+            payload[offset++] = value;
+        }
+
+        WriteU16Count(snapshot.TriggerFlags.Count);
+        var triggerCount = Math.Min(ushort.MaxValue, snapshot.TriggerFlags.Count);
+        for (var i = 0; i < triggerCount; i++)
+        {
+            var (courseId, episodeId, flagId, value) = snapshot.TriggerFlags[i];
+            payload[offset++] = courseId;
+            payload[offset++] = episodeId;
+            BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(offset, 4), flagId);
+            offset += 4;
+            payload[offset++] = value;
+        }
+
+        WriteU16Count(snapshot.SecretFlags.Count);
+        var secretCount = Math.Min(ushort.MaxValue, snapshot.SecretFlags.Count);
+        for (var i = 0; i < secretCount; i++)
+        {
+            var (flagId, value) = snapshot.SecretFlags[i];
+            BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(offset, 4), flagId);
+            offset += 4;
+            payload[offset++] = value;
+        }
+
+        WriteU16Count(snapshot.RedStages.Count);
+        var redCount = Math.Min(ushort.MaxValue, snapshot.RedStages.Count);
+        for (var i = 0; i < redCount; i++)
+        {
+            var stage = snapshot.RedStages[i];
+            payload[offset++] = stage.CourseId;
+            payload[offset++] = stage.EpisodeId;
+            payload[offset++] = stage.Mask;
+            for (var p = 0; p < 8; p++)
+            {
+                var packed = p < stage.PackedPos.Length ? stage.PackedPos[p] : 0u;
+                BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(offset, 4), packed);
+                offset += 4;
+            }
+        }
+
+        WriteU16Count(snapshot.NpcCleanStages.Count);
+        var npcCount = Math.Min(ushort.MaxValue, snapshot.NpcCleanStages.Count);
+        for (var i = 0; i < npcCount; i++)
+        {
+            var (courseId, episodeId, mask) = snapshot.NpcCleanStages[i];
+            payload[offset++] = courseId;
+            payload[offset++] = episodeId;
+            BinaryPrimitives.WriteUInt16LittleEndian(payload.AsSpan(offset, 2), mask);
+            offset += 2;
+        }
+
+        if (offset != payload.Length)
+            Array.Resize(ref payload, offset);
+        return payload;
+    }
+
+    public static bool TryReadWorldProgressSnapshot(ReadOnlySpan<byte> payload,
+        out WorldProgressSnapshot snapshot)
+    {
+        snapshot = WorldProgressSnapshot.CreateUnchanged(0);
+        if (payload.Length < 6)
+            return false;
+
+        var offset = 0;
+        var version = payload[offset++];
+        if (version != WorldProgressSnapshot.FormatVersion)
+            return false;
+
+        var flags = payload[offset++];
+        var progressSeq = BinaryPrimitives.ReadUInt32LittleEndian(payload.Slice(offset, 4));
+        offset += 4;
+        var unchanged = (flags & WorldProgressSnapshot.FlagUnchanged) != 0;
+        if (unchanged)
+        {
+            snapshot = WorldProgressSnapshot.CreateUnchanged(progressSeq);
+            return true;
+        }
+
+        if (payload.Length < offset + WorldProgressSnapshot.ShineBitsByteCount)
+            return false;
+
+        var shineBits = payload.Slice(offset, WorldProgressSnapshot.ShineBitsByteCount).ToArray();
+        offset += WorldProgressSnapshot.ShineBitsByteCount;
+
+        if (payload.Length < offset + 1)
+            return false;
+        var blueCount = payload[offset++];
+        var blues = new List<(byte, ulong)>(blueCount);
+        for (var i = 0; i < blueCount; i++)
+        {
+            if (payload.Length < offset + 1 + 8)
+                return false;
+            var courseId = payload[offset++];
+            var mask = BinaryPrimitives.ReadUInt64LittleEndian(payload.Slice(offset, 8));
+            offset += 8;
+            blues.Add((courseId, mask));
+        }
+
+        if (!TryReadU16(payload, ref offset, out var storyCount))
+            return false;
+        var stories = new List<(uint, byte)>(storyCount);
+        for (var i = 0; i < storyCount; i++)
+        {
+            if (payload.Length < offset + 5)
+                return false;
+            var flagId = BinaryPrimitives.ReadUInt32LittleEndian(payload.Slice(offset, 4));
+            offset += 4;
+            var value = payload[offset++];
+            stories.Add((flagId, value));
+        }
+
+        if (!TryReadU16(payload, ref offset, out var triggerCount))
+            return false;
+        var triggers = new List<(byte, byte, uint, byte)>(triggerCount);
+        for (var i = 0; i < triggerCount; i++)
+        {
+            if (payload.Length < offset + 7)
+                return false;
+            var courseId = payload[offset++];
+            var episodeId = payload[offset++];
+            var flagId = BinaryPrimitives.ReadUInt32LittleEndian(payload.Slice(offset, 4));
+            offset += 4;
+            var value = payload[offset++];
+            triggers.Add((courseId, episodeId, flagId, value));
+        }
+
+        if (!TryReadU16(payload, ref offset, out var secretCount))
+            return false;
+        var secrets = new List<(uint, byte)>(secretCount);
+        for (var i = 0; i < secretCount; i++)
+        {
+            if (payload.Length < offset + 5)
+                return false;
+            var flagId = BinaryPrimitives.ReadUInt32LittleEndian(payload.Slice(offset, 4));
+            offset += 4;
+            var value = payload[offset++];
+            secrets.Add((flagId, value));
+        }
+
+        if (!TryReadU16(payload, ref offset, out var redCount))
+            return false;
+        var reds = new List<WorldProgressSnapshot.RedStageMask>(redCount);
+        for (var i = 0; i < redCount; i++)
+        {
+            if (payload.Length < offset + 3 + 32)
+                return false;
+            var courseId = payload[offset++];
+            var episodeId = payload[offset++];
+            var mask = payload[offset++];
+            var packed = new uint[8];
+            for (var p = 0; p < 8; p++)
+            {
+                packed[p] = BinaryPrimitives.ReadUInt32LittleEndian(payload.Slice(offset, 4));
+                offset += 4;
+            }
+
+            reds.Add(new WorldProgressSnapshot.RedStageMask(courseId, episodeId, mask, packed));
+        }
+
+        if (!TryReadU16(payload, ref offset, out var npcCount))
+            return false;
+        var npcs = new List<(byte, byte, ushort)>(npcCount);
+        for (var i = 0; i < npcCount; i++)
+        {
+            if (payload.Length < offset + 4)
+                return false;
+            var courseId = payload[offset++];
+            var episodeId = payload[offset++];
+            var mask = BinaryPrimitives.ReadUInt16LittleEndian(payload.Slice(offset, 2));
+            offset += 2;
+            npcs.Add((courseId, episodeId, mask));
+        }
+
+        if (offset != payload.Length)
+            return false;
+
+        snapshot = new WorldProgressSnapshot
+        {
+            ProgressSeq = progressSeq,
+            Unchanged = false,
+            ShineBits = shineBits,
+            BlueCourses = blues,
+            StoryFlags = stories,
+            TriggerFlags = triggers,
+            SecretFlags = secrets,
+            RedStages = reds,
+            NpcCleanStages = npcs,
+        };
+        return true;
+    }
+
+    private static bool TryReadU16(ReadOnlySpan<byte> payload, ref int offset, out ushort value)
+    {
+        value = 0;
+        if (payload.Length < offset + 2)
+            return false;
+        value = BinaryPrimitives.ReadUInt16LittleEndian(payload.Slice(offset, 2));
+        offset += 2;
+        return true;
+    }
 
     public static byte[] BuildWorldEventRequest(in WorldEventRequest request)
     {

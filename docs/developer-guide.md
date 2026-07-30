@@ -6,7 +6,7 @@
 SMSO/
 ├── launcher/     # C# solution
 ├── module/       # BSE C++ module
-├── assets/       # levels.ntsc-u.json
+├── assets/       # levels.ntsc-u.json (course display names) + episode-names.ntsc-u.json
 ├── tools/        # build scripts
 └── docs/
 ```

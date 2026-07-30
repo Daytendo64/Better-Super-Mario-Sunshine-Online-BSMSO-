@@ -57,7 +57,7 @@ public sealed class DolphinConfigServiceTests
         var text = string.Join('\n', lines);
         Assert.Contains("CPUThread = True", text);
         Assert.Contains("DSPHLE = True", text);
-        Assert.Contains("FastDiscSpeed = False", text);
+        Assert.Contains("FastDiscSpeed = True", text);
         Assert.Contains("OverclockEnable = True", text);
         Assert.Contains("Overclock = 2.0", text);
         Assert.Contains($"RAMOverrideEnable = True", text);
@@ -203,6 +203,7 @@ public sealed class DolphinConfigServiceTests
                 Path.Combine(gameSettingsDir, $"{GameIdentity.BsmsGameId}.ini"));
             Assert.Contains("OverclockEnable = True", recommendedGameIni);
             Assert.Contains("Overclock = 2.0", recommendedGameIni);
+            Assert.Contains("FastDiscSpeed = True", recommendedGameIni);
 
             // User raises IR in Dolphin; next Launch with recommended on must keep it.
             File.WriteAllText(
@@ -227,12 +228,13 @@ public sealed class DolphinConfigServiceTests
             Assert.Contains("InternalResolution = 6", gfx);
 
             var dolphin = File.ReadAllText(Path.Combine(configDir, "Dolphin.ini"));
-            // CPU clock / disc / RAM are re-applied after restore (always-forced).
+            // CPU clock / RAM are re-applied after restore (always-forced).
+            // Fast Disc Speed is NOT forced when recommended is off — user/Dolphin choice.
             Assert.Contains("OverclockEnable = True", dolphin);
             Assert.Contains("Overclock = 2.0", dolphin);
             Assert.Contains("RAMOverrideEnable = True", dolphin);
             Assert.Contains("MEM1Size = 0x03000000", dolphin);
-            Assert.Contains("FastDiscSpeed = False", dolphin);
+            Assert.DoesNotContain("FastDiscSpeed = True", dolphin);
 
             var gameIni = File.ReadAllText(Path.Combine(gameSettingsDir, $"{GameIdentity.BsmsGameId}.ini"));
             Assert.Contains("FastDiscSpeed = False", gameIni);
@@ -281,7 +283,7 @@ public sealed class DolphinConfigServiceTests
     }
 
     [Fact]
-    public void EnsureMultiplayerMemoryConfig_ForcesEmulateDiscSpeedCpuClockAndRam_NotGraphics()
+    public void EnsureMultiplayerMemoryConfig_ForcesCpuClockAndRam_LeavesFastDiscSpeedAlone()
     {
         var root = Path.Combine(Path.GetTempPath(), "bsmso-dolphin-ram-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(root);
@@ -301,10 +303,10 @@ public sealed class DolphinConfigServiceTests
                 "[Settings]\nInternalResolution = 6\n");
             File.WriteAllText(
                 Path.Combine(configDir, "Dolphin.ini"),
-                "[Core]\nOverclockEnable = False\nOverclock = 0.7\n");
+                "[Core]\nOverclockEnable = False\nOverclock = 0.7\nFastDiscSpeed = False\n");
             File.WriteAllText(
                 Path.Combine(gameSettingsDir, $"{GameIdentity.BsmsGameId}.ini"),
-                "[Core]\nFastDiscSpeed = True\nOverclockEnable = False\nOverclock = 1.0\n\n[Gecko]\n$Keep\n");
+                "[Core]\nFastDiscSpeed = False\nOverclockEnable = False\nOverclock = 1.0\n\n[Gecko]\n$Keep\n");
 
             Assert.True(DolphinConfigService.EnsureMultiplayerMemoryConfig(
                 exePath, _ => { }, out var error), error);
@@ -326,10 +328,10 @@ public sealed class DolphinConfigServiceTests
             Assert.Contains("Overclock = 2.0", gameIni);
             Assert.Contains("$Keep", gameIni);
 
-            // Secondary GameSettings layout is synced too.
+            // Secondary GameSettings layout is synced for required Core only (no FastDiscSpeed).
             var configGameIni = File.ReadAllText(Path.Combine(
                 configDir, "GameSettings", $"{GameIdentity.BsmsGameId}.ini"));
-            Assert.Contains("FastDiscSpeed = False", configGameIni);
+            Assert.DoesNotContain("FastDiscSpeed = True", configGameIni);
             Assert.Contains("Overclock = 2.0", configGameIni);
         }
         finally

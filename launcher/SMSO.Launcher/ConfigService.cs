@@ -19,6 +19,8 @@ public sealed class AppConfig
     public bool NameTagGradientEnabled { get; set; }
     /// <summary>Empty = retail Mario; otherwise 8-char hex pack id from CustomModels library.</summary>
     public string SelectedMarioModelId { get; set; } = "";
+    /// <summary>In-game BGM / streamed music volume percent (0–100). Does not affect SFX.</summary>
+    public int MusicVolumePercent { get; set; } = 100;
     public uint MailboxAddress { get; set; } = 0x817FC000;
     public bool SyncFlags { get; set; }
     public bool SyncObjects { get; set; }
@@ -34,9 +36,22 @@ public sealed class AppConfig
     /// When false, restores the backed-up original Dolphin settings (RAM override still kept).
     /// </summary>
     public bool ApplyRecommendedDolphinSettings { get; set; }
+    /// <summary>
+    /// When true, Install adds <c>BetterSunshineMoveset.kxe</c> (extra moves).
+    /// When false, Install removes that .kxe so you get the vanilla SMS moveset only.
+    /// Click Install after toggling, then restart Dolphin.
+    /// </summary>
+    public bool PatchBseMoveset { get; set; } = false;
+    /// <summary>
+    /// Optional HTTP(S) override for latest-build.json. Empty = read the
+    /// bundled <c>latest-build.json</c> from the release zip (beside the
+    /// launcher, or under <c>assets/</c>). Env <c>BSMSO_UPDATE_MANIFEST_URL</c>
+    /// also overrides.
+    /// </summary>
+    public string UpdateManifestUrl { get; set; } = "";
 }
 
-public sealed class ConfigService
+public sealed class ConfigService : IDisposable
 {
     private static readonly string ConfigDir = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "SMSO");
@@ -46,6 +61,7 @@ public sealed class ConfigService
 
     private readonly string _configPath;
     private readonly string _logSuffix;
+    private readonly InstanceClaim _instanceClaim;
     private System.Timers.Timer? _debounce;
     private AppConfig _config = new();
 
@@ -56,10 +72,13 @@ public sealed class ConfigService
 
     public ConfigService()
     {
-        InstanceIndex = InstanceAllocator.GetInstanceIndex();
         Directory.CreateDirectory(ConfigDir);
         Directory.CreateDirectory(InstancesDir);
         Directory.CreateDirectory(LogDir);
+        // Exclusive lock file, not process enumeration: two launchers must never both be
+        // instance 0 and share config.json / username / log file.
+        _instanceClaim = InstanceAllocator.Claim(InstancesDir);
+        InstanceIndex = _instanceClaim.Index;
 
         if (InstanceIndex == 0)
         {
@@ -81,6 +100,31 @@ public sealed class ConfigService
             {
                 var json = File.ReadAllText(_configPath);
                 _config = JsonSerializer.Deserialize<AppConfig>(json) ?? CreateDefaults();
+                // Migrate / default PatchBseMoveset (and legacy PatchBseMovement).
+                try
+                {
+                    using var doc = JsonDocument.Parse(json);
+                    if (doc.RootElement.TryGetProperty("PatchBseMoveset", out var movesetProp) &&
+                        movesetProp.ValueKind is JsonValueKind.True or JsonValueKind.False)
+                    {
+                        _config.PatchBseMoveset = movesetProp.GetBoolean();
+                    }
+                    else if (doc.RootElement.TryGetProperty("PatchBseMovement", out var legacy) &&
+                             legacy.ValueKind is JsonValueKind.True or JsonValueKind.False)
+                    {
+                        _config.PatchBseMoveset = legacy.GetBoolean();
+                    }
+                    else
+                    {
+                        // Missing key on older configs: default retail (false). Explicit
+                        // true/false in JSON is preserved above.
+                        _config.PatchBseMoveset = false;
+                    }
+                }
+                catch
+                {
+                    _config.PatchBseMoveset = false;
+                }
                 if (MigrateLegacySyncDefaults(_config))
                     Save();
                 NormalizeConfig(_config);
@@ -103,6 +147,7 @@ public sealed class ConfigService
             SyncFlags = true,
             SyncObjects = true,
             SyncProgress = true,
+            PatchBseMoveset = false,
         };
         if (InstanceIndex > 0)
             cfg.Username = $"Player{InstanceIndex + 1}";
@@ -129,16 +174,23 @@ public sealed class ConfigService
             _config.NameTagOutlineColor = shared.NameTagOutlineColor;
             _config.NameTagGradientEnabled = shared.NameTagGradientEnabled;
             _config.SelectedMarioModelId = shared.SelectedMarioModelId;
+            _config.MusicVolumePercent = ClampMusicVolumePercent(shared.MusicVolumePercent);
             _config.MailboxAddress = shared.MailboxAddress;
             _config.SyncFlags = shared.SyncFlags;
             _config.SyncObjects = shared.SyncObjects;
             _config.SyncProgress = shared.SyncProgress;
+            _config.ApplyRecommendedDolphinSettings = shared.ApplyRecommendedDolphinSettings;
+            _config.PatchBseMoveset = shared.PatchBseMoveset;
+            _config.HideSeekGraceSeconds = ClampHideSeekGraceSeconds(shared.HideSeekGraceSeconds);
         }
         catch { /* ignore */ }
     }
 
     private static int ClampMaxPlayers(int value) =>
         Math.Clamp(value, 2, ProtocolConstants.StableMaxPlayers);
+
+    private static int ClampMusicVolumePercent(int value) =>
+        Math.Clamp(value, 0, 100);
 
     /// <summary>Start Tag hide grace: 15 / 30 / 45 / 60 seconds.</summary>
     private static int ClampHideSeekGraceSeconds(int value)
@@ -163,6 +215,7 @@ public sealed class ConfigService
     {
         config.MaxPlayers = ClampMaxPlayers(config.MaxPlayers);
         config.HideSeekGraceSeconds = ClampHideSeekGraceSeconds(config.HideSeekGraceSeconds);
+        config.MusicVolumePercent = ClampMusicVolumePercent(config.MusicVolumePercent);
     }
 
     /// <summary>
@@ -222,10 +275,19 @@ public sealed class ConfigService
             shared.NameTagOutlineColor = _config.NameTagOutlineColor;
             shared.NameTagGradientEnabled = _config.NameTagGradientEnabled;
             shared.SelectedMarioModelId = _config.SelectedMarioModelId;
+            shared.MusicVolumePercent = _config.MusicVolumePercent;
             var sharedJson = JsonSerializer.Serialize(shared, new JsonSerializerOptions { WriteIndented = true });
             File.WriteAllText(SharedConfigPath, sharedJson);
         }
         catch { /* ignore */ }
+    }
+
+    public void Dispose()
+    {
+        _debounce?.Stop();
+        _debounce?.Dispose();
+        _debounce = null;
+        _instanceClaim.Dispose();
     }
 
     public void Log(string message)

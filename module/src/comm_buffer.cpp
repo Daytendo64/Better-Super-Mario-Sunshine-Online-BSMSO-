@@ -31,6 +31,7 @@ void initCommBuffer() {
     buf->magic = COMM_MAGIC;
     buf->version = COMM_VERSION;
     buf->warpTargetSlot = WARP_NO_TARGET;
+    buf->musicVolume = COMM_MUSIC_VOLUME_DEFAULT;
     publishMailboxAnchor();
     OSReport("[SMSO] Comm buffer @ %p anchor @ 0x%08X\n", buf, COMM_GUEST_ADDRESS);
 }
@@ -38,10 +39,12 @@ void initCommBuffer() {
 void resetCommBuffer() {
     CommBuffer *buf = getCommBuffer();
     u8 slot = buf->localSlot;
+    u8 musicVol = buf->musicVolume;
     char name[MAX_PLAYER_NAME] = {};
     memcpy(name, buf->localPlayerName, sizeof(buf->localPlayerName));
     initCommBuffer();
     buf->localSlot = slot;
+    buf->musicVolume = musicVol;
     memcpy(buf->localPlayerName, name, sizeof(buf->localPlayerName));
     publishMailboxAnchor();
 }

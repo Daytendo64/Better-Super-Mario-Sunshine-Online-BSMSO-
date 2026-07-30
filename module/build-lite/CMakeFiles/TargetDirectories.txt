@@ -1,0 +1,8 @@
+C:/Users/young/OneDrive/Desktop/SMSOBB/module/build-lite/CMakeFiles/_SMSO.dir
+C:/Users/young/OneDrive/Desktop/SMSOBB/module/build-lite/CMakeFiles/_SMSO.kxe.dir
+C:/Users/young/OneDrive/Desktop/SMSOBB/module/build-lite/CMakeFiles/edit_cache.dir
+C:/Users/young/OneDrive/Desktop/SMSOBB/module/build-lite/CMakeFiles/rebuild_cache.dir
+C:/Users/young/OneDrive/Desktop/SMSOBB/module/build-lite/lib/BetterSunshineEngine/CMakeFiles/edit_cache.dir
+C:/Users/young/OneDrive/Desktop/SMSOBB/module/build-lite/lib/BetterSunshineEngine/CMakeFiles/rebuild_cache.dir
+C:/Users/young/OneDrive/Desktop/SMSOBB/module/build-lite/lib/BetterSunshineEngine/lib/sms_interface/CMakeFiles/edit_cache.dir
+C:/Users/young/OneDrive/Desktop/SMSOBB/module/build-lite/lib/BetterSunshineEngine/lib/sms_interface/CMakeFiles/rebuild_cache.dir

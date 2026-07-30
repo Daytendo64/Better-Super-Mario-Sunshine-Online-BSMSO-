@@ -28,6 +28,19 @@ dotnet build launcher\SMSO.sln -c Release
 2. Copy `dist\_BSMSO.kxe` into your ISO folder at `files\Kuribo!\Mods\`
 3. Load order: `BetterSunshineEngine.kxe` → `_BSMSO.kxe` (underscore prefix = child module)
 
+Or use the launcher **Settings → Game modules → Install / patch modules**, which also
+overlays bundled title/UI archives from `assets/data/` into `files/data/`:
+
+- `nintendo.szs` — Nintendo logo / boot splash UI
+- `option.szs` — title / file-select / options UI (not the 3D `scene/option.szs` hub)
+
+Retail copies are backed up once as `*.bsmso-retail`. Extracted folders and disc
+images (`.iso`/`.gcm`) both receive these overlays when you run **Install / patch
+modules** (or **Update module**). Launch Dolphin does not rewrite the game tree —
+re-run Install after a zip update so `_BSMSO.kxe` and UI overlays stay current.
+Keep `_BSMSO.kxe` next to `BSMSO.Launcher.exe` so Update always installs the module
+bundled with that launcher.
+
 BSMSO uses the custom GameCube ID **`GMSE90`** instead of vanilla NTSC-U **`GMSE01`**. This keeps BSMSO saves and Dolphin per-game settings separate from stock Super Mario Sunshine. The launcher patches `sys/boot.bin` automatically when you launch Dolphin; you can also patch manually:
 
 ```powershell

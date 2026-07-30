@@ -36,11 +36,11 @@ internal static class DolphinConfigService
     private const string RecommendedAppliedMarkerName = ".recommended-applied";
 
     // Always applied for GMSE90 (even when the recommended performance profile is off).
-    // FastDiscSpeed=False ⇒ Dolphin UI "Emulate Disc Speed" ON (INI key is inverted).
     // Overclock=2.0 ⇒ Dolphin UI "Emulated CPU Clock Override" at 200%.
+    // Fast Disc Speed is NOT forced here — it is part of the recommended profile only
+    // (no separate launcher toggle); when recommended is off the user chooses in Dolphin.
     private static readonly (string Key, string Value)[] CoreRequiredKeys =
     [
-        ("FastDiscSpeed", "False"),
         ("OverclockEnable", "True"),
         ("Overclock", "2.0"),
         (RamOverrideEnableKey, "True"),
@@ -50,6 +50,8 @@ internal static class DolphinConfigService
 
     // BSMSO GameINI / Dolphin.ini [Core] performance + stability profile.
     // Does not force GFXBackend (GPU-dependent).
+    // FastDiscSpeed=True ⇒ Dolphin UI "Emulate Disc Speed" OFF (INI key is inverted).
+    // Prefer Fast Disc Speed with the recommended profile (avoids BSE black-screen hangs).
     private static readonly (string Key, string Value)[] CorePerformanceKeys =
     [
         ("CPUThread", "True"),
@@ -57,7 +59,7 @@ internal static class DolphinConfigService
         ("OverclockEnable", "True"),
         ("Overclock", "2.0"),
         ("EmulationSpeed", "1.0"),
-        ("FastDiscSpeed", "False"), // Dolphin UI: Emulate Disc Speed ON
+        ("FastDiscSpeed", "True"), // Dolphin UI: Emulate Disc Speed OFF
         ("SyncGPU", "False"),
         (RamOverrideEnableKey, "True"),
         (Mem1SizeKey, TargetMem1Size),
@@ -308,11 +310,14 @@ internal static class DolphinConfigService
     }
 
     /// <summary>
-    /// Launch-time Dolphin settings: always keeps Emulate Disc Speed (FastDiscSpeed=False),
-    /// Emulated CPU Clock Override at 200%, and MEM1/MEM2. Optionally applies the recommended
-    /// performance profile once (later launches keep your Dolphin tweaks). When the recommended
-    /// toggle is off: restore the pre-profile backup only when leaving the recommended profile,
-    /// otherwise keep live settings and refresh the pre-profile backup so Dolphin edits stick.
+    /// Launch-time Dolphin settings: always keeps Emulated CPU Clock Override at 200% and
+    /// MEM1/MEM2. Fast Disc Speed is applied only with the recommended performance profile
+    /// (no separate launcher toggle) — when that toggle is off, Dolphin’s own disc-speed
+    /// setting is left alone.
+    /// Optionally applies the recommended performance profile once (later launches keep your
+    /// Dolphin tweaks). When the recommended toggle is off: restore the pre-profile backup only
+    /// when leaving the recommended profile, otherwise keep live settings and refresh the
+    /// pre-profile backup so Dolphin edits stick.
     /// </summary>
     public static bool ApplyLaunchDolphinSettings(
         string dolphinPath,
@@ -325,8 +330,8 @@ internal static class DolphinConfigService
             TryBackupOriginalSettings(dolphinPath, log);
             if (!IsRecommendedProfileApplied(dolphinPath))
             {
-                // Performance profile already includes CPU 200% / disc / MEM; re-apply CoreRequired
-                // afterward so those always-forced keys win even if the profile list drifts.
+                // Performance profile includes Fast Disc Speed + CPU 200% / MEM; re-apply
+                // CoreRequired afterward so always-forced keys win even if the profile list drifts.
                 if (!EnsurePerformanceStabilityConfig(dolphinPath, log, out error))
                     return false;
                 MarkRecommendedProfileApplied(dolphinPath, log);
@@ -335,8 +340,9 @@ internal static class DolphinConfigService
             {
                 log?.Invoke(
                     "Keeping your current Dolphin settings (recommended profile already applied). " +
-                    "Emulate Disc Speed, CPU clock 200%, and MEM1/MEM2 still enforced. " +
-                    "Turn the Connection toggle off and on to re-apply the full recommended profile.");
+                    "CPU clock 200% and MEM1/MEM2 still enforced. " +
+                    "Turn the Connection toggle off and on to re-apply the full recommended profile " +
+                    "(including Fast Disc Speed).");
             }
 
             return EnsureMultiplayerMemoryConfig(dolphinPath, log, out error);
@@ -356,7 +362,7 @@ internal static class DolphinConfigService
             {
                 log?.Invoke(
                     "No backed-up Dolphin settings to restore — keeping current files " +
-                    "(Emulate Disc Speed + CPU clock 200% + MEM1/MEM2 still applied).");
+                    "(CPU clock 200% + MEM1/MEM2 still applied; Fast Disc Speed left as-is).");
             }
         }
         else
@@ -429,8 +435,8 @@ internal static class DolphinConfigService
     }
 
     /// <summary>
-    /// Applies always-required GMSE90 Core keys: Emulate Disc Speed (FastDiscSpeed=False),
-    /// Emulated CPU Clock Override at 200%, and RAM.
+    /// Applies always-required GMSE90 Core keys: Emulated CPU Clock Override at 200%, and RAM.
+    /// Does not change Fast Disc Speed — that is only set by the recommended profile.
     /// </summary>
     public static bool EnsureMultiplayerMemoryConfig(
         string dolphinPath,
@@ -469,8 +475,9 @@ internal static class DolphinConfigService
 
             var verb = changed ? "Configured" : "Dolphin required Core already configured for";
             log?.Invoke(
-                $"{verb} BSMSO: Emulate Disc Speed on (FastDiscSpeed=False), " +
-                $"CPU clock override 200% (Overclock=2.0), MEM1={TargetMem1Size}, MEM2={TargetMem2Size}");
+                $"{verb} BSMSO: CPU clock override 200% (Overclock=2.0), " +
+                $"MEM1={TargetMem1Size}, MEM2={TargetMem2Size} " +
+                "(Fast Disc Speed only via recommended Dolphin settings)");
             log?.Invoke($"Dolphin User directory: {userDirectory}");
             if (configuredIni is not null)
                 log?.Invoke($"BSMSO GameINI: {configuredIni}");
@@ -486,7 +493,7 @@ internal static class DolphinConfigService
     /// <summary>
     /// Upserts GMSE90 GameINI + matching Dolphin.ini [Core] / GFX.ini keys for performance and
     /// stability. Preserves unrelated sections (controls, [Gecko], EnableCheats, etc.).
-    /// Does not force GFXBackend. Also applies Emulate Disc Speed, CPU clock 200%, and MEM1/MEM2.
+    /// Does not force GFXBackend. Includes Fast Disc Speed, CPU clock 200%, and MEM1/MEM2.
     /// </summary>
     public static bool EnsurePerformanceStabilityConfig(
         string dolphinPath,

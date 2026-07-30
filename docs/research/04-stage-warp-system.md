@@ -4,7 +4,9 @@ Flow: Launcher → TCP WarpRequest → server validates → WarpCommand → brid
 
 Blocked when `dolphinState` is LOADING or WARPING.
 
-Level data: `assets/levels.ntsc-u.json` validated against RAScript courseIDs.
+Level data: `assets/levels.ntsc-u.json` validated against RAScript courseIDs (`python tools/verify_levels.py`). The catalog must name **every** playable area ID the Connected Players roster can show — plaza secrets (20–24, 29), stage secrets (31–33, 40–42, 44, 46–48, 50–51), Noki undersea (16), Corona (52), and boss arenas (55–60). Missing entries fall through to `Course {id}` in `LevelCatalog.GetCourseName`. Episode titles live in `assets/episode-names.ntsc-u.json` and must stay aligned with the levels catalog.
+
+**Noki Undersea (16):** `mareUndersea.arc` has a single load scenario (episode **0**). Do not list catalog episodes 3/7 as warpable — those are bay mission contexts for natural waterfall dives (`normalizeMareUnderseaNextSceneForLoad` forces load 0). Host / warp-everyone / Hide & Seek must only select episode 0; `resolveWarpTarget` also forces load 0 if a stale client sends 3/7.
 
 ## Loading-zone episode 0xFF → title screen (CRITICAL)
 

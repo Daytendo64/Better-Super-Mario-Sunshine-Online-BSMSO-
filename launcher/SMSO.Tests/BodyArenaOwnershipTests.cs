@@ -6,9 +6,14 @@ namespace SMSO.Tests;
 /// arena to two network slots must be impossible by construction.
 /// Perform ownership: demoted/parked/ready graphs are module-owned and must
 /// never fall through to retail TMario::perform.
-/// Mid-stage reclaim never freeAlls / ~TMario — only stage-boundary recycle
-/// tears down parked graphs. Soft-defer when the arena pool (heap stand-in)
-/// cannot allocate another child. Main-heap prewarm graphs park as spares.
+/// Mid-stage arena freeAll of live pool graphs is forbidden. Displaced
+/// main-heap retail is recycled one-for-one on custom claim; leftover spares
+/// may reclaim at admit time. Soft-defer when the arena pool (heap stand-in)
+/// cannot allocate another child — but soft-defer must not consume the shared
+/// construction budget (ModBuildId 60). When admit fails, THAT slot's live
+/// main-heap retail may be destroyed one-for-one so a parent-heap custom can
+/// spawn without dual residency. Main-heap prewarm graphs park as spares only
+/// when still referenced at recycle time.
 /// </summary>
 public class BodyArenaOwnershipTests
 {
@@ -859,5 +864,382 @@ public class BodyArenaOwnershipTests
         Assert.Contains(prewarm, model.MainHeapSpares);
         Assert.True(model.IsModuleOwnedRemote(prewarm));
         Assert.False(model.WouldCallRetailPerform(prewarm, model.SlotBody[0]));
+    }
+
+    /// <summary>
+    /// Regression (ModBuildId 57): a mount soft-fail that leaves the volume on
+    /// retail while sSlots still points at a custom pack must NOT stamp
+    /// isCustom / freeze first-residency. Authenticity requires the
+    /// construction-time pack buffer to match the desired cached pack.
+    /// </summary>
+    [Fact]
+    public void FirstResidency_FalseCustomStamp_RequiresRebuild()
+    {
+        // Mirrors applyRemoteBodyModelOnFirstResidency authenticity gate.
+        static bool AuthenticCustom(
+            bool packReady,
+            bool poolIsCustom,
+            IntPtr buildBuffer,
+            IntPtr wantBuffer) =>
+            packReady && poolIsCustom && wantBuffer != IntPtr.Zero &&
+            buildBuffer == wantBuffer;
+
+        var customPack = new IntPtr(0x818100A0);
+        var retail = new IntPtr(0x8083E340);
+
+        // Happy path: body was built under the desired pack.
+        Assert.True(AuthenticCustom(
+            packReady: true,
+            poolIsCustom: true,
+            buildBuffer: customPack,
+            wantBuffer: customPack));
+
+        // Soft-fail stamp: isCustom true but geometry came from retail mount.
+        Assert.False(AuthenticCustom(
+            packReady: true,
+            poolIsCustom: true,
+            buildBuffer: retail,
+            wantBuffer: customPack));
+
+        // Keep-alive before buildBuffer tracking: null build buf is untrusted.
+        Assert.False(AuthenticCustom(
+            packReady: true,
+            poolIsCustom: true,
+            buildBuffer: IntPtr.Zero,
+            wantBuffer: customPack));
+
+        // Mount reported success while volume sat on retail — same as null/mismatch.
+        Assert.False(AuthenticCustom(
+            packReady: true,
+            poolIsCustom: true,
+            buildBuffer: IntPtr.Zero,
+            wantBuffer: customPack));
+    }
+
+    [Fact]
+    public void MountBuffer_RetailFallback_MustReportFailureForCustomRequest()
+    {
+        // Mirrors mountBuffer contract after ModBuildId 57: when mountFixed(custom)
+        // fails and retail is remounted for volume safety, the function returns
+        // false so callers rebind sSlots to retail and do not stamp isCustom.
+        static bool MountBufferReportsSuccess(bool requestedRetail, bool mountFixedOk,
+            bool retailFallbackOk)
+        {
+            if (mountFixedOk)
+                return true;
+            if (!requestedRetail && retailFallbackOk)
+                return false; // volume safe on retail; request failed
+            return false;
+        }
+
+        Assert.True(MountBufferReportsSuccess(
+            requestedRetail: false, mountFixedOk: true, retailFallbackOk: false));
+        Assert.False(MountBufferReportsSuccess(
+            requestedRetail: false, mountFixedOk: false, retailFallbackOk: true));
+        Assert.False(MountBufferReportsSuccess(
+            requestedRetail: true, mountFixedOk: false, retailFallbackOk: false));
+    }
+
+    /// <summary>
+    /// Regression (ModBuildId 60/61/62): after ping-pong arenas are occupied, soft-defer
+    /// on an early slot must not spend the shared construction budget — later
+    /// slots still get a chance. Live body for the upgrading slot (retail or
+    /// custom) may be destroyed one-for-one so a replacement can admit. Build 61+:
+    /// if spawn cannot complete after reclaim, retail must be restored so the
+    /// slot never stays body-null.
+    /// </summary>
+    [Fact]
+    public void SoftDefer_DoesNotBlockLaterSlot_LiveRetailReclaimAllowsParentHeap()
+    {
+        // Mirrors prewarmRequestedCustomBodyStep + queueRequestedReadyBody budget.
+        static bool TryQueue(bool admitOk, bool canReclaimLiveBody, bool spawnOk,
+            out bool usedBudget, out bool softDeferred, out bool liveReclaimed,
+            out bool retailRestored)
+        {
+            usedBudget = false;
+            softDeferred = false;
+            liveReclaimed = false;
+            retailRestored = false;
+            if (admitOk)
+            {
+                usedBudget = true;
+                return true;
+            }
+
+            if (!canReclaimLiveBody)
+            {
+                softDeferred = true;
+                usedBudget = false; // critical: soft-defer is not a spent initValues
+                return false;
+            }
+
+            liveReclaimed = true;
+            if (!spawnOk)
+            {
+                retailRestored = true; // ModBuildId 61: never leave pool/actor empty
+                softDeferred = true;
+                usedBudget = false;
+                return false;
+            }
+
+            usedBudget = true; // parent-heap / arena one-for-one spawn
+            return true;
+        }
+
+        // Slot 2 soft-defers (no live body to reclaim) — budget remains for slot 3.
+        Assert.False(TryQueue(admitOk: false, canReclaimLiveBody: false, spawnOk: true,
+            out var budget2, out var defer2, out var reclaim2, out var restore2));
+        Assert.True(defer2);
+        Assert.False(budget2);
+        Assert.False(reclaim2);
+        Assert.False(restore2);
+
+        Assert.True(TryQueue(admitOk: false, canReclaimLiveBody: true, spawnOk: true,
+            out var budget3, out var defer3, out var reclaim3, out var restore3));
+        Assert.False(defer3);
+        Assert.True(budget3);
+        Assert.True(reclaim3);
+        Assert.False(restore3);
+
+        // Build 61: reclaim + failed spawn restores retail (no empty slot).
+        Assert.False(TryQueue(admitOk: false, canReclaimLiveBody: true, spawnOk: false,
+            out var budget4, out var defer4, out var reclaim4, out var restore4));
+        Assert.True(defer4);
+        Assert.False(budget4);
+        Assert.True(reclaim4);
+        Assert.True(restore4);
+    }
+
+    /// <summary>
+    /// Regression (ModBuildId 62): one-for-one reclaim is decided by whether THIS
+    /// slot has a live body to destroy — not by pre-reclaim bodyFree. Destroying
+    /// the upgrading slot's retail (~612 KiB) or custom/arena is what creates the
+    /// admit hole; build 61's pre-reclaim hopeless gate blocked late joins.
+    /// </summary>
+    [Fact]
+    public void LiveReclaim_AttemptsWheneverSlotHasLiveBody()
+    {
+        static bool ShouldReclaim(bool hasLiveBodyForSlot, uint bodyFree) =>
+            hasLiveBodyForSlot; // bodyFree is informational only after ModBuildId 62
+
+        Assert.True(ShouldReclaim(hasLiveBodyForSlot: true, bodyFree: 685552));
+        Assert.True(ShouldReclaim(hasLiveBodyForSlot: true, bodyFree: 117476)); // late join
+        Assert.True(ShouldReclaim(hasLiveBodyForSlot: true, bodyFree: 655424)); // custom→custom
+        Assert.True(ShouldReclaim(hasLiveBodyForSlot: true, bodyFree: 75716));
+        Assert.False(ShouldReclaim(hasLiveBodyForSlot: false, bodyFree: 702592));
+    }
+
+    /// <summary>
+    /// Regression (ModBuildId 62): custom / arena-backed live bodies must be
+    /// reclaimable for mid-session model changes (A→B). Build 61 refused both.
+    /// </summary>
+    [Fact]
+    public void LiveReclaim_AllowsCustomAndArenaBackedBodies()
+    {
+        static bool CanReclaimLiveBody(bool hasBody, bool isCustom, bool hasArena) =>
+            hasBody; // identity / arena no longer block one-for-one upgrade
+
+        Assert.True(CanReclaimLiveBody(hasBody: true, isCustom: false, hasArena: false));
+        Assert.True(CanReclaimLiveBody(hasBody: true, isCustom: true, hasArena: false));
+        Assert.True(CanReclaimLiveBody(hasBody: true, isCustom: true, hasArena: true));
+        Assert.False(CanReclaimLiveBody(hasBody: false, isCustom: true, hasArena: true));
+    }
+
+    // Body-heap budget mirrored from module/src/remote_actor.cpp: the expanded
+    // MEM1 arena is split 16.5 MiB packs / 7.375 MiB bodies, one TMario graph
+    // costs ~612 KiB, and a staging arena for a replacement graph costs 768 KiB.
+    private const int BodyHeapBytes = 0x0076_0000;
+    private const int BodyGraphBytes = 612 * 1024;
+    private const int StagingArenaBytes = 0x000C_0000;
+
+    /// <summary>
+    /// Counts how many of <paramref name="remoteCount"/> remotes end up wearing
+    /// their own pack when prewarm builds every puppet under retail before the
+    /// packs publish. Each upgrade must construct a second graph inside a staging
+    /// arena while the retail graph stays resident — mid-stage never frees a
+    /// TMario — so the heap runs out long before every remote is served.
+    /// </summary>
+    private static int RemotesWearingTheirPack(int remoteCount, bool prewarmUnderRetail)
+    {
+        var free = BodyHeapBytes;
+        if (!prewarmUnderRetail)
+        {
+            // Build 56: prewarm waits for the pack, so each remote costs one graph.
+            var served = 0;
+            while (served < remoteCount && free >= BodyGraphBytes)
+            {
+                free -= BodyGraphBytes;
+                served++;
+            }
+            return served;
+        }
+
+        var prewarmed = 0;
+        while (prewarmed < remoteCount && free >= BodyGraphBytes)
+        {
+            free -= BodyGraphBytes;
+            prewarmed++;
+        }
+
+        // Ping-pong staging arenas are carved at stage start, then overflow
+        // arenas are created per additional identity.
+        var upgraded = 0;
+        for (var i = 0; i < PingPongArenaCount && upgraded < prewarmed; i++)
+        {
+            if (free < StagingArenaBytes)
+                break;
+            free -= StagingArenaBytes;
+            upgraded++;
+        }
+        while (upgraded < prewarmed && free >= StagingArenaBytes)
+        {
+            free -= StagingArenaBytes;
+            upgraded++;
+        }
+        return upgraded;
+    }
+
+    /// <summary>
+    /// Regression (ModBuildId 56): build 51 raised baseline prewarm to all
+    /// MaxPlayers-1 puppets, but prewarm ran before pack prefetch published and
+    /// therefore built them under the retail mario volume. Since mid-stage never
+    /// frees a TMario, those nine graphs left too little body heap for the
+    /// replacement graphs, and only the first couple of remotes ever received
+    /// their custom pack. Waiting for the pack fits all nine.
+    /// </summary>
+    [Fact]
+    public void FullLobbyDistinctPacks_RetailPrewarmStarvesUpgrades_PackGatedPrewarmDoesNot()
+    {
+        const int remotes = MaxRemoteSlots - 1;
+
+        var retailFirst = RemotesWearingTheirPack(remotes, prewarmUnderRetail: true);
+        Assert.True(retailFirst < remotes,
+            "build 51 retail-first prewarm must be shown to starve custom upgrades");
+        Assert.True(retailFirst <= PingPongArenaCount + 1);
+
+        Assert.Equal(remotes, RemotesWearingTheirPack(remotes, prewarmUnderRetail: false));
+    }
+
+    private enum PrewarmAction
+    {
+        SkipEmptySlot,
+        WaitForPack,
+        BuildCustom,
+        BuildRetail,
+    }
+
+    /// <summary>Mirrors prewarmRemoteBodyPoolStep's per-slot decision.</summary>
+    private static PrewarmAction DecidePrewarm(bool connected, bool announcedCustom,
+        bool packReady, int framesWaited, int deadline)
+    {
+        if (!connected && !announcedCustom)
+            return PrewarmAction.SkipEmptySlot;
+        if (!announcedCustom)
+            return PrewarmAction.BuildRetail;
+        if (packReady)
+            return PrewarmAction.BuildCustom;
+        return framesWaited < deadline ? PrewarmAction.WaitForPack : PrewarmAction.BuildRetail;
+    }
+
+    /// <summary>
+    /// Regression (ModBuildId 56): prewarm never spends a body graph on a slot
+    /// that has no player, and skips (rather than consumes) a slot whose
+    /// announced pack is not ready yet. The wait is bounded so a pack that never
+    /// publishes still yields a visible body.
+    /// </summary>
+    [Fact]
+    public void PrewarmPackGate_SkipsEmptySlots_DefersPendingPacks_FallsBackAfterDeadline()
+    {
+        const int deadline = 900;
+
+        // Empty slot: a speculative retail graph would steal the eventual
+        // occupant's RAM and could never be freed mid-stage.
+        Assert.Equal(PrewarmAction.SkipEmptySlot,
+            DecidePrewarm(connected: false, announcedCustom: false, packReady: false, 0, deadline));
+        // Connected player genuinely on retail Mario.
+        Assert.Equal(PrewarmAction.BuildRetail,
+            DecidePrewarm(connected: true, announcedCustom: false, packReady: false, 0, deadline));
+        Assert.Equal(PrewarmAction.BuildCustom,
+            DecidePrewarm(connected: true, announcedCustom: true, packReady: true, 0, deadline));
+        // Announced before the first snapshot — still occupied.
+        Assert.Equal(PrewarmAction.BuildCustom,
+            DecidePrewarm(connected: false, announcedCustom: true, packReady: true, 0, deadline));
+        Assert.Equal(PrewarmAction.WaitForPack,
+            DecidePrewarm(connected: true, announcedCustom: true, packReady: false, 0, deadline));
+        Assert.Equal(PrewarmAction.WaitForPack,
+            DecidePrewarm(connected: true, announcedCustom: true, packReady: false, deadline - 1, deadline));
+        // Deadline reached: build retail so the player is never bodyless.
+        Assert.Equal(PrewarmAction.BuildRetail,
+            DecidePrewarm(connected: true, announcedCustom: true, packReady: false, deadline, deadline));
+    }
+
+    /// <summary>
+    /// Regression (ModBuildId 56): a ten-player lobby with ten distinct packs must
+    /// end up with exactly one graph per remote — no wasted retail graph, and no
+    /// staging arena, because every body is built under the right archive first.
+    /// </summary>
+    [Fact]
+    public void FullLobbyDistinctPacks_BuildsOneGraphPerRemote_WithinBodyHeap()
+    {
+        const int remotes = MaxRemoteSlots - 1;
+        const int deadline = 900;
+
+        var graphs = 0;
+        for (var slot = 0; slot < remotes; slot++)
+        {
+            // Packs publish one at a time; prewarm revisits the slot until then.
+            Assert.Equal(PrewarmAction.WaitForPack,
+                DecidePrewarm(connected: true, announcedCustom: true, packReady: false, 0, deadline));
+            Assert.Equal(PrewarmAction.BuildCustom,
+                DecidePrewarm(connected: true, announcedCustom: true, packReady: true, 1, deadline));
+            graphs++;
+        }
+
+        Assert.Equal(remotes, graphs);
+        Assert.True(graphs * BodyGraphBytes <= BodyHeapBytes);
+        // Headroom must remain for mid-session model changes (staging arenas).
+        Assert.True(BodyHeapBytes - graphs * BodyGraphBytes >= StagingArenaBytes * PingPongArenaCount);
+    }
+
+    /// <summary>
+    /// Regression (ModBuildId 56): a slot whose pack is already resident must not
+    /// be handed another slot's retail spare — that forces the replace-and-abandon
+    /// upgrade. Adopting a parked graph with a matching identity is always free.
+    /// </summary>
+    [Fact]
+    public void AcquirePoolBody_PrefersMatchingSpare_RefusesRetailSpareWhenPackReady()
+    {
+        // Mirrors acquirePoolBodyForSlot after the build 56 gate.
+        static string Acquire(bool ownPoolBodyFree, bool matchingSpare, bool wantsCustom,
+            bool packReady) =>
+            ownPoolBodyFree ? "own"
+            : matchingSpare ? "adopt"
+            : wantsCustom && packReady ? "build-correct"
+            : "retail-spare";
+
+        Assert.Equal("own", Acquire(true, false, true, true));
+        Assert.Equal("adopt", Acquire(false, true, true, true));
+        Assert.Equal("build-correct", Acquire(false, false, true, true));
+        // Pack still loading: a retail spare keeps the player visible now.
+        Assert.Equal("retail-spare", Acquire(false, false, true, false));
+        Assert.Equal("retail-spare", Acquire(false, false, false, true));
+    }
+
+    /// <summary>
+    /// Regression (ModBuildId 56): demoted main-heap graphs record the identity
+    /// they were built under so a later slot can adopt them. Without the identity
+    /// the spare table is write-only and every stage leaks its demoted graphs.
+    /// </summary>
+    [Fact]
+    public void MainHeapSpare_IsAdoptableByIdentity()
+    {
+        static bool CanAdopt(string spareId, bool spareIsCustom, string wantedId) =>
+            spareId == wantedId && spareIsCustom == (wantedId.Length > 0);
+
+        Assert.True(CanAdopt("", false, ""));
+        Assert.True(CanAdopt("841192a3", true, "841192a3"));
+        Assert.False(CanAdopt("841192a3", true, "36de327c"));
+        // Soft-failed custom mount left retail geometry — not the wanted identity.
+        Assert.False(CanAdopt("841192a3", false, "841192a3"));
     }
 }

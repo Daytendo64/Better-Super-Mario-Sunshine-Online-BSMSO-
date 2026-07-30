@@ -36,6 +36,36 @@ public sealed class GameModeStatePacketTests
         Assert.Equal((ushort)25000, decoded.GraceRemainingMs);
         Assert.True(decoded.GraceActive);
     }
+
+    [Fact]
+    public void GameModeState_RolesArray_MatchesMaxPlayersCapacity()
+    {
+        // Lock Hide & Seek role capacity at ProtocolConstants.MaxPlayers (10).
+        Assert.Equal(10, ProtocolConstants.MaxPlayers);
+        Assert.Equal(ProtocolConstants.MaxPlayers, ProtocolConstants.StableMaxPlayers);
+
+        var state = GameModeStatePacket.CreateDefault();
+        Assert.Equal(ProtocolConstants.MaxPlayers, state.Roles.Length);
+
+        for (byte slot = 0; slot < ProtocolConstants.MaxPlayers; slot++)
+            state.SetRole(slot, slot % 2 == 0 ? HideSeekRole.Seeker : HideSeekRole.Hider);
+
+        // Highest slot must round-trip (no silent 4-player truncate).
+        state.SetRole((byte)(ProtocolConstants.MaxPlayers - 1), HideSeekRole.Seeker);
+        var wire = GameModeStatePacket.ToCommGameMode(localSlot: 9, state);
+        Assert.Equal(ProtocolConstants.MaxPlayers, wire.RoleBySlot.Length);
+        Assert.Equal((byte)HideSeekRole.Seeker, wire.LocalRole);
+        Assert.Equal((byte)HideSeekRole.Seeker, wire.RoleBySlot[ProtocolConstants.MaxPlayers - 1]);
+
+        var frame = PacketSerializer.BuildGameModeState(state);
+        Assert.True(PacketSerializer.TryUnwrapTcp(frame, out _, out var payload));
+        Assert.True(PacketSerializer.TryReadGameModeState(payload, out var decoded));
+        Assert.Equal(ProtocolConstants.MaxPlayers, decoded.Roles.Length);
+        Assert.Equal(HideSeekRole.Seeker, decoded.Roles[ProtocolConstants.MaxPlayers - 1]);
+        // Even slots 0,2,4,6,8 seekers + forced slot 9 seeker = 6 seekers / 4 hiders.
+        Assert.Equal(6, decoded.CountRole(HideSeekRole.Seeker));
+        Assert.Equal(4, decoded.CountRole(HideSeekRole.Hider));
+    }
 }
 
 public sealed class HideSeekServiceTests
@@ -441,6 +471,7 @@ public sealed class HideSeekServiceTests
                 [2] = HideSeekRole.Hider,
             });
             Assert.True(service.TryStartTag(out _));
+            service.ExpireWarpProximityImmunityForTests();
 
             var alive = new PlayerSnapshot
             {
@@ -485,6 +516,7 @@ public sealed class HideSeekServiceTests
                 [2] = HideSeekRole.Hider,
             });
             Assert.True(service.TryStartTag(out _));
+            service.ExpireWarpProximityImmunityForTests();
 
             var dead = new PlayerSnapshot
             {
@@ -523,6 +555,7 @@ public sealed class HideSeekServiceTests
                 [1] = HideSeekRole.Hider,
             });
             Assert.True(service.TryStartTag(out _));
+            service.ExpireWarpProximityImmunityForTests();
 
             var dead = new PlayerSnapshot
             {
@@ -587,7 +620,7 @@ public sealed class HideSeekServiceTests
     }
 
     [Fact]
-    public void HiderDeath_StillPromotesDuringStartImmunity()
+    public void HiderDeath_StillPromotesDuringStartGrace_AfterWarpImmunity()
     {
         var levels = new LevelCatalog();
         var server = new GameServer(levels);
@@ -603,6 +636,13 @@ public sealed class HideSeekServiceTests
                 [2] = HideSeekRole.Hider,
             });
             Assert.True(service.TryStartTag(out _));
+            Assert.True(service.IsStartTagGraceActive);
+            Assert.True(service.IsProximityTagImmunityActive);
+
+            // Short death-edge window absorbs stale Dead; real deaths still promote
+            // during the remaining Start Tag hide grace once that window ends.
+            service.ExpireWarpProximityImmunityForTests();
+            Assert.True(service.IsStartTagGraceActive);
             Assert.True(service.IsProximityTagImmunityActive);
 
             var dead = new PlayerSnapshot
@@ -617,7 +657,7 @@ public sealed class HideSeekServiceTests
             Assert.Equal(HideSeekRole.Seeker, service.CurrentState.Roles[1]);
             Assert.Equal(HideSeekRole.Hider, service.CurrentState.Roles[2]);
             Assert.True(service.CurrentState.TagActive);
-            Assert.True(service.IsProximityTagImmunityActive);
+            Assert.True(service.IsStartTagGraceActive);
         }
         finally
         {
@@ -647,6 +687,10 @@ public sealed class HideSeekServiceTests
 
             service.NotifyPlayersWarped();
             Assert.True(service.IsProximityTagImmunityActive);
+            // Mid-round warp must NOT re-arm the full Start Tag freeze/tint grace —
+            // module skips stage-entry demos and seekers stay movable.
+            Assert.False(service.CurrentState.GraceActive);
+            Assert.False(service.IsStartTagGraceActive);
 
             var seeker = new PlayerSnapshot
             {
@@ -896,8 +940,12 @@ public sealed class HideSeekServiceTests
     }
 
     [Fact]
-    public void OnPlayerDisconnected_KeepsTagActiveWhenLastHiderLeaves()
+    public void OnPlayerDisconnected_CompletesRoundWhenLastHiderLeaves()
     {
+        // A round with nobody left to find can never end on its own, so the last hider
+        // leaving takes the normal round-complete path (fanfare + roles reset to hider).
+        // Disconnects with players still on both sides keep the tag running — see
+        // OnPlayerDisconnected_KeepsTagActive above.
         var levels = new LevelCatalog();
         var server = new GameServer(levels);
         server.Start(27110);
@@ -916,8 +964,9 @@ public sealed class HideSeekServiceTests
 
             var state = service.CurrentState;
             Assert.Equal(GameMode.HideSeek, state.GameMode);
-            Assert.True(state.TagActive);
-            Assert.Equal(HideSeekRole.Seeker, state.Roles[0]);
+            Assert.False(state.TagActive);
+            Assert.True((state.Flags & GameModeFlags.RoundFanfare) != 0);
+            Assert.Equal(HideSeekRole.Hider, state.Roles[0]);
             Assert.Equal(HideSeekRole.Hider, state.Roles[1]);
         }
         finally
@@ -1022,7 +1071,8 @@ public sealed class HideSeekServiceTests
             Assert.False(resumed.GraceActive);
             Assert.Equal((ushort)0, resumed.GraceRemainingMs);
             Assert.False(service.IsStartTagGraceActive);
-            Assert.False(service.IsProximityTagImmunityActive);
+            // Brief warp-style proximity immunity prevents clustered mass-promotes on resume.
+            Assert.True(service.IsProximityTagImmunityActive);
         }
         finally
         {
@@ -1066,9 +1116,12 @@ public sealed class HideSeekServiceTests
             Assert.False(resumed.GraceActive);
             Assert.Equal((ushort)0, resumed.GraceRemainingMs);
             Assert.False(service.IsStartTagGraceActive);
+            Assert.True(service.IsProximityTagImmunityActive);
+
+            // After brief proximity immunity expires, tags work again (no full grace).
+            service.ExpireProximityTagImmunityForTests();
             Assert.False(service.IsProximityTagImmunityActive);
 
-            // Proximity tags must work immediately on resume (no grace / warp immunity).
             var seeker = new PlayerSnapshot
             {
                 Connected = 1,
@@ -1086,6 +1139,60 @@ public sealed class HideSeekServiceTests
             service.ProcessSnapshot(0, seeker, 1, hider);
             Assert.Equal(HideSeekRole.Seeker, service.CurrentState.Roles[1]);
             Assert.Equal(HideSeekRole.Hider, service.CurrentState.Roles[2]);
+        }
+        finally
+        {
+            server.Stop();
+        }
+    }
+
+    [Fact]
+    public void TryStartTag_Resume_AbsorbsStaleDeadSnapshotWithoutPromoting()
+    {
+        // Start Tag without Reset Tag arms resume proximity immunity. A leftover
+        // VFX_DEAD from a prior death reload must not instantly promote a hider.
+        var levels = new LevelCatalog();
+        var server = new GameServer(levels);
+        server.Start(27155);
+        try
+        {
+            var service = server.HideSeek;
+            service.SetGameMode(GameMode.HideSeek);
+            service.SetRoles(new Dictionary<byte, HideSeekRole>
+            {
+                [0] = HideSeekRole.Seeker,
+                [1] = HideSeekRole.Hider,
+                [2] = HideSeekRole.Hider,
+            });
+            Assert.True(service.TryStartTag(out _));
+            service.ExpireProximityTagImmunityForTests();
+            service.StopTag();
+
+            Assert.True(service.TryStartTag(out _));
+            Assert.True(service.IsProximityTagImmunityActive);
+            Assert.False(service.IsStartTagGraceActive);
+
+            var dead = new PlayerSnapshot
+            {
+                Connected = 1,
+                StageId = 2,
+                EpisodeId = 0,
+                VfxFlags = (ushort)VfxFlags.Dead,
+            };
+            service.ProcessHiderDeath(1, dead);
+            Assert.Equal(HideSeekRole.Hider, service.CurrentState.Roles[1]);
+            Assert.Equal((byte)0, service.CurrentState.TagEventId);
+
+            // After immunity expires, still-dead rising edge was absorbed — no promote
+            // until they revive and die again.
+            service.ExpireProximityTagImmunityForTests();
+            service.ProcessHiderDeath(1, dead);
+            Assert.Equal(HideSeekRole.Hider, service.CurrentState.Roles[1]);
+
+            var alive = dead with { VfxFlags = 0 };
+            service.ProcessHiderDeath(1, alive);
+            service.ProcessHiderDeath(1, dead);
+            Assert.Equal(HideSeekRole.Seeker, service.CurrentState.Roles[1]);
         }
         finally
         {
@@ -1208,10 +1315,166 @@ public sealed class HideSeekServiceTests
             server.Stop();
         }
     }
+
+    [Fact]
+    public void SetRoles_DoesNotStopTagWhenRejoiningSeekerDefaultedToHider()
+    {
+        // Host UI used to push rejoins as Hider on roster growth, demoting a seeker and
+        // stopping tag. Server must preserve Seeker and keep TagActive.
+        var levels = new LevelCatalog();
+        var server = new GameServer(levels);
+        server.Start(27140);
+        try
+        {
+            var service = server.HideSeek;
+            service.SetGameMode(GameMode.HideSeek);
+            // Two seekers so the rejoining one is not also the last seeker (which now ends
+            // the round on its own — see OnPlayerDisconnected_CompletesRoundWhenLastHiderLeaves).
+            service.SetRoles(new Dictionary<byte, HideSeekRole>
+            {
+                [0] = HideSeekRole.Seeker,
+                [1] = HideSeekRole.Seeker,
+                [2] = HideSeekRole.Hider,
+            });
+            Assert.True(service.TryStartTag(out _));
+
+            service.OnPlayerDisconnected(0);
+            service.OnPlayerJoined(0);
+            service.SetRoles(new Dictionary<byte, HideSeekRole>
+            {
+                [0] = HideSeekRole.Hider,
+                [1] = HideSeekRole.Seeker,
+                [2] = HideSeekRole.Hider,
+            });
+
+            Assert.True(service.CurrentState.TagActive);
+            Assert.Equal(HideSeekRole.Seeker, service.CurrentState.Roles[0]);
+            Assert.Equal(HideSeekRole.Hider, service.CurrentState.Roles[2]);
+        }
+        finally
+        {
+            server.Stop();
+        }
+    }
+
+    [Fact]
+    public void OnPlayerJoined_RestoresAssignmentWithoutStoppingTag()
+    {
+        var levels = new LevelCatalog();
+        var server = new GameServer(levels);
+        server.Start(27141);
+        try
+        {
+            var service = server.HideSeek;
+            service.SetGameMode(GameMode.HideSeek);
+            // Second hider keeps the round alive when slot 1 drops.
+            service.SetRoles(new Dictionary<byte, HideSeekRole>
+            {
+                [0] = HideSeekRole.Seeker,
+                [1] = HideSeekRole.Hider,
+                [2] = HideSeekRole.Hider,
+            });
+            Assert.True(service.TryStartTag(out _));
+            service.OnPlayerDisconnected(1);
+            Assert.True(service.CurrentState.TagActive);
+
+            service.OnPlayerJoined(1);
+            Assert.True(service.CurrentState.TagActive);
+            Assert.Equal(HideSeekRole.Hider, service.CurrentState.Roles[1]);
+        }
+        finally
+        {
+            server.Stop();
+        }
+    }
+
+    [Fact]
+    public void SetRoles_FullLobby_PreservesAllTenSlots()
+    {
+        // Lock HideSeekService role capacity at ProtocolConstants.MaxPlayers.
+        Assert.Equal(10, ProtocolConstants.MaxPlayers);
+        var levels = new LevelCatalog();
+        var server = new GameServer(levels) { MaxPlayers = ProtocolConstants.MaxPlayers };
+        server.Start(27101);
+        try
+        {
+            var service = server.HideSeek;
+            service.SetGameMode(GameMode.HideSeek);
+
+            var roles = new Dictionary<byte, HideSeekRole>();
+            for (byte slot = 0; slot < ProtocolConstants.MaxPlayers; slot++)
+                roles[slot] = slot == 0 || slot == 9 ? HideSeekRole.Seeker : HideSeekRole.Hider;
+
+            service.SetRoles(roles);
+            var state = service.CurrentState;
+            Assert.Equal(ProtocolConstants.MaxPlayers, state.Roles.Length);
+            Assert.Equal(HideSeekRole.Seeker, state.Roles[0]);
+            Assert.Equal(HideSeekRole.Seeker, state.Roles[ProtocolConstants.MaxPlayers - 1]);
+            Assert.Equal(2, state.CountRole(HideSeekRole.Seeker));
+            Assert.Equal(8, state.CountRole(HideSeekRole.Hider));
+
+            Assert.True(service.TryStartTag(out _));
+            Assert.True(service.CurrentState.TagActive);
+            Assert.True(service.CurrentState.GraceActive);
+            Assert.True(service.CurrentState.GraceRemainingMs > 0);
+
+            // Highest-slot seeker survives Start Tag broadcast.
+            Assert.Equal(HideSeekRole.Seeker, service.CurrentState.Roles[9]);
+        }
+        finally
+        {
+            server.Stop();
+        }
+    }
 }
 
 public sealed class BridgeWorkerGameModeTests
 {
+    [Fact]
+    public void ShouldFallbackGameModeWriteOnRemoteSyncFail_OnlyHideSeek()
+    {
+        var hideSeek = CommGameModeState.CreateDefault();
+        hideSeek.Mode = (byte)GameMode.HideSeek;
+        hideSeek.Flags = (byte)(GameModeFlags.TagActive | GameModeFlags.GraceActive);
+        Assert.True(BridgeWorker.ShouldFallbackGameModeWriteOnRemoteSyncFail(hideSeek));
+
+        var normal = CommGameModeState.CreateDefault();
+        normal.Mode = (byte)GameMode.Normal;
+        Assert.False(BridgeWorker.ShouldFallbackGameModeWriteOnRemoteSyncFail(normal));
+    }
+
+    [Fact]
+    public void FlushInterpolatedRemotes_RemoteSyncFail_FallsBackToGameModeOnlyDuringGrace()
+    {
+        // Regression (ModBuildId 49): Active-play TryWriteRemoteSyncPayload failure used to
+        // return without TryWriteGameModeStateOnly, so Dolphin kept a stale mailbox lacking
+        // GMF_GRACE_ACTIVE until the ~1s TickGrace rebroadcast — intermittent movable seeker.
+        var bridge = new DolphinBridge
+        {
+            DebugSimulateAttached = true,
+            DebugFailRemoteSyncWrite = true,
+        };
+        using var worker = new BridgeWorker(bridge);
+
+        var hideSeek = GameModeStatePacket.CreateDefault();
+        hideSeek.GameMode = GameMode.HideSeek;
+        hideSeek.Flags = GameModeFlags.TagActive | GameModeFlags.GraceActive;
+        hideSeek.GraceRemainingMs = 30_000;
+        hideSeek.Seq = 1;
+        hideSeek.SetRole(0, HideSeekRole.Seeker);
+
+        worker.ApplyGameModeState(0, hideSeek);
+
+        Assert.True(bridge.DebugRemoteSyncWriteCalls >= 1);
+        Assert.True(bridge.DebugGameModeOnlyWriteCalls >= 1);
+        Assert.Equal((byte)GameMode.HideSeek, bridge.DebugLastGameModeOnlyWrite.Mode);
+        Assert.Equal(
+            (byte)(GameModeFlags.TagActive | GameModeFlags.GraceActive),
+            bridge.DebugLastGameModeOnlyWrite.Flags);
+        Assert.Equal((byte)HideSeekRole.Seeker, bridge.DebugLastGameModeOnlyWrite.LocalRole);
+        Assert.Equal((ushort)30_000, bridge.DebugLastGameModeOnlyWrite.GraceRemainingMs);
+    }
+
     [Fact]
     public void ForceReset_AfterHighSeqNormal_AllowsLowSeqHideSeek()
     {
@@ -1321,6 +1584,393 @@ public sealed class BridgeWorkerGameModeTests
         var (lastApplied, incoming) = worker.DebugGetWorldSync();
         Assert.Equal(0u, lastApplied);
         Assert.Equal(0u, incoming);
+    }
+
+    [Fact]
+    public void SetConnected_True_ClearsProgressSnapshotOnFreshConnect()
+    {
+        // Regression (ModBuildId 29): fresh connect cleared world-event lanes but not the
+        // progress snapshot mailbox. Dolphin RAM from a prior session can still hold
+        // moduleAppliedSeq=N; join heal hostSeq=1 then soft-skips (hostSeq <= applied).
+        using var worker = new BridgeWorker(new DolphinBridge());
+
+        var staleLive = CommBuffer.CreateDefault();
+        staleLive.Magic = ProtocolConstants.Magic;
+        staleLive.ProgressSnapshotHostSeq = 42;
+        staleLive.ProgressSnapshotModuleAppliedSeq = 42;
+        staleLive.ProgressSnapshotPayloadLen = 4;
+        staleLive.ProgressSnapshotPayload = new byte[ProtocolConstants.CommProgressSnapshotMaxPayload];
+        staleLive.ProgressSnapshotPayload[0] = 1;
+        worker.DebugAdoptLiveBuffer(staleLive);
+
+        var before = worker.DebugGetWorkingBuffer();
+        Assert.Equal(42u, before.ProgressSnapshotHostSeq);
+        Assert.Equal(42u, before.ProgressSnapshotModuleAppliedSeq);
+
+        worker.SetConnected(true, 1, "Host", true);
+
+        var buf = worker.DebugGetWorkingBuffer();
+        Assert.Equal(0u, buf.ProgressSnapshotHostSeq);
+        Assert.Equal(0u, buf.ProgressSnapshotModuleAppliedSeq);
+        Assert.Equal(0, buf.ProgressSnapshotPayloadLen);
+    }
+
+    [Fact]
+    public void SetConnected_True_DoesNotWipeProgressSnapshotWhenAlreadyConnected()
+    {
+        using var worker = new BridgeWorker(new DolphinBridge());
+        worker.SetConnected(true, 1, "Host", true);
+        worker.PushProgressSnapshot(42, new byte[] { 1, 2, 3, 4 });
+
+        // Re-assert Connected (FlushSnapshotsAfterConnect) must not wipe an in-flight heal.
+        worker.SetConnected(true, 1, "Host", true);
+
+        var buf = worker.DebugGetWorkingBuffer();
+        Assert.Equal(42u, buf.ProgressSnapshotHostSeq);
+        Assert.Equal(4, buf.ProgressSnapshotPayloadLen);
+    }
+
+    [Fact]
+    public void SetConnected_False_ClearsProgressSnapshotLane()
+    {
+        using var worker = new BridgeWorker(new DolphinBridge());
+        worker.SetConnected(true, 1, "Host", true);
+        worker.PushProgressSnapshot(42, new byte[] { 1, 2, 3, 4 });
+
+        worker.SetConnected(false, 0, "", false);
+
+        var buf = worker.DebugGetWorkingBuffer();
+        Assert.Equal(0u, buf.ProgressSnapshotHostSeq);
+        Assert.Equal(0u, buf.ProgressSnapshotModuleAppliedSeq);
+        Assert.Equal(0, buf.ProgressSnapshotPayloadLen);
+    }
+
+    [Fact]
+    public void ClearProgressSnapshot_FullWriteMerge_DoesNotResurrectPreClearLane()
+    {
+        using var worker = new BridgeWorker(new DolphinBridge());
+        worker.SetConnected(true, 1, "Host", true);
+        worker.PushProgressSnapshot(42, new byte[] { 1, 2, 3, 4 });
+        worker.ClearProgressSnapshot();
+
+        var staleLive = CommBuffer.CreateDefault();
+        staleLive.ProgressSnapshotHostSeq = 42;
+        staleLive.ProgressSnapshotModuleAppliedSeq = 42;
+        staleLive.ProgressSnapshotPayloadLen = 4;
+        staleLive.ProgressSnapshotPayload = new byte[ProtocolConstants.CommProgressSnapshotMaxPayload];
+        staleLive.ProgressSnapshotPayload[0] = 1;
+        staleLive.ProgressSnapshotPayload[1] = 2;
+        staleLive.ProgressSnapshotPayload[2] = 3;
+        staleLive.ProgressSnapshotPayload[3] = 4;
+
+        worker.DebugMergeProgressLaneFromLive(staleLive);
+
+        var buf = worker.DebugGetWorkingBuffer();
+        Assert.Equal(0u, buf.ProgressSnapshotHostSeq);
+        Assert.Equal(0u, buf.ProgressSnapshotModuleAppliedSeq);
+        Assert.Equal(0, buf.ProgressSnapshotPayloadLen);
+    }
+
+    [Fact]
+    public void ClearProgressSnapshot_LiveAdopt_DoesNotResurrectPreClearLane()
+    {
+        using var worker = new BridgeWorker(new DolphinBridge());
+        worker.SetConnected(true, 1, "Host", true);
+        worker.PushProgressSnapshot(42, new byte[] { 9, 8, 7, 6 });
+        worker.ClearProgressSnapshot();
+
+        var staleLive = CommBuffer.CreateDefault();
+        staleLive.Magic = ProtocolConstants.Magic;
+        staleLive.ProgressSnapshotHostSeq = 42;
+        staleLive.ProgressSnapshotModuleAppliedSeq = 42;
+        staleLive.ProgressSnapshotPayloadLen = 4;
+        staleLive.ProgressSnapshotPayload = new byte[ProtocolConstants.CommProgressSnapshotMaxPayload];
+        staleLive.ProgressSnapshotPayload[0] = 9;
+
+        worker.DebugAdoptLiveBuffer(staleLive);
+
+        var buf = worker.DebugGetWorkingBuffer();
+        Assert.Equal(0u, buf.ProgressSnapshotHostSeq);
+        Assert.Equal(0u, buf.ProgressSnapshotModuleAppliedSeq);
+        Assert.Equal(0, buf.ProgressSnapshotPayloadLen);
+    }
+
+    [Fact]
+    public void PushProgressSnapshot_AfterClear_AllowsLiveMergeAgain()
+    {
+        using var worker = new BridgeWorker(new DolphinBridge());
+        worker.SetConnected(true, 1, "Host", true);
+        worker.ClearProgressSnapshot();
+        worker.PushProgressSnapshot(7, new byte[] { 1, 2 });
+
+        var newerLive = CommBuffer.CreateDefault();
+        newerLive.ProgressSnapshotHostSeq = 8;
+        newerLive.ProgressSnapshotModuleAppliedSeq = 7;
+        newerLive.ProgressSnapshotPayloadLen = 3;
+        newerLive.ProgressSnapshotPayload = new byte[ProtocolConstants.CommProgressSnapshotMaxPayload];
+        newerLive.ProgressSnapshotPayload[0] = 5;
+        newerLive.ProgressSnapshotPayload[1] = 6;
+        newerLive.ProgressSnapshotPayload[2] = 7;
+
+        worker.DebugMergeProgressLaneFromLive(newerLive);
+
+        var buf = worker.DebugGetWorkingBuffer();
+        Assert.Equal(8u, buf.ProgressSnapshotHostSeq);
+        Assert.Equal(7u, buf.ProgressSnapshotModuleAppliedSeq);
+        Assert.Equal(3, buf.ProgressSnapshotPayloadLen);
+    }
+
+    [Fact]
+    public void PushProgressSnapshot_ForcesModuleAppliedZero_ForSameSeqReheal()
+    {
+        // Regression: force-full re-pushes the same progressSeq after clear. If the bridge
+        // preserved a stale moduleAppliedSeq == hostSeq, the module soft-skipped the heal
+        // while the launcher still advanced _lastAppliedProgressSeq.
+        using var worker = new BridgeWorker(new DolphinBridge());
+        worker.SetConnected(true, 1, "Host", true);
+        worker.PushProgressSnapshot(42, new byte[] { 1, 2, 3, 4 });
+        var afterFirst = worker.DebugGetWorkingBuffer();
+        Assert.Equal(42u, afterFirst.ProgressSnapshotHostSeq);
+        Assert.Equal(0u, afterFirst.ProgressSnapshotModuleAppliedSeq);
+
+        // Simulate module ack, then force-full clear + same-seq push.
+        worker.DebugAdoptLiveBuffer(new CommBuffer
+        {
+            Magic = ProtocolConstants.Magic,
+            ProgressSnapshotHostSeq = 42,
+            ProgressSnapshotModuleAppliedSeq = 42,
+            ProgressSnapshotPayloadLen = 4,
+            ProgressSnapshotPayload = new byte[ProtocolConstants.CommProgressSnapshotMaxPayload],
+        });
+        worker.ClearProgressSnapshot();
+        worker.PushProgressSnapshot(42, new byte[] { 5, 6, 7, 8 });
+
+        var afterForce = worker.DebugGetWorkingBuffer();
+        Assert.Equal(42u, afterForce.ProgressSnapshotHostSeq);
+        Assert.Equal(0u, afterForce.ProgressSnapshotModuleAppliedSeq);
+        Assert.Equal(4, afterForce.ProgressSnapshotPayloadLen);
+        Assert.Equal(5, afterForce.ProgressSnapshotPayload![0]);
+    }
+
+    [Fact]
+    public void TryGetProgressSnapshotAck_ReportsHostAndModuleApplied()
+    {
+        using var worker = new BridgeWorker(new DolphinBridge());
+        worker.SetConnected(true, 1, "Host", true);
+        Assert.True(worker.TryGetProgressSnapshotAck(out var host0, out var applied0));
+        Assert.Equal(0u, host0);
+        Assert.Equal(0u, applied0);
+
+        worker.PushProgressSnapshot(17, new byte[] { 9, 8, 7 });
+        Assert.True(worker.TryGetProgressSnapshotAck(out var host, out var applied));
+        Assert.Equal(17u, host);
+        Assert.Equal(0u, applied);
+        Assert.True(host > applied);
+    }
+
+    [Fact]
+    public void TryRepushPendingProgressSnapshot_RewritesWhenHostAheadOfApplied()
+    {
+        using var worker = new BridgeWorker(new DolphinBridge());
+        worker.SetConnected(true, 1, "Host", true);
+        worker.PushProgressSnapshot(33, new byte[] { 1, 2, 3, 4 });
+
+        // Simulate a stale moduleApplied behind host (pending heal).
+        var payload = new byte[ProtocolConstants.CommProgressSnapshotMaxPayload];
+        payload[0] = 1;
+        payload[1] = 2;
+        payload[2] = 3;
+        payload[3] = 4;
+        worker.DebugAdoptLiveBuffer(new CommBuffer
+        {
+            Magic = ProtocolConstants.Magic,
+            ProgressSnapshotHostSeq = 33,
+            ProgressSnapshotModuleAppliedSeq = 10,
+            ProgressSnapshotPayloadLen = 4,
+            ProgressSnapshotPayload = payload,
+        });
+
+        // Detached Dolphin → Push write fails; working buffer still restages moduleApplied=0.
+        Assert.False(worker.TryRepushPendingProgressSnapshot());
+        var after = worker.DebugGetWorkingBuffer();
+        Assert.Equal(33u, after.ProgressSnapshotHostSeq);
+        Assert.Equal(0u, after.ProgressSnapshotModuleAppliedSeq);
+        Assert.Equal(4, after.ProgressSnapshotPayloadLen);
+        Assert.Equal(1, after.ProgressSnapshotPayload![0]);
+    }
+
+    [Fact]
+    public void TryRepushPendingProgressSnapshot_ReturnsFalseWhenDolphinWriteFails()
+    {
+        // Regression: returning true on a Push write miss made MaybeRequestProgressCatchup
+        // treat the re-push as success and skip force-full for ~20s (stalled heal loop).
+        using var worker = new BridgeWorker(new DolphinBridge());
+        worker.SetConnected(true, 1, "Host", true);
+
+        var payload = new byte[ProtocolConstants.CommProgressSnapshotMaxPayload];
+        payload[0] = 9;
+        payload[1] = 8;
+        payload[2] = 7;
+        payload[3] = 6;
+        // Open the progress lane (SetConnected force-clears it) then leave a pending heal.
+        worker.PushProgressSnapshot(55, payload.AsSpan(0, 4));
+        Assert.True(worker.TryGetProgressSnapshotAck(out var host, out var applied));
+        Assert.True(host > applied);
+
+        // No attached Dolphin process → TryWriteProgressSnapshotOnly returns false.
+        Assert.False(worker.TryRepushPendingProgressSnapshot());
+        Assert.False(worker.PushProgressSnapshot(55, payload.AsSpan(0, 4)));
+    }
+
+    [Fact]
+    public void TryRepushPendingProgressSnapshot_NoOpWhenAlreadyApplied()
+    {
+        using var worker = new BridgeWorker(new DolphinBridge());
+        worker.SetConnected(true, 1, "Host", true);
+        var payload = new byte[ProtocolConstants.CommProgressSnapshotMaxPayload];
+        payload[0] = 5;
+        payload[1] = 6;
+        worker.DebugAdoptLiveBuffer(new CommBuffer
+        {
+            Magic = ProtocolConstants.Magic,
+            ProgressSnapshotHostSeq = 33,
+            ProgressSnapshotModuleAppliedSeq = 33,
+            ProgressSnapshotPayloadLen = 2,
+            ProgressSnapshotPayload = payload,
+        });
+
+        Assert.False(worker.TryRepushPendingProgressSnapshot());
+    }
+
+    [Fact]
+    public void PushProgressSnapshot_Merge_ClearsLatchWhenModuleApplied()
+    {
+        // Module may bulk-apply before poll observes applied=0. Treat applied >= hostSeq
+        // as done only when live still carries this Push's heal epoch.
+        using var worker = new BridgeWorker(new DolphinBridge());
+        worker.SetConnected(true, 1, "Host", true);
+        worker.PushProgressSnapshot(42, new byte[] { 1, 2, 3, 4 });
+        var stagedFlags = worker.DebugGetWorkingBuffer().ProgressSnapshotFlags;
+
+        var appliedLive = CommBuffer.CreateDefault();
+        appliedLive.ProgressSnapshotHostSeq = 42;
+        appliedLive.ProgressSnapshotModuleAppliedSeq = 42;
+        appliedLive.ProgressSnapshotFlags = stagedFlags;
+        appliedLive.ProgressSnapshotPayloadLen = 4;
+        appliedLive.ProgressSnapshotPayload = new byte[ProtocolConstants.CommProgressSnapshotMaxPayload];
+        appliedLive.ProgressSnapshotPayload[0] = 9;
+
+        worker.DebugMergeProgressLaneFromLive(appliedLive);
+
+        var buf = worker.DebugGetWorkingBuffer();
+        Assert.Equal(42u, buf.ProgressSnapshotHostSeq);
+        Assert.Equal(42u, buf.ProgressSnapshotModuleAppliedSeq);
+        Assert.Equal(4, buf.ProgressSnapshotPayloadLen);
+        Assert.Equal(1, buf.ProgressSnapshotPayload![0]);
+    }
+
+    [Fact]
+    public void PushProgressSnapshot_Merge_KeepsPendingOnStaleAppliedAck()
+    {
+        // Same hostSeq + applied>=host with flags=0 (pre-push stale) must NOT clear the
+        // heal latch — that soft-skipped rehals and left stage-enter force looking hung.
+        using var worker = new BridgeWorker(new DolphinBridge());
+        worker.SetConnected(true, 1, "Host", true);
+        worker.PushProgressSnapshot(42, new byte[] { 1, 2, 3, 4 });
+        Assert.NotEqual(0, worker.DebugGetWorkingBuffer().ProgressSnapshotFlags);
+
+        var staleLive = CommBuffer.CreateDefault();
+        staleLive.ProgressSnapshotHostSeq = 42;
+        staleLive.ProgressSnapshotModuleAppliedSeq = 42;
+        staleLive.ProgressSnapshotFlags = 0;
+        staleLive.ProgressSnapshotPayloadLen = 4;
+        staleLive.ProgressSnapshotPayload = new byte[ProtocolConstants.CommProgressSnapshotMaxPayload];
+
+        worker.DebugMergeProgressLaneFromLive(staleLive);
+
+        var buf = worker.DebugGetWorkingBuffer();
+        Assert.Equal(42u, buf.ProgressSnapshotHostSeq);
+        Assert.Equal(0u, buf.ProgressSnapshotModuleAppliedSeq);
+        Assert.True(buf.ProgressSnapshotFlags != 0);
+    }
+
+    [Fact]
+    public void PushProgressSnapshot_Merge_KeepsPendingWhenMidApply()
+    {
+        // 0 < moduleApplied < hostSeq: still pending — keep staged moduleApplied=0.
+        using var worker = new BridgeWorker(new DolphinBridge());
+        worker.SetConnected(true, 1, "Host", true);
+        worker.PushProgressSnapshot(42, new byte[] { 1, 2, 3, 4 });
+
+        var midLive = CommBuffer.CreateDefault();
+        midLive.ProgressSnapshotHostSeq = 42;
+        midLive.ProgressSnapshotModuleAppliedSeq = 10;
+        midLive.ProgressSnapshotPayloadLen = 4;
+        midLive.ProgressSnapshotPayload = new byte[ProtocolConstants.CommProgressSnapshotMaxPayload];
+        midLive.ProgressSnapshotPayload[0] = 9;
+
+        worker.DebugMergeProgressLaneFromLive(midLive);
+
+        var buf = worker.DebugGetWorkingBuffer();
+        Assert.Equal(42u, buf.ProgressSnapshotHostSeq);
+        Assert.Equal(0u, buf.ProgressSnapshotModuleAppliedSeq);
+        Assert.Equal(4, buf.ProgressSnapshotPayloadLen);
+        Assert.Equal(1, buf.ProgressSnapshotPayload![0]);
+    }
+
+    [Fact]
+    public void TryGetProgressSnapshotAck_FastModuleApply_ClearsPendingHeal()
+    {
+        using var worker = new BridgeWorker(new DolphinBridge());
+        worker.SetConnected(true, 1, "Host", true);
+        worker.PushProgressSnapshot(42, new byte[] { 1, 2, 3, 4 });
+        var stagedFlags = worker.DebugGetWorkingBuffer().ProgressSnapshotFlags;
+
+        worker.DebugAdoptLiveBuffer(new CommBuffer
+        {
+            Magic = ProtocolConstants.Magic,
+            ProgressSnapshotHostSeq = 42,
+            ProgressSnapshotModuleAppliedSeq = 42,
+            ProgressSnapshotFlags = stagedFlags,
+            ProgressSnapshotPayloadLen = 4,
+            ProgressSnapshotPayload = new byte[ProtocolConstants.CommProgressSnapshotMaxPayload],
+        });
+
+        Assert.True(worker.TryGetProgressSnapshotAck(out var host, out var applied));
+        Assert.Equal(42u, host);
+        Assert.Equal(42u, applied);
+        Assert.False(host > applied);
+    }
+
+    [Fact]
+    public void PushProgressSnapshot_AfterLiveConfirmsZero_AdoptsRealModuleAck()
+    {
+        using var worker = new BridgeWorker(new DolphinBridge());
+        worker.SetConnected(true, 1, "Host", true);
+        worker.PushProgressSnapshot(42, new byte[] { 1, 2, 3, 4 });
+
+        // Mailbox matches Push intent — release the heal-staged latch.
+        var parked = CommBuffer.CreateDefault();
+        parked.Magic = ProtocolConstants.Magic;
+        parked.ProgressSnapshotHostSeq = 42;
+        parked.ProgressSnapshotModuleAppliedSeq = 0;
+        parked.ProgressSnapshotPayloadLen = 4;
+        parked.ProgressSnapshotPayload = new byte[ProtocolConstants.CommProgressSnapshotMaxPayload];
+        parked.ProgressSnapshotPayload[0] = 1;
+        worker.DebugAdoptLiveBuffer(parked);
+
+        // Module finished bulk-apply — catch-up must see the real ack.
+        var applied = CommBuffer.CreateDefault();
+        applied.Magic = ProtocolConstants.Magic;
+        applied.ProgressSnapshotHostSeq = 42;
+        applied.ProgressSnapshotModuleAppliedSeq = 42;
+        applied.ProgressSnapshotPayloadLen = 4;
+        applied.ProgressSnapshotPayload = parked.ProgressSnapshotPayload;
+        worker.DebugAdoptLiveBuffer(applied);
+
+        Assert.True(worker.TryGetProgressSnapshotAck(out var host, out var moduleApplied));
+        Assert.Equal(42u, host);
+        Assert.Equal(42u, moduleApplied);
     }
 }
 

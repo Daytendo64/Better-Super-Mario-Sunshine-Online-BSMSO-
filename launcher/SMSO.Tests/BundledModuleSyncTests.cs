@@ -71,6 +71,33 @@ public class BundledModuleSyncTests
         }
     }
 
+    [Fact]
+    public void TryFindSourceModule_PrefersFileBesideExecutableDirectory()
+    {
+        // StageBundledModuleBesideTests writes into AppContext.BaseDirectory — same
+        // priority tier as the running test host. Ensure Find returns that path.
+        var payload = new byte[] { 0x50, 0x52, 0x45, 0x46 };
+        var staged = StageBundledModuleBesideTests(payload);
+        try
+        {
+            Assert.True(ModuleInstaller.TryFindSourceModule(ModuleVersionMessages.ModuleFileName, out var found));
+            Assert.NotNull(found);
+            Assert.True(File.Exists(found));
+            Assert.Equal(payload, File.ReadAllBytes(found!));
+            var foundDir = Path.GetFullPath(Path.GetDirectoryName(found!)!)
+                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            var baseDir = Path.GetFullPath(AppContext.BaseDirectory)
+                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            Assert.True(
+                string.Equals(foundDir, baseDir, StringComparison.OrdinalIgnoreCase),
+                $"Expected source beside {baseDir}, got {found}");
+        }
+        finally
+        {
+            TryDeleteFile(staged);
+        }
+    }
+
     /// <summary>
     /// Place a fake bundled module in the test output directory so
     /// <see cref="ModuleInstaller.TryFindSourceModule"/> finds it first.

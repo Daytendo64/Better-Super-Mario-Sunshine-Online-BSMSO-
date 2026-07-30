@@ -6,6 +6,9 @@ namespace smso {
 
 void initStoryFlagSync();
 void resetStoryFlagTrackers();
+/// Clear authority overlay + bootstrap + trackers after a host session progress reset
+/// so plaza Type5 / card bits cannot be re-applied from stale session caches.
+void clearStoryFlagSessionProgress();
 void updateStoryFlagSyncConnectionState(bool connected, bool syncEnabled);
 
 // Called from BSE stageInit AFTER resetStage and BEFORE setupObjects/loadAfter.

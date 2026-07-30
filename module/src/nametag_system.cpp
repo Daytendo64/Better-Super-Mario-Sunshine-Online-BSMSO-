@@ -9,17 +9,15 @@
 #include <JSystem/J2D/J2DPrint.hxx>
 #include <JSystem/JUtility/JUTColor.hxx>
 #include <SMS/Camera/PolarSubCamera.hxx>
-#include <SMS/Map/MapCollisionData.hxx>
 #include <SMS/System/Application.hxx>
 #include <SMS/System/MarDirector.hxx>
-#include <SMS/raw_fn.hxx>
 
 #include "comm_buffer.hpp"
+#include "collision_los.hpp"
+#include "gx_hud_fence.hpp"
 #include "hide_seek.hpp"
 
 extern CPolarSubCamera *gpCamera;
-extern TMapCollisionData *gpMapCollisionData;
-extern TMarDirector *gpMarDirector;
 
 namespace smso::nametag {
 
@@ -57,8 +55,7 @@ static constexpr f32 kAnchorSmoothRate = 30.0f;
 
 // doldecomp TMapCollisionData::intersectLine — margin before the head anchor so floor
 // collision under the target does not false-positive as a wall block.
-static constexpr f32 kOcclusionAnchorMargin = 72.0f;
-static constexpr f32 kOcclusionMinRayLength = 120.0f;
+// (Raycast itself lives in collision_los; these drive sample hysteresis only.)
 static constexpr u8 kOcclusionRefreshFrames = 6; // 10 Hz at 60 fps, staggered per slot
 static constexpr u8 kOcclusionHideSamples = 2;
 static constexpr u8 kNearbyOcclusionHideSamples = 3;
@@ -170,116 +167,10 @@ static bool getCameraPosition(Vec &out) {
     return true;
 }
 
-static bool isValidCollisionHitPointer(const TBGCheckData *tri) {
-    if (!tri)
-        return false;
-
-    const u32 addr = reinterpret_cast<u32>(tri);
-    // Reject garbage returns (e.g. small integers) before touching triangle fields.
-    if (addr < 0x80400000u || addr >= 0x81800000u)
-        return false;
-
-    if (gpMapCollisionData && tri == &gpMapCollisionData->mIllegalCheckData)
-        return false;
-
-    return true;
-}
-
-static bool isMapCollisionReadyForOcclusion() {
-    if (!gpMapCollisionData || gpMapCollisionData->mCheckDataCount == 0)
-        return false;
-
-    if (gpMarDirector && gpMarDirector->mCurState < TMarDirector::STATE_NORMAL)
-        return false;
-
-    return true;
-}
-
-using MapCollisionIntersectLineFn = const TBGCheckData *(*)(const TMapCollisionData *, const TVec3f &,
-                                                            const TVec3f &, bool, TVec3f *);
-
-static const TBGCheckData *mapCollisionIntersectLine(const TVec3f &start, const TVec3f &end,
-                                                     TVec3f *hitPos) {
-    // BSE declares intersectLine as u32, but retail returns const TBGCheckData* in r3.
-    const auto fn = reinterpret_cast<MapCollisionIntersectLineFn>(
-        intersectLine__17TMapCollisionDataCFRCQ29JGeometry8TVec3_f);
-    return fn(gpMapCollisionData, start, end, false, hitPos);
-}
-
-static bool isNameTagOcclusionTriangleBlocking(const TBGCheckData *tri) {
-    if (!isValidCollisionHitPointer(tri))
-        return false;
-
-    if (tri->isIllegalData() || tri->isMarioThrough() || tri->isWaterSurface())
-        return false;
-
-    const TVec3f *normal = tri->getNormal();
-    if (!normal)
-        return false;
-
-    // doldecomp bgIntersectLine + CameraBGCheck: floors (up-facing) do not block sight lines.
-    if (normal->y > 0.55f)
-        return false;
-
-    return true;
-}
-
 // doldecomp TMapCollisionData::intersectLine — ground/wall/roof grid raycast.
+// All modes: hide tags when a wall blocks camera→anchor (matches remote body LOS).
 static bool isNameTagAnchorOccluded(f32 anchorX, f32 anchorY, f32 anchorZ) {
-    if (!isHideSeekNameTagMode() || !gpCamera || !isMapCollisionReadyForOcclusion())
-        return false;
-
-    Vec camera{};
-    if (!getCameraPosition(camera))
-        return false;
-
-    TVec3f segStart = {camera.x, camera.y, camera.z};
-    const TVec3f anchor = {anchorX, anchorY, anchorZ};
-
-    const f32 fullDx = anchor.x - segStart.x;
-    const f32 fullDy = anchor.y - segStart.y;
-    const f32 fullDz = anchor.z - segStart.z;
-    const f32 fullLenSq = fullDx * fullDx + fullDy * fullDy + fullDz * fullDz;
-    if (fullLenSq < kOcclusionMinRayLength * kOcclusionMinRayLength)
-        return false;
-
-    // Compare against (ray length - margin)^2. Subtracting margin^2 from the
-    // squared ray length only excluded a few world units on long rays, so the
-    // target's nearby floor/wall contact repeatedly toggled occlusion while it
-    // moved.
-    const f32 guardedLength = sqrtf(fullLenSq) - kOcclusionAnchorMargin;
-    const f32 anchorGuard = guardedLength * guardedLength;
-
-    for (int attempt = 0; attempt < 4; ++attempt) {
-        TVec3f hitPos{};
-        const TBGCheckData *hit = mapCollisionIntersectLine(segStart, anchor, &hitPos);
-        if (!isValidCollisionHitPointer(hit))
-            return false;
-
-        if (!isNameTagOcclusionTriangleBlocking(hit)) {
-            TVec3f dir = {anchor.x - segStart.x, anchor.y - segStart.y, anchor.z - segStart.z};
-            const f32 segLen = sqrtf(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
-            if (segLen < 1.0f)
-                return false;
-
-            dir.x /= segLen;
-            dir.y /= segLen;
-            dir.z /= segLen;
-
-            segStart.x = hitPos.x + dir.x * 8.0f;
-            segStart.y = hitPos.y + dir.y * 8.0f;
-            segStart.z = hitPos.z + dir.z * 8.0f;
-            continue;
-        }
-
-        const f32 hx = hitPos.x - camera.x;
-        const f32 hy = hitPos.y - camera.y;
-        const f32 hz = hitPos.z - camera.z;
-        const f32 hitLenSq = hx * hx + hy * hy + hz * hz;
-        return hitLenSq < anchorGuard;
-    }
-
-    return false;
+    return collision_los::isPointOccludedFromCamera(anchorX, anchorY, anchorZ);
 }
 
 static f32 measureCameraDistance(f32 wx, f32 wy, f32 wz) {
@@ -503,15 +394,19 @@ static void drawOutline(J2DPrint &printer, int x, int y, const OutlineMetrics &m
     }
 }
 
-static void drawNameTag(int x, int y, int fontSize, const OutlineMetrics &outlineMetrics,
-                        const char *text, const Appearance &appearance, f32 alpha) {
+// The printer is owned by drawAll and reused across every tag: private_initiate
+// fully re-seeds font, colors and leading, so one stack instance per frame does
+// the work that used to cost a construct/destruct pair per tag (and per outline
+// color switch) with several remotes on screen.
+static void drawNameTag(J2DPrint &printer, int x, int y, int fontSize,
+                        const OutlineMetrics &outlineMetrics, const char *text,
+                        const Appearance &appearance, f32 alpha) {
     if (!text || text[0] == '\0' || alpha <= 0.01f)
         return;
 
     const JUtility::TColor top = applyAlpha(appearance.textTopColor, alpha);
     const JUtility::TColor bottom = applyAlpha(appearance.textBottomColor, alpha);
     const JUtility::TColor outline = applyAlpha(appearance.outlineColor, alpha);
-    J2DPrint printer(gpSystemFont, 1);
 
     if (outlineMetrics.offsetPx > 0) {
         configurePrinter(printer, fontSize, outline, outline, false);
@@ -651,10 +546,15 @@ void updateSlot(u8 slot, bool active, f32 anchorX, f32 anchorY, f32 anchorZ, f32
                            moveDx * moveDx + moveDy * moveDy + moveDz * moveDz >=
                                kTeleportDistance * kTeleportDistance;
     if (isHideSeekNameTagMode()) {
+        // Distance/perspective scaling stays for everyone. Local seekers skip the
+        // far-distance fade/cull so teammate tags do not disappear at range.
         state.targetFontSize =
             onScreen ? evaluateHideSeekFontSize(distance, anchorX, anchorY, anchorZ, rawScreenY)
                      : 0.0f;
-        state.targetAlpha = onScreen ? evaluateTargetAlpha(distance) : 0.0f;
+        if (isLocalHideSeekSeeker())
+            state.targetAlpha = onScreen ? 1.0f : 0.0f;
+        else
+            state.targetAlpha = onScreen ? evaluateTargetAlpha(distance) : 0.0f;
         if (!onScreen) {
             // Preserve the last stable occlusion decision while off-screen.
         } else if (largeMove || state.occlusionRefresh == 0) {
@@ -749,8 +649,25 @@ void drawAll(const J2DOrthoGraph *graph) {
     if (!graph || !gpSystemFont)
         return;
 
+    // Skip GX work entirely when nothing is visible — setup2D alone mid-console
+    // can still disturb later TGCConsole2 panes (Z-menu digits / radar).
+    bool anyVisible = false;
+    for (u32 slot = 0; slot < MAX_REMOTE_SLOTS; ++slot) {
+        const SlotRuntime &state = gSlots[slot];
+        if (!state.active || !state.drawVisible || state.smoothedAlpha <= 0.03f)
+            continue;
+        if (static_cast<int>(state.smoothedFontSize + 0.5f) < static_cast<int>(kMinFontSize))
+            continue;
+        anyVisible = true;
+        break;
+    }
+    if (!anyVisible)
+        return;
+
     auto *ctx = const_cast<J2DOrthoGraph *>(graph);
-    ctx->setup2D();
+    gx_hud_fence::beginOverlay(ctx);
+
+    J2DPrint printer(gpSystemFont, 1);
 
     for (u32 slot = 0; slot < MAX_REMOTE_SLOTS; ++slot) {
         SlotRuntime &state = gSlots[slot];
@@ -778,10 +695,12 @@ void drawAll(const J2DOrthoGraph *graph) {
         int y = 0;
         computeDrawRect(centerX, centerY, textWidth, textHeight, outlineMetrics.offsetPx, x, y);
 
-        drawNameTag(x, y, fontSize, outlineMetrics, state.name, state.appearance, state.smoothedAlpha);
+        drawNameTag(printer, x, y, fontSize, outlineMetrics, state.name, state.appearance,
+                    state.smoothedAlpha);
     }
 
-    ctx->setScissor();
+    // Restore retail HUD GX — do not leave J2DPrint TexObj/TEV for later panes.
+    gx_hud_fence::endOverlay(ctx);
 #endif
 }
 

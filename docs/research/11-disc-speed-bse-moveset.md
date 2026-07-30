@@ -2,7 +2,7 @@
 
 ## Summary
 
-Dolphin **Emulate Disc Speed** (`FastDiscSpeed=False`) stresses Better Sunshine Engine’s memory-card settings path and DVD usage. BSMSO forces `FastDiscSpeed=True` for GMSE90; that remains required for reliable settings save/load. This note documents root causes and what BSMSO can fix in-repo.
+Dolphin **Emulate Disc Speed** (`FastDiscSpeed=False`) stresses Better Sunshine Engine’s memory-card settings path and DVD usage. BSMSO enables `FastDiscSpeed=True` for GMSE90 via the **recommended Dolphin settings** profile (not a separate launcher toggle, and not forced when that profile is off). Prefer Fast Disc Speed for reliable settings save/load. This note documents root causes and what BSMSO can fix in-repo.
 
 ## Boot / settings / CARD path (BSE)
 
@@ -35,7 +35,8 @@ That matches “some moves unavailable” when CARD load fails under disc pressu
 
 - `initModule` registers settings (`mGameCode = 'GMSB'`, `mSaveGlobal = false`).
 - `onPlayerInit` loads `/better_movement.prm` from the mounted `"mario"` JKR volume (also `PlayerMovementParams` ctor path `/mario/better_movement.prm`).
-- BSMSO CharacterPack remounts replace the mario archive. Merged custom packs historically **omitted** `better_movement.prm` (retail SMS archive also lacks it unless a Moveset release patched mario). Missing prm → Moveset keeps code defaults (`mMaxJumps=1`, multipliers `1.0`) instead of official Moveset retune.
+- BSMSO CharacterPack remounts replace the mario archive. Merged custom packs historically **omitted** `better_movement.prm` (retail SMS archive also lacks it unless a Moveset release patched mario). Missing prm → Moveset keeps code defaults (`mMaxJumps=1`, multipliers `1.0`) — **this is the release-zip feel**.
+- An earlier BSMSO Install path **injected** `assets/better_movement.prm` whenever Patch BSE moveset was on. That file sets `mGravityMultiplier≈1.04`, `mSpeedMultiplier≈1.06`, `mMultiJumpFSpeedMulti≈1.20`, `mSlideMultiplier≈0.875` and is what made jumps feel heavier than the release build. **Install no longer injects it**; it always strips leftover PRM and only toggles `BetterSunshineMoveset.kxe`.
 
 ## What BSMSO ships
 
@@ -43,8 +44,10 @@ That matches “some moves unavailable” when CARD load fails under disc pressu
    - Source is in `module/lib/BetterSunshineEngine`. Do **not** deploy DEBUG/dev `.kxe` until boot-verified.
    - Installer uses official v4.0.0 `BetterSunshineEngine.kxe` (583744). Local copies are used only if they match that size.
 2. **Moveset source** (`tools/_research-moveset`): keep official init path (no early `emit` at module load). Known-good binary is 46976 bytes.
-3. **CharacterPack**: inject official-default `better_movement.prm` when missing; `MarioPackInstaller` / `ModelLibrary.TryGetPackBytes` repair retail `mario.arc` and library packs. Sample at `assets/better_movement.prm`.
-4. **Launcher**: keep forcing `FastDiscSpeed=True` + MEM1/MEM2 on every launch (already present).
+3. **CharacterPack**: `better_movement.prm` helpers remain for strip/repair only. **Do not inject** on Install — release matching is Moveset.kxe without the PRM retune. Sample at `assets/better_movement.prm` (legacy reference).
+4. **Launcher**: apply `FastDiscSpeed=True` with the recommended performance profile; always force MEM1/MEM2 + CPU 200%. When recommended is off, leave disc speed to the user/Dolphin.
+   - **Regression (builds ~Jul 13–80):** `DolphinConfigService` incorrectly forced `FastDiscSpeed=False` (Emulate Disc Speed ON). That matches release-user black screens where Kuribo loads BSE/Moveset/`_BSMSO` at known-good sizes, then hangs during early CARD + `nintendo.szs` / audio init with no further DVD progress. **Build 81+ restored `FastDiscSpeed=True` as always-forced; later builds keep it on the recommended profile only (user choice when that toggle is off).**
+5. **Patch BSE moveset toggle** (Settings): **defaults to off**. When on, Install copies `BetterSunshineMoveset.kxe` only (extra moves). Install **always strips** `better_movement.prm` from mario archives/packs so weight matches the release zip. Re-run Install + restart Dolphin after toggling.
 
 ### Rebuild commands (dev)
 

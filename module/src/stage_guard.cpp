@@ -120,10 +120,14 @@ bool isNonGameplayStage(u8 areaId) {
     return areaId == 15;
 }
 
-bool isSmsoAuthorizedStageTransition() {
+bool isLauncherAuthorizedStageMove() {
     CommBuffer *buf = getCommBuffer();
     const bool launcherWarp = buf && (buf->bridgeFlags & BF_WARP_PENDING) != 0;
-    return isHideSeekAuthorizedStageTransition() || launcherWarp || s_pendingAuthorizedStageMove;
+    return launcherWarp || s_pendingAuthorizedStageMove;
+}
+
+bool isSmsoAuthorizedStageTransition() {
+    return isHideSeekAuthorizedStageTransition() || isLauncherAuthorizedStageMove();
 }
 
 void authorizeLauncherStageMove() {
@@ -145,8 +149,15 @@ void performSmsoMoveStage(TMarDirector *director) {
     if (!director)
         return;
 
+    // Last line of defense: every BL'd moveStage path ends here. Mid-tag death must
+    // never take plaza hub return (1/0xFF) — rewrite before any branch below.
+    // Skip for intentional launcher / warp-all moves (BF_WARP_PENDING is often already
+    // cleared by consumeWarpIntent; s_pendingAuthorizedStageMove covers that window).
+    if (!isLauncherAuthorizedStageMove())
+        redirectHideSeekDeathStageLeave(director);
+
     // Fix Sirena hotel/casino load ids before vanilla/BSE consumes next-scene
-    // (natural doors use 7/3 even though only delfino2 exists; casino must pick
+    // (natural doors may pass mission ids 3/4/6/7; casino must pick
     // casino0 vs casino1 from beach mission 3/4). Hotel→casino same-shine doors use
     // episode 0xFF — normalize rewrites that to load 0 or 1 and stashes mission 3/4.
     normalizeSirenaNextSceneForLoad();
@@ -161,6 +172,36 @@ void performSmsoMoveStage(TMarDirector *director) {
     const u8 curEp = gpApplication.mCurrentScene.mEpisodeID;
     if (nextArea != curArea || nextEp != curEp) {
         OSReport("[SMSO] moveStage next=%u/%u cur=%u/%u\n", nextArea, nextEp, curArea, curEp);
+    }
+
+    // Destination title/options (area 15): never Delay Context 8 / episode-select.
+    // Post-Bowser clear / movie-skip collapse set next=15/255 and fell through to
+    // beginEpisodeSelectTransition (pipe swirl → black freeze). dolphin.log:
+    // moveStage next=15/255 cur=60/0 → Stage init area=15. Docs: area 15 must
+    // vanilla-moveStage; that only ran for CURRENT.
+    constexpr u8 kCoronaBossAreaId = 60;
+    constexpr u8 kDelfinoPlazaAreaId = 1;
+
+    // Corona boss (60): movie auto-skip may collapse leave to title (15/255) or
+    // another broken 0xFF non-plaza destination. Always force plaza hub — this is
+    // the freeze preventer; cutscene_skip intentionally allows boss ending skip.
+    if (curArea == kCoronaBossAreaId && nextArea != kCoronaBossAreaId &&
+        (isNonGameplayStage(nextArea) ||
+         (nextEp == 0xFF && nextArea != kDelfinoPlazaAreaId))) {
+        gpApplication.mNextScene.mAreaID = kDelfinoPlazaAreaId;
+        gpApplication.mNextScene.mEpisodeID = 0xFF;
+        OSReport("[SMSO] corona boss leave → plaza hub (was %u/%u)\n", nextArea, nextEp);
+        director->moveStage();
+        return;
+    }
+
+    if (isNonGameplayStage(nextArea)) {
+        if (nextEp == 0xFF)
+            gpApplication.mNextScene.mEpisodeID = 0;
+        OSReport("[SMSO] options/title next → moveStage ep%u\n",
+                 gpApplication.mNextScene.mEpisodeID);
+        director->moveStage();
+        return;
     }
 
     if (isNonGameplayStage(gpApplication.mCurrentScene.mAreaID)) {
@@ -195,7 +236,6 @@ void performSmsoMoveStage(TMarDirector *director) {
     // init). Options→plaza already bypasses via isNonGameplayStage; stage→plaza must
     // call moveStage the same way. Plaza→stage with 0xFF still opens episode-select
     // below (next area is the shine stage, not plaza).
-    constexpr u8 kDelfinoPlazaAreaId = 1;
     if (gpApplication.mNextScene.mAreaID == kDelfinoPlazaAreaId &&
         gpApplication.mNextScene.mEpisodeID == 0xFF) {
         OSReport("[SMSO] plaza hub return (ep 0xFF) → moveStage\n");
@@ -238,6 +278,9 @@ void performSmsoMoveStage(TMarDirector *director) {
             // the current episode (hub soft-route).
             const u8 destArea = gpApplication.mNextScene.mAreaID;
             if (destArea == 14) {
+                // Ep5 (mission 4) → casino1; anything else (incl. Ep4 mission 3) → casino0.
+                // normalizeSirenaNextSceneForLoad should already have rewritten 0xFF using
+                // the armed hotel mission — this is only a same-shine safety net.
                 const u8 mission =
                     static_cast<u8>(TFlagManager::smInstance->getFlag(0x40003));
                 gpApplication.mNextScene.mEpisodeID = (mission == 4) ? 1 : 0;

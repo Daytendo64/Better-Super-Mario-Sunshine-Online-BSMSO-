@@ -318,6 +318,95 @@ public class IntegrationTests
     }
 
     [Fact]
+    public async Task HandshakeWrongModBuildId_IsRejectedBeforeJoin()
+    {
+        var server = new GameServer(new LevelCatalog());
+        var port = GetFreePort();
+        server.Start(port);
+        try
+        {
+            using var tcp = new TcpClient();
+            await tcp.ConnectAsync("127.0.0.1", port);
+            var stream = tcp.GetStream();
+            var wrongBuild = (ushort)(ProtocolConstants.ModBuildId == ushort.MaxValue
+                ? ProtocolConstants.ModBuildId - 1
+                : ProtocolConstants.ModBuildId + 1);
+            await stream.WriteAsync(PacketSerializer.BuildHandshake(Guid.NewGuid(), wrongBuild));
+
+            var reject = await ReadJoinRejectedReasonAsync(stream);
+            Assert.Equal(JoinRejectReason.VersionMismatch, reject);
+            Assert.Equal(0, server.SessionCount);
+        }
+        finally
+        {
+            server.Stop();
+        }
+    }
+
+    [Fact]
+    public async Task WrongGameProfileId_IsRejectedAsProfileMismatch()
+    {
+        var server = new GameServer(new LevelCatalog());
+        var port = GetFreePort();
+        server.Start(port);
+        try
+        {
+            using var tcp = new TcpClient();
+            await tcp.ConnectAsync("127.0.0.1", port);
+            var stream = tcp.GetStream();
+            await stream.WriteAsync(PacketSerializer.BuildHandshake(Guid.NewGuid()));
+            // Drain HandshakeAck
+            var ackBuf = new byte[64];
+            _ = await stream.ReadAsync(ackBuf);
+
+            var wrongProfile = (ushort)(ProtocolConstants.CurrentGameProfileId + 1);
+            await stream.WriteAsync(PacketSerializer.BuildJoinRequest(
+                "WrongProfile", null, gameProfileId: wrongProfile));
+
+            var reject = await ReadJoinRejectedReasonAsync(stream);
+            Assert.Equal(JoinRejectReason.ProfileMismatch, reject);
+            Assert.Equal(0, server.SessionCount);
+        }
+        finally
+        {
+            server.Stop();
+        }
+    }
+
+    [Fact]
+    public async Task LegacyJoinWithoutGameProfileId_IsRejectedAsProfileMismatch()
+    {
+        var server = new GameServer(new LevelCatalog());
+        var port = GetFreePort();
+        server.Start(port);
+        try
+        {
+            using var tcp = new TcpClient();
+            await tcp.ConnectAsync("127.0.0.1", port);
+            var stream = tcp.GetStream();
+            await stream.WriteAsync(PacketSerializer.BuildHandshake(Guid.NewGuid()));
+            var ackBuf = new byte[64];
+            _ = await stream.ReadAsync(ackBuf);
+
+            // Pre-profile join: name(16)+modelId(8)+modBuildId(2), no gameProfileId.
+            var full = PacketSerializer.BuildJoinRequest("PreProfile", null);
+            Assert.True(PacketSerializer.TryUnwrapTcp(full, out _, out var payload));
+            var legacyLen = 16 + ProtocolConstants.MarioModelIdSize + 2;
+            var legacyPayload = new byte[legacyLen];
+            Array.Copy(payload, 0, legacyPayload, 0, legacyLen);
+            await stream.WriteAsync(PacketSerializer.WrapTcp(TcpPacketId.JoinRequest, legacyPayload));
+
+            var reject = await ReadJoinRejectedReasonAsync(stream);
+            Assert.Equal(JoinRejectReason.ProfileMismatch, reject);
+            Assert.Equal(0, server.SessionCount);
+        }
+        finally
+        {
+            server.Stop();
+        }
+    }
+
+    [Fact]
     public async Task LegacyJoinWithoutModBuildId_IsRejectedAsVersionMismatch()
     {
         var server = new GameServer(new LevelCatalog());
@@ -1020,12 +1109,5 @@ public class IntegrationTests
         }
     }
 
-    private static int GetFreePort()
-    {
-        var listener = new TcpListener(IPAddress.Loopback, 0);
-        listener.Start();
-        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
-        listener.Stop();
-        return port;
-    }
+    private static int GetFreePort() => TestPortAllocator.Next();
 }

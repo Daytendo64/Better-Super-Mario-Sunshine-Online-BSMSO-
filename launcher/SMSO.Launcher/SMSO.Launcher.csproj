@@ -44,6 +44,14 @@
       <Link>assets\episode-names.ntsc-u.json</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
+    <Content Include="..\..\assets\data\nintendo.szs">
+      <Link>assets\data\nintendo.szs</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="..\..\assets\data\option.szs">
+      <Link>assets\data\option.szs</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
   </ItemGroup>
 
   <ItemGroup>

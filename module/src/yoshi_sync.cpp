@@ -131,17 +131,27 @@ static void restoreRemoteYoshiThinkUpperFludd(TMario *body, const StagedYoshiThi
     trigger->mSprayState = saved.sprayState;
 }
 
-static void calcRemoteYoshiThinkUpper(TMario *body, TYoshi *yoshi, const RemoteYoshiSlot *slot) {
-    if (!body || !yoshi || !slot || !sYoshiThinkUpper)
+static void calcRemoteYoshiThinkUpper(TMario *body, TYoshi *yoshi, RemoteYoshiSlot *slot) {
+    if (!body || !yoshi || !slot || !sYoshiThinkUpper || !body->mFludd)
+        return;
+    // Mouth-open mtx only — idle remotes skip joint mtxCalc churn when several are mounted.
+    // Still run one closing frame after spray/tongue ends so eat mtxCalc is cleared.
+    const bool needMouth =
+        slot->hostSpraying || smso::yoshiTongueIsActive(slot->lastTongueState);
+    if (!needMouth && !slot->thinkUpperMouthWasOpen)
         return;
 
     StagedYoshiThinkFludd staged = {};
     stageRemoteYoshiThinkUpperFludd(body, slot, staged);
     sYoshiThinkUpper(yoshi);
     restoreRemoteYoshiThinkUpperFludd(body, staged);
+    slot->thinkUpperMouthWasOpen = needMouth;
 }
 
-static constexpr const char kEnemyGroupName[] = "敵グループ";
+// "敵グループ" in Shift-JIS — must match retail TNameRef bytes (see kPlayerGroupName).
+// A UTF-8 source literal embeds the wrong code units, so tongue removal silently fails
+// and puppet tongues stay on the enemy perform list (movement/findTarget → multi-Yoshi crash).
+static const char kEnemyGroupName[] = "\x93\x47\x83\x4F\x83\x8B\x81\x5B\x83\x76";
 
 static void *remoteYoshiTongue(TYoshi *yoshi) {
     if (!yoshi)
@@ -389,13 +399,15 @@ static void applyYoshiColor(TYoshi *yoshi, u8 type, u8 bckId) {
     yoshi->thinkBtp(bckId > 0 ? static_cast<int>(bckId) : kYoshiRideAnimId);
 }
 
-static void removeRemoteYoshiTongueFromEnemyGroup(void *tongue) {
+// Returns true when the enemy group was located (tongue erased if present).
+// False means the stage name-ref is missing — do not treat initInLoadAfter as settled.
+static bool removeRemoteYoshiTongueFromEnemyGroup(void *tongue) {
     if (!tongue)
-        return;
+        return false;
 
     JDrama::TNameRefGen *gen = JDrama::TNameRefGen::getInstance();
     if (!gen)
-        return;
+        return false;
 
     JDrama::TNameRef *ref = gen->getNameRef(kEnemyGroupName);
     if (!ref) {
@@ -404,31 +416,46 @@ static void removeRemoteYoshiTongueFromEnemyGroup(void *tongue) {
             ref = root->search(kEnemyGroupName);
     }
     if (!ref)
-        return;
+        return false;
 
     auto *group = reinterpret_cast<JDrama::TViewObjPtrListT<JDrama::TViewObj> *>(ref);
-    for (auto it = group->mViewObjList.begin(); it != group->mViewObjList.end(); ++it) {
-        if (static_cast<void *>(*it) == tongue) {
-            group->mViewObjList.erase(it);
-            return;
-        }
+    // erase every match — a failed prior remove + re-initInLoadAfter can duplicate entries.
+    // JDrama erase returns void; use post-increment like clearRemotePerformGroupMembers.
+    for (auto it = group->mViewObjList.begin(); it != group->mViewObjList.end();) {
+        if (static_cast<void *>(*it) == tongue)
+            group->mViewObjList.erase(it++);
+        else
+            ++it;
     }
+    return true;
 }
 
 static void ensureRemoteYoshiDrawable(TYoshi *yoshi) {
     if (!yoshi)
         return;
 
-    // doldecomp TYoshi::entry skips draw when juice timer fails low-bit checks.
+    // doldecomp TYoshi::entry skips draw when juice timer fails low-bit checks,
+    // and also forces mType=GREEN when juice < 600. Keep remotes well clear of
+    // both the <360 and the 360..599 blink windows.
+    if (yoshi->mMaxJuice <= 0)
+        yoshi->mMaxJuice = 21300;
     if (yoshi->mCurJuice < 600)
-        yoshi->mCurJuice = yoshi->mMaxJuice > 0 ? yoshi->mMaxJuice : 21300;
+        yoshi->mCurJuice = yoshi->mMaxJuice;
+    if (yoshi->mCurJuice < 600)
+        yoshi->mCurJuice = 21300;
     if ((yoshi->mCurJuice & 0x8) == 0 && yoshi->mCurJuice < 360)
         yoshi->mCurJuice |= 0x8;
+    if (yoshi->mCurJuice >= 360 && yoshi->mCurJuice < 600 &&
+        (yoshi->mCurJuice & 0x10) == 0)
+        yoshi->mCurJuice |= 0x10;
 }
 
 static void resetRemoteYoshiToEgg(TYoshi *yoshi, RemoteYoshiSlot &slot) {
     if (!yoshi)
         return;
+
+    // Belt: ensure a dismounting puppet tongue cannot remain on 敵グループ.
+    removeRemoteYoshiTongueFromEnemyGroup(remoteYoshiTongue(yoshi));
 
     yoshi->mState = TYoshi::EGG;
     yoshi->mMario = nullptr;
@@ -441,6 +468,8 @@ static void resetRemoteYoshiToEgg(TYoshi *yoshi, RemoteYoshiSlot &slot) {
     slot.lastMouthActorEnc = 0;
     slot.lastYoshiBck = 0;
     slot.lastFruitEatEventId = 0;
+    slot.thinkUpperMouthWasOpen = false;
+    slot.stageInitAttempted = false;
 }
 
 static void applyRemoteYoshiJuice(TYoshi *yoshi, u8 packedMovement) {
@@ -455,17 +484,47 @@ static void applyRemoteYoshiJuice(TYoshi *yoshi, u8 packedMovement) {
         yoshi->mCurJuice = yoshi->mMaxJuice;
 }
 
+static bool remoteYoshiRigReady(TYoshi *yoshi) {
+    if (!yoshi || !yoshi->mActor || !yoshi->mActor->mModel)
+        return false;
+    if (!remoteYoshiTongue(yoshi))
+        return false;
+    J3DModel **mirrors = yoshiMirrorModels(yoshi);
+    return mirrors[0] != nullptr && mirrors[1] != nullptr;
+}
+
 static bool ensureRemoteYoshiStageReady(TYoshi *yoshi, RemoteYoshiSlot &slot) {
-    if (!yoshi || !yoshi->mActor)
+    if (!remoteYoshiRigReady(yoshi))
         return false;
     if (!slot.stageInitDone) {
-        // doldecomp TYoshi::initInLoadAfter — riding rig + tongue mirror actors after stage load.
-        yoshi->initInLoadAfter();
-        // Puppet tongues must not stay in 敵グループ — retail movement()/findTarget() mutates stage.
+        // NEVER call TYoshi::initInLoadAfter() on network puppets.
+        //
+        // Retail initInLoadAfter creates five TMirrorActors per Yoshi (body + 2
+        // hands via TYoshi, tongue + tip via TYoshiTongue::initInLoadAfter) and
+        // push_back's the tongue onto 敵グループ. Each TMirrorActor also
+        // allocates a second J3DModel sharing the live ModelData and inserts
+        // into 鏡シーン. Five concurrent remote mounts ≈ 25 mirror models —
+        // that exhausts stage/mirror heap and the shared J3D draw path then
+        // drops Mario+Yoshi packets (host sees it first: local + remotes).
+        //
+        // Riding meshes (mActor / mMirrorModels / tongue models) already exist
+        // from TYoshi::init at body spawn. Puppet tongues must never join
+        // 敵グループ (movement/findTarget). Mirror reflections for remotes are
+        // intentionally skipped.
+        //
+        // stageInitAttempted latches the one-shot settle; never re-enter a path
+        // that could call initInLoadAfter (duplicate TMirrorActor crash guard).
+        void *tongue = remoteYoshiTongue(yoshi);
+        if (!slot.stageInitAttempted) {
+            removeRemoteYoshiTongueFromEnemyGroup(tongue);
+            slot.stageInitAttempted = true;
+        }
+        // Belt: erase any tongue that retail/stage paths may have pushed.
+        // Missing 敵グループ name-ref is fine — we never pushed it ourselves.
         removeRemoteYoshiTongueFromEnemyGroup(remoteYoshiTongue(yoshi));
         slot.stageInitDone = true;
     }
-    return true;
+    return remoteYoshiRigReady(yoshi);
 }
 
 static void syncMountedYoshiTransform(TMario *body, TYoshi *yoshi) {
@@ -527,35 +586,38 @@ static bool remoteMountedYoshiDrawAllowed(const TYoshi *yoshi) {
 }
 
 static void viewCalcRemoteMountedYoshi(TYoshi *yoshi) {
-    if (!yoshi || !yoshi->mActor)
+    if (!remoteYoshiRigReady(yoshi))
         return;
 
     yoshi->mActor->viewCalc();
     J3DModel **mirrors = yoshiMirrorModels(yoshi);
-    if (mirrors[0])
-        mirrors[0]->viewCalc();
-    if (mirrors[1])
-        mirrors[1]->viewCalc();
+    mirrors[0]->viewCalc();
+    mirrors[1]->viewCalc();
 
     performRemoteYoshiTongueViewCalc(remoteYoshiTongue(yoshi));
 }
 
 static void drawRemoteMountedYoshi(TYoshi *yoshi) {
-    if (!yoshi || !yoshi->mActor || !remoteMountedYoshiDrawAllowed(yoshi) || !sYoshiEntry)
+    // Prefer slim entry when possible: retail TYoshi::entry always
+    // gpBindShadowManager->request + gpQuestionManager->request, and always
+    // entries hand mirrors even when shape-hidden. With many remotes that floods
+    // shared queues. Keep retail entry for tev body tint (orange/purple/pink).
+    if (!remoteYoshiRigReady(yoshi) || !remoteMountedYoshiDrawAllowed(yoshi) || !sYoshiEntry)
         return;
 
     const u8 savedType = static_cast<u8>(yoshi->mType & 0x0F);
     const u8 bckId =
         static_cast<u8>(yoshi->mActor->getCurAnmIdx(MActor::BCK) & 0xFF);
     applyYoshiColor(yoshi, savedType, bckId);
+    ensureRemoteYoshiDrawable(yoshi);
     sYoshiEntry(yoshi);
     if (static_cast<u8>(yoshi->mType & 0x0F) != savedType)
         applyYoshiColor(yoshi, savedType, bckId);
 }
 
-// MOUNTED subset of doldecomp TYoshi::calcAnim — omits thinkAnimation/thinkUpper side effects
-// except staged thinkUpper for mouth open (spray/tongue).
-static void calcRemoteYoshiMountedAnim(TMario *body, TYoshi *yoshi, const RemoteYoshiSlot *slot) {
+// MOUNTED subset of doldecomp TYoshi::calcAnim — omits thinkAnimation side effects;
+// thinkUpper only when spray/tongue needs mouth open (plus one closing frame).
+static void calcRemoteYoshiMountedAnim(TMario *body, TYoshi *yoshi, RemoteYoshiSlot *slot) {
     if (!body || !yoshi || !yoshi->mActor || !yoshi->mActor->mModel)
         return;
 
@@ -786,7 +848,7 @@ void syncRemoteYoshiFromSnapshot(TMario *body, RemoteYoshiSlot &slot, const Play
     }
 }
 
-void calcRemoteYoshiAnim(TMario *body, const RemoteYoshiSlot *slot) {
+void calcRemoteYoshiAnim(TMario *body, RemoteYoshiSlot *slot) {
     if (!body || !body->mYoshi)
         return;
 

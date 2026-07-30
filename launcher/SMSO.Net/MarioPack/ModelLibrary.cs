@@ -694,15 +694,17 @@ public static class ModelLibrary
 
     /// <summary>
     /// Candidate folders that may ship bundled packs next to the launcher
-    /// (release zip / publish output). First existing folder wins.
+    /// (release zip / publish output). Prefer the exe directory over
+    /// <see cref="AppContext.BaseDirectory"/> so single-file publish layouts
+    /// (temp extract dir) do not hide <c>CustomModels/</c> beside the .exe.
     /// </summary>
     public static IEnumerable<string> EnumerateBundledModelDirectories()
     {
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var root in new[]
                  {
-                     AppContext.BaseDirectory,
                      Path.GetDirectoryName(Environment.ProcessPath) ?? string.Empty,
+                     AppContext.BaseDirectory,
                  })
         {
             if (string.IsNullOrWhiteSpace(root))
@@ -715,6 +717,41 @@ public static class ModelLibrary
     }
 
     /// <summary>
+    /// Picks the richest bundled <c>CustomModels/</c> folder (prefers
+    /// <c>library.json</c> + most <c>.arc</c> files).
+    /// </summary>
+    public static string? ResolveBestBundledModelsDirectory()
+    {
+        string? best = null;
+        var bestScore = -1;
+        foreach (var dir in EnumerateBundledModelDirectories())
+        {
+            int arcs;
+            try
+            {
+                arcs = Directory.EnumerateFiles(dir, "*" + PackExtension).Count();
+            }
+            catch
+            {
+                continue;
+            }
+
+            var hasLibrary = File.Exists(Path.Combine(dir, LibraryFileName)) ? 1_000_000 : 0;
+            var score = hasLibrary + arcs;
+            if (score <= bestScore)
+                continue;
+            bestScore = score;
+            best = dir;
+        }
+
+        return best;
+    }
+
+    /// <summary>True when a release-bundled CustomModels folder exists beside the launcher.</summary>
+    public static bool BundledModelsDirectoryAvailable() =>
+        ResolveBestBundledModelsDirectory() != null;
+
+    /// <summary>
     /// Copy release-bundled <c>CustomModels/</c> packs into the AppData library.
     /// Zip updates always overwrite matching pack / SZS files and library labels
     /// so testers get the same content as the release. User-imported packs whose
@@ -722,8 +759,19 @@ public static class ModelLibrary
     /// bundled display name under an older id are removed.
     /// </summary>
     /// <returns>Number of pack/SZS files written or updated in AppData.</returns>
-    public static int SeedBundledModels(Action<string>? log = null) =>
-        SeedBundledModelsFrom(EnumerateBundledModelDirectories().FirstOrDefault(), log);
+    public static int SeedBundledModels(Action<string>? log = null)
+    {
+        var bundledDir = ResolveBestBundledModelsDirectory();
+        if (bundledDir == null)
+        {
+            log?.Invoke(
+                "No bundled CustomModels/ folder found beside the launcher — " +
+                "custom Mario packs will only install from an existing AppData library.");
+            return 0;
+        }
+
+        return SeedBundledModelsFrom(bundledDir, log);
+    }
 
     /// <summary>Testable seed entry point with an explicit bundled directory.</summary>
     public static int SeedBundledModelsFrom(string? bundledDir, Action<string>? log = null)
@@ -735,6 +783,7 @@ public static class ModelLibrary
         var map = LoadMap();
         var dirty = false;
         var updated = 0;
+        var skippedUnresolved = 0;
 
         Dictionary<string, string>? bundledMap = null;
         var bundledMapPath = Path.Combine(bundledDir, LibraryFileName);
@@ -748,6 +797,27 @@ public static class ModelLibrary
             catch
             {
                 // Ignore corrupt bundled library.json; packs below still seed.
+                log?.Invoke($"WARNING: Could not parse bundled {LibraryFileName} at {bundledMapPath}.");
+            }
+        }
+        else
+        {
+            int bundledArcs;
+            try
+            {
+                bundledArcs = Directory.EnumerateFiles(bundledDir, "*" + PackExtension).Count();
+            }
+            catch
+            {
+                bundledArcs = 0;
+            }
+
+            if (bundledArcs > 0)
+            {
+                log?.Invoke(
+                    $"WARNING: {bundledDir} has {bundledArcs} .arc pack(s) but no {LibraryFileName}. " +
+                    "Display-named packs (e.g. Luigi.arc) cannot be seeded without id labels — " +
+                    "re-publish CustomModels with library.json.");
             }
         }
 
@@ -811,7 +881,10 @@ public static class ModelLibrary
                 }
 
                 if (id.Length == 0)
+                {
+                    skippedUnresolved++;
                     continue;
+                }
             }
 
             var display = map.TryGetValue(id, out var mapped) && !string.IsNullOrWhiteSpace(mapped)
@@ -867,12 +940,23 @@ public static class ModelLibrary
                 updated++;
                 dirty = true;
             }
+
+            // Do NOT stamp better_movement.prm here — that retune belongs only when
+            // Patch BSE moveset is on (ModuleInstaller / SessionCoordinator). Always
+            // injecting left packs heavier even after Moveset.kxe was removed.
         }
 
         DiscoverOrphanPacks(map, ref dirty);
 
         if (dirty)
             SaveMap(map);
+
+        if (skippedUnresolved > 0)
+        {
+            log?.Invoke(
+                $"WARNING: Skipped {skippedUnresolved} bundled .arc pack(s) with unresolved model ids " +
+                $"(need {LibraryFileName} labels).");
+        }
 
         if (updated > 0)
             log?.Invoke($"Updated {updated} bundled custom model file(s) into {LibraryDirectory}.");

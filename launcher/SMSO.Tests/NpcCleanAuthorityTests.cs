@@ -70,14 +70,18 @@ public class NpcCleanAuthorityTests
     }
 
     [Fact]
-    public void WorldEventRelay_IncludesNpcCleanedInDurableHistory()
+    public void WorldEventRelay_NpcCleaned_IsDurableButNotInDiagnosticHistory()
     {
         var relay = new WorldEventRelay();
         relay.CreateWorldEvent(WorldEventType.NpcCleaned, 8, 5, 0x13, 3, 0xABCDEF);
         relay.CreateWorldEvent(WorldEventType.NpcReact, 8, 5, 1, 0, 0x111);
+        relay.CreateWorldEvent(WorldEventType.ShineCollected, 0, 0, 7, 0, 0);
 
+        // Mission events stay IsDurable for protocol semantics, but diagnostic history
+        // is ownership-only — authorities are the heal source of truth.
+        Assert.True(WorldEventRelay.IsDurable(WorldEventType.NpcCleaned));
+        Assert.False(WorldEventRelay.IsOwnershipDurable(WorldEventType.NpcCleaned));
         Assert.Single(relay.History);
-        Assert.Equal(WorldEventType.NpcCleaned, relay.History[0].Type);
-        Assert.Equal(3, relay.History[0].Reserved);
+        Assert.Equal(WorldEventType.ShineCollected, relay.History[0].Type);
     }
 }

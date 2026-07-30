@@ -29,7 +29,13 @@ public sealed class DolphinBridge : IDisposable
     private readonly byte[] _incomingWorldEventScratch = new byte[ProtocolConstants.CommWorldEventSize];
     private readonly byte[] _localPendingClearScratch = new byte[ProtocolConstants.CommWorldEventSize];
     private readonly byte[] _localPendingReadScratch = new byte[ProtocolConstants.CommWorldEventSize];
+    /// <summary>Both outbound localPending lanes (ownership + mission) for full-write splice.</summary>
+    private readonly byte[] _localPendingDualReadScratch =
+        new byte[ProtocolConstants.CommWorldEventSize * 2];
     private readonly byte[] _marioModelIdsScratch = new byte[ProtocolConstants.CommMarioModelIdsSize];
+    private readonly byte[] _musicVolumeScratch = new byte[ProtocolConstants.CommMusicVolumeSize];
+    private readonly byte[] _progressSnapshotScratch =
+        new byte[ProtocolConstants.CommProgressSnapshotSize];
     private readonly byte[] _lastRemoteSyncSnapName =
         new byte[ProtocolConstants.CommRemoteSnapshotsSize + ProtocolConstants.CommNameTagAppearancesSize];
     private readonly byte[] _lastRemoteSyncVoiceMode =
@@ -48,7 +54,7 @@ public sealed class DolphinBridge : IDisposable
         get
         {
             lock (_processLock)
-                return _processHandle != IntPtr.Zero;
+                return _processHandle != IntPtr.Zero || DebugSimulateAttached;
         }
     }
     public bool HasResolvedMailbox => _mailbox.IsResolved;
@@ -56,6 +62,23 @@ public sealed class DolphinBridge : IDisposable
     public TimeSpan MailboxSearchDuration => _mailbox.SearchDuration;
     public int? TrackedProcessId => _trackedProcessId;
     public int WriteCacheEpoch => Volatile.Read(ref _writeCacheEpoch);
+
+    /// <summary>
+    /// Test seam: treat the bridge as attached and route mailbox writes through
+    /// in-memory counters (no Dolphin process). Used to regression-test Active-play
+    /// remote-sync fail → game-mode-only fallback during Start Tag grace.
+    /// </summary>
+    internal bool DebugSimulateAttached { get; set; }
+
+    /// <summary>
+    /// When <see cref="DebugSimulateAttached"/> is set, force
+    /// <see cref="TryWriteRemoteSyncPayload"/> to fail.
+    /// </summary>
+    internal bool DebugFailRemoteSyncWrite { get; set; }
+
+    internal int DebugRemoteSyncWriteCalls { get; private set; }
+    internal int DebugGameModeOnlyWriteCalls { get; private set; }
+    internal CommGameModeState DebugLastGameModeOnlyWrite { get; private set; }
 
     public void SetGuestMailboxAddress(uint address)
     {
@@ -481,9 +504,36 @@ public sealed class DolphinBridge : IDisposable
             buffer.Magic = ProtocolConstants.Magic;
             buffer.Version = ProtocolConstants.CommVersion;
             var bytes = CommBufferEndian.ToDolphinBytes(buffer);
+
+            // Never let a full-buffer write invent outbound localPending lanes. Splice both
+            // live module slots (ownership + mission, including empty) so a stale working
+            // RedCoin cannot resurrect after clear and soft-kill ownership.
+            var localPendingAddress = new UIntPtr(
+                MailboxHost.ToUInt64() + ProtocolConstants.CommLocalPendingOwnershipOffset);
+            if (NativeMethods.ReadProcessMemory(
+                    _processHandle,
+                    localPendingAddress,
+                    _localPendingDualReadScratch,
+                    _localPendingDualReadScratch.Length,
+                    out int read) &&
+                read == _localPendingDualReadScratch.Length)
+            {
+                Buffer.BlockCopy(
+                    _localPendingDualReadScratch,
+                    0,
+                    bytes,
+                    ProtocolConstants.CommLocalPendingOwnershipOffset,
+                    _localPendingDualReadScratch.Length);
+            }
+
             if (!TryWriteProcessMemoryLocked(MailboxHost, bytes))
                 return false;
 
+            // Full-buffer writes overlap the remote-sync skip cache. Without invalidating,
+            // the next TryWriteRemoteSyncPayload can SequenceEqual-skip and leave Dolphin
+            // with Connected remotes from a prior lobby after disconnect/rehost cleared
+            // (or never republish new remotes after SetConnected wrote an empty region).
+            InvalidateWriteCachesLocked();
             return true;
         }
     }
@@ -555,6 +605,12 @@ public sealed class DolphinBridge : IDisposable
     {
         lock (_processLock)
         {
+            if (DebugSimulateAttached && _processHandle == IntPtr.Zero)
+            {
+                DebugRemoteSyncWriteCalls++;
+                return !DebugFailRemoteSyncWrite;
+            }
+
             if (_processHandle == IntPtr.Zero)
                 return false;
 
@@ -683,6 +739,22 @@ public sealed class DolphinBridge : IDisposable
         }
     }
 
+    public bool TryWriteMusicVolumeOnly(byte percent)
+    {
+        lock (_processLock)
+        {
+            if (_processHandle == IntPtr.Zero)
+                return false;
+
+            if (!_mailbox.IsResolved && !TryResolveMailboxAddressLocked())
+                return false;
+
+            _musicVolumeScratch[0] = CommBufferEndian.ClampMusicVolumePercent(percent);
+            var address = new UIntPtr(MailboxHost.ToUInt64() + ProtocolConstants.CommMusicVolumeOffset);
+            return TryWriteProcessMemoryLocked(address, _musicVolumeScratch);
+        }
+    }
+
     public bool TryWriteRemoteMarioVoiceEventsOnly(MarioVoiceEvent[] remotes)
     {
         lock (_processLock)
@@ -709,6 +781,13 @@ public sealed class DolphinBridge : IDisposable
     {
         lock (_processLock)
         {
+            if (DebugSimulateAttached && _processHandle == IntPtr.Zero)
+            {
+                DebugGameModeOnlyWriteCalls++;
+                DebugLastGameModeOnlyWrite = state;
+                return true;
+            }
+
             if (_processHandle == IntPtr.Zero)
                 return false;
 
@@ -743,12 +822,35 @@ public sealed class DolphinBridge : IDisposable
     }
 
     /// <summary>
-    /// Zeroes the localPending world-event slot in Dolphin RAM after the bridge has published
-    /// it to the network. The module only writes the next queued event when this slot is empty,
-    /// so clearing it is the handshake that lets the module advance without overwriting an
-    /// unconsumed event (which previously dropped red-coin collections).
+    /// Dedicated ownership incoming lane (shine/blue/story/secret/trigger/reset). Independent
+    /// of the mission/ephemeral slot so red/gold/fruit cannot block FlagManager writes.
     /// </summary>
-    public bool TryClearLocalPendingWorldEvent()
+    public bool TryWriteIncomingOwnershipWorldEventOnly(in CommWorldEvent incoming)
+    {
+        lock (_processLock)
+        {
+            if (_processHandle == IntPtr.Zero)
+                return false;
+
+            if (!_mailbox.IsResolved && !TryResolveMailboxAddressLocked())
+                return false;
+
+            CommBufferEndian.WriteIncomingWorldEventInto(_incomingWorldEventScratch, incoming);
+            var address = new UIntPtr(
+                MailboxHost.ToUInt64() + ProtocolConstants.CommIncomingOwnershipWorldEventOffset);
+            return TryWriteProcessMemoryLocked(address, _incomingWorldEventScratch);
+        }
+    }
+
+    /// <summary>Zeroes the ownership outbound localPending slot after network publish.</summary>
+    public bool TryClearLocalPendingOwnershipWorldEvent()
+        => TryClearLocalPendingAtOffset(ProtocolConstants.CommLocalPendingOwnershipOffset);
+
+    /// <summary>Zeroes the mission/ephemeral outbound localPending slot after network publish.</summary>
+    public bool TryClearLocalPendingMissionWorldEvent()
+        => TryClearLocalPendingAtOffset(ProtocolConstants.CommLocalPendingMissionOffset);
+
+    private bool TryClearLocalPendingAtOffset(int offset)
     {
         lock (_processLock)
         {
@@ -759,16 +861,20 @@ public sealed class DolphinBridge : IDisposable
                 return false;
 
             Array.Clear(_localPendingClearScratch, 0, _localPendingClearScratch.Length);
-            var address = new UIntPtr(MailboxHost.ToUInt64() + ProtocolConstants.CommWorldSyncOffset);
+            var address = new UIntPtr(MailboxHost.ToUInt64() + (uint)offset);
             return TryWriteProcessMemoryLocked(address, _localPendingClearScratch);
         }
     }
 
-    /// <summary>
-    /// Lightweight re-read of localPending only. Used after TryClearLocalPendingWorldEvent so
-    /// the same poll can drain a graffiti backlog if the module already flushed the next event.
-    /// </summary>
-    public bool TryReadLocalPendingWorldEvent(out CommWorldEvent worldEvent)
+    /// <summary>Lightweight re-read of the ownership outbound localPending slot.</summary>
+    public bool TryReadLocalPendingOwnershipWorldEvent(out CommWorldEvent worldEvent)
+        => TryReadLocalPendingAtOffset(ProtocolConstants.CommLocalPendingOwnershipOffset, out worldEvent);
+
+    /// <summary>Lightweight re-read of the mission outbound localPending slot.</summary>
+    public bool TryReadLocalPendingMissionWorldEvent(out CommWorldEvent worldEvent)
+        => TryReadLocalPendingAtOffset(ProtocolConstants.CommLocalPendingMissionOffset, out worldEvent);
+
+    private bool TryReadLocalPendingAtOffset(int offset, out CommWorldEvent worldEvent)
     {
         worldEvent = default;
         lock (_processLock)
@@ -779,7 +885,7 @@ public sealed class DolphinBridge : IDisposable
             if (!_mailbox.IsResolved && !TryResolveMailboxAddressLocked())
                 return false;
 
-            var address = new UIntPtr(MailboxHost.ToUInt64() + ProtocolConstants.CommWorldSyncOffset);
+            var address = new UIntPtr(MailboxHost.ToUInt64() + (uint)offset);
             if (!NativeMethods.ReadProcessMemory(
                     _processHandle,
                     address,
@@ -797,11 +903,54 @@ public sealed class DolphinBridge : IDisposable
     }
 
     /// <summary>
-    /// Zeroes the incoming world-event slot in Dolphin RAM. Used when an authority resync
-    /// replaces pending delivery so a previously stuck durable event cannot block live
-    /// shine/blue ownership applies forever.
+    /// Read the mission/ephemeral incoming slot without clearing it.
+    /// </summary>
+    public bool TryPeekIncomingWorldEvent(out CommWorldEvent worldEvent)
+        => TryPeekIncomingAtOffset(ProtocolConstants.CommIncomingWorldEventOffset, out worldEvent);
+
+    /// <summary>Read the dedicated ownership incoming slot without clearing it.</summary>
+    public bool TryPeekIncomingOwnershipWorldEvent(out CommWorldEvent worldEvent)
+        => TryPeekIncomingAtOffset(ProtocolConstants.CommIncomingOwnershipWorldEventOffset, out worldEvent);
+
+    private bool TryPeekIncomingAtOffset(int offset, out CommWorldEvent worldEvent)
+    {
+        worldEvent = default;
+        lock (_processLock)
+        {
+            if (_processHandle == IntPtr.Zero)
+                return false;
+
+            if (!_mailbox.IsResolved && !TryResolveMailboxAddressLocked())
+                return false;
+
+            var address = new UIntPtr(MailboxHost.ToUInt64() + (uint)offset);
+            if (!NativeMethods.ReadProcessMemory(
+                    _processHandle,
+                    address,
+                    _incomingWorldEventScratch,
+                    _incomingWorldEventScratch.Length,
+                    out int read) ||
+                read != _incomingWorldEventScratch.Length)
+            {
+                return false;
+            }
+
+            worldEvent = CommBufferEndian.ReadWorldEventFromDolphinBytes(_incomingWorldEventScratch);
+            return worldEvent.EventId != 0;
+        }
+    }
+
+    /// <summary>
+    /// Zeroes the mission/ephemeral incoming world-event slot in Dolphin RAM.
     /// </summary>
     public bool TryClearIncomingWorldEvent()
+        => TryClearIncomingAtOffset(ProtocolConstants.CommIncomingWorldEventOffset);
+
+    /// <summary>Zeroes the dedicated ownership incoming slot.</summary>
+    public bool TryClearIncomingOwnershipWorldEvent()
+        => TryClearIncomingAtOffset(ProtocolConstants.CommIncomingOwnershipWorldEventOffset);
+
+    private bool TryClearIncomingAtOffset(int offset)
     {
         lock (_processLock)
         {
@@ -812,8 +961,64 @@ public sealed class DolphinBridge : IDisposable
                 return false;
 
             Array.Clear(_incomingWorldEventScratch, 0, _incomingWorldEventScratch.Length);
-            var address = new UIntPtr(MailboxHost.ToUInt64() + ProtocolConstants.CommIncomingWorldEventOffset);
+            var address = new UIntPtr(MailboxHost.ToUInt64() + (uint)offset);
             return TryWriteProcessMemoryLocked(address, _incomingWorldEventScratch);
+        }
+    }
+
+    /// <summary>
+    /// Latest-wins compact progress heal into the dedicated mailbox lane. Always writes
+    /// <c>moduleAppliedSeq=0</c> so the module bulk-applies (<c>hostSeq &gt; applied</c>) even
+    /// when force-full re-pushes the same authority <paramref name="hostSeq"/> after a failed
+    /// clear, or when a prior apply already ack'd that seq — preserving live applied was a
+    /// mid-run soft-skip (launcher advanced lastApplied while the module never re-healed).
+    /// </summary>
+    public bool TryWriteProgressSnapshotOnly(uint hostSeq, ReadOnlySpan<byte> payload,
+        byte healEpoch = 0)
+    {
+        if (payload.Length > ProtocolConstants.CommProgressSnapshotMaxPayload)
+            return false;
+
+        lock (_processLock)
+        {
+            if (_processHandle == IntPtr.Zero)
+                return false;
+
+            if (!_mailbox.IsResolved && !TryResolveMailboxAddressLocked())
+                return false;
+
+            var address = new UIntPtr(MailboxHost.ToUInt64() + ProtocolConstants.CommProgressSnapshotOffset);
+
+            Array.Clear(_progressSnapshotScratch, 0, _progressSnapshotScratch.Length);
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(
+                _progressSnapshotScratch.AsSpan(0, 4), hostSeq);
+            // Force re-apply: do not preserve stale moduleAppliedSeq from Dolphin.
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(
+                _progressSnapshotScratch.AsSpan(4, 4), 0u);
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(
+                _progressSnapshotScratch.AsSpan(8, 2), (ushort)payload.Length);
+            _progressSnapshotScratch[10] = healEpoch;
+            _progressSnapshotScratch[11] = 0;
+            if (payload.Length > 0)
+                payload.CopyTo(_progressSnapshotScratch.AsSpan(12, payload.Length));
+
+            return TryWriteProcessMemoryLocked(address, _progressSnapshotScratch);
+        }
+    }
+
+    public bool TryClearProgressSnapshot()
+    {
+        lock (_processLock)
+        {
+            if (_processHandle == IntPtr.Zero)
+                return false;
+
+            if (!_mailbox.IsResolved && !TryResolveMailboxAddressLocked())
+                return false;
+
+            Array.Clear(_progressSnapshotScratch, 0, _progressSnapshotScratch.Length);
+            var address = new UIntPtr(MailboxHost.ToUInt64() + ProtocolConstants.CommProgressSnapshotOffset);
+            return TryWriteProcessMemoryLocked(address, _progressSnapshotScratch);
         }
     }
 

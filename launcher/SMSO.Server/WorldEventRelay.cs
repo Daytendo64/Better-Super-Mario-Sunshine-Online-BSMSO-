@@ -27,7 +27,18 @@ public sealed class WorldEventRelay
         WorldEventType.BlueCoinCollected or
         WorldEventType.RedCoinCollected or
         WorldEventType.NpcCleaned or
-        WorldEventType.GraffitiCleaned or
+        // GraffitiCleaned intentionally excluded — goop sync permanently disabled.
+        WorldEventType.EpisodeComplete or
+        WorldEventType.StoryFlag or
+        WorldEventType.TriggerFlag or
+        WorldEventType.SecretComplete;
+
+    /// <summary>
+    /// Card ownership only — diagnostic history no longer retains red/NPC (authorities heal).
+    /// </summary>
+    public static bool IsOwnershipDurable(WorldEventType type) => type is
+        WorldEventType.ShineCollected or
+        WorldEventType.BlueCoinCollected or
         WorldEventType.EpisodeComplete or
         WorldEventType.StoryFlag or
         WorldEventType.TriggerFlag or
@@ -40,8 +51,15 @@ public sealed class WorldEventRelay
         {
             var id = _nextEventId++;
             var packet = new WorldEventPacket(id, type, courseId, episodeId, payload0, reserved, payload1, payload2);
-            if (IsDurable(type))
+            // Authorities are the ONLY durable heal source. Tiny ownership-only diagnostic
+            // ring for host Reset / debugging — never grow with playtime.
+            if (IsOwnershipDurable(type))
+            {
                 _durableHistory.Add(packet);
+                const int maxDiagnosticHistory = 4;
+                if (_durableHistory.Count > maxDiagnosticHistory)
+                    _durableHistory.RemoveRange(0, _durableHistory.Count - maxDiagnosticHistory);
+            }
             return PacketSerializer.BuildWorldEventBroadcast(packet);
         }
     }
@@ -59,6 +77,38 @@ public sealed class WorldEventRelay
                 e.Type == WorldEventType.RedCoinCollected &&
                 RedCoinAuthority.NormalizeStage(e.CourseId, e.EpisodeId) == key);
         }
+    }
+
+    /// <summary>Drops durable red-coin history for every episode of a course (plaza hub empty).</summary>
+    public void RemoveCourseRedCoinHistory(byte courseId)
+    {
+        lock (_gate)
+        {
+            _durableHistory.RemoveAll(e =>
+                e.Type == WorldEventType.RedCoinCollected && e.CourseId == courseId);
+        }
+    }
+
+    /// <summary>
+    /// Drops durable shine/blue ownership history after a host Reset Flags so
+    /// heal / late-join replay cannot resurrect cleared collectibles.
+    /// </summary>
+    public void RemoveShineBlueHistory()
+    {
+        lock (_gate)
+        {
+            _durableHistory.RemoveAll(e =>
+                e.Type is WorldEventType.ShineCollected or WorldEventType.BlueCoinCollected);
+        }
+    }
+
+    /// <summary>
+    /// Drops all durable world-event history after a host session progress reset.
+    /// </summary>
+    public void ClearDurableHistory()
+    {
+        lock (_gate)
+            _durableHistory.Clear();
     }
 
     public byte[] BuildWorldStateReplay()
@@ -95,135 +145,125 @@ public sealed class WorldEventRelay
     }
 
     /// <summary>
-    /// Rebuild a complete durable collectible + story-flag snapshot from authoritative state.
-    /// Used for late join, periodic rebroadcast, and explicit client resync so a lost
-    /// one-shot event can never leave a client permanently desynced.
+    /// Legacy event-list heal. Prefer <see cref="BuildAuthorityProgressSnapshot"/>.
+    /// Synthetic heal ids no longer advance <see cref="_nextEventId"/> (that inflation
+    /// was a primary mid-run desync amplifier under lobby-wide resync).
     /// </summary>
     /// <param name="includeRedCoinStage">
-    /// Optional filter for red-coin stages. Solo (occupancy &lt; 2) stages should be excluded
-    /// so death-reset progress is never rebroadcast; co-op stages (2+ players) persist.
+    /// Optional filter for red-coin stages. True solo (never co-op this occupancy window)
+    /// stages should be excluded so death-reset progress is never rebroadcast; stages that
+    /// hit occupancy 2+ persist in heals even after a peer leaves (occupancy 1) so
+    /// force-full / sticky co-op revive can restore authority bits.
     /// </param>
     public byte[] BuildAuthoritySnapshotReplay(
         ShineAuthority shines,
         BlueCoinAuthority blueCoins,
         RedCoinAuthority redCoins,
         NpcCleanAuthority npcCleans,
-        GraffitiCleanAuthority graffitiCleans,
         StoryFlagAuthority storyFlags,
         Func<byte, byte, bool>? includeRedCoinStage = null)
     {
+        var snapshot = BuildAuthorityProgressSnapshot(
+            shines, blueCoins, redCoins, npcCleans, storyFlags, progressSeq: 0,
+            includeRedCoinStage);
+        return BuildWorldStateReplay(snapshot.ExpandToWorldEvents());
+    }
+
+    /// <summary>
+    /// Compact authority heal from bitsets / sparse flag sets. Does not touch live event ids.
+    /// </summary>
+    public WorldProgressSnapshot BuildAuthorityProgressSnapshot(
+        ShineAuthority shines,
+        BlueCoinAuthority blueCoins,
+        RedCoinAuthority redCoins,
+        NpcCleanAuthority npcCleans,
+        StoryFlagAuthority storyFlags,
+        uint progressSeq,
+        Func<byte, byte, bool>? includeRedCoinStage = null,
+        bool unchanged = false)
+    {
+        if (unchanged)
+            return WorldProgressSnapshot.CreateUnchanged(progressSeq);
+
         lock (_gate)
         {
-        // Priority order matters: BuildWorldStateReplay silently truncates the TAIL when
-        // the sparse snapshot exceeds MaxTcpPayloadSize. Graffiti alone can be 384 cells ×
-        // many stages — previously serialized BEFORE story/secret flags, so a graffiti-heavy
-        // 10-player run could permanently omit story catch-up from late-join / 45s resync.
-        // Ownership + story first; mission second; graffiti fills remaining budget only.
-        var maxEvents = (ProtocolConstants.MaxTcpPayloadSize - 2) /
-                        ProtocolConstants.WorldEventBroadcastPayloadSize;
-        var events = new List<WorldEventPacket>(Math.Min(maxEvents, 4096));
-        var nextId = _nextEventId;
+            var shineBits = new byte[WorldProgressSnapshot.ShineBitsByteCount];
+            foreach (var shineId in shines.Collected)
+                WorldProgressSnapshot.SetShineBit(shineBits, shineId);
 
-        void Add(WorldEventPacket packet)
-        {
-            if (events.Count < maxEvents)
-                events.Add(packet);
-        }
+            var blues = blueCoins.AllCourses
+                .OrderBy(pair => pair.Key)
+                .Select(pair => (pair.Key, pair.Value))
+                .ToList();
 
-        foreach (var shineId in shines.Collected.OrderBy(id => id))
-        {
-            Add(new WorldEventPacket(nextId++, WorldEventType.ShineCollected, 0, 0, shineId, 0, 0));
-        }
+            var stories = storyFlags.StoryFlags
+                .OrderBy(pair => pair.Key)
+                .Select(pair => (pair.Key, pair.Value))
+                .ToList();
 
-        foreach (var (courseId, mask) in blueCoins.AllCourses.OrderBy(pair => pair.Key))
-        {
-            for (byte index = 0; index < BlueCoinAuthority.MaxIndexExclusive; index++)
+            var triggers = storyFlags.TriggerFlags
+                .OrderBy(pair => pair.Key.CourseId)
+                .ThenBy(pair => pair.Key.EpisodeId)
+                .ThenBy(pair => pair.Key.FlagId)
+                .Select(pair => (pair.Key.CourseId, pair.Key.EpisodeId, pair.Key.FlagId, pair.Value))
+                .ToList();
+
+            var secrets = storyFlags.SecretFlags
+                .OrderBy(pair => pair.Key)
+                .Select(pair => (pair.Key, pair.Value))
+                .ToList();
+
+            var redStages = new List<WorldProgressSnapshot.RedStageMask>();
+            foreach (var ((courseId, episodeId), mask) in redCoins.AllStages.OrderBy(pair => pair.Key))
             {
-                if ((mask & (1ul << index)) == 0)
+                if (includeRedCoinStage != null && !includeRedCoinStage(courseId, episodeId))
                     continue;
-                Add(new WorldEventPacket(
-                    nextId++, WorldEventType.BlueCoinCollected, courseId, 0, index, 0, 0));
+
+                var packed = new uint[8];
+                for (byte index = 0; index < 8; index++)
+                {
+                    if ((mask & (1 << index)) == 0)
+                        continue;
+                    packed[index] = redCoins.PackedPos(courseId, episodeId, index);
+                }
+
+                redStages.Add(new WorldProgressSnapshot.RedStageMask(
+                    courseId, episodeId, mask, packed));
             }
-        }
 
-        foreach (var (flagId, value) in storyFlags.StoryFlags.OrderBy(pair => pair.Key))
-        {
-            Add(new WorldEventPacket(
-                nextId++, WorldEventType.StoryFlag, 0, 0, value, 0, flagId));
-        }
+            var npcStages = npcCleans.AllStages
+                .OrderBy(pair => pair.Key)
+                .Select(pair => (pair.Key.CourseId, pair.Key.EpisodeId, pair.Value))
+                .ToList();
 
-        foreach (var (key, value) in storyFlags.TriggerFlags
-                     .OrderBy(pair => pair.Key.CourseId)
-                     .ThenBy(pair => pair.Key.EpisodeId)
-                     .ThenBy(pair => pair.Key.FlagId))
-        {
-            Add(new WorldEventPacket(
-                nextId++, WorldEventType.TriggerFlag,
-                key.CourseId, key.EpisodeId, value, 0, key.FlagId));
-        }
-
-        foreach (var (flagId, value) in storyFlags.SecretFlags.OrderBy(pair => pair.Key))
-        {
-            Add(new WorldEventPacket(
-                nextId++, WorldEventType.SecretComplete, 0, 0, value, 0, flagId));
-        }
-
-        foreach (var ((courseId, episodeId), mask) in redCoins.AllStages.OrderBy(pair => pair.Key))
-        {
-            if (includeRedCoinStage != null && !includeRedCoinStage(courseId, episodeId))
-                continue;
-
-            var count = System.Numerics.BitOperations.PopCount(mask);
-            for (byte index = 0; index < 8; index++)
+            return new WorldProgressSnapshot
             {
-                if ((mask & (1 << index)) == 0)
-                    continue;
-                var payload0 = (byte)((count << 4) | index);
-                var packedPos = redCoins.PackedPos(courseId, episodeId, index);
-                Add(new WorldEventPacket(
-                    nextId++, WorldEventType.RedCoinCollected, courseId, episodeId, payload0, index, mask,
-                    packedPos));
-            }
+                ProgressSeq = progressSeq,
+                Unchanged = false,
+                ShineBits = shineBits,
+                BlueCourses = blues,
+                StoryFlags = stories,
+                TriggerFlags = triggers,
+                SecretFlags = secrets,
+                RedStages = redStages,
+                NpcCleanStages = npcStages,
+            };
         }
+    }
 
-        foreach (var ((courseId, episodeId), mask) in npcCleans.AllStages.OrderBy(pair => pair.Key))
-        {
-            var count = System.Numerics.BitOperations.PopCount(mask);
-            for (byte index = 0; index < 16; index++)
-            {
-                if ((mask & (1 << index)) == 0)
-                    continue;
-                var payload0 = (byte)((count << 4) | index);
-                Add(new WorldEventPacket(
-                    nextId++, WorldEventType.NpcCleaned, courseId, episodeId, payload0, index, 0));
-            }
-        }
-
-        // Graffiti is healable visually on re-spray / stage re-entry; never let it
-        // crowd out shine/blue/story ownership from the catch-up frame.
-        foreach (var ((courseId, episodeId), cells) in graffitiCleans.AllStages.OrderBy(pair => pair.Key))
-        {
-            foreach (var cell in cells.OrderBy(c => c.CellX).ThenBy(c => c.CellY).ThenBy(c => c.CellZ))
-            {
-                if (events.Count >= maxEvents)
-                    break;
-
-                var cellPacked = GraffitiCleanAuthority.PackCell(cell.CellX, cell.CellY, cell.CellZ);
-                Add(new WorldEventPacket(
-                    nextId++, WorldEventType.GraffitiCleaned, courseId, episodeId, cell.SizeQuant, 0,
-                    cell.PackedPos, cellPacked));
-            }
-
-            if (events.Count >= maxEvents)
-                break;
-        }
-
-        // Advance the live counter past synthetic snapshot ids so a later real event cannot
-        // collide with a resync packet the client already applied.
-        if (events.Count > 0)
-            _nextEventId = nextId;
-
-        return BuildWorldStateReplay(events);
-        }
+    public byte[] BuildAuthorityProgressSnapshotFrame(
+        ShineAuthority shines,
+        BlueCoinAuthority blueCoins,
+        RedCoinAuthority redCoins,
+        NpcCleanAuthority npcCleans,
+        StoryFlagAuthority storyFlags,
+        uint progressSeq,
+        Func<byte, byte, bool>? includeRedCoinStage = null,
+        bool unchanged = false)
+    {
+        var snapshot = BuildAuthorityProgressSnapshot(
+            shines, blueCoins, redCoins, npcCleans, storyFlags, progressSeq,
+            includeRedCoinStage, unchanged);
+        return PacketSerializer.BuildWorldProgressSnapshot(snapshot);
     }
 }

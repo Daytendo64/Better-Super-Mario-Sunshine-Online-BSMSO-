@@ -14,6 +14,8 @@ $AppDataZipCache = Join-Path $env:APPDATA "SMSO\BetterSunshineEngine_RELEASE.zip
 $AppDataStaging = Join-Path $env:APPDATA "SMSO\bse-v4.0.0"
 $BseReleaseZipUrl = "https://github.com/DotKuribo/BetterSunshineEngine/releases/download/v4.0.0/BetterSunshineEngine_RELEASE.zip"
 $OfficialBseSize = 583744
+$OfficialMovesetSize = 46976
+$OfficialMainDolSize = 4128928
 
 function Ensure-OfficialBsePayload {
     $stagingKuribo = Join-Path $AppDataStaging "Kuribo!"
@@ -225,16 +227,64 @@ function Install-BseRuntime {
             Write-Warning "Replacing non-release BetterSunshineEngine.kxe ($existingSize bytes); backup: $backup"
         }
     }
-    Copy-Item $stagingKxe $bseDest -Force
-    $movesetSrc = Join-Path $Root "dist\BetterSunshineMoveset.kxe"
-    if (-not (Test-Path $movesetSrc)) {
-        Write-Error "Missing dist\BetterSunshineMoveset.kxe"
+    $stagingKxeSize = (Get-Item $stagingKxe).Length
+    if ($stagingKxeSize -ne $OfficialBseSize) {
+        Write-Error "Refusing BetterSunshineEngine.kxe ($stagingKxeSize bytes; expected $OfficialBseSize). DEBUG/dev BSE black-screens boot."
     }
-    Copy-Item $movesetSrc (Join-Path $modsDest "BetterSunshineMoveset.kxe") -Force
+    Copy-Item $stagingKxe $bseDest -Force
+
+    # Respect launcher PatchBseMoveset (default off). Always installing Moveset left
+    # Mario heavier after users turned the toggle off / never ran Install again.
+    $patchMoveset = $false
+    $launcherConfig = Join-Path $env:APPDATA "SMSO\config.json"
+    if (Test-Path $launcherConfig) {
+        try {
+            $cfg = Get-Content $launcherConfig -Raw | ConvertFrom-Json
+            if ($null -ne $cfg.PatchBseMoveset) {
+                $patchMoveset = [bool]$cfg.PatchBseMoveset
+            }
+        } catch {}
+    }
+
+    $movesetDest = Join-Path $modsDest "BetterSunshineMoveset.kxe"
+    if ($patchMoveset) {
+        $movesetSrc = Join-Path $Root "dist\BetterSunshineMoveset.kxe"
+        if (-not (Test-Path $movesetSrc)) {
+            Write-Error "Missing dist\BetterSunshineMoveset.kxe"
+        }
+        $movesetSize = (Get-Item $movesetSrc).Length
+        if ($movesetSize -ne $OfficialMovesetSize) {
+            Write-Error "Refusing BetterSunshineMoveset.kxe ($movesetSize bytes; expected $OfficialMovesetSize). Wrong Moveset black-screens boot."
+        }
+        Copy-Item $movesetSrc $movesetDest -Force
+        Write-Host "Installed BetterSunshineMoveset.kxe → $movesetDest ($((Get-Item $movesetDest).Length) bytes)"
+    } elseif (Test-Path $movesetDest) {
+        Remove-Item $movesetDest -Force
+        Write-Host "Removed BetterSunshineMoveset.kxe (PatchBseMoveset off)"
+    } else {
+        Write-Host "Skipping BetterSunshineMoveset.kxe (PatchBseMoveset off)"
+    }
+
     Copy-Item $Source (Join-Path $modsDest "_BSMSO.kxe") -Force
     Copy-Item $stagingMain (Join-Path $sysDir "main.dol") -Force
     Copy-Item $stagingBoot (Join-Path $sysDir "boot.bin") -Force
 
+    $installedBse = (Get-Item $bseDest).Length
+    $installedMain = (Get-Item (Join-Path $sysDir "main.dol")).Length
+    if ($installedBse -ne $OfficialBseSize) {
+        Write-Error "Post-install BetterSunshineEngine.kxe is $installedBse bytes (expected $OfficialBseSize)."
+    }
+    if ($installedMain -ne $OfficialMainDolSize) {
+        Write-Error "Post-install main.dol is $installedMain bytes (expected $OfficialMainDolSize)."
+    }
+    if ($patchMoveset) {
+        $installedMoveset = (Get-Item $movesetDest).Length
+        if ($installedMoveset -ne $OfficialMovesetSize) {
+            Write-Error "Post-install BetterSunshineMoveset.kxe is $installedMoveset bytes (expected $OfficialMovesetSize)."
+        }
+    } elseif (Test-Path $movesetDest) {
+        Write-Error "BetterSunshineMoveset.kxe still present after PatchBseMoveset-off install."
+    }
     # Patch GMSE90 into boot.bin (first 6 ASCII bytes), matching launcher GameIdentity.
     $bootDest = Join-Path $sysDir "boot.bin"
     $bytes = [System.IO.File]::ReadAllBytes($bootDest)
@@ -245,8 +295,24 @@ function Install-BseRuntime {
     Write-Host "Installed KuriboKernel.bin → $(Join-Path $systemDest 'KuriboKernel.bin')"
     Write-Host "Installed BSE main.dol / boot.bin (GMSE90) → $sysDir"
     Write-Host "Installed BetterSunshineEngine.kxe → $bseDest ($((Get-Item $bseDest).Length) bytes)"
-    Write-Host "Installed BetterSunshineMoveset.kxe → $(Join-Path $modsDest 'BetterSunshineMoveset.kxe') ($((Get-Item (Join-Path $modsDest 'BetterSunshineMoveset.kxe')).Length) bytes)"
     Write-Host "Installed _BSMSO.kxe → $(Join-Path $modsDest '_BSMSO.kxe') ($((Get-Item (Join-Path $modsDest '_BSMSO.kxe')).Length) bytes)"
+
+    # Title / options UI archives (assets/data → files/data).
+    $assetsData = Join-Path $Root "assets\data"
+    $destData = Join-Path $filesDir "data"
+    New-Item -ItemType Directory -Force -Path $destData | Out-Null
+    foreach ($name in @("nintendo.szs", "option.szs")) {
+        $src = Join-Path $assetsData $name
+        if (-not (Test-Path $src)) { continue }
+        $dest = Join-Path $destData $name
+        $backup = "$dest.bsmso-retail"
+        if ((Test-Path $dest) -and -not (Test-Path $backup)) {
+            Copy-Item $dest $backup -Force
+            Write-Host "Backed up retail $name → $name.bsmso-retail"
+        }
+        Copy-Item $src $dest -Force
+        Write-Host "Installed disc overlay files\data\$name ($((Get-Item $dest).Length) bytes)"
+    }
 }
 
 if (-not (Test-Path $Source)) {

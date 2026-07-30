@@ -24,6 +24,8 @@ set(SMSO_SOURCES
     src/comm_buffer.cpp
     src/puppets.cpp
     src/nametag_system.cpp
+    src/collision_los.cpp
+    src/gx_hud_fence.cpp
     src/connection_hud.cpp
     src/remote_mario.cpp
     src/remote_actor.cpp
@@ -47,6 +49,8 @@ set(SMSO_SOURCES
     src/graffiti_clean_sync.cpp
     src/mario_model_system.cpp
     src/mario_tex_anim.cpp
+    src/jump_spray_rspmp.cpp
+    src/music_volume.cpp
 )
 
 add_executable(_SMSO ${SMSO_SOURCES})

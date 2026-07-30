@@ -1,0 +1,15 @@
+C:\Users\young\OneDrive\Desktop\SMSOBB\tools\_tmp_dump_anims\obj\Release\net8.0\DumpAnims.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\young\OneDrive\Desktop\SMSOBB\tools\_tmp_dump_anims\obj\Release\net8.0\DumpAnims.AssemblyInfoInputs.cache
+C:\Users\young\OneDrive\Desktop\SMSOBB\tools\_tmp_dump_anims\obj\Release\net8.0\DumpAnims.AssemblyInfo.cs
+C:\Users\young\OneDrive\Desktop\SMSOBB\tools\_tmp_dump_anims\obj\Release\net8.0\DumpAnims.csproj.CoreCompileInputs.cache
+C:\Users\young\OneDrive\Desktop\SMSOBB\tools\_tmp_dump_anims\obj\Release\net8.0\DumpAnims.sourcelink.json
+C:\Users\young\OneDrive\Desktop\SMSOBB\tools\_tmp_dump_anims\bin\Release\net8.0\DumpAnims.exe
+C:\Users\young\OneDrive\Desktop\SMSOBB\tools\_tmp_dump_anims\bin\Release\net8.0\DumpAnims.deps.json
+C:\Users\young\OneDrive\Desktop\SMSOBB\tools\_tmp_dump_anims\bin\Release\net8.0\DumpAnims.runtimeconfig.json
+C:\Users\young\OneDrive\Desktop\SMSOBB\tools\_tmp_dump_anims\bin\Release\net8.0\DumpAnims.dll
+C:\Users\young\OneDrive\Desktop\SMSOBB\tools\_tmp_dump_anims\bin\Release\net8.0\DumpAnims.pdb
+C:\Users\young\OneDrive\Desktop\SMSOBB\tools\_tmp_dump_anims\obj\Release\net8.0\DumpAnims.dll
+C:\Users\young\OneDrive\Desktop\SMSOBB\tools\_tmp_dump_anims\obj\Release\net8.0\refint\DumpAnims.dll
+C:\Users\young\OneDrive\Desktop\SMSOBB\tools\_tmp_dump_anims\obj\Release\net8.0\DumpAnims.pdb
+C:\Users\young\OneDrive\Desktop\SMSOBB\tools\_tmp_dump_anims\obj\Release\net8.0\DumpAnims.genruntimeconfig.cache
+C:\Users\young\OneDrive\Desktop\SMSOBB\tools\_tmp_dump_anims\obj\Release\net8.0\ref\DumpAnims.dll

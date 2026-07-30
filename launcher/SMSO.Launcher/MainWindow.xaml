@@ -65,6 +65,7 @@
         <Grid Background="Transparent">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
             <RowDefinition Height="*"/>
             <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
@@ -128,7 +129,36 @@
             </Border>
         </Border>
 
-        <TabControl x:Name="MainTabControl" Grid.Row="1" BorderThickness="0" Margin="0,0,0,0">
+        <!-- Launcher update banner (hidden until remote build is newer) -->
+        <Border x:Name="LauncherUpdateBanner"
+                Grid.Row="1"
+                Visibility="Collapsed"
+                Background="#3F1D1D"
+                BorderBrush="#F87171"
+                BorderThickness="0,0,0,1"
+                Padding="24,10,24,10">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock x:Name="LauncherUpdateBannerText"
+                           TextWrapping="Wrap"
+                           Foreground="#FECACA"
+                           FontSize="12"
+                           VerticalAlignment="Center"
+                           Text="A newer BSMSO launcher is available."/>
+                <Button x:Name="LauncherUpdateOpenButton"
+                        Grid.Column="1"
+                        Content="Open download page"
+                        Style="{StaticResource SmsSecondaryButton}"
+                        Margin="16,0,0,0"
+                        VerticalAlignment="Center"
+                        Click="LauncherUpdateOpen_Click"/>
+            </Grid>
+        </Border>
+
+        <TabControl x:Name="MainTabControl" Grid.Row="2" BorderThickness="0" Margin="0,0,0,0">
             <TabItem x:Name="SettingsTab" Header="Settings">
                 <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="20,12,20,20">
                     <StackPanel MaxWidth="980" HorizontalAlignment="Stretch">
@@ -359,7 +389,7 @@
                                                       IsChecked="False"
                                                       Checked="ApplyRecommendedDolphinSettings_Changed"
                                                       Unchecked="ApplyRecommendedDolphinSettings_Changed"
-                                                      ToolTip="When on, Launch Dolphin applies the BSMSO performance profile (1× IR, Dual Core, CPU clock 200%, EFB-to-texture off, etc.). When off, restores your pre-profile backup once, then keeps and updates that backup from your current Dolphin settings on later launches. Emulate Disc Speed, CPU clock 200%, and MEM1/MEM2 still stay on either way."/>
+                                                      ToolTip="On: Launch Dolphin applies the BSMSO profile (Fast Disc Speed, 1× IR, Dual Core, CPU 200%, EFB-to-texture off, etc.). Off: restores your backup once, then keeps your Dolphin settings (including disc speed). CPU 200% and MEM1/MEM2 stay on either way. No separate Fast Disc Speed toggle."/>
                                         <Button x:Name="LaunchDolphinButton" Content="Launch Dolphin" Style="{StaticResource SmsPrimaryButton}" Click="LaunchDolphin_Click" VerticalAlignment="Center" Margin="0,0,0,4"/>
                                     </WrapPanel>
                                     <WrapPanel Orientation="Horizontal">
@@ -375,7 +405,7 @@
                                                     BorderThickness="1"
                                                     CornerRadius="12"
                                                     IsHitTestVisible="True">
-                                                <TextBlock Text="Launch Dolphin from this launcher (not a desktop shortcut). Dolphin and the game need to be linked before you can host or connect."
+                                                <TextBlock Text="Launch Dolphin from this launcher first. Host/Connect unlock once the game is linked."
                                                            Style="{StaticResource SmsHintText}"
                                                            HorizontalAlignment="Center"
                                                            VerticalAlignment="Center"
@@ -396,19 +426,43 @@
                                                Margin="0,0,0,6"
                                                FontSize="11"
                                                TextWrapping="Wrap"
-                                               Text="Requires an original Super Mario Sunshine copy with nothing installed on it (vanilla dump / clean extract — no prior mods, packs, or BSE). Installs the full Better Sunshine Engine / Kuribo runtime for the Game ISO path in Paths: Kuribo!\System\ (KuriboKernel.bin), BSE-patched sys\main.dol and sys\boot.bin, BetterSunshineEngine.kxe, BetterSunshineMoveset.kxe, and _BSMSO.kxe. Works with an extracted folder or a .iso/.gcm (backs up, then patches the disc in place). Does not support .gcz."/>
+                                               Text="Needs a clean NTSC-U SMS copy (no prior mods/BSE) — or an official Super Mario Eclipse install. Vanilla: installs Kuribo, BSE (main.dol/boot.bin), BetterSunshineEngine.kxe, optional Moveset.kxe, and _BSMSO.kxe. Eclipse: additive-only — _BSMSO.kxe + Mario packs are added and Eclipse's own runtime is never touched. Works on an extracted folder or .iso/.gcm (Eclipse disc images are backed up first). Not .gcz."/>
+                                    <TextBlock x:Name="GameProfileText"
+                                               Style="{StaticResource SmsHintText}"
+                                               Margin="0,0,0,6"
+                                               FontSize="11"
+                                               FontWeight="SemiBold"
+                                               TextWrapping="Wrap"
+                                               Text="Game profile: —"/>
                                     <TextBlock x:Name="ModuleInstallStatusText"
                                                Style="{StaticResource SmsHintText}"
                                                Margin="0,0,0,8"
                                                FontSize="11"
                                                TextWrapping="Wrap"
-                                               Text="Set Game ISO path to check module install status."/>
+                                               Text="Set Game ISO path to check install status."/>
+                                    <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
+                                        <ToggleButton x:Name="PatchBseMovesetToggle"
+                                                      Content="Patch BSE moveset"
+                                                      Style="{StaticResource SmsRedToggleButton}"
+                                                      VerticalAlignment="Center"
+                                                      Margin="0,0,10,0"
+                                                      IsChecked="True"
+                                                      Checked="PatchBseMoveset_Changed"
+                                                      Unchecked="PatchBseMoveset_Changed"
+                                                      ToolTip="On: Install adds BetterSunshineMoveset.kxe (extra moves). Off: Install removes it so you get the vanilla SMS moveset only. Click Install after changing, then restart Dolphin."/>
+                                    </StackPanel>
+                                    <TextBlock Style="{StaticResource SmsHintText}"
+                                               Margin="0,0,0,8"
+                                               FontSize="11"
+                                               TextWrapping="Wrap"
+                                               Text="After changing Patch BSE moveset, click Install again and restart Dolphin. Off removes Moveset.kxe and leaves the vanilla moveset only."/>
                                     <StackPanel Orientation="Horizontal">
                                         <Button x:Name="InstallModulesButton"
                                                 Content="Install / patch modules"
                                                 Style="{StaticResource SmsPrimaryButton}"
                                                 Click="InstallModules_Click"
-                                                Margin="0,0,8,0"/>
+                                                Margin="0,0,8,0"
+                                                ToolTip="Writes .kxe modules, BSE runtime, disc overlays, and model packs. With Patch BSE moveset off, removes Moveset.kxe (vanilla moveset only). Run after zip updates — does not auto-patch on open or Launch Dolphin."/>
                                         <Button x:Name="OpenModsFolderButton"
                                                 Content="Open Mods folder"
                                                 Style="{StaticResource SmsSecondaryButton}"
@@ -424,7 +478,7 @@
                                 <TextBlock Style="{StaticResource SmsHintText}"
                                            Margin="0,0,0,6"
                                            FontSize="11"
-                                           Text="Launch Dolphin from Connection — not a desktop shortcut — so the launcher can link to your game."/>
+                                           Text="Launch Dolphin from Connection (not a desktop shortcut) so the launcher can link to the game."/>
                                 <Grid Margin="0,0,0,6">
                                     <Grid.ColumnDefinitions>
                                         <ColumnDefinition Width="Auto"/>
@@ -471,35 +525,76 @@
                         <RowDefinition Height="Auto"/>
                         <RowDefinition Height="*"/>
                     </Grid.RowDefinitions>
-                    <!-- Model stays usable even when not connected (outside overlay). -->
-                    <GroupBox Grid.Row="0" Header="Model" Padding="14,8,14,10" Margin="0,0,0,12">
-                        <Grid>
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="Auto"/>
-                                <ColumnDefinition Width="*" MinWidth="220"/>
-                            </Grid.ColumnDefinitions>
-                            <TextBlock Grid.Column="0"
-                                       Text="Character model"
-                                       Style="{StaticResource SmsSectionLabel}"
-                                       VerticalAlignment="Center"
-                                       Margin="0,0,10,0"/>
-                            <ComboBox x:Name="MarioModelCombo"
-                                      Grid.Column="1"
-                                      SelectionChanged="MarioModelCombo_SelectionChanged"
-                                      Margin="0">
-                                <ComboBox.ItemTemplate>
-                                    <DataTemplate>
-                                        <TextBlock Text="{Binding DisplayName}"/>
-                                    </DataTemplate>
-                                </ComboBox.ItemTemplate>
-                            </ComboBox>
-                        </Grid>
-                    </GroupBox>
+                    <!-- Model + music stay usable even when not connected (outside overlay). -->
+                    <Grid Grid.Row="0" Margin="0,0,0,12">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="16"/>
+                            <ColumnDefinition Width="Auto" MinWidth="220"/>
+                        </Grid.ColumnDefinitions>
+                        <GroupBox Grid.Column="0" Header="Model" Padding="14,8,14,10" Margin="0">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="*" MinWidth="180"/>
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Grid.Column="0"
+                                           Text="Character model"
+                                           Style="{StaticResource SmsSectionLabel}"
+                                           VerticalAlignment="Center"
+                                           Margin="0,0,10,0"/>
+                                <ComboBox x:Name="MarioModelCombo"
+                                          Grid.Column="1"
+                                          SelectionChanged="MarioModelCombo_SelectionChanged"
+                                          Margin="0">
+                                    <ComboBox.ItemTemplate>
+                                        <DataTemplate>
+                                            <TextBlock Text="{Binding DisplayName}"/>
+                                        </DataTemplate>
+                                    </ComboBox.ItemTemplate>
+                                </ComboBox>
+                            </Grid>
+                        </GroupBox>
+                        <GroupBox Grid.Column="2" Header="Audio" Padding="14,8,14,10" Margin="0">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="*" MinWidth="120"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Grid.Column="0"
+                                           Text="Game music"
+                                           Style="{StaticResource SmsSectionLabel}"
+                                           VerticalAlignment="Center"
+                                           Margin="0,0,10,0"
+                                           ToolTip="In-game BGM volume only — does not change sound effects or Dolphin emulator volume."/>
+                                <Slider x:Name="ClientMusicVolumeSlider"
+                                        Grid.Column="1"
+                                        Minimum="0"
+                                        Maximum="100"
+                                        TickFrequency="5"
+                                        IsSnapToTickEnabled="False"
+                                        VerticalAlignment="Center"
+                                        ValueChanged="MusicVolumeSlider_ValueChanged"/>
+                                <TextBlock x:Name="ClientMusicVolumeValueText"
+                                           Grid.Column="2"
+                                           Text="100%"
+                                           Style="{StaticResource SmsHintText}"
+                                           VerticalAlignment="Center"
+                                           Margin="10,0,0,0"
+                                           MinWidth="36"
+                                           TextAlignment="Right"/>
+                            </Grid>
+                        </GroupBox>
+                    </Grid>
                     <Grid Grid.Row="1">
+                    <ScrollViewer VerticalScrollBarVisibility="Auto"
+                                  HorizontalScrollBarVisibility="Disabled"
+                                  CanContentScroll="False">
                     <Grid x:Name="ClientActionsPanel">
                         <Grid.RowDefinitions>
                             <RowDefinition Height="Auto"/>
-                            <RowDefinition Height="*" MinHeight="360"/>
+                            <RowDefinition Height="Auto"/>
                         </Grid.RowDefinitions>
                         <Grid Grid.Row="0" x:Name="ClientActionsMidRow">
                             <Grid.ColumnDefinitions>
@@ -559,7 +654,7 @@
                                                        HorizontalAlignment="Center" VerticalAlignment="Center"/>
                                         </Border>
                                         <TextBlock x:Name="ClientTeleportOverlayText"
-                                                   Text="The host needs to enable client teleporting to use this."
+                                                   Text="Host must enable client teleporting."
                                                    HorizontalAlignment="Center"
                                                    Foreground="{StaticResource SmsForegroundDim}"
                                                    FontSize="14"
@@ -590,21 +685,23 @@
                                             </Grid.ColumnDefinitions>
                                             <StackPanel Grid.Column="0">
                                                 <TextBlock Text="Hiders" Style="{StaticResource SmsSectionLabel}"/>
-                                                <Border BorderBrush="{StaticResource SmsBorder}" BorderThickness="1" CornerRadius="6" MinHeight="120">
-                                                    <ListBox x:Name="ClientHideSeekHidersList"
+                                                <Border BorderBrush="{StaticResource SmsBorder}" BorderThickness="1" CornerRadius="6" MinHeight="120" MaxHeight="260">
+                                                <ListBox x:Name="ClientHideSeekHidersList"
                                                              Focusable="False"
                                                              IsHitTestVisible="False"
+                                                             ScrollViewer.VerticalScrollBarVisibility="Auto"
                                                              DisplayMemberPath="Username"/>
-                                                </Border>
+                                            </Border>
                                             </StackPanel>
                                             <StackPanel Grid.Column="2">
                                                 <TextBlock Text="Seekers" Style="{StaticResource SmsSectionLabel}"/>
-                                                <Border BorderBrush="{StaticResource SmsBorder}" BorderThickness="1" CornerRadius="6" MinHeight="120">
-                                                    <ListBox x:Name="ClientHideSeekSeekersList"
+                                                <Border BorderBrush="{StaticResource SmsBorder}" BorderThickness="1" CornerRadius="6" MinHeight="120" MaxHeight="260">
+                                                <ListBox x:Name="ClientHideSeekSeekersList"
                                                              Focusable="False"
                                                              IsHitTestVisible="False"
+                                                             ScrollViewer.VerticalScrollBarVisibility="Auto"
                                                              DisplayMemberPath="Username"/>
-                                                </Border>
+                                            </Border>
                                             </StackPanel>
                                         </Grid>
                                         <TextBlock x:Name="ClientHideSeekTagElapsedText"
@@ -619,23 +716,27 @@
                                 </StackPanel>
                             </GroupBox>
                         </Grid>
-                        <GroupBox Grid.Row="1" x:Name="ClientRosterPanel" Header="Connected Players">
+                        <GroupBox Grid.Row="1" x:Name="ClientRosterPanel" Header="Connected Players" Margin="0,12,0,0">
                             <ListView x:Name="ClientRosterList"
-                                      MinHeight="340"
+                                      MinHeight="200"
+                                      MaxHeight="420"
                                       VerticalAlignment="Stretch"
+                                      ScrollViewer.VerticalScrollBarVisibility="Auto"
                                       ScrollViewer.HorizontalScrollBarVisibility="Disabled"
                                       SelectionMode="Single">
                                 <ListView.View>
                                     <GridView>
-                                        <GridViewColumn Header="Name" DisplayMemberBinding="{Binding Username}" Width="140"/>
-                                        <GridViewColumn Header="Level" DisplayMemberBinding="{Binding LevelName}" Width="220"/>
-                                        <GridViewColumn Header="Episode" DisplayMemberBinding="{Binding EpisodeName}" Width="220"/>
+                                        <GridViewColumn Header="Name" DisplayMemberBinding="{Binding DisplayName}" Width="140"/>
+                                        <GridViewColumn Header="Level" DisplayMemberBinding="{Binding LevelName}" Width="180"/>
+                                        <GridViewColumn Header="Episode" DisplayMemberBinding="{Binding EpisodeName}" Width="180"/>
+                                        <GridViewColumn Header="Model" DisplayMemberBinding="{Binding ModelName}" Width="120"/>
                                         <GridViewColumn Header="Status" DisplayMemberBinding="{Binding Status}" Width="100"/>
                                     </GridView>
                                 </ListView.View>
                             </ListView>
                         </GroupBox>
                     </Grid>
+                    </ScrollViewer>
                     <Border x:Name="ClientActionsOverlay"
                             Panel.ZIndex="1"
                             Background="#E0080810"
@@ -668,35 +769,77 @@
 
             <TabItem x:Name="ServerTab" Header="Server Actions">
                 <Grid Margin="20,12,20,20">
+                    <!-- Scroll so Hide & Seek controls cannot clip Connected Players off-screen. -->
+                    <ScrollViewer VerticalScrollBarVisibility="Auto"
+                                  HorizontalScrollBarVisibility="Disabled"
+                                  CanContentScroll="False">
                     <Grid x:Name="ServerActionsPanel">
                         <Grid.RowDefinitions>
                             <RowDefinition Height="Auto"/>
                             <RowDefinition Height="Auto"/>
-                            <RowDefinition Height="*" MinHeight="360"/>
+                            <RowDefinition Height="Auto"/>
                         </Grid.RowDefinitions>
-                        <GroupBox Grid.Row="0" Header="Model" Padding="14,8,14,10" Margin="0,0,0,12">
-                            <Grid>
-                                <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="Auto"/>
-                                    <ColumnDefinition Width="*" MinWidth="220"/>
-                                </Grid.ColumnDefinitions>
-                                <TextBlock Grid.Column="0"
-                                           Text="Character model"
-                                           Style="{StaticResource SmsSectionLabel}"
-                                           VerticalAlignment="Center"
-                                           Margin="0,0,10,0"/>
-                                <ComboBox x:Name="ServerMarioModelCombo"
-                                          Grid.Column="1"
-                                          SelectionChanged="MarioModelCombo_SelectionChanged"
-                                          Margin="0">
-                                    <ComboBox.ItemTemplate>
-                                        <DataTemplate>
-                                            <TextBlock Text="{Binding DisplayName}"/>
-                                        </DataTemplate>
-                                    </ComboBox.ItemTemplate>
-                                </ComboBox>
-                            </Grid>
-                        </GroupBox>
+                        <Grid Grid.Row="0" Margin="0,0,0,12">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="16"/>
+                                <ColumnDefinition Width="Auto" MinWidth="220"/>
+                            </Grid.ColumnDefinitions>
+                            <GroupBox Grid.Column="0" Header="Model" Padding="14,8,14,10" Margin="0">
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="*" MinWidth="180"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Grid.Column="0"
+                                               Text="Character model"
+                                               Style="{StaticResource SmsSectionLabel}"
+                                               VerticalAlignment="Center"
+                                               Margin="0,0,10,0"/>
+                                    <ComboBox x:Name="ServerMarioModelCombo"
+                                              Grid.Column="1"
+                                              SelectionChanged="MarioModelCombo_SelectionChanged"
+                                              Margin="0">
+                                        <ComboBox.ItemTemplate>
+                                            <DataTemplate>
+                                                <TextBlock Text="{Binding DisplayName}"/>
+                                            </DataTemplate>
+                                        </ComboBox.ItemTemplate>
+                                    </ComboBox>
+                                </Grid>
+                            </GroupBox>
+                            <GroupBox Grid.Column="2" Header="Audio" Padding="14,8,14,10" Margin="0">
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="*" MinWidth="120"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Grid.Column="0"
+                                               Text="Game music"
+                                               Style="{StaticResource SmsSectionLabel}"
+                                               VerticalAlignment="Center"
+                                               Margin="0,0,10,0"
+                                               ToolTip="In-game BGM volume only — does not change sound effects or Dolphin emulator volume."/>
+                                    <Slider x:Name="ServerMusicVolumeSlider"
+                                            Grid.Column="1"
+                                            Minimum="0"
+                                            Maximum="100"
+                                            TickFrequency="5"
+                                            IsSnapToTickEnabled="False"
+                                            VerticalAlignment="Center"
+                                            ValueChanged="MusicVolumeSlider_ValueChanged"/>
+                                    <TextBlock x:Name="ServerMusicVolumeValueText"
+                                               Grid.Column="2"
+                                               Text="100%"
+                                               Style="{StaticResource SmsHintText}"
+                                               VerticalAlignment="Center"
+                                               Margin="10,0,0,0"
+                                               MinWidth="36"
+                                               TextAlignment="Right"/>
+                                </Grid>
+                            </GroupBox>
+                        </Grid>
                         <Grid Grid.Row="1">
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="*"/>
@@ -735,11 +878,17 @@
                                     <ToggleButton x:Name="WorldSyncToggle"
                                                   Content="Sync collectibles"
                                                   Style="{StaticResource SmsRedToggleButton}"
-                                                  Margin="0,0,0,4"
+                                                  Margin="0,0,10,4"
                                                   IsChecked="True"
                                                   Checked="WorldSync_Changed"
                                                   Unchecked="WorldSync_Changed"
-                                                  ToolTip="Shines and blue coins sync everywhere. Yellow and red coins only sync when players share the same course and episode."/>
+                                                  ToolTip="Shines and blues sync everywhere. Yellow/red coins sync only when players share course and episode."/>
+                                    <Button x:Name="ResetFlagsButton"
+                                            Content="Reset Progress"
+                                            Style="{StaticResource SmsDangerButton}"
+                                            Margin="0,0,0,4"
+                                            Click="ResetFlagsButton_Click"
+                                            ToolTip="Resets everyone’s session like a new file (shines, blues, story, secrets, nozzles, plaza gates, red coins, NPC cleans, graffiti). Re-enter stages to respawn actors."/>
                                 </WrapPanel>                            </StackPanel>
                         </GroupBox>
                         <GroupBox Grid.Column="2" Header="Game Modes">
@@ -760,23 +909,25 @@
                                         </Grid.ColumnDefinitions>
                                         <StackPanel Grid.Column="0">
                                             <TextBlock Text="Hiders" Style="{StaticResource SmsSectionLabel}"/>
-                                            <Border BorderBrush="{StaticResource SmsBorder}" BorderThickness="1" CornerRadius="6" MinHeight="120">
+                                            <Border BorderBrush="{StaticResource SmsBorder}" BorderThickness="1" CornerRadius="6" MinHeight="120" MaxHeight="260">
                                                 <ListBox x:Name="HideSeekHidersList" AllowDrop="True"
                                                          PreviewMouseLeftButtonDown="HideSeekRoleList_PreviewMouseLeftButtonDown"
                                                          PreviewMouseMove="HideSeekRoleList_MouseMove"
                                                          DragOver="HideSeekRoleList_DragOver"
                                                          Drop="HideSeekHidersList_Drop"
+                                                         ScrollViewer.VerticalScrollBarVisibility="Auto"
                                                          DisplayMemberPath="Username"/>
                                             </Border>
                                         </StackPanel>
                                         <StackPanel Grid.Column="2">
                                             <TextBlock Text="Seekers" Style="{StaticResource SmsSectionLabel}"/>
-                                            <Border BorderBrush="{StaticResource SmsBorder}" BorderThickness="1" CornerRadius="6" MinHeight="120">
+                                            <Border BorderBrush="{StaticResource SmsBorder}" BorderThickness="1" CornerRadius="6" MinHeight="120" MaxHeight="260">
                                                 <ListBox x:Name="HideSeekSeekersList" AllowDrop="True"
                                                          PreviewMouseLeftButtonDown="HideSeekRoleList_PreviewMouseLeftButtonDown"
                                                          PreviewMouseMove="HideSeekRoleList_MouseMove"
                                                          DragOver="HideSeekRoleList_DragOver"
                                                          Drop="HideSeekSeekersList_Drop"
+                                                         ScrollViewer.VerticalScrollBarVisibility="Auto"
                                                          DisplayMemberPath="Username"/>
                                             </Border>
                                         </StackPanel>
@@ -791,21 +942,21 @@
                                         <Button x:Name="RandomTagButton" Content="Random Tagger"
                                                 Style="{StaticResource SmsPrimaryButton}" Margin="0,0,8,0"
                                                 Click="RandomTagButton_Click"
-                                                ToolTip="Pick a random connected player as the seeker (never the same one twice in a row)."/>
+                                                ToolTip="Pick a random connected seeker (won’t repeat the same player twice in a row)."/>
                                         <Button x:Name="RandomLevelButton" Content="Random Level"
                                                 Style="{StaticResource SmsDangerButton}" Margin="0,0,16,0"
                                                 Click="RandomLevelButton_Click"
-                                                ToolTip="Warp everyone to a random level (Pinna → Park Area Episode 8; Sirena → Episode 5 beach / Noki overrides; never the same level within 5 rounds)."/>
+                                                ToolTip="Warp everyone to a random level (Pinna → Park Area Ep. 8; Sirena → Ep. 5 beach / Noki overrides; no repeat within 5 rounds)."/>
                                         <TextBlock Text="Hider timer"
                                                    Style="{StaticResource SmsSectionLabel}"
                                                    VerticalAlignment="Center"
                                                    Margin="0,0,8,0"
-                                                   ToolTip="Seconds seekers stay frozen after Start Tag (15–60, in 15s steps)."/>
+                                                   ToolTip="Seconds seekers stay frozen after Start Tag (15–60). Applies to the next Start Tag only."/>
                                         <ComboBox x:Name="HideSeekGraceSecondsCombo"
                                                   Width="120"
                                                   VerticalAlignment="Center"
                                                   SelectionChanged="HideSeekGraceSecondsCombo_SelectionChanged"
-                                                  ToolTip="Seconds seekers stay frozen after Start Tag (15–60, in 15s steps)."/>
+                                                  ToolTip="Seconds seekers stay frozen after Start Tag (15–60). Applies to the next Start Tag only."/>
                                     </WrapPanel>
                                     <TextBlock x:Name="HideSeekTagElapsedText"
                                                FontWeight="SemiBold"
@@ -817,16 +968,19 @@
                             </StackPanel>
                         </GroupBox>
                         </Grid>
-                        <GroupBox Grid.Row="2" Header="Connected Players">
+                        <GroupBox Grid.Row="2" Header="Connected Players" Margin="0,12,0,0">
                             <ListView x:Name="ServerRosterList"
-                                      MinHeight="340"
+                                      MinHeight="200"
+                                      MaxHeight="420"
                                       VerticalAlignment="Stretch"
+                                      ScrollViewer.VerticalScrollBarVisibility="Auto"
                                       ScrollViewer.HorizontalScrollBarVisibility="Disabled">
                                 <ListView.View>
                                     <GridView>
-                                        <GridViewColumn Header="Name" DisplayMemberBinding="{Binding Username}" Width="120"/>
-                                        <GridViewColumn Header="Level" DisplayMemberBinding="{Binding LevelName}" Width="200"/>
-                                        <GridViewColumn Header="Episode" DisplayMemberBinding="{Binding EpisodeName}" Width="200"/>
+                                        <GridViewColumn Header="Name" DisplayMemberBinding="{Binding DisplayName}" Width="120"/>
+                                        <GridViewColumn Header="Level" DisplayMemberBinding="{Binding LevelName}" Width="160"/>
+                                        <GridViewColumn Header="Episode" DisplayMemberBinding="{Binding EpisodeName}" Width="160"/>
+                                        <GridViewColumn Header="Model" DisplayMemberBinding="{Binding ModelName}" Width="110"/>
                                         <GridViewColumn Header="Ping" DisplayMemberBinding="{Binding PingMs}" Width="60"/>
                                         <GridViewColumn Header="Status" DisplayMemberBinding="{Binding Status}" Width="100"/>
                                     </GridView>
@@ -834,6 +988,7 @@
                             </ListView>
                         </GroupBox>
                     </Grid>
+                    </ScrollViewer>
                     <Border x:Name="ServerActionsOverlay"
                             Panel.ZIndex="1"
                             Background="#E0080810"
@@ -852,7 +1007,7 @@
                                            Foreground="{StaticResource SmsAccent}"
                                            HorizontalAlignment="Center" VerticalAlignment="Center"/>
                             </Border>
-                            <TextBlock Text="Host and connect to enable server actions"
+                            <TextBlock Text="Host a server to enable server actions"
                                        HorizontalAlignment="Center"
                                        Foreground="{StaticResource SmsForegroundDim}"
                                        FontSize="14"
@@ -867,48 +1022,23 @@
                 <TabControl Margin="12,8,12,12">
                     <TabItem Header="Start here">
                         <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="8,12,8,8">
-                            <Grid MaxWidth="900">
-                                <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="*"/>
-                                    <ColumnDefinition Width="*"/>
-                                </Grid.ColumnDefinitions>
-                                <Border Grid.Column="0" Background="{StaticResource SmsCard}" CornerRadius="12" Padding="16" Margin="0,0,6,0"
-                                        BorderBrush="{StaticResource SmsBorder}" BorderThickness="1">
-                                    <StackPanel>
-                                        <TextBlock Text="Downloads" FontWeight="SemiBold" FontSize="14" Foreground="{StaticResource SmsAccent}" Margin="0,0,0,8"/>
-                                        <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,8"
-                                                   Text="You need: BSMSO release zip, Dolphin x64, and a legally owned NTSC-U Super Mario Sunshine disc image (GMSE01). BSE is included in the BSMSO zip."/>
-                                        <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4">
-                                            <Run FontWeight="SemiBold" Text="BSMSO — "/>
-                                            <Hyperlink NavigateUri="https://github.com/Daytendo64/Better-Super-Mario-Sunshine-Online-BSMSO-/releases" RequestNavigate="HelpLink_RequestNavigate">GitHub Releases</Hyperlink>
-                                        </TextBlock>
-                                        <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4">
-                                            <Run FontWeight="SemiBold" Text="Dolphin — "/>
-                                            <Hyperlink NavigateUri="https://dolphin-emu.org/download" RequestNavigate="HelpLink_RequestNavigate">dolphin-emu.org</Hyperlink>
-                                        </TextBlock>
-                                        <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap">
-                                            <Run FontWeight="SemiBold" Text="BSE (if needed) — "/>
-                                            <Hyperlink NavigateUri="https://github.com/DotKuribo/BetterSunshineEngine/releases" RequestNavigate="HelpLink_RequestNavigate">BSE Releases</Hyperlink>
-                                        </TextBlock>
-                                    </StackPanel>
-                                </Border>
-                                <Border Grid.Column="1" Background="{StaticResource SmsCard}" CornerRadius="12" Padding="16" Margin="6,0,0,0"
-                                        BorderBrush="{StaticResource SmsBorder}" BorderThickness="1">
-                                    <StackPanel>
-                                        <TextBlock Text="Every session" FontWeight="SemiBold" FontSize="14" Foreground="{StaticResource SmsAccent}" Margin="0,0,0,8"/>
-                                        <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
-                                                   Text="1. Set username, Dolphin path, and game path in Settings."/>
-                                        <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
-                                                   Text="2. In Settings → Game modules, click Install / patch modules (extracted folder or .iso/.gcm)."/>
-                                        <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
-                                                   Text="3. Launch Dolphin — wait for title screen or in-game. (Optional: Connection → Apply recommended Dolphin settings — see Help → Dolphin settings.)"/>
-                                        <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
-                                                   Text="4. Host Server or Connect (port 27015)."/>
-                                        <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap"
-                                                   Text="5. Each player runs their own Dolphin. Wait for everyone to finish loading before warping again."/>
-                                    </StackPanel>
-                                </Border>
-                            </Grid>
+                            <Border MaxWidth="900" Background="{StaticResource SmsCard}" CornerRadius="12" Padding="16"
+                                    BorderBrush="{StaticResource SmsBorder}" BorderThickness="1"
+                                    HorizontalAlignment="Left">
+                                <StackPanel>
+                                    <TextBlock Text="Every session" FontWeight="SemiBold" FontSize="14" Foreground="{StaticResource SmsAccent}" Margin="0,0,0,8"/>
+                                    <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
+                                               Text="1. Settings: set username, Dolphin path, and game path."/>
+                                    <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
+                                               Text="2. Settings → Game modules → Install / patch modules (folder or .iso/.gcm)."/>
+                                    <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
+                                               Text="3. Launch Dolphin and wait for title screen or in-game. Optional: Connection → Apply recommended Dolphin settings."/>
+                                    <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
+                                               Text="4. Host Server or Connect (port 27015)."/>
+                                    <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap"
+                                               Text="5. Each player uses their own Dolphin. Wait for everyone to finish loading before warping."/>
+                                </StackPanel>
+                            </Border>
                         </ScrollViewer>
                     </TabItem>
                     <TabItem Header="Game files">
@@ -919,9 +1049,9 @@
                                     <StackPanel>
                                         <TextBlock Text="Overview" FontWeight="SemiBold" FontSize="14" Foreground="{StaticResource SmsAccent}" Margin="0,0,0,8"/>
                                         <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
-                                                   Text="You can play from an extracted game folder or a patched .iso/.gcm disc image. Install / patch modules installs Kuribo System (KuriboKernel.bin), BSE-patched main.dol/boot.bin, BetterSunshineEngine.kxe, BetterSunshineMoveset.kxe, and _BSMSO.kxe."/>
+                                                   Text="Play from an extracted folder or a patched .iso/.gcm. Install writes Kuribo, BSE, BetterSunshineEngine.kxe, optional Moveset.kxe (if Patch BSE moveset is on), and _BSMSO.kxe. With the toggle off, Install removes Moveset.kxe so you keep the vanilla moveset only."/>
                                         <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap"
-                                                   Text="Use Settings → Game modules → Install / patch modules. Set Paths → Game ISO to either your extracted folder (or sys\main.dol) or a raw .iso/.gcm file."/>
+                                                   Text="Settings → Game modules → Install / patch modules. Paths → Game ISO: extracted folder (or sys\main.dol) or a .iso/.gcm."/>
                                     </StackPanel>
                                 </Border>
                                 <Grid Margin="0,0,0,12">
@@ -934,15 +1064,15 @@
                                         <StackPanel>
                                             <TextBlock Text="Option A: Extracted folder" FontWeight="SemiBold" FontSize="14" Foreground="{StaticResource SmsAccent}" Margin="0,0,0,8"/>
                                             <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
-                                                       Text="1. In Dolphin: right-click NTSC-U SMS → Properties → Filesystem → Extract All Files (or Extract Contents)."/>
+                                                       Text="1. Dolphin: right-click NTSC-U SMS → Properties → Filesystem → Extract All / Extract Contents."/>
                                             <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
                                                        Text="2. Confirm the folder has sys\ and files\."/>
                                             <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
-                                                       Text="3. Settings → Paths: set Game ISO to that folder or sys\main.dol."/>
+                                                       Text="3. Paths → Game ISO: that folder or sys\main.dol."/>
                                             <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
-                                                       Text="4. Settings → Game modules → Install / patch modules (Kuribo System, BSE main.dol/boot.bin, and the .kxe modules)."/>
+                                                       Text="4. Game modules → Install / patch modules."/>
                                             <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap"
-                                                       Text="5. Launch Dolphin. Install also patches sys\boot.bin to GMSE90 and boots from the extracted tree."/>
+                                                       Text="5. Launch Dolphin. Install sets boot.bin to GMSE90 and boots from the extracted tree."/>
                                         </StackPanel>
                                     </Border>
                                     <Border Grid.Column="1" Background="{StaticResource SmsCard}" CornerRadius="12" Padding="16" Margin="6,0,0,0"
@@ -950,15 +1080,15 @@
                                         <StackPanel>
                                             <TextBlock Text="Option B: Patch .iso / .gcm" FontWeight="SemiBold" FontSize="14" Foreground="{StaticResource SmsAccent}" Margin="0,0,0,8"/>
                                             <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
-                                                       Text="1. Settings → Paths: set Game ISO to your .iso or .gcm file."/>
+                                                       Text="1. Paths → Game ISO: your .iso or .gcm."/>
                                             <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
-                                                       Text="2. Settings → Game modules → Install / patch modules. The launcher backs up the image, extracts, installs Kuribo System + BSE main.dol/boot.bin + .kxe modules, rebuilds, and replaces the file in place (also ensures game ID GMSE90)."/>
+                                                       Text="2. Install / patch modules — choose where to save the patched .iso/.gcm (default: Game_BSMSO.iso). Source is left unchanged unless you overwrite it (then a .bak is made)."/>
                                             <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
-                                                       Text="3. Launch Dolphin with that same disc image."/>
+                                                       Text="3. Game ISO path updates to the patched file; Launch Dolphin with that image (game ID GMSE90)."/>
                                             <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
-                                                       Text="4. To update mods later, run Install / patch modules again (another backup is created if .bak already exists)."/>
+                                                       Text="4. To update later, set Game ISO to the patched image (or the clean source) and Install again."/>
                                             <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap"
-                                                       Text=".gcz is not supported — convert to .iso/.gcm in Dolphin first, or use Option A."/>
+                                                       Text=".gcz not supported — convert to .iso/.gcm in Dolphin, or use Option A."/>
                                         </StackPanel>
                                     </Border>
                                 </Grid>
@@ -967,19 +1097,19 @@
                                     <StackPanel>
                                         <TextBlock Text="Tips" FontWeight="SemiBold" FontSize="14" Foreground="{StaticResource SmsAccent}" Margin="0,0,0,8"/>
                                         <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
-                                                   Text="• NTSC-U Super Mario Sunshine only (GMSE01 → GMSE90)."/>
+                                                   Text="• NTSC-U SMS only (GMSE01 → GMSE90)."/>
                                         <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
-                                                   Text="• Kuribo requires files\Kuribo!\System\KuriboKernel.bin plus BSE-patched sys\main.dol (vanilla SMS cannot load .kxe modules alone)."/>
+                                                   Text="• Kuribo needs files\Kuribo!\System\KuriboKernel.bin plus BSE-patched sys\main.dol."/>
                                         <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
-                                                   Text="• BetterSunshineEngine.kxe must load before BetterSunshineMoveset.kxe and _BSMSO.kxe (all in Mods\)."/>
+                                                   Text="• Load order in Mods\: BetterSunshineEngine.kxe before Moveset.kxe and _BSMSO.kxe."/>
                                         <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
                                                    Text="• Fully restart Dolphin after installing or updating modules."/>
                                         <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
                                                    Text="• Do not use SMSCoop with BSMSO."/>
                                         <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
-                                                   Text="• Extracted folders are easier for frequent mod updates; ISO patch is fine if you prefer a single disc file."/>
+                                                   Text="• Extracted folders are easier for frequent updates; ISO is fine for a single disc file."/>
                                         <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap"
-                                                   Text="• Prefer Install / patch modules over manual copy. Manual fallback needs the full BSE zip (Kuribo!, main.dol, boot.bin) plus BetterSunshineEngine.kxe, BetterSunshineMoveset.kxe, and _BSMSO.kxe."/>
+                                                   Text="• Prefer Install / patch modules over manual copy (needs full BSE zip + the .kxe modules)."/>
                                     </StackPanel>
                                 </Border>
                             </StackPanel>
@@ -993,7 +1123,7 @@
                                     <StackPanel>
                                         <TextBlock Text="Optional on Launch Dolphin" FontWeight="SemiBold" FontSize="14" Foreground="{StaticResource SmsAccent}" Margin="0,0,0,8"/>
                                         <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
-                                                   Text="Connection has “Apply recommended Dolphin settings.” When that is on, Launch Dolphin writes a performance + stability profile into GMSE90 GameSettings (and matching Dolphin.ini / GFX.ini keys), including Store EFB copies to texture only off. When you turn it off, your pre-profile backup is restored once; later launches with it off keep your current Dolphin settings and refresh that backup so edits you make in Dolphin stick. Emulate Disc Speed (FastDiscSpeed=False), Emulated CPU Clock Override at 200% (Overclock=2.0), and MEM1/MEM2 always stay on either way. Controls, hotkeys, and your [Gecko] codes are left alone. Other games are not affected."/>
+                                                   Text="Connection → Apply recommended Dolphin settings. On: Launch Dolphin writes a performance profile (Fast Disc Speed, EFB-to-texture off, etc.). Off: restores your backup once, then keeps your Dolphin settings including disc speed. CPU 200% and MEM1/MEM2 stay on either way. No separate Fast Disc Speed toggle. Controls, hotkeys, and [Gecko] codes are left alone."/>
                                         <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap">
                                             <Run Text="Based on Dolphin’s "/>
                                             <Hyperlink NavigateUri="https://dolphin-emu.org/docs/guides/performance-guide/" RequestNavigate="HelpLink_RequestNavigate">official performance guide</Hyperlink>
@@ -1015,13 +1145,13 @@
                                             <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
                                                        Text="• DSP-HLE — on (fast audio)"/>
                                             <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
-                                                       Text="• CPU clock override — on at 200% (recommended profile + always; OverclockEnable=True, Overclock=2.0)."/>
+                                                       Text="• CPU clock override — 200% (always; Overclock=2.0)"/>
                                             <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
                                                        Text="• Emulation speed — 100%"/>
                                             <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
-                                                       Text="• Emulate Disc Speed — on (always; Dolphin INI FastDiscSpeed=False). Applied even when recommended settings are off."/>
+                                                       Text="• Fast Disc Speed — only with recommended profile (Emulate Disc Speed off). Otherwise left alone."/>
                                             <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap"
-                                                       Text="• RAM override — MEM1 48 MiB, MEM2 64 MiB (always; required for BSMSO)"/>
+                                                       Text="• RAM override — MEM1 48 MiB, MEM2 64 MiB (always; required)"/>
                                         </StackPanel>
                                     </Border>
                                     <Border Grid.Column="1" Background="{StaticResource SmsCard}" CornerRadius="12" Padding="16" Margin="6,0,0,0"
@@ -1069,11 +1199,11 @@
                                         <StackPanel>
                                             <TextBlock Text="Not forced" FontWeight="SemiBold" FontSize="14" Foreground="{StaticResource SmsAccent}" Margin="0,0,0,8"/>
                                             <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
-                                                       Text="• Graphics backend — leave as-is (Vulkan vs D3D11 depends on your GPU; Intel often prefers D3D11/12)."/>
+                                                       Text="• Graphics backend — leave as-is (Vulkan vs D3D; Intel often prefers D3D11/12)."/>
                                             <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
                                                        Text="• Controllers / hotkeys — never overwritten."/>
                                             <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap"
-                                                       Text="• If you raise internal resolution for visuals with the recommended profile on, Launch Dolphin will set 1× again next time. Turn the Connection toggle off to keep your own graphics settings."/>
+                                                       Text="• With recommended settings on, Launch Dolphin resets internal resolution to 1×. Turn the toggle off to keep your own graphics."/>
                                         </StackPanel>
                                     </Border>
                                 </Grid>
@@ -1103,7 +1233,7 @@
                                                    Text="Launch Dolphin → Host Server. Allow firewall for BSMSO and Dolphin."/>
                                         <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4" FontWeight="SemiBold" Text="Clients"/>
                                         <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="8,0,0,4"
-                                                   Text="Join network → Settings: host's Radmin IP, port 27015."/>
+                                                   Text="Join network → Settings: host Radmin IP, port 27015."/>
                                         <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="8,0,0,0"
                                                    Text="Launch Dolphin → Connect. Usernames must be unique (3–16 letters, numbers, underscore)."/>
                                     </StackPanel>
@@ -1113,14 +1243,14 @@
                                     <StackPanel>
                                         <TextBlock Text="Port forwarding" FontWeight="SemiBold" FontSize="14" Foreground="{StaticResource SmsAccent}" Margin="0,0,0,8"/>
                                         <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,8"
-                                                   Text="Alternative if you skip VPN: host forwards TCP and UDP 27015 on their router to their PC."/>
+                                                   Text="Without VPN: host forwards TCP/UDP 27015 to their PC."/>
                                         <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
                                                    Text="Share public IP + port 27015. Clients enter that in Settings."/>
                                         <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,8"
                                                    Text="Allow BSMSO.Launcher.exe and Dolphin.exe through Windows Firewall when hosting."/>
                                         <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" FontWeight="SemiBold" Text="Module updates"/>
                                         <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,4,0,0"
-                                                   Text="In Settings → Game modules, click Install / patch modules again (folder or .iso/.gcm), then fully restart Dolphin."/>
+                                                   Text="Game modules → Install / patch modules again, then fully restart Dolphin."/>
                                     </StackPanel>
                                 </Border>
                             </Grid>
@@ -1140,19 +1270,19 @@
                                             </Grid.ColumnDefinitions>
                                             <StackPanel Grid.Column="0" Margin="0,0,8,0">
                                                 <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
-                                                           Text="• Black screen — check Dolphin log; BSE must load before _BSMSO.kxe in Mods\."/>
+                                                           Text="• Black screen — check Dolphin log; BSE must load before _BSMSO.kxe."/>
                                                 <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
-                                                           Text="• Cannot connect — verify host IP (Radmin IP with VPN, public IP with port forward)."/>
+                                                           Text="• Cannot connect — check host IP (Radmin with VPN, or public IP + port forward)."/>
                                                 <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap"
-                                                           Text="• Bridge not attached — launch Dolphin from BSMSO first; load into the game before Host/Connect."/>
+                                                           Text="• Bridge not attached — launch Dolphin from BSMSO; enter the game before Host/Connect."/>
                                             </StackPanel>
                                             <StackPanel Grid.Column="1" Margin="8,0,0,0">
                                                 <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
                                                            Text="• Warp blocked — wait until all players finish loading."/>
                                                 <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap" Margin="0,0,0,4"
-                                                           Text="• Name rejected — use 3–16 alphanumeric characters and underscore; no duplicates."/>
+                                                           Text="• Name rejected — 3–16 letters/numbers/underscore; no duplicates."/>
                                                 <TextBlock Style="{StaticResource SmsHintText}" TextWrapping="Wrap"
-                                                           Text="• Antivirus — memory reads for sync can trigger false positives on unsigned builds."/>
+                                                           Text="• Antivirus — memory reads for sync can false-flag unsigned builds."/>
                                             </StackPanel>
                                         </Grid>
                                     </StackPanel>
@@ -1172,7 +1302,7 @@
         </TabControl>
 
         <!-- Status bar -->
-        <Border Grid.Row="2"
+        <Border Grid.Row="3"
                 Background="{StaticResource SmsSurface}"
                 Padding="20,10"
                 BorderBrush="{StaticResource SmsBorderGlow}"

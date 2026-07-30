@@ -23,8 +23,24 @@ public static class ModuleVersionMessages
         "Updated BSMSO module installed — close Dolphin and Launch Dolphin again before hosting or connecting.";
 
     public const string UpdateRequired =
-        "Outdated BSMSO module — press Update module to install the version bundled with this launcher.";
+        "Outdated BSMSO module — press Update module to install the bundled _BSMSO.kxe.";
+
+    public const string LauncherUpdateRequiredGeneric =
+        "Download the latest BSMSO zip and replace BSMSO.Launcher.exe and _BSMSO.kxe (then run Update module).";
+
+    /// <summary>
+    /// Shown when installed modules match this launcher's ModBuildId and no launcher update is required.
+    /// </summary>
+    public const string EverythingUpToDateReadyToPlay =
+        "Everything is up to date — ready to play";
+
+    public static string EverythingUpToDateReadyToPlayWithBuild(ushort buildId) =>
+        $"{EverythingUpToDateReadyToPlay} (build {buildId}).";
+
+    public static string LauncherUpdateRequired(ushort localBuild, ushort remoteBuild) =>
+        $"Outdated BSMSO launcher (build {localBuild}) — latest is build {remoteBuild}. " +
+        LauncherUpdateRequiredGeneric;
 
     public static string MissingModuleFile(string path) =>
-        $"BSMSO module not found at {path}. In Settings → Game modules, use Install / patch modules to install Kuribo System (KuriboKernel.bin), BSE main.dol/boot.bin, {BseModuleFileName}, {MovesetModuleFileName}, and {ModuleFileName} (extracted folder or .iso/.gcm patch).";
+        $"BSMSO module not found at {path}. Settings → Game modules → Install / patch modules to install Kuribo, BSE main.dol/boot.bin, {BseModuleFileName}, {MovesetModuleFileName}, and {ModuleFileName}.";
 }

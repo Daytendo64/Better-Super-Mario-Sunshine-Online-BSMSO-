@@ -6,11 +6,17 @@
 
 #include <BetterSMS/libs/constmath.hxx>
 #include <BetterSMS/loading.hxx>
+#include <BetterSMS/player.hxx>
 #include <Dolphin/OS.h>
+#include <Dolphin/math.h>
 #include <Dolphin/mem.h>
 #include <Dolphin/string.h>
 #include <Dolphin/types.h>
+#include <JSystem/JDrama/JDRGraphics.hxx>
 #include <SMS/Camera/PolarSubCamera.hxx>
+#include <SMS/Enemy/EnemyMario.hxx>
+#include <SMS/GC2D/GCConsole2.hxx>
+#include <SMS/MSound/MSBGM.hxx>
 #include <SMS/Manager/FlagManager.hxx>
 #include <SMS/Map/BGCheck.hxx>
 #include <SMS/Player/Mario.hxx>
@@ -19,6 +25,7 @@
 #include <SMS/System/MarDirector.hxx>
 #include <SMS/macros.h>
 #include <SMS/raw_fn.hxx>
+#include <sdk.h>
 
 extern TMarDirector *gpMarDirector;
 extern TMario *gpMarioAddress;
@@ -61,7 +68,11 @@ static constexpr DelfinoPlazaEpisode kDelfinoPlazaEpisodes[] = {
     {7, 2}, // dolpic10 — post-flood (scenario 2, not 10)
 };
 
-// Sirena hotel interior (area 7): only delfino0/2/4 stage files load; 6 and 7 crash to title.
+// Sirena hotel interior (area 7). Disc has delfino0..delfino4; indices 5+ fall to title.
+// Natural beach→hotel doors (dolphin.log): ep3→delfino1, ep4/5→delfino2.
+// Ep7 Shadow Mario → delfino3 (only archive with kagemario.sb); Ep8 Red Coins → delfino4.
+// Manager doors often use episode 0xFF or pass load index 3/4 — must not treat those as
+// casino mission 3/4 (that forced delfino0/delfino2 + wrong scripts).
 // timenoe/RAScripts: Sirena ep 8 red coins use logical episode 5 → scenario 4.
 struct SirenaHotelEpisode {
     u8 catalogId;
@@ -77,13 +88,24 @@ struct WarpTarget {
 static constexpr u8 kSirenaBeachAreaId = 6;
 static constexpr u8 kSirenaHotelAreaId = 7;
 static constexpr u8 kInvalidHotelMission = 0xFF;
+// Hotel Ep7 Shadow Mario chase BGM: load row arms hotel ambient only (no DistFade).
+// Track live EnemyMario via vtable perform hook and crossfade like retail DistFade.
+static TEnemyMario *s_trackedEnemyMario = nullptr;
+static bool s_hotelShadowMarioBgmActive = false;
+static bool s_hotelShadowMarioChaseStarted = false;
+static bool s_hotelShadowMarioBgmLogged = false;
+static bool s_hotelShadowMarioChaseDone = false;
+
 // Survives stageExit/clearPuppets — set in consumeWarpIntent, consumed in applyHotelWarpMissionOverride.
-// doldecomp/BSE Stage::getStageName indexes mStageArchiveAry by episode; delfino6 is missing on disc.
+// getStageName indexes mStageArchiveAry by load scenario (delfino0..4); mission rides 0x40003 / director.
 static u8 s_hotelMissionEpisodeSync = kInvalidHotelMission;
 static u8 s_hotelWarpDemoSkipFrames = 0;
 // Beach/hotel mission 3 (Casino) or 4 (King Boo) preserved across casino archive load.
 // Archive index is separate: mission 3 → casino0, mission 4 → casino1.
 static u8 s_casinoMissionEpisodeSync = kInvalidHotelMission;
+
+static bool isSirenaCasinoMissionEpisode(u8 mission);
+static u8 sirenaCasinoLoadForMission(u8 mission);
 
 struct ResolvedWarp {
     u8 areaId;
@@ -92,11 +114,11 @@ struct ResolvedWarp {
 
 static constexpr SirenaHotelEpisode kSirenaHotelEpisodes[] = {
     {0, 0, 0}, // delfino0 lobby
-    {2, 2, 2}, // Sirena ep 3 — Mysterious Hotel Delfino
+    {2, 1, 2}, // Sirena ep 3 — Mysterious Hotel Delfino (delfino1)
     {3, 2, 3}, // Sirena ep 4 — Casino path (delfino2 map, keep ep4 mission in hotel)
     {4, 2, 4}, // Sirena ep 5 — King Boo path (delfino2 map, keep ep5 mission in hotel)
-    {6, 0, 6}, // Sirena ep 7 — Shadow Mario (delfino0 map, ep7 mission scripts)
-    {7, 4, 4}, // Sirena ep 8 — Red Coins (logical ep 5 → scenario 4)
+    {6, 3, 6}, // Sirena ep 7 — Shadow Mario (delfino3 map, ep7 mission scripts)
+    {7, 4, 4}, // Sirena ep 8 — Red Coins (delfino4, logical mission 4)
 };
 
 // Single-episode Sirena secret stages. Beach ep4 leaves 0x40003=3 through the hotel;
@@ -171,6 +193,20 @@ static WarpTarget resolveCasinoWarpTarget(u8 catalogEpisodeId) {
     return {catalogEpisodeId, catalogEpisodeId};
 }
 
+// stageArc.bin area 16 = mareUndersea.arc (single scenario / load episode 0).
+// Catalog used to expose Ep4/Ep8 mission ids 3/7 as warpable episodes; passing
+// those through to setNextStage loads a missing archive and soft-fails to title
+// (same class as natural 16/255 without normalizeMareUnderseaNextSceneForLoad).
+static constexpr u8 kMareUnderseaAreaId = 16;
+
+static WarpTarget resolveMareUnderseaWarpTarget(u8 catalogEpisodeId) {
+    // Always load scenario 0. Preserve 3/7 as mission context when a stale client
+    // still sends those catalog ids; otherwise mission matches load.
+    const u8 mission =
+        (catalogEpisodeId == 3 || catalogEpisodeId == 7) ? catalogEpisodeId : static_cast<u8>(0);
+    return {0, mission};
+}
+
 static WarpTarget resolveWarpTarget(u8 areaId, u8 catalogEpisodeId) {
     if (areaId == kSirenaHotelAreaId)
         return resolveHotelWarpTarget(catalogEpisodeId);
@@ -180,6 +216,9 @@ static WarpTarget resolveWarpTarget(u8 areaId, u8 catalogEpisodeId) {
 
     if (areaId == kPinnaParkAreaId)
         return resolvePinnaParkWarpTarget(catalogEpisodeId);
+
+    if (areaId == kMareUnderseaAreaId)
+        return resolveMareUnderseaWarpTarget(catalogEpisodeId);
 
     if (areaId == kDelfinoPlazaAreaId) {
         for (const auto &ep : kDelfinoPlazaEpisodes) {
@@ -191,11 +230,14 @@ static WarpTarget resolveWarpTarget(u8 areaId, u8 catalogEpisodeId) {
     return {catalogEpisodeId, catalogEpisodeId};
 }
 
-// Shadow Mario / hotel red coins play inside area 7 even when launched from Sirena Beach (area 6).
+// Beach Shadow Mario (catalog 6) / hotel red coins (catalog 7) redirect to hotel interior.
+// Catalog ids are preserved so resolveHotelWarpTarget picks delfino3/delfino4 — the old
+// table used load 0 for catalog 6 and never finished spawn; current rows use load 3/4.
 static ResolvedWarp resolveFullWarp(u8 areaId, u8 catalogEpisodeId) {
-    if (areaId == kSirenaBeachAreaId && (catalogEpisodeId == 6 || catalogEpisodeId == 7))
+    if (areaId == kSirenaBeachAreaId &&
+        (catalogEpisodeId == 6 || catalogEpisodeId == 7)) {
         return {kSirenaHotelAreaId, resolveHotelWarpTarget(catalogEpisodeId)};
-
+    }
     return {areaId, resolveWarpTarget(areaId, catalogEpisodeId)};
 }
 
@@ -598,10 +640,16 @@ void exportLocalPlayer(TMario *mario, TMarDirector *director) {
 }
 
 // doldecomp TMarDirector::setMario unkD1: 1=rollingStart, 2=returnStart, 3=waitingStart, 4=torocco.
+// Scene flags @ 0x4E / entry flags @ 0x50 gate the intro camera + Mario-ready wipe.
 constexpr u32 kDirectorMarioEntryKindOffset = 0xD1u;
+constexpr u32 kDirectorSceneFlagsOffset = 0x4Eu;
 constexpr u32 kDirectorEntryFlagsOffset = 0x50u;
 constexpr u8 kMarioEntryWaitingStart = 3u;
 constexpr u16 kDirectorMarioReadyFlag = 1u;
+constexpr u16 kDirectorSkipIntroCameraFlag = 2u;
+constexpr u16 kDirectorWipeCloseFlag = 4u;
+constexpr u32 kMarioGamePadFlagsOffset = 0xE2u;
+constexpr u16 kMarioGamePadControlEnabledFlag = 0x2u;
 constexpr u32 kMarioStatusTypeMask = 0x1C0u;
 constexpr u32 kMarioStatusTypeDemo = 0x100u;
 constexpr u32 kMarioStatusWait = 0xC400201u;
@@ -616,7 +664,75 @@ static bool isMarioInDemoState(const TMario *mario) {
     return mario && (mario->mState & kMarioStatusTypeMask) == kMarioStatusTypeDemo;
 }
 
-static void forceInstantMarioSpawn(TMarDirector *director, TMario *mario) {
+static bool isMarioPlayableAfterSkip(const TMario *mario) {
+    return mario && !isMarioInDemoState(mario);
+}
+
+static void openConsoleWipeForSkip(TMarDirector *director) {
+    if (!director || !director->mGCConsole || !director->mGCConsole->mConsoleStr)
+        return;
+    director->mGCConsole->mConsoleStr->startOpenWipe();
+}
+
+// End gate/title-card fly-throughs that leave cinematic camera + no HUD.
+static void skipDirectorIntroState(TMarDirector *director) {
+    if (!director)
+        return;
+
+    u8 *raw = reinterpret_cast<u8 *>(director);
+    u16 &sceneFlags = *reinterpret_cast<u16 *>(raw + kDirectorSceneFlagsOffset);
+    sceneFlags &= ~(kDirectorSkipIntroCameraFlag | kDirectorWipeCloseFlag);
+
+    if (gpCamera)
+        gpCamera->endDemoCamera();
+
+    openConsoleWipeForSkip(director);
+    endStageEntranceDemo__10MSMainProcFUcUc(director->mAreaID, director->mEpisodeID);
+
+    if (director->mCurState < TMarDirector::STATE_NORMAL)
+        director->mCurState = TMarDirector::STATE_NORMAL;
+
+    if (director->mGamePads && director->mGamePads[0]) {
+        u8 *padRaw = reinterpret_cast<u8 *>(director->mGamePads[0]);
+        *reinterpret_cast<u16 *>(padRaw + kMarioGamePadFlagsOffset) |=
+            kMarioGamePadControlEnabledFlag;
+    }
+}
+
+static void enableMarioPadControl(TMarDirector *director, TMario *mario) {
+    // BSE updateCollisionContext / resetValuesOnStateChange copies mIsDisableInput onto
+    // mReadInput every Mario perform. Clearing only the pad leaves a permanent softlock
+    // after Hide & Seek same-stage death reloads (Pianta / Mare / Noki repro).
+    // Also abort a mid-flight BSE wipe-warp: spawn / death-reload can land with
+    // mIsWarpActive stuck, which re-sets mIsDisableInput every processWarpCallback.
+    if (mario) {
+        if (auto *playerData = BetterSMS::Player::getData(mario)) {
+            playerData->mCollisionFlags.mIsDisableInput = false;
+            playerData->mCollisionFlags.mIsWarpUsed = false;
+            if (playerData->mIsWarpActive || playerData->mWarpState != 0xFF) {
+                playerData->mIsWarpActive = false;
+                playerData->mIsWarpEnding = false;
+                playerData->mWarpState = 0xFF;
+                playerData->mWarpTimer = -1;
+            }
+        }
+        if (mario->mController) {
+            mario->mController->mState.mReadInput = true;
+            mario->mController->mState.mDisable = false;
+        }
+    }
+
+    if (director && director->mGamePads && director->mGamePads[0]) {
+        u8 *padRaw = reinterpret_cast<u8 *>(director->mGamePads[0]);
+        *reinterpret_cast<u16 *>(padRaw + kMarioGamePadFlagsOffset) |=
+            kMarioGamePadControlEnabledFlag;
+    }
+}
+
+// Finish waitingStart / demo status without TMarDirector::setMario().
+// setMario rebuilds Mario graph state and re-enters entry demos — after a fresh
+// same-stage load (Hide & Seek death reload) that softlocks control (Mare/Noki).
+static void finishMarioEntryWithoutSetMario(TMarDirector *director, TMario *mario) {
     if (!director || !mario)
         return;
 
@@ -627,8 +743,6 @@ static void forceInstantMarioSpawn(TMarDirector *director, TMario *mario) {
     if (!(entryFlags & kDirectorMarioReadyFlag))
         startStageBGM__10MSMainProcFUcUc(director->mAreaID, director->mEpisodeID);
 
-    director->setMario();
-
     if (isMarioInDemoState(mario))
         mario->waitingStart(nullptr, 0.0f);
 
@@ -636,23 +750,107 @@ static void forceInstantMarioSpawn(TMarDirector *director, TMario *mario) {
         mario->changePlayerStatus(kMarioStatusWait, 0, true);
 
     entryFlags |= kDirectorMarioReadyFlag;
+    enableMarioPadControl(director, mario);
+}
+
+bool isStageEntryDemoActive(const TMarDirector *director, const TMario *mario) {
+    if (!director)
+        return true;
+
+    // Title-card / gate camera / spawn roll before Mario is controllable.
+    if (director->mCurState < TMarDirector::STATE_NORMAL)
+        return true;
+
+    if (isMarioInDemoState(mario))
+        return true;
+
+    // Bianco (and other course) fly-throughs can leave demo camera after STATE_NORMAL.
+    if (gpCamera && gpCamera->isSimpleDemoCamera())
+        return true;
+
+    const u8 *raw = reinterpret_cast<const u8 *>(director);
+    const u16 sceneFlags = *reinterpret_cast<const u16 *>(raw + kDirectorSceneFlagsOffset);
+    if (sceneFlags & kDirectorSkipIntroCameraFlag)
+        return true;
+
+    return false;
+}
+
+void restoreLocalMarioControl(TMarDirector *director, TMario *mario) {
+    enableMarioPadControl(director, mario);
+}
+
+bool isLocalMarioControlPlayable(const TMarDirector *director, const TMario *mario) {
+    if (!director || !mario || !mario->mController)
+        return false;
+    if (director->mCurState < TMarDirector::STATE_NORMAL)
+        return false;
+    if (isStageEntryDemoActive(director, mario))
+        return false;
+    if (!mario->mController->mState.mReadInput || mario->mController->mState.mDisable)
+        return false;
+    if (auto *playerData = BetterSMS::Player::getData(const_cast<TMario *>(mario))) {
+        if (playerData->mCollisionFlags.mIsDisableInput)
+            return false;
+    }
+    return isMarioPlayableAfterSkip(mario);
 }
 
 void respawnLocalMarioAtStageSpawn(TMarDirector *director, TMario *mario) {
-    forceInstantMarioSpawn(director, mario);
+    // Prefer retail setMario from a fresh stage load. Callers that already completed
+    // normal entry should use restoreLocalMarioControl / forceSkipStageEntryDemo only.
+    // Hide & Seek death reload must NOT call this — finishMarioEntryWithoutSetMario
+    // softlocks after same-stage moveStage (Mare/Noki / builds 67–68).
+    skipDirectorIntroState(director);
+    finishMarioEntryWithoutSetMario(director, mario);
+    restoreLocalMarioControl(director, mario);
+}
+
+bool forceSkipStageEntryDemo(TMarDirector *director, TMario *mario) {
+    if (!director)
+        return false;
+
+    overrideDirectorEntryKind(director);
+    skipDirectorIntroState(director);
+
+    // Do not call setMario() — it re-arms waitingStart/demo after a successful skip
+    // (Hide & Seek death-finish softlock on Mare). End the intro in-place instead.
+    if (mario)
+        finishMarioEntryWithoutSetMario(director, mario);
+    restoreLocalMarioControl(director, mario);
+
+    return isLocalMarioControlPlayable(director, mario);
+}
+
+void armHotelMissionEpisodeSync(u8 missionEpisode) {
+    s_hotelMissionEpisodeSync = missionEpisode;
 }
 
 void reloadLocalStage(TMarDirector *director, u8 areaId, u8 episodeId) {
+    reloadLocalStage(director, areaId, episodeId, episodeId);
+}
+
+void reloadLocalStage(TMarDirector *director, u8 areaId, u8 loadEpisode, u8 missionEpisode) {
     if (!director)
         return;
 
-    const u16 stageId = static_cast<u16>(((static_cast<u32>(areaId) + 1) << 8) | episodeId);
+    const u16 stageId =
+        static_cast<u16>(((static_cast<u32>(areaId) + 1) << 8) | loadEpisode);
 
     gpApplication.mNextScene.mAreaID = areaId;
-    gpApplication.mNextScene.mEpisodeID = episodeId;
+    gpApplication.mNextScene.mEpisodeID = loadEpisode;
 
     TFlagManager::smInstance->setFlag(0x40002, 0);
-    TFlagManager::smInstance->setFlag(0x40003, episodeId);
+    TFlagManager::smInstance->setFlag(0x40003, missionEpisode);
+
+    // Hotel archives key off load scenario; mission scripts need director override
+    // after resetStage (same path as consumeWarpIntent). Without this, Hide & Seek
+    // death reload left director on load id while remotes stayed on mission id —
+    // isSameStage failed and remotes vanished (dolphin.log area=7 ep=2 vs mission 4).
+    if (areaId == kSirenaHotelAreaId && loadEpisode != missionEpisode)
+        armHotelMissionEpisodeSync(missionEpisode);
+    else if (areaId != kSirenaHotelAreaId)
+        s_hotelMissionEpisodeSync = kInvalidHotelMission;
 
     BetterSMS::Loading::setLoading(false);
     setHideSeekAllowDeathStageReload(true);
@@ -704,6 +902,11 @@ void consumeWarpIntent() {
 
     BetterSMS::Loading::setLoading(false);
 
+    // Sticky death-recovery must not survive an intentional launcher warp — otherwise
+    // RoundComplete/Stop Tag warp-all is rewritten back onto the death stage
+    // (dolphin.log: next=1/2 → death, tag=0 death=1) while remotes leave.
+    clearHideSeekDeathForLauncherWarp();
+
     setHideSeekAllowStageTransition(true);
     authorizeLauncherStageMove();
     gpMarDirector->setNextStage(stageId, nullptr);
@@ -713,19 +916,43 @@ void consumeWarpIntent() {
 }
 
 void applyHotelWarpMissionOverride(TMarDirector *director) {
-    if (!director || s_hotelMissionEpisodeSync == kInvalidHotelMission)
+    if (!director || director->mAreaID != kSirenaHotelAreaId)
         return;
-    if (director->mAreaID != kSirenaHotelAreaId)
-        return;
+
+    // Safety net: natural beach→hotel doors enter as load 7/2 (delfino2) for both Ep4
+    // and Ep5 without always arming s_hotelMissionEpisodeSync. If the director is still
+    // on the archive load id while 0x40003 holds mission 3/4, apply that mission so
+    // hotel scripts and hotel→casino stash see Ep4 vs Ep5 correctly.
+    if (s_hotelMissionEpisodeSync == kInvalidHotelMission) {
+        if (gpApplication.mCurrentScene.mEpisodeID == 2 && director->mEpisodeID == 2) {
+            const u8 flagMission =
+                static_cast<u8>(TFlagManager::smInstance->getFlag(0x40003));
+            if (isSirenaCasinoMissionEpisode(flagMission))
+                s_hotelMissionEpisodeSync = flagMission;
+        }
+        if (s_hotelMissionEpisodeSync == kInvalidHotelMission)
+            return;
+    }
 
     const u8 missionEpisode = s_hotelMissionEpisodeSync;
 
     // After TFlagManager::resetStage(). Mission scripts read mEpisodeID during setupObjects;
-    // mCurrentScene.mEpisodeID stays on the load scenario so getStageName loads delfino0/2/4.
+    // mCurrentScene.mEpisodeID stays on the load scenario so getStageName loads delfino0..4.
+    // Do NOT start BGM_KAGEMARIO at full volume here — that stacked over hotel ambient.
+    // Ep7 (mission 6 / delfino3): sound enter used load ep 3 so DistFade never armed;
+    // updateHotelShadowMarioBgm crossfades chase music by EnemyMario distance instead.
     director->mEpisodeID = missionEpisode;
     TFlagManager::smInstance->setFlag(0x40003, missionEpisode);
-    s_hotelWarpDemoSkipFrames = 120;
+    // Hide & Seek death settle already force-skips intros — do not stack a 120-frame
+    // hotel demo skip on top (felt slower than Pianta remount).
+    s_hotelWarpDemoSkipFrames = isHideSeekTaggedDeathActive() ? 0 : 120;
     s_hotelMissionEpisodeSync = kInvalidHotelMission;
+    s_hotelShadowMarioBgmActive = (missionEpisode == 6);
+    s_hotelShadowMarioChaseStarted = false;
+    s_hotelShadowMarioBgmLogged = false;
+    s_hotelShadowMarioChaseDone = false;
+    if (!s_hotelShadowMarioBgmActive)
+        s_trackedEnemyMario = nullptr;
 
     OSReport("[SMSO] Hotel mission override load=%u mission=%u\n",
              gpApplication.mCurrentScene.mEpisodeID, missionEpisode);
@@ -763,18 +990,26 @@ static u8 resolveSirenaCasinoMissionToStash() {
     const u8 dirEp = gpMarDirector ? gpMarDirector->mEpisodeID : static_cast<u8>(0xFF);
     const u8 curArea = gpApplication.mCurrentScene.mAreaID;
     const u8 curEp = gpApplication.mCurrentScene.mEpisodeID;
+    // Hotel archive load for shared Ep4/Ep5 map (delfino2). Director may still be 2.
+    const u8 hotelLoadEp =
+        (curArea == kSirenaHotelAreaId) ? curEp : static_cast<u8>(0xFF);
 
     u8 chosen = 0xFF;
     if (isSirenaCasinoMissionEpisode(hotelSync))
         chosen = hotelSync;
     else if (curArea == kSirenaHotelAreaId && isSirenaCasinoMissionEpisode(dirEp))
         chosen = dirEp;
+    else if (curArea == kSirenaHotelAreaId && hotelLoadEp == 2 &&
+             isSirenaCasinoMissionEpisode(flag))
+        // Shared delfino2: director/load stay on archive index 2 — mission is in the flag.
+        chosen = flag;
     else if (curArea == kSirenaBeachAreaId && isSirenaCasinoMissionEpisode(curEp))
         chosen = curEp;
     else if (isSirenaCasinoMissionEpisode(flag))
         chosen = flag;
 
-    // Conflict: prefer 4 when beach/hotel catalog or director says Ep5.
+    // Conflict: prefer 4 when beach/hotel catalog or director says Ep5 (King Boo).
+    // Covers "selected Ep5 but unfinished Ep4 left flag=3" when beach catalog is still 4.
     if (hotelSync == 4 || (curArea == kSirenaHotelAreaId && dirEp == 4) ||
         (curArea == kSirenaBeachAreaId && curEp == 4))
         chosen = 4;
@@ -816,7 +1051,6 @@ void normalizeMareUnderseaNextSceneForLoad() {
     // not exist and the game boots intro → title (area 15). dolphin.log:
     // moveStage next=16/255 cur=9/7 → Entrance.thp → option.szs.
     constexpr u8 kMareBayAreaId = 9;
-    constexpr u8 kMareUnderseaAreaId = 16;
 
     const u8 nextArea = gpApplication.mNextScene.mAreaID;
     const u8 nextEp = gpApplication.mNextScene.mEpisodeID;
@@ -839,21 +1073,80 @@ void normalizeMareUnderseaNextSceneForLoad() {
 void normalizeSirenaNextSceneForLoad() {
     const u8 nextArea = gpApplication.mNextScene.mAreaID;
     const u8 nextEp = gpApplication.mNextScene.mEpisodeID;
+    const u8 curArea = gpApplication.mCurrentScene.mAreaID;
+    const u8 curEp = gpApplication.mCurrentScene.mEpisodeID;
+    const u8 flagMission = static_cast<u8>(TFlagManager::smInstance->getFlag(0x40003));
 
-    // Same-shine loading zones use episode 0xFF. Still must stash/clear mission for
-    // Sirena casino / King Boo / secrets — do not bail for those destinations.
+    // Beach catalog episode when leaving sirenaN; otherwise mission flag / hotel director.
+    // Beach ep indices match catalog (sirena6 = Shadow Mario Checks In).
+    const u8 contextMission =
+        (curArea == kSirenaBeachAreaId) ? curEp
+        : (gpMarDirector && gpMarDirector->mAreaID == kSirenaHotelAreaId)
+              ? gpMarDirector->mEpisodeID
+              : flagMission;
+
+    // Same-shine 0xFF into the hotel (manager door from beach). Must pick delfinoN from
+    // the beach episode — leaving 0xFF falls through to delfino0 while mission flag 6
+    // still plays Shadow Mario music (dolphin.log: load=0 mission=6).
+    if (nextArea == kSirenaHotelAreaId && nextEp == 0xFF) {
+        const WarpTarget target = resolveHotelWarpTarget(contextMission);
+        gpApplication.mNextScene.mEpisodeID = target.loadScenario;
+        TFlagManager::smInstance->setFlag(0x40003, target.missionEpisode);
+        if (target.loadScenario != target.missionEpisode)
+            s_hotelMissionEpisodeSync = target.missionEpisode;
+        else
+            s_hotelMissionEpisodeSync = kInvalidHotelMission;
+        s_casinoMissionEpisodeSync = kInvalidHotelMission;
+        OSReport("[SMSO] Sirena hotel 0xFF → load=%u mission=%u (from beach/context %u/%u flag=%u)\n",
+                 target.loadScenario, target.missionEpisode, curArea, curEp, flagMission);
+        return;
+    }
+
+    // Casino / King Boo / secrets still need 0xFF handling below.
     if (nextEp == 0xFF && !isSirenaCasinoOrSecretDest(nextArea))
         return;
 
-    // Natural beach→hotel door uses episode 3 (casino path) even for King Boo (ep5).
-    // Only delfino0/2/4 exist — remap archive to 2 and keep beach mission 3/4 in sync.
-    // (Never runs for 0xFF — hotel doors use real catalog ids.)
+    // Door episode 3/4 is ambiguous:
+    //   - Casino / King Boo paths pass mission ids 3/4 → remap load to delfino2
+    //   - Shadow Mario / Red Coins may pass archive load indices 3/4 (delfino3/4)
+    //     while beach context is catalog 6/7. Treating those as casino steals Ep7
+    //     into delfino2 + mission 3 (dolphin.log after sirena6: door=3 → load=2).
     if (nextArea == kSirenaHotelAreaId && (nextEp == 3 || nextEp == 4)) {
-        u8 mission = static_cast<u8>(TFlagManager::smInstance->getFlag(0x40003));
+        if (contextMission == 6 && nextEp == 3) {
+            gpApplication.mNextScene.mEpisodeID = 3;
+            TFlagManager::smInstance->setFlag(0x40003, 6);
+            s_hotelMissionEpisodeSync = 6;
+            s_casinoMissionEpisodeSync = kInvalidHotelMission;
+            OSReport("[SMSO] Sirena hotel door=3 as Shadow Mario load=3 mission=6 "
+                     "(context=%u)\n",
+                     contextMission);
+            return;
+        }
+        if (contextMission == 7 && nextEp == 4) {
+            gpApplication.mNextScene.mEpisodeID = 4;
+            TFlagManager::smInstance->setFlag(0x40003, 4);
+            s_hotelMissionEpisodeSync = 4;
+            s_casinoMissionEpisodeSync = kInvalidHotelMission;
+            OSReport("[SMSO] Sirena hotel door=4 as Red Coins load=4 mission=4 "
+                     "(context=%u)\n",
+                     contextMission);
+            return;
+        }
+
+        u8 mission = flagMission;
+        // Door encodes casino-path mission after Ep7/Ep8 disambiguation above.
+        // Treat door 3/4 as authoritative so a stale Ep5 flag cannot ride into Ep4
+        // (and vice versa is already handled by nextEp == 4).
         if (nextEp == 4)
             mission = 4;
+        else if (nextEp == 3)
+            mission = 3;
         else if (!isSirenaCasinoMissionEpisode(mission))
             mission = 3;
+
+        // Prefer beach catalog when it is clearly Ep4/Ep5.
+        if (curArea == kSirenaBeachAreaId && isSirenaCasinoMissionEpisode(curEp))
+            mission = curEp;
 
         gpApplication.mNextScene.mEpisodeID = 2;
         TFlagManager::smInstance->setFlag(0x40003, mission);
@@ -864,12 +1157,67 @@ void normalizeSirenaNextSceneForLoad() {
         return;
     }
 
+    // Beach ep7/ep8 doors may pass catalog 6/7 — those archive slots are missing
+    // (title fallback). Remap to delfino3 / delfino4 and keep mission scripts.
+    if (nextArea == kSirenaHotelAreaId && (nextEp == 6 || nextEp == 7)) {
+        const WarpTarget target = resolveHotelWarpTarget(nextEp);
+        gpApplication.mNextScene.mEpisodeID = target.loadScenario;
+        TFlagManager::smInstance->setFlag(0x40003, target.missionEpisode);
+        s_hotelMissionEpisodeSync = target.missionEpisode;
+        s_casinoMissionEpisodeSync = kInvalidHotelMission;
+        OSReport("[SMSO] Sirena hotel next-scene remap door=%u -> load=%u mission=%u\n", nextEp,
+                 target.loadScenario, target.missionEpisode);
+        return;
+    }
+
+    // Natural beach→hotel for Ep4/Ep5 already sets load=2 (delfino2). Unlike door 3/4 /
+    // 0xFF paths above, that path used to leave hotel sync unarmed — director stayed on
+    // load 2 while a stale 0x40003 from unfinished Ep4 could remain 3 even after the
+    // player selected Ep5. Hotel→casino then defaulted to casino0 (Ep4 slots).
+    if (nextArea == kSirenaHotelAreaId && nextEp == 2) {
+        u8 mission = 0xFF;
+        // Prefer an already-armed hotel/casino sync (casino→hotel return, warps).
+        if (isSirenaCasinoMissionEpisode(s_hotelMissionEpisodeSync))
+            mission = s_hotelMissionEpisodeSync;
+        else if (isSirenaCasinoMissionEpisode(s_casinoMissionEpisodeSync))
+            mission = s_casinoMissionEpisodeSync;
+        else if (curArea == kSirenaBeachAreaId && isSirenaCasinoMissionEpisode(curEp))
+            mission = curEp;
+        else if (isSirenaCasinoMissionEpisode(contextMission))
+            mission = contextMission;
+        else if (isSirenaCasinoMissionEpisode(flagMission))
+            mission = flagMission;
+
+        // Beach catalog Ep5 wins over a stale Ep4 flag (unfinished Casino Delfino).
+        if (curArea == kSirenaBeachAreaId && curEp == 4)
+            mission = 4;
+
+        if (isSirenaCasinoMissionEpisode(mission)) {
+            // Keep archive load 2; arm mission for StageInit + casino stash.
+            gpApplication.mNextScene.mEpisodeID = 2;
+            TFlagManager::smInstance->setFlag(0x40003, mission);
+            s_hotelMissionEpisodeSync = mission;
+            s_casinoMissionEpisodeSync = kInvalidHotelMission;
+            OSReport("[SMSO] Sirena hotel load=2 arm mission=%u (from %u/%u flagWas=%u)\n",
+                     mission, curArea, curEp, flagMission);
+        }
+        return;
+    }
+
     // Casino: Ep4 → casino0 (load 0, mission 3); Ep5 → casino1 (load 1, mission 4).
     // 0xFF hotel→casino doors must pick load from mission — never always-0.
     if (nextArea == kSirenaCasinoAreaId) {
         const u8 mission = resolveSirenaCasinoMissionToStash();
-        const u8 loadEp =
-            isSirenaCasinoMissionEpisode(mission) ? sirenaCasinoLoadForMission(mission) : 0;
+        u8 loadEp;
+        if (isSirenaCasinoMissionEpisode(mission)) {
+            loadEp = sirenaCasinoLoadForMission(mission);
+        } else if (nextEp == 0 || nextEp == 1) {
+            // Door already encoded an archive index — do not invent Ep4 (casino0).
+            loadEp = nextEp;
+        } else {
+            // Ambiguous (typically 0xFF with no usable mission). Last resort casino0.
+            loadEp = 0;
+        }
 
         gpApplication.mNextScene.mEpisodeID = loadEp;
         if (isSirenaCasinoMissionEpisode(mission)) {
@@ -974,13 +1322,88 @@ void syncHotelWarpMissionEpisode(TMarDirector *director) {
     if (!gpMarioAddress)
         return;
 
-    if (isMarioInDemoState(gpMarioAddress))
-        forceInstantMarioSpawn(director, gpMarioAddress);
+    if (isStageEntryDemoActive(director, gpMarioAddress))
+        forceSkipStageEntryDemo(director, gpMarioAddress);
 
-    if (!isMarioInDemoState(gpMarioAddress) || s_hotelWarpDemoSkipFrames == 1)
+    if (!isStageEntryDemoActive(director, gpMarioAddress) || s_hotelWarpDemoSkipFrames == 1)
         s_hotelWarpDemoSkipFrames = 0;
     else
         --s_hotelWarpDemoSkipFrames;
+}
+
+static void stopHotelShadowMarioChaseBgm() {
+    if (s_hotelShadowMarioChaseStarted) {
+        MSBgm::stopBGM(BGM_KAGEMARIO, 0);
+        MSBgm::setTrackVolume(0, 1.0f, 0, 0);
+        s_hotelShadowMarioChaseStarted = false;
+    }
+    s_trackedEnemyMario = nullptr;
+    s_hotelShadowMarioBgmLogged = false;
+}
+
+static void finishHotelShadowMarioChaseBgm(const char *reason) {
+    stopHotelShadowMarioChaseBgm();
+    s_hotelShadowMarioBgmActive = false;
+    s_hotelShadowMarioChaseDone = true;
+    OSReport("[SMSO] Hotel Shadow Mario chase BGM finished (%s)\n", reason);
+}
+
+void updateHotelShadowMarioBgm(TMarDirector *director) {
+    if (!s_hotelShadowMarioBgmActive || s_hotelShadowMarioChaseDone)
+        return;
+
+    if (!director || director->mAreaID != kSirenaHotelAreaId || director->mEpisodeID != 6) {
+        finishHotelShadowMarioChaseBgm("left-stage");
+        return;
+    }
+    if (!gpMarioAddress || !MSBgm::getHandle(0))
+        return;
+
+    // Shine fanfare / retail stop clears track 1 — do not re-arm KAGEMARIO over hotel ambient.
+    if (s_hotelShadowMarioChaseStarted && !MSBgm::getHandle(1)) {
+        finishHotelShadowMarioChaseBgm("track-cleared");
+        return;
+    }
+
+    TEnemyMario *enemy = s_trackedEnemyMario;
+    if (!enemy)
+        return;
+
+    // Defeated Shadow Mario stays near the shine spawn; keep hotel ambient, not chase.
+    if (enemy->mEnemyHealth <= 0) {
+        finishHotelShadowMarioChaseBgm("defeated");
+        return;
+    }
+
+    const TVec3f &emPos = enemy->mTranslation;
+    const TVec3f &marioPos = gpMarioAddress->mTranslation;
+    const f32 dx = emPos.x - marioPos.x;
+    const f32 dy = emPos.y - marioPos.y;
+    const f32 dz = emPos.z - marioPos.z;
+    const f32 dist = sqrtf(dx * dx + dy * dy + dz * dz);
+
+    // MSStage::init DistFade thresholds when area param == 7 (hotel-scale).
+    constexpr f32 kFar = 3000.0f;
+    constexpr f32 kNear = 800.0f;
+    f32 mix = 0.0f;
+    if (dist < kNear)
+        mix = 1.0f;
+    else if (dist < kFar)
+        mix = (kFar - dist) / (kFar - kNear);
+
+    if (!MSBgm::getHandle(1)) {
+        JAISound *chase = MSBgm::startBGM(BGM_KAGEMARIO);
+        if (chase)
+            chase->setVolume(0.0f, 0, 0);
+        s_hotelShadowMarioChaseStarted = true;
+        if (!s_hotelShadowMarioBgmLogged) {
+            OSReport("[SMSO] Hotel Shadow Mario chase BGM armed (proximity crossfade)\n");
+            s_hotelShadowMarioBgmLogged = true;
+        }
+    }
+
+    MSBgm::setTrackVolume(0, 1.0f - mix, 2, 0);
+    MSBgm::setTrackVolume(1, mix, 2, 0);
 }
 
 void applyPendingWarpPoint(TMarDirector *director) {
@@ -1032,6 +1455,23 @@ void clearPuppets() {
     CommBuffer *buf = getCommBuffer();
     memset(buf->remoteSnapshots, 0, sizeof(buf->remoteSnapshots));
     buf->playerCount = 0;
+    stopHotelShadowMarioChaseBgm();
+    s_hotelShadowMarioBgmActive = false;
+    s_hotelShadowMarioChaseDone = false;
+}
+
+using EnemyMarioPerformFn = int (*)(TEnemyMario *, u32, JDrama::TGraphics *);
+static EnemyMarioPerformFn sOrigEnemyMarioPerform = reinterpret_cast<EnemyMarioPerformFn>(
+    SMS_PORT_REGION(0x8003F814, 0x8003F664, 0, 0x8003F814));
+
+// Vtable hook target (must have external linkage for SMS_WRITE_32 address).
+int TEnemyMario_perform_track(TEnemyMario *self, u32 flags, JDrama::TGraphics *graphics) {
+    s_trackedEnemyMario = self;
+    return sOrigEnemyMarioPerform(self, flags, graphics);
 }
 
 } // namespace smso
+
+// perform is at vtable + 0x20 (same slot layout as TMario @ 0x803DD680).
+SMS_WRITE_32(SMS_PORT_REGION(0x803AEF44, 0x803A72C4, 0, 0x803AEF44),
+             reinterpret_cast<u32>(&smso::TEnemyMario_perform_track));

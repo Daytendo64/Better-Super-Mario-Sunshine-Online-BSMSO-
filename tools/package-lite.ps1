@@ -1,5 +1,5 @@
 # Build + publish + package the BSMSO Lite client zip.
-# Does NOT overwrite dist\BSMSO_1.0.zip or dist\_BSMSO.kxe (full release).
+# Does NOT overwrite dist\BSMSO_1.1.zip or dist\_BSMSO.kxe (full release).
 #
 # Lite differences:
 # - Client Actions: Game Modes + Connected Players hidden
@@ -8,7 +8,7 @@
 # Output: dist\BSMSO_<Version>_lite.zip
 
 param(
-    [string]$Version = "1.0"
+    [string]$Version = "2.0"
 )
 
 $ErrorActionPreference = "Stop"

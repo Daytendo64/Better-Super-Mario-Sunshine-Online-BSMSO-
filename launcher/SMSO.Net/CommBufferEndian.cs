@@ -49,6 +49,16 @@ public static class CommBufferEndian
         buf.RemoteMarioModelIds ??=
             new byte[ProtocolConstants.MarioModelIdSize * ProtocolConstants.MaxRemoteSlots];
         Array.Copy(data, o, buf.RemoteMarioModelIds, 0, buf.RemoteMarioModelIds.Length);
+        o += buf.RemoteMarioModelIds.Length;
+        buf.ProgressSnapshotHostSeq = BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(o, 4)); o += 4;
+        buf.ProgressSnapshotModuleAppliedSeq = BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(o, 4)); o += 4;
+        buf.ProgressSnapshotPayloadLen = BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(o, 2)); o += 2;
+        buf.ProgressSnapshotFlags = data[o++];
+        buf.ProgressSnapshotReserved = data[o++];
+        buf.ProgressSnapshotPayload ??= new byte[ProtocolConstants.CommProgressSnapshotMaxPayload];
+        Array.Copy(data, o, buf.ProgressSnapshotPayload, 0, ProtocolConstants.CommProgressSnapshotMaxPayload);
+        o += ProtocolConstants.CommProgressSnapshotMaxPayload;
+        buf.MusicVolume = o < data.Length ? data[o] : ProtocolConstants.CommMusicVolumeDefault;
         return buf;
     }
 
@@ -150,7 +160,38 @@ public static class CommBufferEndian
             new byte[ProtocolConstants.MarioModelIdSize * ProtocolConstants.MaxRemoteSlots];
         remoteModels.AsSpan(0, ProtocolConstants.CommMarioModelIdsSize - ProtocolConstants.MarioModelIdSize)
             .CopyTo(data.AsSpan(o, ProtocolConstants.CommMarioModelIdsSize - ProtocolConstants.MarioModelIdSize));
+        o += ProtocolConstants.CommMarioModelIdsSize - ProtocolConstants.MarioModelIdSize;
+        BinaryPrimitives.WriteUInt32BigEndian(data.AsSpan(o, 4), buffer.ProgressSnapshotHostSeq); o += 4;
+        BinaryPrimitives.WriteUInt32BigEndian(data.AsSpan(o, 4), buffer.ProgressSnapshotModuleAppliedSeq); o += 4;
+        BinaryPrimitives.WriteUInt16BigEndian(data.AsSpan(o, 2), buffer.ProgressSnapshotPayloadLen); o += 2;
+        data[o++] = buffer.ProgressSnapshotFlags;
+        data[o++] = buffer.ProgressSnapshotReserved;
+        var snapPayload = buffer.ProgressSnapshotPayload ??
+            new byte[ProtocolConstants.CommProgressSnapshotMaxPayload];
+        var copyLen = Math.Min(snapPayload.Length, ProtocolConstants.CommProgressSnapshotMaxPayload);
+        snapPayload.AsSpan(0, copyLen).CopyTo(data.AsSpan(o, copyLen));
+        o += ProtocolConstants.CommProgressSnapshotMaxPayload;
+        data[o] = buffer.MusicVolume;
         return data;
+    }
+
+    public static void WriteProgressSnapshotInto(Span<byte> dest, uint hostSeq, ushort payloadLen,
+        ReadOnlySpan<byte> payload, byte flags = 0)
+    {
+        if (dest.Length < ProtocolConstants.CommProgressSnapshotSize)
+            throw new ArgumentException("Progress snapshot buffer is too small.", nameof(dest));
+        if (payloadLen > ProtocolConstants.CommProgressSnapshotMaxPayload)
+            throw new ArgumentOutOfRangeException(nameof(payloadLen));
+
+        BinaryPrimitives.WriteUInt32BigEndian(dest.Slice(0, 4), hostSeq);
+        // Preserve moduleAppliedSeq — caller passes existing value via dest or we leave bytes 4-7.
+        // Callers that want a full overwrite should clear moduleAppliedSeq separately.
+        BinaryPrimitives.WriteUInt16BigEndian(dest.Slice(8, 2), payloadLen);
+        dest[10] = flags;
+        dest[11] = 0;
+        dest.Slice(12, ProtocolConstants.CommProgressSnapshotMaxPayload).Clear();
+        if (payloadLen > 0)
+            payload.Slice(0, payloadLen).CopyTo(dest.Slice(12, payloadLen));
     }
 
     public static byte[] ToRosterHudSyncDolphinBytes(in CommRosterHudSync sync)
@@ -225,6 +266,16 @@ public static class CommBufferEndian
             new byte[ProtocolConstants.MarioModelIdSize * ProtocolConstants.MaxRemoteSlots];
         remotes.AsSpan(0, Math.Min(remotes.Length, ProtocolConstants.MarioModelIdSize * ProtocolConstants.MaxRemoteSlots))
             .CopyTo(dest.Slice(ProtocolConstants.MarioModelIdSize));
+    }
+
+    public static byte ClampMusicVolumePercent(int percent) =>
+        (byte)Math.Clamp(percent, 0, 100);
+
+    public static void WriteMusicVolumeInto(Span<byte> dest, byte percent)
+    {
+        if (dest.Length < ProtocolConstants.CommMusicVolumeSize)
+            throw new ArgumentException("Music volume buffer is too small.", nameof(dest));
+        dest[0] = ClampMusicVolumePercent(percent);
     }
 
     public static byte[] ToRemoteMarioVoiceEventsDolphinBytes(MarioVoiceEvent[] remotes)
@@ -342,7 +393,9 @@ public static class CommBufferEndian
     {
         var state = new CommWorldSyncState
         {
-            LocalPending = ReadWorldEvent(data, ref o),
+            LocalPendingOwnership = ReadWorldEvent(data, ref o),
+            LocalPendingMission = ReadWorldEvent(data, ref o),
+            IncomingOwnership = ReadWorldEvent(data, ref o),
             Incoming = ReadWorldEvent(data, ref o),
             LastAppliedEventId = BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(o, 4)),
         };
@@ -352,7 +405,9 @@ public static class CommBufferEndian
 
     private static void WriteWorldSyncState(Span<byte> data, ref int o, in CommWorldSyncState state)
     {
-        WriteWorldEvent(data, ref o, state.LocalPending);
+        WriteWorldEvent(data, ref o, state.LocalPendingOwnership);
+        WriteWorldEvent(data, ref o, state.LocalPendingMission);
+        WriteWorldEvent(data, ref o, state.IncomingOwnership);
         WriteWorldEvent(data, ref o, state.Incoming);
         BinaryPrimitives.WriteUInt32BigEndian(data.Slice(o, 4), state.LastAppliedEventId);
         o += 4;

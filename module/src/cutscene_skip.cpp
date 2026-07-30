@@ -28,14 +28,20 @@ constexpr u32 kDebsAlertSkipPatch = 0x48000078u;
 constexpr u32 kDebsAlertSkipPatchAddr = 0x80142998;
 constexpr u32 kDebsAlertVanillaWord = 0x41800078u;
 
-constexpr u8 kCoronaMountainAreaId = 52; // 0x34
+// 0426078C 60000000  -> nop @ 0x8026078C
+constexpr u32 kUserNopPatch = 0x60000000u;
+constexpr u32 kUserNopPatchAddr = 0x8026078C;
+
+constexpr u8 kCoronaMountainAreaId = 52; // 0x34 — flooded-plaza loading FMV dest
 constexpr u8 kDelfinoPlazaAreaId = 1;
 constexpr u8 kFloodedPlazaEpisodeId = 9; // dolpic9 load scenario
 
 // Default to skip enabled; runtime may temporarily restore vanilla for first Corona FMV.
+// Bowser ending stays skippable — stage_guard catches title/15 leave after skip.
 SMS_WRITE_32(SMS_PORT_REGION(kMovieSkipPatchAddr1, 0x802ADE88, 0, 0), kMovieSkipPatch);
 SMS_WRITE_32(SMS_PORT_REGION(kMovieSkipPatchAddr2, 0x802ADE20, 0, 0), kMovieSkipPatch);
 SMS_WRITE_32(SMS_PORT_REGION(kDebsAlertSkipPatchAddr, 0x80135CF8, 0, 0), kDebsAlertSkipPatch);
+SMS_WRITE_32(SMS_PORT_REGION(kUserNopPatchAddr, 0, 0, 0), kUserNopPatch);
 
 struct RuntimePatchSite {
     u32 memAddr;
@@ -83,6 +89,8 @@ static bool isFloodedPlazaContext() {
 }
 
 // Only block skip for the flooded-plaza -> Corona loading FMV (not the whole visit).
+// Post-Bowser ending may use the auto-skip patch again — stage_guard redirects a
+// collapsed title leave (60→15/255) to plaza hub so skip cannot black-freeze.
 static bool isCoronaLoadingMoviePending() {
     return gpApplication.mNextScene.mAreaID == kCoronaMountainAreaId &&
            gpApplication.mCurrentScene.mAreaID != kCoronaMountainAreaId &&

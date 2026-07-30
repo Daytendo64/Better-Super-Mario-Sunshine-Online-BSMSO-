@@ -48,6 +48,17 @@ public sealed class StoryFlagAuthority
     public const uint SpawnDirectorFlag30001 = 0x30001;
     public const uint SpawnDirectorFlag30004 = 0x30004;
 
+    /// <summary>
+    /// Card bool latched when Corona Mountain (area 52) is entered. decideNextScenario
+    /// returns scenario 2 (dolpic10 post-flood) when set; otherwise all seven Shadow
+    /// Mario episode shines unlock flooded scenario 9 (dolpic9). Must sync like other
+    /// plaza story bits so one peer's Corona visit unlocks final plaza for everyone.
+    /// </summary>
+    public const uint CoronaVisitedFlagId = 0x103AE;
+
+    /// <summary>Corona Mountain story stage (flooded-plaza loading FMV destination).</summary>
+    public const byte CoronaMountainAreaId = 52;
+
     private readonly Dictionary<uint, byte> _storyFlags = new();
     private readonly Dictionary<StageFlagKey, byte> _triggerFlags = new();
     private readonly Dictionary<uint, byte> _secretFlags = new();

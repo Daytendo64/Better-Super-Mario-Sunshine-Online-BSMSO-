@@ -1,0 +1,12 @@
+[OSREPORT]: [BSMSO] Demand async pack priority=2 slot=1 id='78044865'
+[OSREPORT]: [BSMSO] Remote model id slot=1 '' -> '78044865' reapply requested (same-stage body rebuild when pack/heap ready)
+[OSREPORT]: [SMSOBB] story-flag baseline merge started
+[OSREPORT]: [SMSO] Remote actors session reconnect (heap=0x82890000 pool=0 reserved=1)
+[OSREPORT]: [BSMSO] Demand async pack priority=2 slot=0 id='36de327c'
+35:20:819 Core\HW\DVD\FileMonitor.cpp:85 W[FileMon]:   1,403 kB data/bsmso_models/78044865.arc
+35:20:823 Core\HW\DVD\FileMonitor.cpp:85 W[FileMon]:   1,440 kB data/bsmso_models/36de327c.arc
+[OSREPORT]: [BSMSO] Pack async diag reads=1 failures=0 readMs=0 validations=0 validationMs=0 hits=592 misses=2 deferred=0 cache=1/12 job=4 packFree=14456864/17301504
+35:21:368 Common\DirectIOFile.cpp:202 E[COMMON]: OverlappedTransfer: Reached the end of the file.
+35:21:521 Core\HW\DVD\DVDThread.cpp:276 E[MASTER]: Warning: The disc could not be read (at 0x6ca8000 - 0x6caeae0).
+[OSREPORT]: [BSMSO] Async pack failed state=6 slot=0 id='36de327c': RARC/body/cap validation rejected
+[OSREPORT]: [BSMSO] Pack id='36de327c' quarantined (RARC/body/cap validation rejected) 窶・retail fallback, no DVD retry

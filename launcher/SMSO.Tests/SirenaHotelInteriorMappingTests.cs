@@ -6,10 +6,10 @@ public class SirenaHotelInteriorMappingTests
 {
     [Theory]
     [InlineData(0, 0, 0)]
-    [InlineData(2, 2, 2)]
+    [InlineData(2, 1, 2)]
     [InlineData(3, 2, 3)]
     [InlineData(4, 2, 4)]
-    [InlineData(6, 0, 6)]
+    [InlineData(6, 3, 6)]
     [InlineData(7, 4, 4)]
     public void CatalogToScenario_MapsHotelInteriorStates(byte catalogId, byte loadScenario, byte missionScenario)
     {
@@ -38,6 +38,14 @@ public class SirenaHotelInteriorMappingTests
     }
 
     [Fact]
+    public void ResolveEpisodeForWarp_MysteriousHotelUsesDelfinoOne()
+    {
+        Assert.Equal(2, LevelCatalog.ResolveEpisodeForWarp(SirenaHotelInteriorMapping.AreaId, 2));
+        Assert.True(SirenaHotelInteriorMapping.TryCatalogToLoadScenario(2, out var load));
+        Assert.Equal(1, load);
+    }
+
+    [Fact]
     public void ResolveEpisodeForWarp_KingBooUsesCasinoPathLoadTwoMissionFour()
     {
         Assert.Equal(4, LevelCatalog.ResolveEpisodeForWarp(SirenaHotelInteriorMapping.AreaId, 4));
@@ -46,11 +54,11 @@ public class SirenaHotelInteriorMappingTests
     }
 
     [Fact]
-    public void ResolveEpisodeForWarp_ShadowMarioUsesMissionSixLoadZero()
+    public void ResolveEpisodeForWarp_ShadowMarioUsesMissionSixLoadThree()
     {
         Assert.Equal(6, LevelCatalog.ResolveEpisodeForWarp(SirenaHotelInteriorMapping.AreaId, 6));
         Assert.True(SirenaHotelInteriorMapping.TryCatalogToLoadScenario(6, out var load));
-        Assert.Equal(0, load);
+        Assert.Equal(3, load);
     }
 
     [Theory]
@@ -62,17 +70,27 @@ public class SirenaHotelInteriorMappingTests
         Assert.True(LevelCatalog.TryResolveWarpDestination(courseId, catalogId, out var areaId, out var mission));
         Assert.Equal(expectedArea, areaId);
         Assert.Equal(expectedMission, mission);
+
+        // Warp path keeps catalog episode ids so the module hotel load table sees 6/7.
+        LevelCatalog.ResolveWarpDestination(courseId, catalogId, out var warpArea, out var warpEpisode);
+        Assert.Equal(expectedArea, warpArea);
+        Assert.Equal(catalogId, warpEpisode);
+        Assert.Equal(expectedMission, LevelCatalog.ResolveEpisodeForWarp(courseId, catalogId));
     }
 
-    // Random Level must use a beach episode (e.g. catalog 5 Scrubbing) — not 6/7 hotel remaps.
+    // Random Level / beach scrubbing must stay on sirenaN — not hotel remaps.
     [Theory]
-    [InlineData(0)]
-    [InlineData(5)]
-    public void TryResolveWarpDestination_SirenaBeachEpisodesStayOnBeach(byte catalogId)
+    [InlineData(6, 0)]
+    [InlineData(6, 5)]
+    public void TryResolveWarpDestination_SirenaBeachEpisodesStayOnBeach(byte courseId, byte catalogId)
     {
-        Assert.False(LevelCatalog.TryResolveWarpDestination(6, catalogId, out var areaId, out var mission));
-        Assert.Equal(6, areaId);
+        Assert.False(LevelCatalog.TryResolveWarpDestination(courseId, catalogId, out var areaId, out var mission));
+        Assert.Equal(courseId, areaId);
         Assert.Equal(catalogId, mission);
-        Assert.Equal(catalogId, LevelCatalog.ResolveEpisodeForWarp(6, catalogId));
+        Assert.Equal(catalogId, LevelCatalog.ResolveEpisodeForWarp(courseId, catalogId));
+
+        LevelCatalog.ResolveWarpDestination(courseId, catalogId, out var warpArea, out var warpEpisode);
+        Assert.Equal(courseId, warpArea);
+        Assert.Equal(catalogId, warpEpisode);
     }
 }

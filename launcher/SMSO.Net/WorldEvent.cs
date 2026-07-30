@@ -21,7 +21,13 @@ public struct CommWorldEvent
 [StructLayout(LayoutKind.Sequential, Pack = 1, Size = ProtocolConstants.CommWorldSyncSize)]
 public struct CommWorldSyncState
 {
-    public CommWorldEvent LocalPending;
+    /// <summary>Module→bridge ownership: shine/blue/story/secret/trigger/episode/reset.</summary>
+    public CommWorldEvent LocalPendingOwnership;
+    /// <summary>Module→bridge mission/ephemeral: red/NPC/gold/fruit/hip-drop/NPC react.</summary>
+    public CommWorldEvent LocalPendingMission;
+    /// <summary>Dedicated bridge→module lane for shine/blue/story/secret/trigger/reset.</summary>
+    public CommWorldEvent IncomingOwnership;
+    /// <summary>Mission + ephemeral lane (red/NPC/gold/fruit/hip-drop/NPC react).</summary>
     public CommWorldEvent Incoming;
     public uint LastAppliedEventId;
 }

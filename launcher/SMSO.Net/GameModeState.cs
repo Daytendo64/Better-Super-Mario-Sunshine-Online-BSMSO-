@@ -36,7 +36,7 @@ public sealed class GameModeStatePacket
     public ushort Seq { get; set; }
     public uint RoundStartMs { get; set; }
     public byte TagEventId { get; set; }
-    public HideSeekRole[] Roles { get; } = new HideSeekRole[ProtocolConstants.StableMaxPlayers];
+    public HideSeekRole[] Roles { get; } = new HideSeekRole[ProtocolConstants.MaxPlayers];
     public byte LastTaggedSlot { get; set; } = 0xFF;
     /// <summary>Milliseconds left in Start Tag grace (0 when inactive).</summary>
     public ushort GraceRemainingMs { get; set; }
@@ -103,7 +103,7 @@ public sealed class GameModeStatePacket
         state.TagEventId = packet.TagEventId;
         state.RoundStartMs = packet.RoundStartMs;
         state.GraceRemainingMs = packet.GraceRemainingMs;
-        for (int i = 0; i < ProtocolConstants.StableMaxPlayers; i++)
+        for (int i = 0; i < ProtocolConstants.MaxPlayers; i++)
             state.RoleBySlot[i] = packet.GetRole((byte)i);
         return state;
     }
@@ -128,7 +128,7 @@ public struct CommGameModeState
     public byte TagEventId;
     public uint RoundStartMs;
 
-    [System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.ByValArray, SizeConst = ProtocolConstants.StableMaxPlayers)]
+    [System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.ByValArray, SizeConst = ProtocolConstants.MaxPlayers)]
     public byte[] RoleBySlot;
 
     public ushort GraceRemainingMs;
@@ -137,7 +137,7 @@ public struct CommGameModeState
     {
         return new CommGameModeState
         {
-            RoleBySlot = new byte[ProtocolConstants.StableMaxPlayers],
+            RoleBySlot = new byte[ProtocolConstants.MaxPlayers],
             LastTaggedSlot = 0xFF,
             GraceRemainingMs = 0,
         };

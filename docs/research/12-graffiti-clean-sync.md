@@ -1,5 +1,15 @@
 # Graffiti / Pollution Clean Sync
 
+> **STATUS: PERMANENTLY DISABLED (2026-07-19)**
+>
+> Durable `GraffitiCleaned` cell spray flooded long co-op sessions (tens of thousands of
+> events, mailbox queue full, progress starve). Module APIs are no-ops; server rejects
+> the event type; it is not durable and not in authority snapshots. Local spray still
+> works via retail `TPollutionManager::clean` (hook removed). Do not re-enable without a
+> non-durable design.
+>
+> Historical design notes below are retained for reference only.
+
 ## How SMS graffiti works
 
 Surface goop/graffiti is **not** a FlagManager bit. It lives in `TPollutionManager` (`gpPollution` @ NTSC-U `0x8040DED0`), which owns one or more `TPollutionLayer` canvases.

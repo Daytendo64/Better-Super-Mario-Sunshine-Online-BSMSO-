@@ -20,17 +20,24 @@ public sealed class HideSeekService
     public const int MaxStartTagGraceMs = 60_000;
     internal const int StartTagGraceMs = DefaultStartTagGraceMs;
     /// <summary>
-    /// After mid-round warp-all, ignore proximity tags briefly so clustered spawn positions
-    /// do not mass-promote hiders. Does NOT re-arm the full 30s freeze/tint (too long on warp).
-    /// Death promotions are unaffected.
+    /// After mid-round warp-all / Start Tag resume, ignore proximity tags briefly so
+    /// clustered spawn positions do not mass-promote hiders. Does NOT re-arm the full
+    /// 30s freeze/tint. Death promotions during this window are absorbed into baseline
+    /// (stale VFX_DEAD) rather than promoting — real deaths after the window still work.
     /// </summary>
-    internal const int TagProximityImmunityMs = 4000;
+    internal const int TagProximityImmunityMs = 8000;
 
     private readonly GameServer _server;
     private GameModeStatePacket _state = GameModeStatePacket.CreateDefault();
     private readonly Dictionary<(byte seeker, byte hider), long> _tagCooldowns = new();
     private readonly Dictionary<byte, bool> _hiderDeathWasActive = new();
     private readonly HashSet<byte> _assignedRoleSlots = new();
+    /// <summary>
+    /// Username that last occupied a slot when it was released. A slot reclaimed by a
+    /// different player must not inherit the previous occupant's Seeker role; the same
+    /// name coming back within the reconnect window keeps it.
+    /// </summary>
+    private readonly Dictionary<byte, string> _lastOccupantBySlot = new();
     private byte _tagEventId;
     private uint _tagElapsedMs;
     private long _tagSegmentStartTick;
@@ -47,7 +54,11 @@ public sealed class HideSeekService
 
     public HideSeekService(GameServer server) => _server = server;
 
-    /// <summary>Start Tag hide-grace duration in milliseconds (clamped).</summary>
+    /// <summary>
+    /// Start Tag hide-grace duration in milliseconds (clamped). Applies to the next
+    /// Start Tag: an in-flight grace countdown is never re-armed or truncated, so the
+    /// host cannot accidentally extend or cut a round that is already hiding.
+    /// </summary>
     public int StartTagGraceDurationMs
     {
         get => _startTagGraceMs;
@@ -66,12 +77,40 @@ public sealed class HideSeekService
         }
     }
 
+    /// <summary>
+    /// Allocation-free reads for the per-snapshot hot path — <see cref="CurrentState"/>
+    /// clones the packet, which at 10 players ran ~600 times a second.
+    /// </summary>
+    internal bool IsTagActive => _state.TagActive && _state.GameMode == GameMode.HideSeek;
+
+    internal byte GetRoleForSlot(byte slot) => _state.GetRole(slot);
+
     public void Reset()
     {
         _state = GameModeStatePacket.CreateDefault();
+        ClearRoundState();
+    }
+
+    /// <summary>
+    /// Drop every trace of the current round: roles, timers, grace, tag ids and slot
+    /// bookkeeping. Shared by <see cref="Reset"/> and <see cref="SetGameMode"/>(Normal)
+    /// so leaving Hide &amp; Seek can never leave a half-started round behind (a stale
+    /// <c>_tagRoundStarted</c> made the next Start Tag skip the hide grace entirely).
+    /// Does not touch <see cref="GameModeStatePacket.Seq"/> — clients ignore rollbacks.
+    /// </summary>
+    private void ClearRoundState()
+    {
+        _state.Flags = GameModeFlags.None;
+        _state.RoundStartMs = 0;
+        _state.LastTaggedSlot = 0xFF;
+        _state.TagEventId = 0;
+        _state.GraceRemainingMs = 0;
+        for (int i = 0; i < _state.Roles.Length; i++)
+            _state.Roles[i] = HideSeekRole.Hider;
         _tagCooldowns.Clear();
         _hiderDeathWasActive.Clear();
         _assignedRoleSlots.Clear();
+        _lastOccupantBySlot.Clear();
         _tagEventId = 0;
         _tagElapsedMs = 0;
         _tagSegmentStartTick = 0;
@@ -186,9 +225,22 @@ public sealed class HideSeekService
            Environment.TickCount64 < _proximityTagImmunityUntilTick;
 
     /// <summary>Test helper: allow proximity tags immediately after Start Tag / warp.</summary>
+    internal void NoteHiderDeathBaseline(byte slot, bool currentlyDead)
+    {
+        // Always record alive OR dead so a Clear()+Seed race cannot see a missing
+        // entry and treat a stale VFX_DEAD packet as a fresh rising edge.
+        _hiderDeathWasActive[slot] = currentlyDead;
+    }
+
     internal void ExpireProximityTagImmunityForTests()
     {
         ClearStartTagGrace();
+        ClearProximityTagImmunity();
+    }
+
+    /// <summary>Clear only the short warp/Start-Tag death-edge window; keep hide grace.</summary>
+    internal void ExpireWarpProximityImmunityForTests()
+    {
         ClearProximityTagImmunity();
     }
 
@@ -208,22 +260,7 @@ public sealed class HideSeekService
     {
         _state.GameMode = mode;
         if (mode == GameMode.Normal)
-        {
-            _state.Flags = GameModeFlags.None;
-            _state.RoundStartMs = 0;
-            _state.LastTaggedSlot = 0xFF;
-            _state.GraceRemainingMs = 0;
-            for (int i = 0; i < _state.Roles.Length; i++)
-                _state.Roles[i] = HideSeekRole.Hider;
-            _tagCooldowns.Clear();
-            _hiderDeathWasActive.Clear();
-            _assignedRoleSlots.Clear();
-            _tagEventId = 0;
-            _tagElapsedMs = 0;
-            _tagSegmentStartTick = 0;
-            ClearStartTagGrace();
-            ClearProximityTagImmunity();
-        }
+            ClearRoundState();
 
         BumpAndBroadcast();
     }
@@ -242,6 +279,16 @@ public sealed class HideSeekService
         foreach (var (slot, role) in roles)
         {
             _assignedRoleSlots.Add(slot);
+
+            // During tag, never demote Seeker→Hider via SetRoles. Rejoin UI races used to
+            // push rejoining seekers as Hider and stop the round; intentional mid-tag
+            // reassignment requires Stop Tag first.
+            if (_state.TagActive && role == HideSeekRole.Hider &&
+                _state.GetRole(slot) == (byte)HideSeekRole.Seeker)
+            {
+                continue;
+            }
+
             if (_state.GetRole(slot) == (byte)role)
                 continue;
 
@@ -299,18 +346,23 @@ public sealed class HideSeekService
         // would otherwise mass-promote hiders on the first proximity checks.
         ClearProximityTagImmunity();
         // Fresh Start Tag (first start after Reset) gets hide grace.
-        // Resume after Stop Tag continues the same round — no re-arm of wash/freeze,
-        // even if Stop landed on the same tick as Start (elapsed still 0) or mid-grace.
+        // Resume after Stop Tag continues the same round — no full hide grace.
+        // Always arm brief proximity/death-edge immunity so clustered players and
+        // leftover VFX_DEAD cannot instantly mass-promote on the first snapshots.
         var isResume = _tagRoundStarted;
         _tagRoundStarted = true;
+        ArmProximityTagImmunity();
         if (isResume)
             ClearStartTagGrace();
         else
             ArmStartTagGrace();
+        // Suppress stale VFX_DEAD rising edges left over from prior deaths / reloads so
+        // Start Tag does not instantly promote a hider who is still carrying Dead.
+        _server.SeedHideSeekDeathBaseline();
         BeginTagSegment();
         BumpAndBroadcast();
         _server.LogMessage(isResume
-            ? "Hide & Seek tag resumed (no hide grace)."
+            ? "Hide & Seek tag resumed (no hide grace; brief proximity immunity)."
             : $"Hide & Seek tag started ({_startTagGraceMs / 1000}s hide grace).");
         return true;
     }
@@ -327,6 +379,9 @@ public sealed class HideSeekService
         _state.LastTaggedSlot = 0xFF;
         _state.TagEventId = 0;
         _state.GraceRemainingMs = 0;
+        // Tag ids restart at 1 on the next promotion; a client that missed the last
+        // event must never see a reused id as "already applied" (wire id is u8).
+        _tagEventId = 0;
         _tagCooldowns.Clear();
         _hiderDeathWasActive.Clear();
         ClearStartTagGrace();
@@ -440,6 +495,16 @@ public sealed class HideSeekService
 
         var isDead = IsSnapshotDead(snap);
         var wasDead = _hiderDeathWasActive.TryGetValue(hiderSlot, out var previous) && previous;
+
+        // Brief proximity immunity (armed on every Start Tag + after warps): absorb
+        // stale VFX_DEAD rising edges without promoting. Full Start Tag hide grace
+        // still allows real water/void deaths to promote after this window.
+        if (IsWarpProximityImmunityActive)
+        {
+            _hiderDeathWasActive[hiderSlot] = isDead;
+            return;
+        }
+
         _hiderDeathWasActive[hiderSlot] = isDead;
 
         if (!isDead || wasDead)
@@ -496,12 +561,7 @@ public sealed class HideSeekService
 
         var roundComplete = CountConnectedRole(HideSeekRole.Hider, GetActiveRoleSlots()) == 0;
         if (roundComplete)
-        {
-            _state.Flags &= ~(GameModeFlags.TagActive | GameModeFlags.GraceActive);
-            _state.GraceRemainingMs = 0;
-            _startTagGraceUntilTick = 0;
-            _state.Flags |= GameModeFlags.RoundComplete;
-        }
+            MarkRoundCompleteFlags();
 
         BumpAndBroadcast();
         if (taggedBySeekerSlot.HasValue)
@@ -521,10 +581,27 @@ public sealed class HideSeekService
         ClearTagPulse();
     }
 
-    public void OnPlayerDisconnected(byte slot)
+    /// <summary>Clear tag/grace and flag the round as won. Caller broadcasts.</summary>
+    private void MarkRoundCompleteFlags()
+    {
+        _state.Flags &= ~(GameModeFlags.TagActive | GameModeFlags.GraceActive);
+        _state.GraceRemainingMs = 0;
+        _startTagGraceUntilTick = 0;
+        // Set RoundFanfare here too so a coalesced mailbox write cannot drop the
+        // brief RoundComplete-only packet before ResetTag (module missed fanfare).
+        _state.Flags |= GameModeFlags.RoundComplete | GameModeFlags.RoundFanfare;
+    }
+
+    public void OnPlayerDisconnected(byte slot, string? username = null)
     {
         _assignedRoleSlots.Remove(slot);
         _hiderDeathWasActive.Remove(slot);
+
+        // Remember who released the slot so a different player reclaiming it cannot
+        // inherit their role. The role itself stays put: the reconnect window restores
+        // the same slot for the same name, and a returning seeker must stay a seeker.
+        if (!string.IsNullOrEmpty(username))
+            _lastOccupantBySlot[slot] = username;
 
         var staleCooldowns = new List<(byte seeker, byte hider)>();
         foreach (var key in _tagCooldowns.Keys)
@@ -536,10 +613,70 @@ public sealed class HideSeekService
         foreach (var key in staleCooldowns)
             _tagCooldowns.Remove(key);
 
-        // Disconnect never ends an active tag round — even if the last hider/seeker
-        // leaves. The host stops or resets tag explicitly when they want the round over.
-        if (_state.GameMode == GameMode.HideSeek && _state.TagActive)
-            _server.LogMessage($"Player slot {slot} left during Hide & Seek — tag continues.");
+        if (_state.GameMode != GameMode.HideSeek || !_state.TagActive)
+            return;
+
+        // A disconnect alone must not end a tag with players left on both sides — the
+        // host decides when a round is over. But a round with nobody left to find (or
+        // nobody left to find them) can never end on its own, so resolve it here.
+        var roleSlots = GetActiveRoleSlots();
+        if (roleSlots.Count == 0)
+        {
+            _server.LogMessage("Hide & Seek tag stopped — no players remain.");
+            StopTag();
+            return;
+        }
+
+        if (CountConnectedRole(HideSeekRole.Hider, roleSlots) == 0)
+        {
+            MarkRoundCompleteFlags();
+            BumpAndBroadcast();
+            _server.LogMessage("Hide & Seek round complete — the last hider disconnected.");
+            ResetTag(playRoundFanfare: true);
+            return;
+        }
+
+        if (CountConnectedRole(HideSeekRole.Seeker, roleSlots) == 0)
+        {
+            _server.LogMessage("Hide & Seek tag stopped — the last seeker disconnected.");
+            StopTag();
+            return;
+        }
+
+        _server.LogMessage($"Player slot {slot} left during Hide & Seek — tag continues.");
+    }
+
+    /// <summary>
+    /// Rejoin / first join while Hide &amp; Seek is active — restore assignment membership
+    /// without stopping tag. A slot reclaimed by a different player is forced back to
+    /// Hider so a new arrival never spawns as a seeker (or worse, mid-round with no grace).
+    /// </summary>
+    public void OnPlayerJoined(byte slot, string? username = null)
+    {
+        if (_state.GameMode != GameMode.HideSeek)
+            return;
+
+        _assignedRoleSlots.Add(slot);
+
+        if (string.IsNullOrEmpty(username) ||
+            !_lastOccupantBySlot.TryGetValue(slot, out var previous))
+        {
+            return;
+        }
+
+        var sameOccupant = string.Equals(previous, username, StringComparison.OrdinalIgnoreCase);
+        _lastOccupantBySlot.Remove(slot);
+        if (sameOccupant)
+            return;
+
+        if (_state.GetRole(slot) == (byte)HideSeekRole.Hider)
+            return;
+
+        _state.SetRole(slot, HideSeekRole.Hider);
+        _hiderDeathWasActive.Remove(slot);
+        _server.LogMessage(
+            $"Hide & Seek: slot {slot} reclaimed by '{username}' — role reset to hider.");
+        BumpAndBroadcast();
     }
 
     private IReadOnlyList<byte> GetActiveRoleSlots()

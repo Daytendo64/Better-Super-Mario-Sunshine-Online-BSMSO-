@@ -30,9 +30,94 @@ public class CommBufferTests
     {
         Assert.Equal(10, ProtocolConstants.StableMaxPlayers);
         Assert.Equal(ProtocolConstants.StableMaxPlayers, ProtocolConstants.MaxPlayers);
-        Assert.True(ProtocolConstants.MaxRemoteSlots >= ProtocolConstants.MaxPlayers);
+        Assert.Equal(10, ProtocolConstants.MaxRemoteSlots);
+        Assert.Equal(ProtocolConstants.MaxPlayers, ProtocolConstants.MaxRemoteSlots);
         Assert.Equal(ProtocolConstants.MaxPlayers, ProtocolConstants.CommRosterHudRingSlots);
-        Assert.Equal(11, ProtocolConstants.CommVersion);
+        Assert.Equal(15, ProtocolConstants.CommVersion);
+    }
+
+    [Fact]
+    public void TenPlayerCapacity_RemoteArraysAndUdpBatchSizedForFullLobby()
+    {
+        // Protocol max is 10 players / 10 remote-slot indices (local left empty).
+        Assert.Equal(10, ProtocolConstants.MaxPlayers);
+        Assert.Equal(10, ProtocolConstants.MaxRemoteSlots);
+        Assert.Equal(ProtocolConstants.MaxPlayers - 1, 9); // body count per client
+
+        var remotes = CommBuffer.CreateRemoteArray();
+        Assert.Equal(ProtocolConstants.MaxRemoteSlots, remotes.Length);
+
+        var appearances = CommBuffer.CreateRemoteAppearanceArray();
+        Assert.Equal(ProtocolConstants.MaxRemoteSlots, appearances.Length);
+
+        var voices = CommBuffer.CreateRemoteMarioVoiceEventArray();
+        Assert.Equal(ProtocolConstants.MaxRemoteSlots, voices.Length);
+
+        var mode = GameModeStatePacket.CreateDefault();
+        Assert.Equal(ProtocolConstants.StableMaxPlayers, mode.Roles.Length);
+
+        var wire = GameModeStatePacket.ToCommGameMode(localSlot: 0, mode);
+        Assert.Equal(ProtocolConstants.StableMaxPlayers, wire.RoleBySlot.Length);
+        Assert.Equal(ProtocolConstants.CommGameModeStateSize, 11 + ProtocolConstants.MaxPlayers);
+
+        // Coalesced UDP fanout must fit every slot at once (10 × entry).
+        Assert.Equal(
+            ProtocolConstants.UdpSnapshotBatchHeaderSize +
+            ProtocolConstants.UdpSnapshotBatchEntrySize * ProtocolConstants.StableMaxPlayers,
+            ProtocolConstants.UdpSnapshotBatchMaxSize);
+        Assert.True(ProtocolConstants.UdpSnapshotBatchMaxSize <= 1500,
+            "Full-lobby SnapshotBatch should stay within a typical LAN MTU");
+
+        Assert.Equal(
+            ProtocolConstants.PlayerSnapshotSize * ProtocolConstants.MaxRemoteSlots,
+            ProtocolConstants.CommRemoteSnapshotsSize);
+        Assert.Equal(
+            ProtocolConstants.MarioModelIdSize * (ProtocolConstants.MaxRemoteSlots + 1),
+            ProtocolConstants.CommMarioModelIdsSize);
+    }
+
+    [Fact]
+    public void TenPlayerCapacity_EndianRoundTrip_PreservesAllRemoteSlotsAndRoles()
+    {
+        var buf = CommBuffer.CreateDefault();
+        buf.Magic = ProtocolConstants.Magic;
+        buf.LocalSlot = 0;
+        for (byte slot = 0; slot < ProtocolConstants.MaxRemoteSlots; slot++)
+        {
+            buf.RemoteSnapshots[slot] = new PlayerSnapshot
+            {
+                Connected = slot == 0 ? (byte)0 : (byte)1,
+                Slot = slot,
+                Name = new byte[16],
+                Position = new Vec3 { X = slot * 100f, Y = 50f, Z = slot * -20f },
+                ActionId = 0x0201,
+            };
+            buf.RemoteNameTagAppearances[slot] = NameTagAppearance.CreateDefault();
+        }
+
+        buf.GameModeState.Mode = (byte)GameMode.HideSeek;
+        buf.GameModeState.RoleBySlot ??= new byte[ProtocolConstants.MaxPlayers];
+        for (var i = 0; i < ProtocolConstants.MaxPlayers; i++)
+            buf.GameModeState.RoleBySlot[i] = (byte)(i % 2 == 0 ? HideSeekRole.Seeker : HideSeekRole.Hider);
+
+        var dolphinBytes = CommBufferEndian.ToDolphinBytes(buf);
+        var restored = CommBufferEndian.FromDolphinBytes(dolphinBytes);
+
+        Assert.Equal(ProtocolConstants.MaxRemoteSlots, restored.RemoteSnapshots.Length);
+        for (byte slot = 1; slot < ProtocolConstants.MaxRemoteSlots; slot++)
+        {
+            Assert.Equal(1, restored.RemoteSnapshots[slot].Connected);
+            Assert.Equal(slot, restored.RemoteSnapshots[slot].Slot);
+            Assert.Equal(slot * 100f, restored.RemoteSnapshots[slot].Position.X, precision: 2);
+        }
+
+        Assert.Equal(ProtocolConstants.MaxPlayers, restored.GameModeState.RoleBySlot.Length);
+        for (var i = 0; i < ProtocolConstants.MaxPlayers; i++)
+        {
+            Assert.Equal(
+                (byte)(i % 2 == 0 ? HideSeekRole.Seeker : HideSeekRole.Hider),
+                restored.GameModeState.RoleBySlot[i]);
+        }
     }
 
     [Fact]
@@ -142,7 +227,7 @@ public class CommBufferTests
     public void DolphinEndian_RoundTrip_PreservesWorldSyncState()
     {
         var buf = CommBuffer.CreateDefault();
-        buf.WorldSync.LocalPending = new CommWorldEvent
+        buf.WorldSync.LocalPendingOwnership = new CommWorldEvent
         {
             Sequence = 9,
             Type = WorldEventType.BlueCoinCollected,
@@ -150,6 +235,16 @@ public class CommBufferTests
             EpisodeId = 1,
             Payload0 = 7,
             Payload1 = 0,
+        };
+        buf.WorldSync.LocalPendingMission = new CommWorldEvent
+        {
+            Sequence = 10,
+            Type = WorldEventType.RedCoinCollected,
+            CourseId = 3,
+            EpisodeId = 1,
+            Payload0 = 0x10,
+            Reserved = 2,
+            Payload1 = 0x04,
         };
         buf.WorldSync.Incoming = new CommWorldEvent
         {
@@ -164,8 +259,10 @@ public class CommBufferTests
 
         var restored = CommBufferEndian.FromDolphinBytes(CommBufferEndian.ToDolphinBytes(buf));
 
-        Assert.Equal(9, restored.WorldSync.LocalPending.Sequence);
-        Assert.Equal(WorldEventType.BlueCoinCollected, restored.WorldSync.LocalPending.Type);
+        Assert.Equal(9, restored.WorldSync.LocalPendingOwnership.Sequence);
+        Assert.Equal(WorldEventType.BlueCoinCollected, restored.WorldSync.LocalPendingOwnership.Type);
+        Assert.Equal(10, restored.WorldSync.LocalPendingMission.Sequence);
+        Assert.Equal(WorldEventType.RedCoinCollected, restored.WorldSync.LocalPendingMission.Type);
         Assert.Equal(55u, restored.WorldSync.Incoming.EventId);
         Assert.Equal(54u, restored.WorldSync.LastAppliedEventId);
     }
@@ -290,5 +387,31 @@ public class CommBufferTests
         Assert.Equal("Mario", restored.GetLocalPlayerName());
         Assert.Equal(4, restored.LocalSnapshot.StageId);
         Assert.Equal(2, restored.LocalSnapshot.EpisodeId);
+    }
+
+    [Fact]
+    public void MusicVolume_EndianRoundTrip_AndClamp()
+    {
+        Assert.Equal(
+            ProtocolConstants.CommProgressSnapshotOffset + ProtocolConstants.CommProgressSnapshotSize,
+            ProtocolConstants.CommMusicVolumeOffset);
+        Assert.Equal(
+            ProtocolConstants.CommMusicVolumeOffset + ProtocolConstants.CommMusicVolumeSize,
+            ProtocolConstants.CommBufferSize);
+
+        var buf = CommBuffer.CreateDefault();
+        Assert.Equal(ProtocolConstants.CommMusicVolumeDefault, buf.MusicVolume);
+        buf.MusicVolume = 37;
+
+        var restored = CommBufferEndian.FromDolphinBytes(CommBufferEndian.ToDolphinBytes(buf));
+        Assert.Equal(37, restored.MusicVolume);
+
+        Assert.Equal(0, CommBufferEndian.ClampMusicVolumePercent(-5));
+        Assert.Equal(100, CommBufferEndian.ClampMusicVolumePercent(250));
+        Assert.Equal(42, CommBufferEndian.ClampMusicVolumePercent(42));
+
+        Span<byte> scratch = stackalloc byte[1];
+        CommBufferEndian.WriteMusicVolumeInto(scratch, 88);
+        Assert.Equal(88, scratch[0]);
     }
 }

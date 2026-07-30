@@ -98,6 +98,15 @@ constexpr u8 kPackBodyReadyDelayTicks = 2;
 static u32 sPackCacheCount = 0;
 static bool sPackCacheFullLogged = false;
 static bool sPackCacheRecycleRequested = false;
+// A cached pack can still be rejected by JKRMemArchive::mountFixed even after
+// structural validation passed. Each retry costs a remount plus a full
+// TMario::initValues, so attempts are bounded per identity; past the limit the
+// id is served as retail. dropPackCache() re-arms the table, which is also the
+// point at which a replaced pack file on disc becomes visible again.
+constexpr u8 kMaxPackMountFailures = 3;
+static char sPackMountFailIds[kMaxPackCacheEntries][MARIO_MODEL_ID_SIZE];
+static u8 sPackMountFailCounts[kMaxPackCacheEntries];
+static u32 sPackMountFailEntryCount = 0;
 static bool sBootstrapped = false;
 static bool sInitialized = false;
 static bool sLocalRebuildBusy = false;
@@ -212,6 +221,68 @@ static void formatId(char out[MARIO_MODEL_ID_SIZE + 1], const char id[MARIO_MODE
     for (; len < MARIO_MODEL_ID_SIZE && id[len] != '\0'; ++len)
         out[len] = id[len];
     out[len] = '\0';
+}
+
+static bool packMountIsQuarantined(const char id[MARIO_MODEL_ID_SIZE]) {
+    if (!id || marioModelIdIsEmpty(id))
+        return false;
+    for (u32 i = 0; i < sPackMountFailEntryCount; ++i) {
+        if (idsEqual(sPackMountFailIds[i], id))
+            return sPackMountFailCounts[i] >= kMaxPackMountFailures;
+    }
+    return false;
+}
+
+static u32 findOrInsertPackFailEntry(const char id[MARIO_MODEL_ID_SIZE]) {
+    if (!id || marioModelIdIsEmpty(id))
+        return kMaxPackCacheEntries;
+    for (u32 i = 0; i < sPackMountFailEntryCount; ++i) {
+        if (idsEqual(sPackMountFailIds[i], id))
+            return i;
+    }
+    // Table full: the pack heap already bounds how many identities can be
+    // resident, so drop the record rather than evicting a live quarantine.
+    if (sPackMountFailEntryCount >= kMaxPackCacheEntries)
+        return kMaxPackCacheEntries;
+    const u32 index = sPackMountFailEntryCount;
+    copyId(sPackMountFailIds[index], id);
+    sPackMountFailCounts[index] = 0;
+    ++sPackMountFailEntryCount;
+    return index;
+}
+
+static void notePackMountFailure(const char id[MARIO_MODEL_ID_SIZE]) {
+    const u32 index = findOrInsertPackFailEntry(id);
+    if (index >= kMaxPackCacheEntries)
+        return;
+    if (sPackMountFailCounts[index] >= kMaxPackMountFailures)
+        return;
+
+    ++sPackMountFailCounts[index];
+    char idStr[MARIO_MODEL_ID_SIZE + 1] = {};
+    formatId(idStr, id);
+    OSReport("[BSMSO] Pack mount rejected id='%s' attempt=%u/%u%s\n", idStr,
+             static_cast<u32>(sPackMountFailCounts[index]),
+             static_cast<u32>(kMaxPackMountFailures),
+             sPackMountFailCounts[index] >= kMaxPackMountFailures
+                 ? " — quarantined, serving retail until cache drop"
+                 : "");
+}
+
+// Permanent session quarantine: DVD I/O errors, FST misses, and RARC validation
+// rejects are immutable for this boot. Retrying them re-issues DirectoryBlob
+// reads that can raise the retail "disc could not be read" fatal.
+static void quarantinePackId(const char id[MARIO_MODEL_ID_SIZE], const char *reason) {
+    const u32 index = findOrInsertPackFailEntry(id);
+    if (index >= kMaxPackCacheEntries)
+        return;
+    if (sPackMountFailCounts[index] >= kMaxPackMountFailures)
+        return;
+    sPackMountFailCounts[index] = kMaxPackMountFailures;
+    char idStr[MARIO_MODEL_ID_SIZE + 1] = {};
+    formatId(idStr, id);
+    OSReport("[BSMSO] Pack id='%s' quarantined (%s) — retail fallback, no DVD retry\n",
+             idStr, reason ? reason : "failed");
 }
 
 // Immutable pack allocations use their own expanded-MEM1 heap. nullptr means
@@ -333,7 +404,10 @@ static void dropPackCache() {
         sPackCacheSizes[i] = 0;
         clearId(sPackCacheIds[i]);
         sPackCacheBodyReadyDelay[i] = 0;
+        clearId(sPackMountFailIds[i]);
+        sPackMountFailCounts[i] = 0;
     }
+    sPackMountFailEntryCount = 0;
     sPackCacheCount = 0;
     sPackCacheFullLogged = false;
     sPackCacheRecycleRequested = false;
@@ -404,6 +478,18 @@ static void *resolveBufferForId(const char id[MARIO_MODEL_ID_SIZE], bool *logged
 
     if (marioModelIdIsEmpty(id))
         return sRetailBuffer;
+
+    // A quarantined id still sits in the cache (its buffer backs no graph), but
+    // binding a slot to it would only produce another failed mount.
+    if (packMountIsQuarantined(id)) {
+        if (loggedMissing && !*loggedMissing) {
+            char idStr[MARIO_MODEL_ID_SIZE + 1] = {};
+            formatId(idStr, id);
+            OSReport("[BSMSO] Pack id='%s' quarantined (mount kept failing) — retail\n", idStr);
+            *loggedMissing = true;
+        }
+        return sRetailBuffer;
+    }
 
     if (void *cached = findCachedPack(id)) {
         ++sPackCacheHits;
@@ -660,16 +746,27 @@ static void resetPackLoadJob(bool freeUnpublishedBuffer) {
     sPackLoadJob.state = PackLoadState::Idle;
 }
 
-static void failPackLoadJob(const char *reason) {
+enum class PackFailKind : u8 {
+    // Heap pressure / cache full — retry after cooldown when RAM frees.
+    Transient,
+    // Disc I/O, missing FST entry, corrupt/unsafe RARC — never retry this boot.
+    Permanent,
+};
+
+static void failPackLoadJob(const char *reason,
+                            PackFailKind kind = PackFailKind::Permanent) {
     char idStr[MARIO_MODEL_ID_SIZE + 1] = {};
     formatId(idStr, sPackLoadJob.id);
     OSReport("[BSMSO] Async pack failed state=%u slot=%u id='%s': %s\n",
              static_cast<u32>(sPackLoadJob.state), sPackLoadJob.slot, idStr,
              reason ? reason : "unknown");
     ++sAsyncReadFailureCount;
+    if (kind == PackFailKind::Permanent)
+        quarantinePackId(sPackLoadJob.id, reason);
     if (sPackLoadJob.slot < kMaxSlots)
         sPackPrefetchCooldown[sPackLoadJob.slot] =
-            kPackPrefetchFailCooldownFrames;
+            kind == PackFailKind::Permanent ? 0xFFu
+                                            : kPackPrefetchFailCooldownFrames;
     resetPackLoadJob(true);
 }
 
@@ -710,8 +807,15 @@ static void advancePackLoadJob(bool *outReadStarted) {
             failPackLoadJob("archive size outside bounded limit");
             return;
         }
-        sPackLoadJob.allocationBytes =
-            (sPackLoadJob.fileBytes + 31u) & ~31u;
+        // DVD length must be a 32-byte multiple and must NEVER exceed the FST
+        // length. Rounding up past mLen makes DirectoryBlob read past the host
+        // file and raises the retail disc-error fatal. Reject unaligned FST
+        // sizes instead of over-reading.
+        if ((sPackLoadJob.fileBytes & 31u) != 0) {
+            failPackLoadJob("archive size not 32-byte aligned");
+            return;
+        }
+        sPackLoadJob.allocationBytes = sPackLoadJob.fileBytes;
         sPackLoadJob.state = PackLoadState::Allocate;
         return;
     }
@@ -719,13 +823,15 @@ static void advancePackLoadJob(bool *outReadStarted) {
         sPackLoadJob.heap = archiveHeap(sPackLoadJob.allocationBytes);
         if (!sPackLoadJob.heap) {
             ++sPackDeferredCount;
-            failPackLoadJob("dedicated pack heap has no contiguous capacity");
+            failPackLoadJob("dedicated pack heap has no contiguous capacity",
+                            PackFailKind::Transient);
             return;
         }
         sPackLoadJob.buffer =
             sPackLoadJob.heap->alloc(sPackLoadJob.allocationBytes, 0x20);
         if (!sPackLoadJob.buffer) {
-            failPackLoadJob("aligned pack allocation failed");
+            failPackLoadJob("aligned pack allocation failed",
+                            PackFailKind::Transient);
             return;
         }
         sPackLoadJob.state = PackLoadState::SubmitRead;
@@ -735,11 +841,12 @@ static void advancePackLoadJob(bool *outReadStarted) {
         sPackLoadJob.callbackResult = DVD_ERROR_FATAL;
         DCInvalidateRange(sPackLoadJob.buffer, sPackLoadJob.allocationBytes);
         if (!DVDReadAsyncPrio(&sPackLoadJob.file, sPackLoadJob.buffer,
-                              // The drive API requires a 32-byte-multiple read;
-                              // the destination was reserved to this rounded size.
-                              static_cast<s32>(sPackLoadJob.allocationBytes), 0,
+                              // Exact FST length (already 32-byte aligned). Never
+                              // round up — DirectoryBlob EOF becomes disc-fatal.
+                              static_cast<s32>(sPackLoadJob.fileBytes), 0,
                               packReadCallback, 2)) {
-            failPackLoadJob("DVDReadAsyncPrio queue rejected");
+            failPackLoadJob("DVDReadAsyncPrio queue rejected",
+                            PackFailKind::Transient);
             return;
         }
         sPackLoadJob.state = PackLoadState::Reading;
@@ -755,7 +862,9 @@ static void advancePackLoadJob(bool *outReadStarted) {
         if (!done)
             return;
         if (result < 0 ||
-            static_cast<u32>(result) != sPackLoadJob.allocationBytes) {
+            static_cast<u32>(result) != sPackLoadJob.fileBytes) {
+            // DVD DEINT / short read: quarantining prevents a 10-player lobby
+            // from re-issuing the same fatal DirectoryBlob EOF every 2s.
             failPackLoadJob("short/error async read");
             return;
         }
@@ -799,7 +908,7 @@ static void advancePackLoadJob(bool *outReadStarted) {
         }
         if (sPackCacheCount >= kMaxPackCacheEntries) {
             sPackCacheRecycleRequested = true;
-            failPackLoadJob("bounded pack cache full");
+            failPackLoadJob("bounded pack cache full", PackFailKind::Transient);
             return;
         }
         void *published = sPackLoadJob.buffer;
@@ -818,9 +927,21 @@ static void advancePackLoadJob(bool *outReadStarted) {
     }
 }
 
-static bool mountBuffer(void *buffer) {
+enum class MountOutcome : u8 {
+    // Volume is unusable / was left unmounted.
+    Failed,
+    // The requested buffer is the live "mario" volume.
+    Mounted,
+    // The requested buffer was rejected; retail is the live volume instead.
+    // The volume is usable, but callers holding per-slot custom state MUST
+    // rebind that slot to retail — otherwise the slot reads as "already on its
+    // pack" while every resource resolves from retail, and it never upgrades.
+    RetailFallback,
+};
+
+static MountOutcome mountBufferChecked(void *buffer) {
     if (!buffer)
-        return false;
+        return MountOutcome::Failed;
 
     auto *archive = reinterpret_cast<JKRMemArchive *>(JKRFileLoader::getVolume("mario"));
     if (!archive) {
@@ -834,18 +955,18 @@ static bool mountBuffer(void *buffer) {
             prev->becomeCurrentHeap();
         if (!archive) {
             OSReport("[BSMSO] Failed to create mario JKRMemArchive\n");
-            return false;
+            return MountOutcome::Failed;
         }
         arcBufMario = buffer;
         clearArchiveCachedFilePointers(buffer);
-        return true;
+        return MountOutcome::Mounted;
     }
 
     if (arcBufMario == buffer) {
         // Continuously mounted: SDIFileEntry.mData is live for this buffer.
         // Clearing/re-reporting here is only needed after a real remountFixed
         // (below). Matches setActiveMarioArchive's arcBufMario==buffer skip.
-        return true;
+        return MountOutcome::Mounted;
     }
 
     OSReport("[BSMSO] remountFixed mario %p -> %p\n", arcBufMario, buffer);
@@ -859,14 +980,21 @@ static bool mountBuffer(void *buffer) {
             arcBufMario = sRetailBuffer;
             if (archive->mountFixed(sRetailBuffer, UNK_0)) {
                 clearArchiveCachedFilePointers(sRetailBuffer);
-                return true;
+                return MountOutcome::RetailFallback;
             }
         }
-        return false;
+        return MountOutcome::Failed;
     }
     clearArchiveCachedFilePointers(buffer);
     OSReport("[BSMSO] remountFixed ok @ %p\n", buffer);
-    return true;
+    return MountOutcome::Mounted;
+}
+
+// For callers that only need a usable "mario" volume (retail remount, teardown,
+// boot fallback). Callers that care *which* archive is live must use
+// mountBufferChecked and handle RetailFallback.
+static bool mountBuffer(void *buffer) {
+    return mountBufferChecked(buffer) != MountOutcome::Failed;
 }
 
 static void readSlotId(CommBuffer *buf, u32 slot, char out[MARIO_MODEL_ID_SIZE]) {
@@ -1312,6 +1440,10 @@ bool isMarioModelPackCached(const char id[MARIO_MODEL_ID_SIZE]) {
 bool isMarioModelPackReadyForBodyInit(const char id[MARIO_MODEL_ID_SIZE]) {
     if (!id || marioModelIdIsEmpty(id))
         return true;
+    // Resident but unmountable: no body path may spend an initValues budget on
+    // it, and acquirePoolBodyForSlot may hand this slot a retail spare again.
+    if (packMountIsQuarantined(id))
+        return false;
     for (u32 i = 0; i < sPackCacheCount; ++i) {
         if (idsEqual(sPackCacheIds[i], id))
             return sPackCacheBuffers[i] != nullptr && sPackCacheBodyReadyDelay[i] == 0;
@@ -1331,11 +1463,19 @@ bool readMarioModelPackCacheId(u32 index, char out[MARIO_MODEL_ID_SIZE]) {
 bool mountCachedMarioModelPack(const char id[MARIO_MODEL_ID_SIZE]) {
     if (!sInitialized || !id || marioModelIdIsEmpty(id))
         return mountRetailMarioArchive();
+    if (packMountIsQuarantined(id))
+        return false;
     void *buffer = findCachedPack(id);
     if (!buffer || !marioPackBufferIsInitSafe(buffer, findCachedPackSize(id)))
         return false;
-    if (!mountBuffer(buffer))
+    // Only "the requested pack is live" counts. A retail fallback here would
+    // build a ready body from retail assets under a custom identity.
+    const MountOutcome outcome = mountBufferChecked(buffer);
+    if (outcome != MountOutcome::Mounted) {
+        if (outcome == MountOutcome::RetailFallback)
+            notePackMountFailure(id);
         return false;
+    }
     sActiveSlot = 0xFFFFFFFFu;
     return true;
 }
@@ -1411,6 +1551,11 @@ bool prefetchRemoteMarioPacks(bool *outLoadStarted) {
             if (marioModelIdIsEmpty(desired))
                 continue;
 
+            // Quarantined identities are immutable failures for this boot —
+            // never open another DVD job (10-player stampede amplifier).
+            if (packMountIsQuarantined(desired))
+                continue;
+
             if (!local) {
                 const bool hasBody =
                     hasRemoteBodyForSlotLoose(static_cast<u8>(slot));
@@ -1430,7 +1575,9 @@ bool prefetchRemoteMarioPacks(bool *outLoadStarted) {
 
             if (findCachedPack(desired)) {
                 ++sPackCacheHits;
-                if (!local &&
+                // A quarantined id is cached but will never bind; re-syncing it
+                // every frame only re-resolves back to retail.
+                if (!local && !packMountIsQuarantined(desired) &&
                     (!marioSlotHasCustomPack(slot) || !idsEqual(sSlots[slot].modelId, desired)))
                     syncRemoteMarioArchiveSlot(slot);
                 continue;
@@ -1518,8 +1665,11 @@ bool setActiveMarioArchive(u32 slot) {
     OSReport("[BSMSO] setActiveMarioArchive(%u) id='%s' buf=%p retail=%p\n", slot, idStr, buffer,
              sRetailBuffer);
 
-    if (!mountBuffer(buffer)) {
+    const MountOutcome outcome = mountBufferChecked(buffer);
+    if (outcome == MountOutcome::Failed) {
         // Soft-fail: never leave the volume unmounted.
+        if (buffer != sRetailBuffer)
+            notePackMountFailure(sSlots[slot].modelId);
         OSReport("[BSMSO] setActiveMarioArchive(%u) mount failed — attempting retail fallback\n",
                  slot);
         if (sRetailBuffer && sRetailBuffer != buffer && mountBuffer(sRetailBuffer)) {
@@ -1529,6 +1679,24 @@ bool setActiveMarioArchive(u32 slot) {
         }
         OSReport("[BSMSO] setActiveMarioArchive(%u) mount failed\n", slot);
         return false;
+    }
+
+    if (outcome == MountOutcome::RetailFallback) {
+        // mountBufferChecked already remounted retail, so the volume is usable
+        // and this stays a soft-fail. But the slot must now read as retail:
+        // leaving the custom buffer bound makes marioSlotHasCustomPack() true,
+        // and spawnRemoteBody would stamp the puppet as a finished custom body
+        // built from retail geometry — permanently stuck, never re-swapped.
+        // modelId is deliberately left on the desired pack so the desired-vs-live
+        // reconciliation (and syncRemoteMarioArchiveSlot's soft-fail retry) still
+        // see this slot as wanting its pack.
+        notePackMountFailure(sSlots[slot].modelId);
+        sSlots[slot].buffer = sRetailBuffer;
+        OSReport("[BSMSO] setActiveMarioArchive(%u) id='%s' fell back to retail — slot rebound "
+                 "(body will build retail and upgrade later)\n",
+                 slot, idStr);
+        sActiveSlot = slot;
+        return true;
     }
 
     sActiveSlot = slot;
@@ -1585,10 +1753,15 @@ void syncRemoteMarioArchiveSlot(u32 slot) {
     if (fromCache) {
         // Silent cache hit.
     } else if (marioModelIdIsEmpty(desired) || buffer == sRetailBuffer) {
-        if (retryingSoftFail)
-            OSReport("[BSMSO] syncRemoteMarioArchiveSlot(%u) id='%s' still retail (retry)\n", slot,
-                     idStr);
-        else
+        if (retryingSoftFail) {
+            // Prefetch re-syncs this slot every frame while it wants a pack it
+            // does not have; log the retry once per identity, not per frame.
+            if (!sSlots[slot].loggedMissing) {
+                OSReport("[BSMSO] syncRemoteMarioArchiveSlot(%u) id='%s' still retail (retry)\n",
+                         slot, idStr);
+                sSlots[slot].loggedMissing = true;
+            }
+        } else
             OSReport("[BSMSO] syncRemoteMarioArchiveSlot(%u) id='%s' retail\n", slot, idStr);
     } else
         OSReport("[BSMSO] syncRemoteMarioArchiveSlot(%u) id='%s' loaded @ %p\n", slot, idStr,

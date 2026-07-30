@@ -36,12 +36,64 @@ public sealed class NetClient : IDisposable
     private string? _pendingMarioModelId;
     private int _marioModelIntentSequence;
 
+    /// <summary>
+    /// UDP liveness. A firewalled UDP path after a successful TCP join leaves remote
+    /// players frozen while the session still looks healthy — TCP never times out.
+    /// Silence is measured against server Pongs (sent ~1 Hz) plus any remote snapshot,
+    /// so it is independent of how many peers are moving.
+    /// </summary>
+    private DateTime _udpActiveSinceUtc = DateTime.MinValue;
+    private DateTime _lastUdpInboundUtc = DateTime.MinValue;
+    private int _consecutiveUdpSendFailures;
+    private bool _udpDegradedReported;
+
+    /// <summary>Grace after UDP starts before silence counts (join / NAT warm-up).</summary>
+    internal static readonly TimeSpan UdpHealthGrace = TimeSpan.FromSeconds(4);
+    /// <summary>Sustained silence that warrants a visible warning (not brief packet loss).</summary>
+    internal static readonly TimeSpan UdpDegradedSilence = TimeSpan.FromSeconds(6);
+    /// <summary>Sustained silence that means the UDP path is dead — drop the session.</summary>
+    internal static readonly TimeSpan UdpDeadSilence = TimeSpan.FromSeconds(20);
+    /// <summary>Consecutive send failures that mean the local socket is unusable.</summary>
+    internal const int UdpDeadSendFailures = 300;
+
+    internal enum UdpHealth
+    {
+        Healthy,
+        Degraded,
+        Dead,
+    }
+
+    /// <summary>
+    /// Pure policy for <see cref="UdpReadLoop"/> / <see cref="UdpSnapshotSendLoop"/> health.
+    /// Kept side-effect free so thresholds are unit-testable without sockets.
+    /// </summary>
+    internal static UdpHealth EvaluateUdpHealth(
+        TimeSpan sinceUdpStart, TimeSpan sinceLastInbound, int consecutiveSendFailures)
+    {
+        if (consecutiveSendFailures >= UdpDeadSendFailures)
+            return UdpHealth.Dead;
+        if (sinceUdpStart < UdpHealthGrace)
+            return UdpHealth.Healthy;
+        if (sinceLastInbound >= UdpDeadSilence)
+            return UdpHealth.Dead;
+        if (sinceLastInbound >= UdpDegradedSilence)
+            return UdpHealth.Degraded;
+        return UdpHealth.Healthy;
+    }
+
+    /// <summary>
+    /// Bad-magic / bad-version resync budget. Byte-at-a-time resync could otherwise chew
+    /// silently through a permanently corrupt stream for the rest of the session.
+    /// </summary>
+    internal const int MaxResyncSkippedBytes = 4096;
+
     public event Action<PlayerRosterEntry[]>? RosterUpdated;
     public event Action<byte, byte, byte, byte>? WarpCommandReceived;
     public event Action<byte, PlayerSnapshot>? SnapshotReceived;
     public event Action<byte, MarioVoiceEvent>? MarioVoiceEventReceived;
     public event Action<WorldEventPacket>? WorldEventReceived;
     public event Action<WorldEventPacket[]>? WorldStateReplayReceived;
+    public event Action<WorldProgressSnapshot>? WorldProgressSnapshotReceived;
     public event Action<JoinRejectReason>? JoinRejected;
     public event Action? JoinAccepted;
     public event Action<DisconnectReason>? Disconnected;
@@ -108,7 +160,7 @@ public sealed class NetClient : IDisposable
     }
 
     public async Task ConnectAsync(string host, int port, string username, CancellationToken ct = default,
-        string? marioModelId = null)
+        string? marioModelId = null, ushort? gameProfileId = null)
     {
         EnsureFullyDisposed();
 
@@ -138,14 +190,9 @@ public sealed class NetClient : IDisposable
         try
         {
             var serverAddress = await ResolveHostAsync(host, ct).ConfigureAwait(false);
-            _tcp = new TcpClient(AddressFamily.InterNetwork) { NoDelay = true };
-            ConfigureTcpSocket(_tcp.Client);
+            await ConnectTcpWithRetriesAsync(serverAddress, port, ct).ConfigureAwait(false);
 
-            using var connectCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            connectCts.CancelAfter(TimeSpan.FromMilliseconds(ProtocolConstants.ConnectTimeoutMs));
-            await _tcp.ConnectAsync(serverAddress, port, connectCts.Token).ConfigureAwait(false);
-
-            _tcpStream = _tcp.GetStream();
+            _tcpStream = _tcp!.GetStream();
             _udp = new UdpClient(AddressFamily.InterNetwork);
             ConfigureUdpSocket(_udp.Client);
             _udp.Client.Bind(new IPEndPoint(IPAddress.Any, 0));
@@ -154,7 +201,9 @@ public sealed class NetClient : IDisposable
             _tcpReadTask = Task.Run(() => TcpReadLoop(_cts.Token), _cts.Token);
 
             await SendTcpAsync(PacketSerializer.BuildHandshake(Guid.NewGuid()), _cts.Token);
-            await SendTcpAsync(PacketSerializer.BuildJoinRequest(username, marioModelId), _cts.Token);
+            await SendTcpAsync(
+                PacketSerializer.BuildJoinRequest(username, marioModelId, gameProfileId: gameProfileId),
+                _cts.Token);
 
             using var joinCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             joinCts.CancelAfter(TimeSpan.FromMilliseconds(ProtocolConstants.ConnectTimeoutMs));
@@ -177,6 +226,10 @@ public sealed class NetClient : IDisposable
             var udpPort = (ushort)((IPEndPoint)_udp.Client.LocalEndPoint!).Port;
             await SendTcpAsync(PacketSerializer.BuildUdpRegister(udpPort), _cts.Token);
 
+            _udpActiveSinceUtc = DateTime.UtcNow;
+            _lastUdpInboundUtc = _udpActiveSinceUtc;
+            _consecutiveUdpSendFailures = 0;
+            _udpDegradedReported = false;
             _udpReadTask = Task.Run(() => UdpReadLoop(_cts.Token), _cts.Token);
             _udpSendTask = Task.Run(() => UdpSnapshotSendLoop(_cts.Token), _cts.Token);
             _heartbeatTask = Task.Run(() => HeartbeatLoop(_cts.Token), _cts.Token);
@@ -220,22 +273,10 @@ public sealed class NetClient : IDisposable
         }
 
         SendSnapshotPacket(snap);
-        // #region agent log
-        AgentDebugLog.Write("D", "NetClient.SendSnapshotNow", "immediate udp sent", new
-        {
-            slot = _assignedSlot,
-            seq = _snapshotSeq,
-            connected = snap.Connected,
-            port = ((IPEndPoint)_udp!.Client.LocalEndPoint!).Port,
-        });
-        // #endregion
     }
 
     public void ForceDispose()
     {
-        if (_isDisconnecting && _tcp == null && _udp == null)
-            return;
-
         _isDisconnecting = true;
         try
         {
@@ -258,16 +299,128 @@ public sealed class NetClient : IDisposable
         DisposeResources();
     }
 
+    /// <summary>
+    /// Test hook mirroring UDP-Dead / TCP-EOF: mark disconnecting before raising
+    /// <see cref="Disconnected"/> so <see cref="IsConnected"/> is not sticky.
+    /// </summary>
+    internal void BeginTransportTeardownForTests(DisconnectReason reason = DisconnectReason.Timeout)
+    {
+        if (_isDisconnecting)
+            return;
+        _isDisconnecting = true;
+        try { _cts?.Cancel(); } catch { /* ignore */ }
+        Disconnected?.Invoke(reason);
+    }
+
+    /// <summary>
+    /// TCP connect with backoff for ConnectionRefused / timed-out hosts that are still
+    /// binding after rehost or AcceptLoop scheduling lag.
+    /// </summary>
+    private async Task ConnectTcpWithRetriesAsync(IPAddress serverAddress, int port, CancellationToken ct)
+    {
+        Exception? last = null;
+        for (var attempt = 0; attempt < ProtocolConstants.ConnectRetryCount; attempt++)
+        {
+            ct.ThrowIfCancellationRequested();
+            try { _tcp?.Dispose(); } catch { /* ignore */ }
+            _tcp = null;
+
+            var client = new TcpClient(AddressFamily.InterNetwork) { NoDelay = true };
+            ConfigureTcpSocket(client.Client);
+            try { client.Client.LingerState = new LingerOption(true, 0); } catch { /* platform */ }
+
+            try
+            {
+                using var attemptCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                var remainingBudget = Math.Max(
+                    500,
+                    ProtocolConstants.ConnectTimeoutMs / ProtocolConstants.ConnectRetryCount);
+                attemptCts.CancelAfter(TimeSpan.FromMilliseconds(remainingBudget));
+                await client.ConnectAsync(serverAddress, port, attemptCts.Token).ConfigureAwait(false);
+                _tcp = client;
+                if (attempt > 0)
+                    Log?.Invoke($"Connected to {serverAddress}:{port} on attempt {attempt + 1}");
+                return;
+            }
+            catch (Exception ex) when (IsTransientConnectFailure(ex) &&
+                                       attempt + 1 < ProtocolConstants.ConnectRetryCount &&
+                                       !ct.IsCancellationRequested)
+            {
+                last = ex;
+                try { client.Dispose(); } catch { /* ignore */ }
+                var delay = ProtocolConstants.ConnectRetryBaseDelayMs * (attempt + 1);
+                Log?.Invoke(
+                    $"Connect attempt {attempt + 1}/{ProtocolConstants.ConnectRetryCount} to " +
+                    $"{serverAddress}:{port} failed ({DescribeConnectFailure(ex)}); retry in {delay}ms");
+                await Task.Delay(delay, ct).ConfigureAwait(false);
+            }
+            catch
+            {
+                try { client.Dispose(); } catch { /* ignore */ }
+                throw;
+            }
+        }
+
+        throw last ?? new SocketException((int)SocketError.ConnectionRefused);
+    }
+
+    private static bool IsTransientConnectFailure(Exception ex)
+    {
+        if (ex is OperationCanceledException)
+            return true;
+        if (ex is SocketException sock)
+        {
+            return sock.SocketErrorCode is SocketError.ConnectionRefused
+                or SocketError.TimedOut
+                or SocketError.HostUnreachable
+                or SocketError.NetworkUnreachable
+                or SocketError.AddressNotAvailable
+                or SocketError.WouldBlock
+                or SocketError.TryAgain;
+        }
+
+        return ex.InnerException != null && IsTransientConnectFailure(ex.InnerException);
+    }
+
+    private static string DescribeConnectFailure(Exception ex) =>
+        ex is SocketException sock ? sock.SocketErrorCode.ToString() : ex.GetType().Name;
+
+    // Best-effort senders. SendTcpAsync now faults on a dead stream (durable publishes must
+    // see that), so these log and swallow instead of surfacing to fire-and-forget callers —
+    // warps, voices and progress requests are all re-driven by the user or a periodic resync.
     public async Task SendWarpRequestAsync(byte targetSlot, byte courseId, byte episodeId)
     {
-        await SendTcpAsync(PacketSerializer.BuildWarpRequest(targetSlot, courseId, episodeId),
-            _cts?.Token ?? default);
+        if (!IsConnected)
+        {
+            Log?.Invoke("Warp request dropped — not connected");
+            return;
+        }
+
+        try
+        {
+            await SendTcpAsync(PacketSerializer.BuildWarpRequest(targetSlot, courseId, episodeId),
+                _cts?.Token ?? default).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (!_isDisconnecting)
+        {
+            Log?.Invoke($"Warp request send failed: {ex.Message}");
+        }
     }
 
     public async Task SendMarioVoiceEventAsync(MarioVoiceEvent voiceEvent)
     {
-        await SendTcpAsync(PacketSerializer.BuildMarioVoiceEvent(_assignedSlot, voiceEvent),
-            _cts?.Token ?? default);
+        if (!IsConnected)
+            return;
+
+        try
+        {
+            await SendTcpAsync(PacketSerializer.BuildMarioVoiceEvent(_assignedSlot, voiceEvent),
+                _cts?.Token ?? default).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (!_isDisconnecting)
+        {
+            Log?.Invoke($"Mario voice send failed: {ex.Message}");
+        }
     }
 
     public async Task SendWorldEventAsync(WorldEventRequest request)
@@ -276,10 +429,46 @@ public sealed class NetClient : IDisposable
             _cts?.Token ?? default);
     }
 
-    public async Task SendWorldProgressRequestAsync()
+    /// <summary>
+    /// Durable world-event send with an explicit result. False means the frame never
+    /// reached the socket, so the caller must keep the event queued (the server's
+    /// authorities are the only heal source and cannot recover what they never received).
+    /// </summary>
+    public async Task<bool> TrySendWorldEventAsync(WorldEventRequest request)
     {
-        await SendTcpAsync(PacketSerializer.BuildWorldProgressRequest(),
-            _cts?.Token ?? default);
+        if (!IsConnected)
+            return false;
+
+        try
+        {
+            await SendTcpAsync(PacketSerializer.BuildWorldEventRequest(request),
+                _cts?.Token ?? default).ConfigureAwait(false);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Log?.Invoke($"World sync: world-event send failed ({ex.GetType().Name}: {ex.Message})");
+            return false;
+        }
+    }
+
+    public async Task SendWorldProgressRequestAsync(uint clientProgressSeq = 0)
+    {
+        if (!IsConnected)
+        {
+            Log?.Invoke("World progress request dropped — not connected");
+            return;
+        }
+
+        try
+        {
+            await SendTcpAsync(PacketSerializer.BuildWorldProgressRequest(clientProgressSeq),
+                _cts?.Token ?? default).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (!_isDisconnecting)
+        {
+            Log?.Invoke($"World progress request send failed: {ex.Message}");
+        }
     }
 
     public Task SendSnapshotAsync(PlayerSnapshot snap)
@@ -301,6 +490,7 @@ public sealed class NetClient : IDisposable
             {
                 _udpPingTickCount = 0;
                 SendUdpPing();
+                CheckUdpHealth();
             }
 
             try
@@ -326,11 +516,67 @@ public sealed class NetClient : IDisposable
             try
             {
                 _udp.Send(_udpPingScratch, _udpPingScratch.Length, _udpServerEndpoint);
+                _consecutiveUdpSendFailures = 0;
             }
             catch (Exception ex) when (!_isDisconnecting)
             {
+                _consecutiveUdpSendFailures++;
                 Log?.Invoke($"UDP ping send error: {ex.Message}");
             }
+        }
+    }
+
+    /// <summary>
+    /// Escalates a dead UDP path. Without this, a firewalled or reset UDP socket left the
+    /// session "connected" with every remote frozen in place and no user-visible cause.
+    /// </summary>
+    private void CheckUdpHealth()
+    {
+        if (_isDisconnecting || _udpActiveSinceUtc == DateTime.MinValue)
+            return;
+
+        var now = DateTime.UtcNow;
+        var health = EvaluateUdpHealth(
+            now - _udpActiveSinceUtc,
+            now - _lastUdpInboundUtc,
+            Volatile.Read(ref _consecutiveUdpSendFailures));
+
+        switch (health)
+        {
+            case UdpHealth.Healthy:
+                if (_udpDegradedReported)
+                {
+                    _udpDegradedReported = false;
+                    Log?.Invoke("UDP link recovered — remote player updates resumed");
+                }
+
+                break;
+
+            case UdpHealth.Degraded:
+                if (!_udpDegradedReported)
+                {
+                    _udpDegradedReported = true;
+                    Log?.Invoke(
+                        "UDP link degraded — no player updates received for " +
+                        $"{(int)(now - _lastUdpInboundUtc).TotalSeconds}s. Remote players will " +
+                        $"appear frozen; check that UDP port {_udpServerEndpoint?.Port} is open.");
+                }
+
+                break;
+
+            case UdpHealth.Dead:
+                // One-shot: previously left _isDisconnecting=false so IsConnected stayed sticky
+                // and CheckUdpHealth re-fired Disconnected every ~1s until TearDown ran.
+                if (_isDisconnecting)
+                    break;
+                _isDisconnecting = true;
+                Log?.Invoke(
+                    "UDP link dead — no player updates for " +
+                    $"{(int)(now - _lastUdpInboundUtc).TotalSeconds}s " +
+                    $"(sendFailures={_consecutiveUdpSendFailures}); dropping session.");
+                try { _cts?.Cancel(); } catch { /* ignore */ }
+                Disconnected?.Invoke(DisconnectReason.Timeout);
+                break;
         }
     }
 
@@ -377,10 +623,13 @@ public sealed class NetClient : IDisposable
             try
             {
                 _udp.Send(_udpSendScratch, _udpSendScratch.Length, _udpServerEndpoint);
+                _consecutiveUdpSendFailures = 0;
             }
             catch (Exception ex) when (!_isDisconnecting)
             {
-                Log?.Invoke($"UDP snapshot send error: {ex.Message}");
+                // Logged at most once per second — a broken socket fails 60×/s.
+                if (_consecutiveUdpSendFailures++ % 60 == 0)
+                    Log?.Invoke($"UDP snapshot send error: {ex.Message}");
             }
         }
     }
@@ -465,9 +714,9 @@ public sealed class NetClient : IDisposable
 
     private void EnsureFullyDisposed()
     {
-        if (_tcp == null && _udp == null && _cts == null)
-            return;
-
+        // Always force-clean leftover tasks/sockets. A prior DisconnectInternalAsync may
+        // leave _isDisconnecting=true with null sockets; the old early-return path skipped
+        // waiting on background tasks and made the next ConnectAsync flaky until app restart.
         ForceDispose();
     }
 
@@ -500,16 +749,24 @@ public sealed class NetClient : IDisposable
         _udpSendTask = null;
         _heartbeatTask = null;
         _udpServerEndpoint = null;
+        _udpActiveSinceUtc = DateTime.MinValue;
+        _lastUdpInboundUtc = DateTime.MinValue;
+        _consecutiveUdpSendFailures = 0;
+        _udpDegradedReported = false;
     }
 
+    /// <summary>
+    /// Throws when the TCP stream is gone. A silent no-op here made durable world-event
+    /// publishes look successful to the bridge, which then cleared the Dolphin localPending
+    /// lane and advanced the published sequence for a mutation the server never saw.
+    /// </summary>
     private async Task SendTcpAsync(byte[] data, CancellationToken ct)
     {
         await _tcpSendLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            var stream = _tcpStream;
-            if (stream == null)
-                return;
+            var stream = _tcpStream ??
+                         throw new InvalidOperationException("TCP stream is not connected");
             await stream.WriteAsync(data, ct).ConfigureAwait(false);
         }
         finally
@@ -522,6 +779,7 @@ public sealed class NetClient : IDisposable
     {
         var buffer = new byte[4096];
         var pending = new List<byte>(4096);
+        var resyncSkipped = 0;
         try
         {
             while (!ct.IsCancellationRequested && _tcpStream != null)
@@ -530,15 +788,47 @@ public sealed class NetClient : IDisposable
                 if (read <= 0)
                 {
                     if (!_isDisconnecting)
+                    {
+                        _isDisconnecting = true;
                         Disconnected?.Invoke(DisconnectReason.Timeout);
+                    }
                     break;
                 }
 
-                pending.AddRange(buffer.AsSpan(0, read).ToArray());
+                // Avoid ToArray()+AddRange (allocates every TCP read). Append in place.
+                if (pending.Capacity < pending.Count + read)
+                    pending.Capacity = Math.Max(pending.Capacity * 2, pending.Count + read);
+                for (var i = 0; i < read; i++)
+                    pending.Add(buffer[i]);
                 while (pending.Count >= 13)
                 {
-                    if (!TryExtractFrame(pending, out var frame))
+                    var extracted = TryExtractFrame(pending, out var frame, out var skipped);
+                    if (skipped > 0)
+                    {
+                        resyncSkipped += skipped;
+                        Log?.Invoke(
+                            $"TCP resync: skipped {skipped} bad header byte(s) " +
+                            $"(total {resyncSkipped}/{MaxResyncSkippedBytes})");
+                        if (resyncSkipped >= MaxResyncSkippedBytes)
+                        {
+                            Log?.Invoke(
+                                "TCP stream unrecoverable — too much unframed data; disconnecting.");
+                            if (!_isDisconnecting)
+                            {
+                                _isDisconnecting = true;
+                                try { _cts?.Cancel(); } catch { /* ignore */ }
+                                Disconnected?.Invoke(DisconnectReason.Timeout);
+                            }
+                            return;
+                        }
+                    }
+
+                    if (!extracted)
                         break;
+
+                    // A good frame proves the stream re-synchronised; budget applies to
+                    // continuous garbage, not to one corrupt frame across a long session.
+                    resyncSkipped = 0;
                     HandleTcpFrame(frame);
                 }
             }
@@ -553,7 +843,9 @@ public sealed class NetClient : IDisposable
         }
         catch (Exception ex) when (!_isDisconnecting)
         {
+            _isDisconnecting = true;
             Log?.Invoke($"TCP read error: {ex.Message}");
+            try { _cts?.Cancel(); } catch { /* ignore */ }
             Disconnected?.Invoke(DisconnectReason.Timeout);
         }
     }
@@ -566,8 +858,21 @@ public sealed class NetClient : IDisposable
         switch (id)
         {
             case TcpPacketId.HandshakeAck:
-                if (payload.Length >= 17)
+                if (PacketSerializer.TryReadHandshakeAck(payload, out var ackSlot, out var serverBuild))
+                {
+                    _assignedSlot = ackSlot;
+                    if (serverBuild is ushort build && build != ProtocolConstants.ModBuildId)
+                    {
+                        Log?.Invoke(
+                            $"HandshakeAck VersionMismatch: server build {build}, " +
+                            $"client build {ProtocolConstants.ModBuildId}");
+                        JoinRejected?.Invoke(JoinRejectReason.VersionMismatch);
+                    }
+                }
+                else if (payload.Length >= 17)
+                {
                     _assignedSlot = payload[16];
+                }
                 break;
             case TcpPacketId.JoinAccepted:
                 _assignedSlot = payload.Length > 0 ? payload[0] : _assignedSlot;
@@ -607,26 +912,55 @@ public sealed class NetClient : IDisposable
                 break;
             case TcpPacketId.WorldEvent:
                 if (PacketSerializer.TryReadWorldEventBroadcast(payload, out var worldEvent))
-                    WorldEventReceived?.Invoke(worldEvent);
+                    InvokeDetached(WorldEventReceived, worldEvent);
                 break;
             case TcpPacketId.WorldStateReplay:
                 if (PacketSerializer.TryReadWorldStateReplay(payload, out var replayEvents))
-                    WorldStateReplayReceived?.Invoke(replayEvents);
+                    InvokeDetached(WorldStateReplayReceived, replayEvents);
+                break;
+            case TcpPacketId.WorldProgressSnapshot:
+                if (PacketSerializer.TryReadWorldProgressSnapshot(payload, out var progressSnapshot))
+                    InvokeDetached(WorldProgressSnapshotReceived, progressSnapshot);
                 break;
             case TcpPacketId.WorldProgressRequest:
                 // Server→client should not receive this; ignore if echoed.
                 break;
             case TcpPacketId.Disconnect:
-                if (!_isDisconnecting)
-                    Disconnected?.Invoke(payload.Length > 0 ? (DisconnectReason)payload[0] : DisconnectReason.ServerShutdown);
+            {
+                var already = _isDisconnecting;
                 _isDisconnecting = true;
-                _cts?.Cancel();
+                try { _cts?.Cancel(); } catch { /* ignore */ }
+                if (!already)
+                    Disconnected?.Invoke(payload.Length > 0 ? (DisconnectReason)payload[0] : DisconnectReason.ServerShutdown);
                 break;
+            }
             case TcpPacketId.PlayerLeft:
                 if (payload.Length >= 1)
                     ParseRoster(payload);
                 break;
         }
+    }
+
+    /// <summary>
+    /// Run world-sync handlers off the TCP read loop. A synchronous hang inside
+    /// SessionCoordinator (progress apply / gold flood) used to stall reads, back-pressure
+    /// the server send path, and leave stage-enter force requests with no reply.
+    /// </summary>
+    private static void InvokeDetached<T>(Action<T>? handler, T arg)
+    {
+        if (handler == null)
+            return;
+        ThreadPool.UnsafeQueueUserWorkItem(_ =>
+        {
+            try
+            {
+                handler(arg);
+            }
+            catch
+            {
+                // Session handlers log their own failures; never kill the read loop.
+            }
+        }, null);
     }
 
     private void ParseRoster(ReadOnlySpan<byte> data)
@@ -635,13 +969,14 @@ public sealed class NetClient : IDisposable
             return;
 
         int count = data[0];
-        var entries = new List<PlayerRosterEntry>(count);
+        var entries = new PlayerRosterEntry[count];
         int offset = 1;
         // Prefer v9 roster entries (30 bytes); fall back to legacy 22-byte entries.
         int entrySize = ProtocolConstants.RosterEntrySize;
         if (count > 0 && offset + entrySize * count > data.Length)
             entrySize = 22;
 
+        var parsed = 0;
         for (int i = 0; i < count && offset + entrySize <= data.Length; i++)
         {
             var entry = new PlayerRosterEntry
@@ -659,27 +994,44 @@ public sealed class NetClient : IDisposable
                     data.Slice(offset + 22, ProtocolConstants.MarioModelIdSize));
             }
 
-            entries.Add(entry);
+            entries[parsed++] = entry;
             offset += entrySize;
         }
 
-        var activeSlots = new HashSet<byte>(entries.Select(e => e.Slot));
-        foreach (var slot in _knownRosterSlots.Where(s => !activeSlots.Contains(s)).ToArray())
+        if (parsed != entries.Length)
+            Array.Resize(ref entries, parsed);
+
+        // Diff against prior roster without LINQ allocs (roster ticks ~5 Hz keep-alive).
+        foreach (var slot in _knownRosterSlots)
         {
-            if (slot < _hasReceivedSnapshotSeq.Length)
+            var stillPresent = false;
+            for (var j = 0; j < entries.Length; j++)
+            {
+                if (entries[j].Slot == slot)
+                {
+                    stillPresent = true;
+                    break;
+                }
+            }
+
+            if (!stillPresent && slot < _hasReceivedSnapshotSeq.Length)
                 _hasReceivedSnapshotSeq[slot] = false;
         }
-        foreach (var slot in activeSlots.Where(s => !_knownRosterSlots.Contains(s)))
+
+        for (var j = 0; j < entries.Length; j++)
         {
+            var slot = entries[j].Slot;
+            if (_knownRosterSlots.Contains(slot))
+                continue;
             if (slot < _hasReceivedSnapshotSeq.Length)
                 _hasReceivedSnapshotSeq[slot] = false;
         }
 
         _knownRosterSlots.Clear();
-        foreach (var slot in activeSlots)
-            _knownRosterSlots.Add(slot);
+        for (var j = 0; j < entries.Length; j++)
+            _knownRosterSlots.Add(entries[j].Slot);
 
-        RosterUpdated?.Invoke(entries.ToArray());
+        RosterUpdated?.Invoke(entries);
     }
 
     private async Task UdpReadLoop(CancellationToken ct)
@@ -691,13 +1043,37 @@ public sealed class NetClient : IDisposable
         {
             while (!ct.IsCancellationRequested)
             {
-                var result = await _udp.ReceiveAsync(ct).ConfigureAwait(false);
+                UdpReceiveResult result;
+                try
+                {
+                    result = await _udp.ReceiveAsync(ct).ConfigureAwait(false);
+                }
+                catch (SocketException ex) when (!_isDisconnecting && !ct.IsCancellationRequested)
+                {
+                    // Windows surfaces ICMP port-unreachable as ConnectionReset on the next
+                    // receive. Leaving the loop here froze every remote for the rest of the
+                    // session; health is tracked separately by EvaluateUdpHealth.
+                    Log?.Invoke($"UDP read error: {ex.SocketErrorCode} — continuing");
+                    try
+                    {
+                        await Task.Delay(50, ct).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        break;
+                    }
+
+                    continue;
+                }
+
                 if (_udpServerEndpoint != null && !result.RemoteEndPoint.Equals(_udpServerEndpoint))
                     continue;
                 if (result.Buffer.Length < ProtocolConstants.UdpSnapshotBatchHeaderSize)
                     continue;
                 if (BinaryPrimitives.ReadUInt32LittleEndian(result.Buffer.AsSpan(0, 4)) != ProtocolConstants.Magic)
                     continue;
+
+                _lastUdpInboundUtc = DateTime.UtcNow;
 
                 var packetId = (UdpPacketId)result.Buffer[4];
                 if (packetId == UdpPacketId.Pong)
@@ -869,9 +1245,18 @@ public sealed class NetClient : IDisposable
         return span.Slice(0, len).ToArray();
     }
 
-    private static bool TryExtractFrame(List<byte> pending, out byte[] frame)
+    internal static bool TryExtractFrame(List<byte> pending, out byte[] frame) =>
+        TryExtractFrame(pending, out frame, out _);
+
+    /// <summary>
+    /// Byte-at-a-time resync on a bad magic/version. <paramref name="skippedBytes"/> lets the
+    /// caller bound how much garbage a corrupt stream may consume before the session is
+    /// declared unrecoverable.
+    /// </summary>
+    internal static bool TryExtractFrame(List<byte> pending, out byte[] frame, out int skippedBytes)
     {
         frame = Array.Empty<byte>();
+        skippedBytes = 0;
         while (pending.Count >= 13)
         {
             Span<byte> header = stackalloc byte[13];
@@ -880,6 +1265,7 @@ public sealed class NetClient : IDisposable
             if (!PacketSerializer.TryGetTcpFrameLength(header, out var total))
             {
                 pending.RemoveAt(0);
+                skippedBytes++;
                 continue;
             }
 

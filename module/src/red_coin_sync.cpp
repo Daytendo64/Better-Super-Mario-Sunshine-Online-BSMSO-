@@ -3,6 +3,7 @@
 #include "coin_collect_fx.hpp"
 #include "collectible_scan.hpp"
 #include "comm_buffer.hpp"
+#include "episode_equiv.hpp"
 #include "world_sync.hpp"
 
 #include <Dolphin/OS.h>
@@ -28,7 +29,7 @@ extern TMapObjManager *gpMapObjManager;
 namespace {
 
 constexpr u32 kStageSettleFrames = 90;
-constexpr f32 kRebindPosEpsilon = 4.0f;
+constexpr f32 kRebindPosEpsilon = 24.0f; // pack scale=16; 4.0 missed fingerprint hides
 constexpr u32 kCoinTakenFlagOffset = 0x152;
 constexpr u8 kMaxStageRedCoins = 8;
 constexpr u8 kInvalidHudSlot = 0xFF;
@@ -46,6 +47,10 @@ static bool sStageSnapshotReady = false;
 /// grow via switch-spawn trickle (pre-placed / enemy-drop stages still expand by pos).
 static bool sSnapshotFinal = false;
 static u8 sCollectedMask = 0;
+/// Bits that still need remote collect FX (hide arrived late after apply).
+static u8 sPendingCollectFxMask = 0;
+/// Bits that already played remote collect FX this stage (avoid double sparkle).
+static u8 sPlayedCollectFxMask = 0;
 // Set by stageInit so same course/episode reloads still reset trackers.
 static bool sForceStageTrackerReset = false;
 // Remote collections recorded while the local switch mission was idle; flush HUD
@@ -120,19 +125,6 @@ static bool isHubArea(u8 areaId) {
     return areaId == 15;
 }
 
-// Sirena casino (14): director/mission uses beach ids 3/4; archive/catalog uses 0/1.
-static bool sameCasinoEpisode(u8 a, u8 b) {
-    if (a == b)
-        return true;
-    const bool aEp4 = (a == 0 || a == 3);
-    const bool bEp4 = (b == 0 || b == 3);
-    if (aEp4 && bEp4)
-        return true;
-    const bool aEp5 = (a == 1 || a == 4);
-    const bool bEp5 = (b == 1 || b == 4);
-    return aEp5 && bEp5;
-}
-
 static bool redCoinPublishEnabled(const smso::CommBuffer *buf) {
     return buf && (buf->bridgeFlags & smso::BF_CONNECTED) != 0 &&
            (buf->bridgeFlags & (smso::BF_SYNC_EVENT | smso::BF_SYNC_MISSION)) != 0;
@@ -143,25 +135,14 @@ static bool redCoinScanReady(const smso::CommBuffer *buf) {
 }
 
 static bool sameStage(u8 courseId, u8 episodeId) {
-    if (courseId != currentCourseId())
-        return false;
-    if (episodeId == currentEpisodeId())
-        return true;
-    if (courseId == 14)
-        return sameCasinoEpisode(episodeId, currentEpisodeId());
-    return false;
+    return smso::episode_equiv::sameStage(courseId, episodeId, currentCourseId(),
+                                          currentEpisodeId());
 }
 
 static bool peerMatchesStage(const smso::PlayerSnapshot &snap, u8 courseId, u8 episodeId) {
     if (snap.connected == 0)
         return false;
-    if (snap.stageId != courseId)
-        return false;
-    if (snap.episodeId == episodeId)
-        return true;
-    if (courseId == 14)
-        return sameCasinoEpisode(snap.episodeId, episodeId);
-    return false;
+    return smso::episode_equiv::sameStage(snap.stageId, snap.episodeId, courseId, episodeId);
 }
 
 /// True when at least one remote snapshot is on the same course+episode.
@@ -175,6 +156,41 @@ static bool hasSameStagePeer(const smso::CommBuffer *buf) {
             return true;
     }
     return false;
+}
+
+/// Deferred red-coin identity: (course, episode, coin index). Catalog↔mission episode
+/// aliasing and repeated authority snapshots re-deliver the same coin many times.
+static bool deferredRedCoinKeyMatches(const smso::CommWorldEvent &a,
+                                      const smso::CommWorldEvent &b) {
+    return a.courseId == b.courseId && a.episodeId == b.episodeId && a.reserved == b.reserved;
+}
+
+/// Coalesce by key before resorting to a spill so a repeat flood cannot evict a distinct
+/// coin that has not been applied yet. Latest payload wins (mask / packed position grow).
+static bool storeDeferredRedCoinEvent(const smso::CommWorldEvent &event) {
+    constexpr u8 kDeferCap =
+        static_cast<u8>(sizeof(sDeferredRedCoinEvents) / sizeof(sDeferredRedCoinEvents[0]));
+
+    for (u8 i = 0; i < sDeferredRedCoinCount; ++i) {
+        if (!deferredRedCoinKeyMatches(sDeferredRedCoinEvents[i], event))
+            continue;
+        sDeferredRedCoinEvents[i] = event;
+        return true;
+    }
+
+    if (sDeferredRedCoinCount < kDeferCap) {
+        sDeferredRedCoinEvents[sDeferredRedCoinCount++] = event;
+        return true;
+    }
+
+    // Cap reached with 16 distinct coins pending — spill the oldest so the newest still
+    // lands and the durable mailbox slot is freed. Authority heals recover the loser.
+    OSReport("[SMSOBB] red-coin defer cap — spilled oldest for course=%u/%u idx=%u\n",
+             event.courseId, event.episodeId, event.reserved);
+    for (u8 i = 0; i + 1 < sDeferredRedCoinCount; ++i)
+        sDeferredRedCoinEvents[i] = sDeferredRedCoinEvents[i + 1];
+    sDeferredRedCoinEvents[sDeferredRedCoinCount - 1] = event;
+    return true;
 }
 
 static void clearDeferredRedCoinEventsForCurrentStage() {
@@ -805,6 +821,8 @@ static void resetRedCoinTrackersForStage(u8 courseId, u8 episodeId, bool preserv
     sSnapshotFinal = false;
     sStageRedCoinCount = 0;
     sCollectedMask = 0;
+    sPendingCollectFxMask = 0;
+    sPlayedCollectFxMask = 0;
     sPendingHudCatchUp = false;
     sHudAppliedMask = 0;
     sFramesSinceRebind = 0;
@@ -912,17 +930,17 @@ static void catchUpRedCoinHudIfArmed(TFlagManager *fm) {
     reconcileCollectedRedCoinActors();
 }
 
-static void publishLocalRedCoinEvent(smso::WorldEventType type, u8 courseId, u8 episodeId, u8 payload0,
-                                     u8 stableIndex, u32 payload1, u32 payload2) {
+static bool publishLocalRedCoinEvent(smso::WorldEventType type, u8 courseId, u8 episodeId,
+                                     u8 payload0, u8 stableIndex, u32 payload1, u32 payload2) {
     if (sApplyingRemoteEvent)
-        return;
+        return false;
 
     smso::CommBuffer *buf = smso::getCommBuffer();
     if (!redCoinPublishEnabled(buf))
-        return;
+        return false;
 
-    smso::enqueueLocalWorldEvent(static_cast<u8>(type), courseId, episodeId, payload0, stableIndex,
-                                 payload1, payload2);
+    return smso::enqueueLocalWorldEvent(static_cast<u8>(type), courseId, episodeId, payload0,
+                                        stableIndex, payload1, payload2);
 }
 
 static u8 popCountMask(u8 mask) {
@@ -938,6 +956,27 @@ static u8 redCoinStableIndex(u8 reserved) {
     if (reserved < kMaxStageRedCoins)
         return reserved;
     return 0;
+}
+
+static void playRedCollectFxAt(u8 stableIndex, const TVec3f &pos) {
+    if (stableIndex >= kMaxStageRedCoins)
+        return;
+    const u8 bit = static_cast<u8>(1u << stableIndex);
+    if ((sPlayedCollectFxMask & bit) != 0)
+        return;
+    sPlayedCollectFxMask |= bit;
+    sPendingCollectFxMask = static_cast<u8>(sPendingCollectFxMask & static_cast<u8>(~bit));
+    smso::playRemoteCoinCollectParticles(pos, false);
+    OSReport("[SMSOBB] red-coin fx i=%u\n", stableIndex);
+}
+
+static void maybePlayPendingRedCollectFx(u8 stableIndex, const TVec3f &pos) {
+    if (stableIndex >= kMaxStageRedCoins)
+        return;
+    const u8 bit = static_cast<u8>(1u << stableIndex);
+    if ((sPendingCollectFxMask & bit) == 0)
+        return;
+    playRedCollectFxAt(stableIndex, pos);
 }
 
 static void hideRedCoinActor(TMapObjBase *obj) {
@@ -980,6 +1019,12 @@ static void hideRedCoinByStableIndex(u8 stableIndex) {
     sStageRedCoins[stableIndex].active = false;
     OSReport("[SMSOBB] red-coin hide-by-index i=%u mask=0x%02X count=%u\n", stableIndex,
              sCollectedMask, popCountMask(sCollectedMask));
+    TVec3f fxPos = sStageRedCoins[stableIndex].initialPos;
+    if (!entryHasPos(sStageRedCoins[stableIndex])) {
+        auto *base = reinterpret_cast<TMapObjBase *>(coin);
+        fxPos = base->mTranslation;
+    }
+    maybePlayPendingRedCollectFx(stableIndex, fxPos);
 }
 
 static bool collectedIndexNeedsActor(u8 stableIndex) {
@@ -1055,17 +1100,9 @@ static void rememberCollectedPos(u8 stableIndex, const TVec3f &pos) {
         sStageRedCoinCount = static_cast<u8>(stableIndex + 1);
 }
 
-/// payload1 low byte = authoritative collected mask when not a packed XYZ (legacy).
-static u8 maskFromPayload1(u32 payload1) {
-    if (payload1 == 0)
-        return 0;
-    if (smso::looksLikePackedCollectibleWorldPos(payload1))
-        return 0;
-    if (payload1 > 0xFFu)
-        return 0;
-    return static_cast<u8>(payload1 & 0xFFu);
-}
-
+/// payload1 low byte was historically the authoritative collected mask (legacy packed XYZ
+/// ignored). Ownership-push expand still sends the stage mask there, but apply only trusts
+/// the per-index event identity — see applySingleRedCoinCollected.
 static void applySingleRedCoinCollected(TFlagManager *fm, TGCConsole2 *console, u8 stableIndex,
                                         u8 payload0, u32 payload1, u32 payload2) {
     if (!fm || stableIndex >= kMaxStageRedCoins)
@@ -1082,7 +1119,6 @@ static void applySingleRedCoinCollected(TFlagManager *fm, TGCConsole2 *console, 
     const u8 publishHudSlot = payload0 & 0xF;
     const u32 targetCount = (payload0 >> 4) & 0xF;
     const bool missionLive = isLocalRedCoinMissionLive(fm);
-    const u8 remoteMask = maskFromPayload1(payload1);
 
     TVec3f fingerprintPos = {};
     bool haveFingerprint = false;
@@ -1106,8 +1142,11 @@ static void applySingleRedCoinCollected(TFlagManager *fm, TGCConsole2 *console, 
     markCollectedIndex(stableIndex, publishHudSlot);
     if (haveFingerprint)
         rememberCollectedPos(stableIndex, fingerprintPos);
-    if (remoteMask != 0)
-        sCollectedMask |= remoteMask;
+    // payload1 may carry the stage-wide authoritative mask (ownership-push expand). Do not
+    // OR it into sCollectedMask here — that marked sibling indices "already" and skipped
+    // their hide-as-new / collect FX for the rest of the bulk apply. Each set bit arrives
+    // as its own apply; targetCount from payload0 still drives HUD count.
+    (void)payload1;
 
     OSReport("[SMSOBB] red-coin apply i=%u mask=0x%02X count=%u live=%u already=%u pos=%u\n",
              stableIndex, sCollectedMask, targetCount > 0 ? targetCount : popCountMask(sCollectedMask),
@@ -1145,13 +1184,28 @@ static void applySingleRedCoinCollected(TFlagManager *fm, TGCConsole2 *console, 
     if (!already && resolvedCount > 0)
         applyHudSlotForCollection(console, publishHudSlot, stableIndex);
 
-    // Sound/particles only when a live world coin was actually removed — avoids
-    // Pianta/NPC reward sound-only when the drop was never hidden (or not spawned).
-    if (!already && hidLiveCoin) {
+    // Prefer FX when a live coin was hidden. If the actor is not bound yet (common on
+    // Red Coin Field deferred drops / packed-pos mismatch), still sparkle at the
+    // fingerprint and retry hide — late bindPending/hide-by-index plays pending FX once.
+    if (!already) {
         TVec3f fxPos = fingerprintPos;
-        if (!haveFingerprint && stableIndex < sStageRedCoinCount)
+        if (!haveFingerprint && stableIndex < sStageRedCoinCount &&
+            entryHasPos(sStageRedCoins[stableIndex]))
             fxPos = sStageRedCoins[stableIndex].initialPos;
-        smso::playRemoteCoinCollectParticles(fxPos, false);
+
+        if (hidLiveCoin) {
+            playRedCollectFxAt(stableIndex, fxPos);
+        } else if (haveFingerprint ||
+                   (stableIndex < sStageRedCoinCount &&
+                    entryHasPos(sStageRedCoins[stableIndex]))) {
+            sPendingCollectFxMask |= static_cast<u8>(1u << stableIndex);
+            playRedCollectFxAt(stableIndex, fxPos);
+            OSReport("[SMSOBB] red-coin defer-hide i=%u (fx at fingerprint, will rebind)\n",
+                     stableIndex);
+        } else {
+            sPendingCollectFxMask |= static_cast<u8>(1u << stableIndex);
+            OSReport("[SMSOBB] red-coin defer-fx i=%u (no pos yet)\n", stableIndex);
+        }
     }
 }
 
@@ -1239,6 +1293,24 @@ static void detectLocalRedCoinProgress(TFlagManager *fm, u8 courseId, u8 episode
         if (publishHudSlot == kInvalidHudSlot || publishHudSlot >= kMaxStageRedCoins)
             publishHudSlot = stableIndex;
 
+        const u8 bit = static_cast<u8>(1u << stableIndex);
+        const u32 payload1 = static_cast<u32>(sCollectedMask | bit);
+        u32 payload2 = 0;
+        if (entryHasPos(sStageRedCoins[stableIndex])) {
+            const TVec3f &p = sStageRedCoins[stableIndex].initialPos;
+            payload2 = smso::packCollectibleWorldPos(p.x, p.y, p.z);
+        } else if (isBoundActorValid(sStageRedCoins[stableIndex].actor)) {
+            auto *base = reinterpret_cast<TMapObjBase *>(sStageRedCoins[stableIndex].actor);
+            payload2 = smso::packCollectibleWorldPos(base->mInitialPosition.x,
+                                                    base->mInitialPosition.y,
+                                                    base->mInitialPosition.z);
+        }
+
+        // Publish before marking so a queue-full drop retries while the coin stays "found".
+        if (!publishLocalRedCoinEvent(smso::WE_RED_COIN_COLLECTED, courseId, episodeId,
+                                      publishHudSlot, stableIndex, payload1, payload2))
+            break;
+
         markCollectedIndex(stableIndex, publishHudSlot);
         sStageRedCoins[stableIndex].active = false;
         if (isBoundActorValid(sStageRedCoins[stableIndex].actor)) {
@@ -1247,14 +1319,6 @@ static void detectLocalRedCoinProgress(TFlagManager *fm, u8 courseId, u8 episode
         }
 
         const u32 newCount = sLastRedCoinCount + 1;
-        const u32 payload1 = static_cast<u32>(sCollectedMask);
-        u32 payload2 = 0;
-        if (entryHasPos(sStageRedCoins[stableIndex])) {
-            const TVec3f &p = sStageRedCoins[stableIndex].initialPos;
-            payload2 = smso::packCollectibleWorldPos(p.x, p.y, p.z);
-        }
-        publishLocalRedCoinEvent(smso::WE_RED_COIN_COLLECTED, courseId, episodeId, publishHudSlot,
-                                 stableIndex, payload1, payload2);
         sLastRedCoinCount = newCount;
 
         OSReport("[SMSOBB] red-coin collect i=%u mask=0x%02X count=%u\n", stableIndex,
@@ -1478,22 +1542,14 @@ void captureLocalRedCoinProgress() {
 }
 
 bool applyRedCoinWorldEvent(const CommWorldEvent &event) {
-    if (!sameStage(event.courseId, event.episodeId)) {
-        if (sDeferredRedCoinCount >= sizeof(sDeferredRedCoinEvents) / sizeof(sDeferredRedCoinEvents[0]))
-            return true;
-
-        sDeferredRedCoinEvents[sDeferredRedCoinCount++] = event;
-        return true;
-    }
+    if (!sameStage(event.courseId, event.episodeId))
+        return storeDeferredRedCoinEvent(event);
 
     if (applyRedCoinWorldEventOnStage(event))
         return true;
 
-    if (sDeferredRedCoinCount >= sizeof(sDeferredRedCoinEvents) / sizeof(sDeferredRedCoinEvents[0]))
-        return false;
-
-    sDeferredRedCoinEvents[sDeferredRedCoinCount++] = event;
-    return true;
+    // Never hold the durable incoming slot forever — defer (coalesced) and retry on flush.
+    return storeDeferredRedCoinEvent(event);
 }
 
 void flushDeferredRedCoinEvents() {

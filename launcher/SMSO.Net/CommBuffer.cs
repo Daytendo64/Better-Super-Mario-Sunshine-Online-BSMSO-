@@ -49,6 +49,18 @@ public struct CommBuffer
     [MarshalAs(UnmanagedType.ByValArray, SizeConst = ProtocolConstants.MarioModelIdSize * ProtocolConstants.MaxRemoteSlots)]
     public byte[] RemoteMarioModelIds;
 
+    public uint ProgressSnapshotHostSeq;
+    public uint ProgressSnapshotModuleAppliedSeq;
+    public ushort ProgressSnapshotPayloadLen;
+    public byte ProgressSnapshotFlags;
+    public byte ProgressSnapshotReserved;
+
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = ProtocolConstants.CommProgressSnapshotMaxPayload)]
+    public byte[] ProgressSnapshotPayload;
+
+    /// <summary>0–100 percent in-game music volume (BGM / streamed music; not SFX).</summary>
+    public byte MusicVolume;
+
     public static CommBuffer CreateDefault()
     {
         return new CommBuffer
@@ -66,6 +78,8 @@ public struct CommBuffer
             RosterHud = CommRosterHudSync.CreateDefault(),
             LocalMarioModelId = new byte[ProtocolConstants.MarioModelIdSize],
             RemoteMarioModelIds = new byte[ProtocolConstants.MarioModelIdSize * ProtocolConstants.MaxRemoteSlots],
+            ProgressSnapshotPayload = new byte[ProtocolConstants.CommProgressSnapshotMaxPayload],
+            MusicVolume = ProtocolConstants.CommMusicVolumeDefault,
         };
     }
 
@@ -189,6 +203,8 @@ public static class CommBufferMarshal
             buffer.LocalMarioModelId ??= new byte[ProtocolConstants.MarioModelIdSize];
             buffer.RemoteMarioModelIds ??=
                 new byte[ProtocolConstants.MarioModelIdSize * ProtocolConstants.MaxRemoteSlots];
+            buffer.ProgressSnapshotPayload ??=
+                new byte[ProtocolConstants.CommProgressSnapshotMaxPayload];
             for (int i = 0; i < buffer.RemoteSnapshots.Length; i++)
                 buffer.RemoteSnapshots[i].Name ??= new byte[16];
             return buffer;

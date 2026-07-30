@@ -31,10 +31,12 @@ internal sealed class BseRuntimeProbe
     public bool BseInstalled { get; init; }
     public bool MovesetInstalled { get; init; }
     public bool BsmsInstalled { get; init; }
+    /// <summary>Eclipse Mods folder detected (additive installs only — runtime never replaced).</summary>
+    public bool EclipseModsPresent { get; init; }
 
     public bool IsComplete =>
         KuriboKernelInstalled && MainDolInstalled && BootBinInstalled &&
-        BseInstalled && MovesetInstalled && BsmsInstalled;
+        BseInstalled && BsmsInstalled;
 }
 
 internal static class ModuleInstallValidator
@@ -57,6 +59,7 @@ internal static class ModuleInstallValidator
         var bsePath = Path.Combine(modsDir, ModuleVersionMessages.BseModuleFileName);
         var movesetPath = Path.Combine(modsDir, ModuleVersionMessages.MovesetModuleFileName);
         var bsmsPath = Path.Combine(modsDir, ModuleVersionMessages.ModuleFileName);
+        var eclipseModulePath = Path.Combine(modsDir, GameProfileDetector.EclipseModuleFileName);
 
         static bool ExistsWithSize(string path, long expectedSize) =>
             File.Exists(path) && new FileInfo(path).Length == expectedSize;
@@ -83,10 +86,133 @@ internal static class ModuleInstallValidator
             KuriboKernelInstalled = kernelOk,
             MainDolInstalled = mainOk,
             BootBinInstalled = bootOk,
-            BseInstalled = File.Exists(bsePath),
+            // Presence alone is not enough — DEBUG BSE (603424) exists but black-screens.
+            BseInstalled = ExistsWithSize(bsePath, ModuleInstaller.OfficialBseSizeBytes),
             MovesetInstalled = File.Exists(movesetPath),
             BsmsInstalled = File.Exists(bsmsPath),
+            EclipseModsPresent = File.Exists(eclipseModulePath),
         };
+    }
+
+    /// <summary>
+    /// Post-Install / Launch gate: official BSE + DOL sizes, Moveset size when present,
+    /// and (when <paramref name="requireMovesetAbsentWhenDisabled"/>) Moveset absence when
+    /// the Patch BSE moveset toggle is off.
+    /// Returns null when the tree is boot-safe; otherwise a user-facing error.
+    /// </summary>
+    public static string? ValidateInstalledRuntimeSizes(
+        BseRuntimeProbe probe,
+        bool patchBseMovesetExpected,
+        bool requireMovesetAbsentWhenDisabled = true)
+    {
+        if (probe.BsePath == null || !File.Exists(probe.BsePath))
+        {
+            return $"{ModuleVersionMessages.BseModuleFileName} missing after install.\n" +
+                   "Re-run Install / patch modules.";
+        }
+
+        var bseSize = new FileInfo(probe.BsePath).Length;
+        if (bseSize != ModuleInstaller.OfficialBseSizeBytes)
+        {
+            return $"{ModuleVersionMessages.BseModuleFileName} is {bseSize} bytes " +
+                   $"(expected {ModuleInstaller.OfficialBseSizeBytes}). " +
+                   "DEBUG/dev BSE black-screens boot. Re-run Install / patch modules " +
+                   "so the official v4.0.0 release payload is restored.";
+        }
+
+        if (probe.MainDolPath == null ||
+            new FileInfo(probe.MainDolPath).Length != ModuleInstaller.OfficialMainDolSizeBytes)
+        {
+            var size = probe.MainDolPath != null ? new FileInfo(probe.MainDolPath).Length : 0L;
+            return $"sys\\main.dol is incomplete ({size} bytes; expected " +
+                   $"{ModuleInstaller.OfficialMainDolSizeBytes}). Re-run Install / patch modules.";
+        }
+
+        if (probe.BootBinPath == null || !File.Exists(probe.BootBinPath))
+            return "sys\\boot.bin missing after install. Re-run Install / patch modules.";
+
+        if (probe.KernelPath == null || !File.Exists(probe.KernelPath))
+            return "KuriboKernel.bin missing after install. Re-run Install / patch modules.";
+
+        if (probe.BsmsPath == null || !File.Exists(probe.BsmsPath))
+        {
+            return $"{ModuleVersionMessages.ModuleFileName} missing after install.\n" +
+                   "Re-run Install / patch modules.";
+        }
+
+        if (patchBseMovesetExpected)
+        {
+            if (probe.MovesetPath == null || !File.Exists(probe.MovesetPath))
+            {
+                return $"{ModuleVersionMessages.MovesetModuleFileName} missing but Patch BSE moveset is ON.\n" +
+                       "Re-run Install / patch modules.";
+            }
+
+            var movesetSize = new FileInfo(probe.MovesetPath).Length;
+            if (movesetSize != ModuleInstaller.OfficialMovesetSizeBytes)
+            {
+                return $"{ModuleVersionMessages.MovesetModuleFileName} is {movesetSize} bytes " +
+                       $"(expected {ModuleInstaller.OfficialMovesetSizeBytes}). " +
+                       "Wrong/corrupt Moveset black-screens boot after BSE. " +
+                       "Restore the release-zip Moveset and re-run Install.";
+            }
+        }
+        else if (probe.MovesetPath != null && File.Exists(probe.MovesetPath))
+        {
+            var movesetSize = new FileInfo(probe.MovesetPath).Length;
+            if (movesetSize != ModuleInstaller.OfficialMovesetSizeBytes)
+            {
+                return $"{ModuleVersionMessages.MovesetModuleFileName} is {movesetSize} bytes " +
+                       $"(expected {ModuleInstaller.OfficialMovesetSizeBytes} or absent). " +
+                       "Wrong/corrupt Moveset black-screens boot — re-run Install with Patch BSE moveset OFF.";
+            }
+
+            if (requireMovesetAbsentWhenDisabled)
+            {
+                return $"{ModuleVersionMessages.MovesetModuleFileName} is still present but Patch BSE moveset is OFF.\n" +
+                       "Re-run Install / patch modules with the toggle off to remove it.";
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Launch-time check for extracted trees: wrong-size BSE/Moveset or incomplete Kuribo runtime.
+    /// Correct-size leftover Moveset with the toggle off is allowed (warns elsewhere) — only
+    /// wrong sizes block boot. Disc images cannot be size-probed without extract.
+    /// </summary>
+    public static string? ValidateBootReadyModules(string isoPath, bool patchBseMoveset)
+    {
+        // Eclipse trees own their BSE/Moveset builds — official size pins do not apply.
+        if (GameProfileDetector.Detect(isoPath).IsEclipse)
+            return null;
+
+        var kind = ClassifyInstallTarget(isoPath);
+        if (kind is ModuleInstallTargetKind.DiscImage or ModuleInstallTargetKind.CompressedDiscImage
+            or ModuleInstallTargetKind.None)
+        {
+            // Prefer a sibling extracted tree when present.
+            if (!TryResolveGameRoot(isoPath, out var siblingRoot) || siblingRoot == null)
+                return null;
+
+            var siblingProbe = ProbeBseRuntime(siblingRoot);
+            if (!siblingProbe.IsComplete && siblingProbe.BsePath == null && siblingProbe.BsmsPath == null)
+                return null;
+
+            return ValidateInstalledRuntimeSizes(
+                siblingProbe, patchBseMoveset, requireMovesetAbsentWhenDisabled: false);
+        }
+
+        if (!TryResolveGameRoot(isoPath, out var gameRoot) || gameRoot == null)
+            return null;
+
+        var probe = ProbeBseRuntime(gameRoot);
+        if (!probe.IsComplete && probe.BsePath == null && probe.BsmsPath == null)
+            return null;
+
+        return ValidateInstalledRuntimeSizes(
+            probe, patchBseMoveset, requireMovesetAbsentWhenDisabled: false);
     }
 
     public static bool IsPatchableDiscImage(string path) =>
@@ -176,6 +302,11 @@ internal static class ModuleInstallValidator
             return "Compressed .gcz is not supported for Install modules. Convert to .iso/.gcm or use an extracted folder.";
         }
 
+        // Eclipse runtime is Eclipse-owned: presence of _BSMSO.kxe is the only BSMSO check —
+        // the official BSE/Moveset size pins would reject Eclipse's own modules.
+        var eclipseProfile = GameProfileDetector.Detect(isoPath);
+        var skipOfficialSizeChecks = eclipseProfile.IsEclipse;
+
         if (kind == ModuleInstallTargetKind.DiscImage)
         {
             var trimmed = isoPath.Trim().Trim('"');
@@ -215,10 +346,10 @@ internal static class ModuleInstallValidator
 
         if (!TryFindModuleFile(isoPath, out var modulePath) || modulePath == null)
         {
-            if (TryResolveGameRoot(isoPath, out var gameRoot) && gameRoot != null)
+            if (TryResolveGameRoot(isoPath, out var gameRoot2) && gameRoot2 != null)
             {
                 return ModuleVersionMessages.MissingModuleFile(
-                    Path.Combine(gameRoot, "files", "Kuribo!", "Mods", ModuleVersionMessages.ModuleFileName));
+                    Path.Combine(gameRoot2, "files", "Kuribo!", "Mods", ModuleVersionMessages.ModuleFileName));
             }
 
             if (Directory.Exists(isoPath))
@@ -234,6 +365,33 @@ internal static class ModuleInstallValidator
                 StringComparison.OrdinalIgnoreCase))
         {
             return $"Legacy {ModuleVersionMessages.LegacyModuleFileName} found — rename or replace with {ModuleVersionMessages.ModuleFileName} after updating.";
+        }
+
+        if (!skipOfficialSizeChecks &&
+            TryResolveGameRoot(isoPath, out var extractedRoot) && extractedRoot != null)
+        {
+            var probe = ProbeBseRuntime(extractedRoot);
+            if (probe.BsePath != null && File.Exists(probe.BsePath))
+            {
+                var bseSize = new FileInfo(probe.BsePath).Length;
+                if (bseSize != ModuleInstaller.OfficialBseSizeBytes)
+                {
+                    return $"{ModuleVersionMessages.BseModuleFileName} is {bseSize} bytes " +
+                           $"(expected {ModuleInstaller.OfficialBseSizeBytes}). " +
+                           "DEBUG/dev BSE black-screens boot — re-run Install / patch modules.";
+                }
+            }
+
+            if (probe.MovesetPath != null && File.Exists(probe.MovesetPath))
+            {
+                var movesetSize = new FileInfo(probe.MovesetPath).Length;
+                if (movesetSize != ModuleInstaller.OfficialMovesetSizeBytes)
+                {
+                    return $"{ModuleVersionMessages.MovesetModuleFileName} is {movesetSize} bytes " +
+                           $"(expected {ModuleInstaller.OfficialMovesetSizeBytes}). " +
+                           "Wrong Moveset black-screens boot — restore the release zip or re-run Install.";
+                }
+            }
         }
 
         return null;

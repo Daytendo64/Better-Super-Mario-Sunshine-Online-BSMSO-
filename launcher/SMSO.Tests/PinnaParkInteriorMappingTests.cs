@@ -160,20 +160,45 @@ public class PinnaParkInteriorMappingTests
     }
 
     [Fact]
-    public void BeachEpisodeEight_StillUsesCatalogSevenWithoutParkRemap()
+    public void BeachEpisodeEight_RedirectsToParkArea()
     {
-        // Beach (area 5) Episode 8 stays 1:1; gate remap happens in-module on 13/255.
-        // Random Level excludes beach and warps area 13.
-        Assert.Equal(7, LevelCatalog.ResolveEpisodeForWarp(PinnaParkInteriorMapping.BeachAreaId, 7));
-        Assert.False(LevelCatalog.TryResolveWarpDestination(
-            PinnaParkInteriorMapping.BeachAreaId, 7, out _, out _));
+        // Beach catalog Ep8 → park area 13 / mission scenario 5 (pinnaParco5).
+        // ResolveWarpDestination keeps catalog 7; module maps to load 5.
+        Assert.True(LevelCatalog.TryResolveWarpDestination(
+            PinnaParkInteriorMapping.BeachAreaId, 7, out var areaId, out var mission));
+        Assert.Equal(PinnaParkInteriorMapping.AreaId, areaId);
+        Assert.Equal(5, mission);
+        Assert.Equal(5, LevelCatalog.ResolveEpisodeForWarp(PinnaParkInteriorMapping.BeachAreaId, 7));
+
+        LevelCatalog.ResolveWarpDestination(
+            PinnaParkInteriorMapping.BeachAreaId, 7, out var warpArea, out var warpEpisode);
+        Assert.Equal(PinnaParkInteriorMapping.AreaId, warpArea);
+        Assert.Equal(7, warpEpisode);
     }
 
     [Fact]
-    public void BeachEpisodeSeven_StillUsesCatalogSixWithoutParkRemap()
+    public void BeachEpisodeSeven_RedirectsToParkArea()
     {
-        Assert.Equal(6, LevelCatalog.ResolveEpisodeForWarp(PinnaParkInteriorMapping.BeachAreaId, 6));
+        Assert.True(LevelCatalog.TryResolveWarpDestination(
+            PinnaParkInteriorMapping.BeachAreaId, 6, out var areaId, out var mission));
+        Assert.Equal(PinnaParkInteriorMapping.AreaId, areaId);
+        Assert.Equal(4, mission);
+        Assert.Equal(4, LevelCatalog.ResolveEpisodeForWarp(PinnaParkInteriorMapping.BeachAreaId, 6));
+
+        LevelCatalog.ResolveWarpDestination(
+            PinnaParkInteriorMapping.BeachAreaId, 6, out var warpArea, out var warpEpisode);
+        Assert.Equal(PinnaParkInteriorMapping.AreaId, warpArea);
+        Assert.Equal(6, warpEpisode);
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(3)]
+    public void BeachOnlyEpisodes_StayOnBeach(byte catalogId)
+    {
         Assert.False(LevelCatalog.TryResolveWarpDestination(
-            PinnaParkInteriorMapping.BeachAreaId, 6, out _, out _));
+            PinnaParkInteriorMapping.BeachAreaId, catalogId, out var areaId, out var mission));
+        Assert.Equal(PinnaParkInteriorMapping.BeachAreaId, areaId);
+        Assert.Equal(catalogId, mission);
     }
 }

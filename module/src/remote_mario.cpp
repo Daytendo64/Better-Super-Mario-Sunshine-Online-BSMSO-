@@ -4,6 +4,7 @@
 #include "nametag_system.hpp"
 #include "hide_seek.hpp"
 #include "remote_actor.hpp"
+#include "episode_equiv.hpp"
 
 #include <Dolphin/mem.h>
 #include <Dolphin/string.h>
@@ -36,8 +37,14 @@ static bool isReasonableWorldPos(f32 x, f32 y, f32 z) {
 }
 
 static bool isSameStage(const CommBuffer *buf, const PlayerSnapshot &snap) {
-    return snap.stageId == buf->localSnapshot.stageId &&
-           snap.episodeId == buf->localSnapshot.episodeId;
+    const u8 localArea =
+        gpMarDirector ? gpMarDirector->mAreaID : buf->localSnapshot.stageId;
+    const u8 localEpisode =
+        gpMarDirector ? gpMarDirector->mEpisodeID : buf->localSnapshot.episodeId;
+    const u8 remoteArea = snap.stageId;
+    const u8 remoteEpisode = snap.episodeId;
+    // Hotel/casino load↔mission — keep nametags with bodies across death remount.
+    return episode_equiv::sameStage(remoteArea, remoteEpisode, localArea, localEpisode);
 }
 
 static bool isValidSnapshot(const PlayerSnapshot &snap) {
@@ -145,6 +152,13 @@ void updateRemoteMarioVisuals(TMarDirector *director) {
         // The mailbox array index is authoritative. A stale/malformed embedded
         // slot byte must not make one player's tag sample another body/appearance.
         const u8 playerId = static_cast<u8>(slot);
+
+        // Unoccupied slot that is already cleared: its nametag runtime was reset
+        // when it went inactive and nothing can change it until a snapshot
+        // arrives. A 2-player session should not pay nine full tag evaluations
+        // (projection, camera distance, hide&seek queries) every frame.
+        if (!r.active && snap.connected == 0)
+            continue;
 
         const bool validSnapshot = isValidSnapshot(snap);
         const bool sameStage = !validSnapshot || isSameStage(buf, snap);

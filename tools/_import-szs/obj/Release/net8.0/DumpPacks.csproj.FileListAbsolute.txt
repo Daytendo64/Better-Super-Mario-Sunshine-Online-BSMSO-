@@ -1,0 +1,6 @@
+C:\Users\young\OneDrive\Desktop\SMSOBB\tools\_import-szs\obj\Release\net8.0\DumpPacks.csproj.AssemblyReference.cache
+C:\Users\young\OneDrive\Desktop\SMSOBB\tools\_import-szs\obj\Release\net8.0\DumpPacks.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\young\OneDrive\Desktop\SMSOBB\tools\_import-szs\obj\Release\net8.0\DumpPacks.AssemblyInfoInputs.cache
+C:\Users\young\OneDrive\Desktop\SMSOBB\tools\_import-szs\obj\Release\net8.0\DumpPacks.AssemblyInfo.cs
+C:\Users\young\OneDrive\Desktop\SMSOBB\tools\_import-szs\obj\Release\net8.0\DumpPacks.csproj.CoreCompileInputs.cache
+C:\Users\young\OneDrive\Desktop\SMSOBB\tools\_import-szs\obj\Release\net8.0\DumpPacks.sourcelink.json

@@ -1,0 +1,174 @@
+[SMSOBB] monte-clean snapshot count=16 alreadyClear=0xFFFF mask=0x0
+[SMSOBB] hud-snap shine=0/0 blue=0/0 mode=1
+[SMSOBB] progress snapshot bulk-applied bytes=64 shinesChanged=0
+[SMSOBB] hud-snap shine=0/0 blue=0/0 mode=1
+[SMSOBB] progress snapshot bulk-applied bytes=64 shinesChanged=0
+[SMSOBB] hud-snap shine=0/0 blue=0/0 mode=1
+[SMSOBB] progress snapshot bulk-applied bytes=64 shinesChanged=0
+[SMSOBB] hud-snap shine=0/0 blue=0/0 mode=1
+[SMSOBB] progress snapshot bulk-applied bytes=64 shinesChanged=0
+[SMSOBB] hud-snap shine=0/0 blue=0/0 mode=1
+[SMSOBB] progress snapshot bulk-applied bytes=64 shinesChanged=0
+[SMSOBB] hud-snap shine=0/0 blue=0/0 mode=1
+[SMSOBB] progress snapshot bulk-applied bytes=69 shinesChanged=0
+[SMSOBB] red-coin snapshot ready count=8 mask=0x00 final=0
+[SMSOBB] hud-snap shine=0/0 blue=0/0 mode=1
+[SMSOBB] progress snapshot bulk-applied bytes=69 shinesChanged=0
+[SMSOBB] hud-snap shine=0/0 blue=0/0 mode=1
+[SMSOBB] progress snapshot bulk-applied bytes=69 shinesChanged=0
+[SMSOBB] hud-snap shine=0/0 blue=0/0 mode=1
+[SMSOBB] progress snapshot bulk-applied bytes=69 shinesChanged=0
+[SMSOBB] hud-snap shine=0/0 blue=0/0 mode=1
+[SMSOBB] progress snapshot bulk-applied bytes=69 shinesChanged=0
+[SMSOBB] hud-snap shine=0/0 blue=0/0 mode=1
+[SMSOBB] progress snapshot bulk-applied bytes=69 shinesChanged=0
+[SMSOBB] hud-snap shine=0/0 blue=0/0 mode=1
+[SMSOBB] progress snapshot bulk-applied bytes=69 shinesChanged=0
+[SMSOBB] hud-snap shine=0/0 blue=0/0 mode=1
+[SMSOBB] progress snapshot bulk-applied bytes=69 shinesChanged=0
+[SMSOBB] hud-snap shine=0/0 blue=0/0 mode=1
+[SMSOBB] progress snapshot bulk-applied bytes=69 shinesChanged=0
+[SMSOBB] hud-snap shine=0/0 blue=0/0 mode=1
+[SMSOBB] progress snapshot bulk-applied bytes=69 shinesChanged=0
+[SMSOBB] hud-snap shine=0/0 blue=0/0 mode=1
+[SMSOBB] progress snapshot bulk-applied bytes=69 shinesChanged=0
+[SMSOBB] red-coin co-op peer joined 窶・resume persist course=2/7
+[SMSOBB] red-coin snapshot ready count=8 mask=0x00 final=0
+[SMSOBB] red-coin snapshot ready count=8 mask=0x00 final=0
+[SMSOBB] npc-sync snapshot count=5
+[SMSOBB] red-coin snapshot ready count=8 mask=0x00 final=0
+[SMSOBB] red-coin co-op peer joined 窶・resume persist course=2/7
+[SMSOBB] monte-clean snapshot count=15 alreadyClear=0x79FF mask=0x0
+[SMSOBB] red-coin co-op peer joined 窶・resume persist course=2/7
+[SMSOBB] red-coin co-op peer joined 窶・resume persist course=2/7
+[SMSOBB] npc-sync snapshot count=5
+[SMSOBB] npc-sync snapshot count=5
+[SMSOBB] npc-sync snapshot count=5
+[SMSOBB] monte-clean snapshot count=15 alreadyClear=0x79FF mask=0x0
+[SMSOBB] monte-clean snapshot count=15 alreadyClear=0x79FF mask=0x0
+[SMSOBB] monte-clean snapshot count=15 alreadyClear=0x79FF mask=0x0
+[SMSOBB] story-flag session authority cache cleared
+[SMSOBB] progress-reset watermark + lastApplied + snapshot lane cleared (disconnect)
+[SMSO] Remote actors session reconnect (heap=0x82890000 pool=3 reserved=1)
+[SMSOBB] hud-snap shine=0/0 blue=0/0 mode=1
+[SMSOBB] progress snapshot bulk-applied bytes=69 shinesChanged=0
+[SMSOBB] graffiti-clean sync DISABLED (no publish / apply / assist)
+[SMSO] Remote actors session reconnect (heap=0x82890000 pool=0 reserved=1)
+[SMSOBB] hud-snap shine=0/0 blue=0/0 mode=1
+[SMSOBB] progress snapshot bulk-applied bytes=49 shinesChanged=0
+[SMSOBB] hud-snap shine=0/0 blue=0/0 mode=1
+[SMSOBB] progress snapshot bulk-applied bytes=64 shinesChanged=0
+[SMSOBB] npc-sync snapshot count=17
+[SMSOBB] monte-clean snapshot count=16 alreadyClear=0xFFFF mask=0x0
+[SMSOBB] graffiti-clean sync DISABLED (no publish / apply / assist)
+[SMSOBB] graffiti-clean sync DISABLED (no publish / apply / assist)
+[SMSO] Remote actors session reconnect (heap=0x82890000 pool=0 reserved=1)
+[SMSO] Remote actors session reconnect (heap=0x82890000 pool=0 reserved=1)
+[SMSOBB] hud-snap shine=0/0 blue=0/0 mode=1
+[SMSOBB] progress snapshot bulk-applied bytes=49 shinesChanged=0
+[SMSOBB] hud-snap shine=0/0 blue=0/0 mode=1
+[SMSOBB] progress snapshot bulk-applied bytes=49 shinesChanged=0
+[SMSOBB] hud-snap shine=0/0 blue=0/0 mode=1
+[SMSOBB] progress snapshot bulk-applied bytes=64 shinesChanged=0
+[SMSOBB] hud-snap shine=0/0 blue=0/0 mode=1
+[SMSOBB] progress snapshot bulk-applied bytes=64 shinesChanged=0
+[SMSOBB] hud-snap shine=0/0 blue=0/0 mode=1
+[SMSOBB] progress snapshot bulk-applied bytes=64 shinesChanged=0
+[SMSOBB] red-coin co-op peer joined 窶・resume persist course=1/8
+[SMSOBB] red-coin co-op peer joined 窶・resume persist course=1/8
+[SMSOBB] npc-sync snapshot count=17
+[SMSOBB] monte-clean snapshot count=16 alreadyClear=0xFFFF mask=0x0
+[SMSOBB] npc-sync snapshot count=17
+[SMSOBB] monte-clean snapshot count=16 alreadyClear=0xFFFF mask=0x0
+[SMSOBB] blue publish course=1/8 idx=14 slot=0
+[SMSOBB] blue apply-flag course=1 idx=14 changed=1 localCourse=1
+[SMSOBB] hud-snap shine=0/0 blue=1/1 mode=1
+[SMSOBB] progress snapshot bulk-applied bytes=73 shinesChanged=0
+[SMSOBB] hud-snap shine=0/0 blue=1/1 mode=1
+[SMSOBB] progress snapshot bulk-applied bytes=73 shinesChanged=0
+[SMSOBB] hud-snap shine=0/0 blue=1/1 mode=1
+[SMSOBB] progress snapshot bulk-applied bytes=73 shinesChanged=0
+[SMSOBB] hud-snap shine=0/0 blue=1/1 mode=1
+[SMSOBB] progress snapshot bulk-applied bytes=73 shinesChanged=0
+[SMSOBB] hud-snap shine=0/0 blue=1/1 mode=1
+[SMSOBB] progress snapshot bulk-applied bytes=73 shinesChanged=0
+[SMSOBB] red-coin co-op peer joined 窶・resume persist course=23/0
+[SMSOBB] hud-snap shine=0/0 blue=1/1 mode=1
+[SMSOBB] progress snapshot bulk-applied bytes=73 shinesChanged=0
+[SMSOBB] hud-snap shine=0/0 blue=1/1 mode=1
+[SMSOBB] progress snapshot bulk-applied bytes=73 shinesChanged=0
+[SMSOBB] red-coin snapshot ready count=2 mask=0x00 final=0
+[SMSOBB] red-coin co-op peer joined 窶・resume persist course=23/0
+[SMSOBB] monte-clean snapshot count=0 alreadyClear=0x0 mask=0x0
+[SMSOBB] red-coin snapshot ready count=2 mask=0x00 final=0
+[SMSOBB] monte-clean snapshot count=0 alreadyClear=0x0 mask=0x0
+[SMSOBB] npc-sync snapshot count=2
+[SMSOBB] npc-sync snapshot count=2
+[SMSOBB] red-coin collect i=1 mask=0x02 count=1
+[SMSOBB] red-coin apply i=1 mask=0x02 count=1 live=1 already=0 pos=1
+[SMSOBB] red-coin hide-by-index i=1 mask=0x02 count=1
+[SMSOBB] hud-snap shine=0/0 blue=1/1 mode=1
+[SMSOBB] progress snapshot bulk-applied bytes=108 shinesChanged=0
+[SMSOBB] red-coin apply i=1 mask=0x02 count=1 live=1 already=1 pos=1
+[SMSOBB] hud-snap shine=0/0 blue=1/1 mode=1
+[SMSOBB] progress snapshot bulk-applied bytes=108 shinesChanged=0
+[SMSOBB] red-coin snapshot expand count=3 (+1) mask=0x02
+[SMSOBB] red-coin collect i=2 mask=0x06 count=2
+[SMSOBB] red-coin apply i=1 mask=0x02 count=2 live=1 already=1 pos=1
+[SMSOBB] red-coin apply i=2 mask=0x06 count=2 live=1 already=0 pos=1
+[SMSOBB] hud-snap shine=0/0 blue=1/1 mode=1
+[SMSOBB] progress snapshot bulk-applied bytes=108 shinesChanged=0
+[SMSOBB] red-coin apply i=1 mask=0x06 count=2 live=1 already=1 pos=1
+[SMSOBB] red-coin apply i=2 mask=0x06 count=2 live=1 already=1 pos=1
+[SMSOBB] hud-snap shine=0/0 blue=1/1 mode=1
+[SMSOBB] progress snapshot bulk-applied bytes=108 shinesChanged=0
+[SMSOBB] red-coin snapshot expand count=4 (+1) mask=0x06
+[SMSOBB] red-coin hide-by-index i=2 mask=0x06 count=2
+[SMSOBB] red-coin apply i=1 mask=0x06 count=2 live=1 already=1 pos=1
+[SMSOBB] red-coin apply i=2 mask=0x06 count=2 live=1 already=1 pos=1
+[SMSOBB] hud-snap shine=0/0 blue=1/1 mode=1
+[SMSOBB] progress snapshot bulk-applied bytes=108 shinesChanged=0
+[SMSOBB] red-coin apply i=1 mask=0x06 count=2 live=1 already=1 pos=1
+[SMSOBB] red-coin apply i=2 mask=0x06 count=2 live=1 already=1 pos=1
+[SMSOBB] hud-snap shine=0/0 blue=1/1 mode=1
+[SMSOBB] progress snapshot bulk-applied bytes=108 shinesChanged=0
+[SMSOBB] hud-snap shine=0/0 blue=1/1 mode=1
+[SMSOBB] progress snapshot bulk-applied bytes=73 shinesChanged=0
+[SMSOBB] hud-snap shine=0/0 blue=1/1 mode=1
+[SMSOBB] progress snapshot bulk-applied bytes=73 shinesChanged=0
+[SMSOBB] hud-snap shine=0/0 blue=1/1 mode=1
+[SMSOBB] progress snapshot bulk-applied bytes=73 shinesChanged=0
+[SMSOBB] hud-snap shine=0/0 blue=1/1 mode=1
+[SMSOBB] progress snapshot bulk-applied bytes=73 shinesChanged=0
+[SMSOBB] hud-snap shine=0/0 blue=1/1 mode=1
+[SMSOBB] progress snapshot bulk-applied bytes=73 shinesChanged=0
+[SMSOBB] hud-snap shine=0/0 blue=1/1 mode=1
+[SMSOBB] progress snapshot bulk-applied bytes=73 shinesChanged=0
+[SMSOBB] red-coin snapshot ready count=8 mask=0x00 final=0
+[SMSOBB] red-coin snapshot ready count=8 mask=0x00 final=0
+[SMSOBB] hud-snap shine=0/0 blue=1/1 mode=1
+[SMSOBB] progress snapshot bulk-applied bytes=73 shinesChanged=0
+[SMSOBB] hud-snap shine=0/0 blue=1/1 mode=1
+[SMSOBB] progress snapshot bulk-applied bytes=73 shinesChanged=0
+[SMSOBB] hud-snap shine=0/0 blue=1/1 mode=1
+[SMSOBB] progress snapshot bulk-applied bytes=73 shinesChanged=0
+[SMSOBB] red-coin co-op peer joined 窶・resume persist course=23/0
+[SMSOBB] hud-snap shine=0/0 blue=1/1 mode=1
+[SMSOBB] progress snapshot bulk-applied bytes=73 shinesChanged=0
+[SMSOBB] hud-snap shine=0/0 blue=1/1 mode=1
+[SMSOBB] progress snapshot bulk-applied bytes=73 shinesChanged=0
+[SMSOBB] red-coin co-op peer joined 窶・resume persist course=23/0
+[SMSOBB] red-coin snapshot ready count=2 mask=0x00 final=0
+[SMSOBB] red-coin snapshot ready count=2 mask=0x00 final=0
+[SMSOBB] monte-clean snapshot count=0 alreadyClear=0x0 mask=0x0
+[SMSOBB] monte-clean snapshot count=0 alreadyClear=0x0 mask=0x0
+[SMSOBB] npc-sync snapshot count=2
+[SMSOBB] npc-sync snapshot count=2
+[SMSOBB] red-coin collect i=1 mask=0x02 count=1
+[SMSOBB] red-coin apply i=1 mask=0x02 count=1 live=1 already=0 pos=1
+[SMSOBB] red-coin hide-by-index i=1 mask=0x02 count=1
+[SMSOBB] hud-snap shine=0/0 blue=1/1 mode=1
+[SMSOBB] progress snapshot bulk-applied bytes=108 shinesChanged=0
+[SMSOBB] red-coin apply i=1 mask=0x02 count=1 live=1 already=1 pos=1
+[SMSOBB] hud-snap shine=0/0 blue=1/1 mode=1
+[SMSOBB] progress snapshot bulk-applied bytes=108 shinesChanged=0

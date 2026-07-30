@@ -363,6 +363,59 @@ public class PacketTests
     }
 
     [Fact]
+    public void WorldProgressSnapshot_RoundTrip_PreservesBitsets()
+    {
+        var shineBits = new byte[WorldProgressSnapshot.ShineBitsByteCount];
+        WorldProgressSnapshot.SetShineBit(shineBits, 7);
+        WorldProgressSnapshot.SetShineBit(shineBits, 120);
+        WorldProgressSnapshot.SetShineBit(shineBits, 200);
+        WorldProgressSnapshot.SetShineBit(shineBits, 255);
+        var snapshot = new WorldProgressSnapshot
+        {
+            ProgressSeq = 99,
+            ShineBits = shineBits,
+            BlueCourses = new[] { ((byte)2, 1ul << 5) },
+            StoryFlags = new[] { (0x10384u, (byte)1) },
+            TriggerFlags = new[] { ((byte)1, (byte)0xFF, 0x50001u, (byte)1) },
+            SecretFlags = new[] { (0x10390u, (byte)1) },
+            RedStages = new[]
+            {
+                new WorldProgressSnapshot.RedStageMask(3, 4, 0x05,
+                    new uint[] { 0x111, 0, 0x222, 0, 0, 0, 0, 0 }),
+            },
+            NpcCleanStages = new[] { ((byte)8, (byte)5, (ushort)0x0008) },
+        };
+
+        var frame = PacketSerializer.BuildWorldProgressSnapshot(snapshot);
+        Assert.True(PacketSerializer.TryUnwrapTcp(frame, out var id, out var payload));
+        Assert.Equal(TcpPacketId.WorldProgressSnapshot, id);
+        Assert.True(PacketSerializer.TryReadWorldProgressSnapshot(payload, out var restored));
+        Assert.Equal(99u, restored.ProgressSeq);
+        Assert.Equal(WorldProgressSnapshot.FormatVersion, payload[0]);
+        Assert.Equal(WorldProgressSnapshot.ShineBitsByteCount, restored.ShineBits.Length);
+        Assert.True(WorldProgressSnapshot.TestBit(restored.ShineBits, 7));
+        Assert.True(WorldProgressSnapshot.TestBit(restored.ShineBits, 120));
+        Assert.True(WorldProgressSnapshot.TestBit(restored.ShineBits, 200));
+        Assert.True(WorldProgressSnapshot.TestBit(restored.ShineBits, 255));
+        Assert.Single(restored.BlueCourses);
+        Assert.Equal(2, restored.BlueCourses[0].CourseId);
+        Assert.Equal(1ul << 5, restored.BlueCourses[0].Mask);
+        Assert.Equal(0x10384u, restored.StoryFlags[0].FlagId);
+        Assert.Equal(0x50001u, restored.TriggerFlags[0].FlagId);
+        Assert.Equal((byte)0xFF, restored.TriggerFlags[0].EpisodeId);
+        Assert.Equal(0x05, restored.RedStages[0].Mask);
+        Assert.Equal(0x111u, restored.RedStages[0].PackedPos[0]);
+        Assert.Equal((ushort)0x0008, restored.NpcCleanStages[0].Mask);
+
+        var unchanged = PacketSerializer.BuildWorldProgressSnapshot(
+            WorldProgressSnapshot.CreateUnchanged(99));
+        Assert.True(PacketSerializer.TryUnwrapTcp(unchanged, out _, out var unchangedPayload));
+        Assert.True(PacketSerializer.TryReadWorldProgressSnapshot(unchangedPayload, out var u));
+        Assert.True(u.Unchanged);
+        Assert.Equal(99u, u.ProgressSeq);
+    }
+
+    [Fact]
     public void ClientTeleportSettings_RoundTrip()
     {
         var frame = PacketSerializer.BuildClientTeleportSettings(true);
@@ -465,6 +518,28 @@ public class PacketTests
     }
 
     [Fact]
+    public void JoinRequest_RoundTrip_PreservesGameProfileId()
+    {
+        var frame = PacketSerializer.BuildJoinRequest(
+            "Player1", "4ef21b6e", gameProfileId: (ushort)GameProfileId.MarioEclipse);
+        Assert.True(PacketSerializer.TryUnwrapTcp(frame, out _, out var payload));
+        Assert.True(PacketSerializer.TryReadJoinRequest(
+            payload, out _, out _, out var buildId, out var profileId));
+        Assert.Equal(ProtocolConstants.ModBuildId, buildId);
+        Assert.Equal((ushort)GameProfileId.MarioEclipse, profileId);
+    }
+
+    [Fact]
+    public void JoinRequest_DefaultProfile_IsVanilla()
+    {
+        var frame = PacketSerializer.BuildJoinRequest("Player1", null);
+        Assert.True(PacketSerializer.TryUnwrapTcp(frame, out _, out var payload));
+        Assert.True(PacketSerializer.TryReadJoinRequest(payload, out _, out _, out _, out var profileId));
+        Assert.Equal((ushort)GameProfileId.VanillaSms, profileId);
+        Assert.Equal(ProtocolConstants.CurrentGameProfileId, profileId);
+    }
+
+    [Fact]
     public void JoinRequest_LegacyPayloadWithoutBuildId_ReadsAsZero()
     {
         var legacy = new byte[16 + ProtocolConstants.MarioModelIdSize];
@@ -474,6 +549,35 @@ public class PacketTests
         Assert.Equal("Legacy", name);
         Assert.Equal("4ef21b6e", modelId);
         Assert.Equal((ushort)0, buildId);
+    }
+
+    [Fact]
+    public void Handshake_RoundTrip_PreservesModBuildId()
+    {
+        var frame = PacketSerializer.BuildHandshake(Guid.Parse("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"));
+        Assert.True(PacketSerializer.TryUnwrapTcp(frame, out var id, out var payload));
+        Assert.Equal(TcpPacketId.Handshake, id);
+        Assert.Equal(ProtocolConstants.HandshakePayloadSize, payload.Length);
+        Assert.True(PacketSerializer.TryReadHandshakeModBuildId(payload, out var buildId));
+        Assert.Equal(ProtocolConstants.ModBuildId, buildId);
+    }
+
+    [Fact]
+    public void HandshakeAck_RoundTrip_PreservesSlotAndServerBuild()
+    {
+        var frame = PacketSerializer.BuildHandshakeAck(3);
+        Assert.True(PacketSerializer.TryUnwrapTcp(frame, out var id, out var payload));
+        Assert.Equal(TcpPacketId.HandshakeAck, id);
+        Assert.True(PacketSerializer.TryReadHandshakeAck(payload, out var slot, out var serverBuild));
+        Assert.Equal((byte)3, slot);
+        Assert.Equal(ProtocolConstants.ModBuildId, serverBuild);
+    }
+
+    [Fact]
+    public void Handshake_LegacyGuidOnly_HasNoModBuildId()
+    {
+        var legacy = Guid.NewGuid().ToByteArray();
+        Assert.False(PacketSerializer.TryReadHandshakeModBuildId(legacy, out _));
     }
 
     [Fact]

@@ -49,7 +49,7 @@ Retail fields replicated on remotes:
 | `findTarget()` | **No** | Scans `mCollisions[]` for grabbables |
 | `thinkUpper()` / `emitTongue()` | **No** | Local-input tongue emit loop |
 
-After `TYoshi::initInLoadAfter()`, remote puppet tongues are **removed from 敵グループ** so retail collision/movement paths never run on network bodies.
+After `TYoshi::initInLoadAfter()`, remote puppet tongues are **removed from 敵グループ** so retail collision/movement paths never run on network bodies. The group name must be the retail **Shift-JIS** byte sequence (`\x93\x47\x83\x4F\x83\x8B\x81\x5B\x83\x76`) — a UTF-8 source literal silently fails the name lookup, leaves tongues on the enemy perform list, and crashes inconsistently once **two or more** remotes are mounted.
 
 ## Fruit eating
 
@@ -60,10 +60,10 @@ After `TYoshi::initInLoadAfter()`, remote puppet tongues are **removed from 敵�
 ## Remote apply (`yoshi_sync.cpp` + `remote_actor.cpp`)
 
 1. **Before** `syncRemoteAnimation`: mount puppet via `TYoshi::MOUNTED` + `setBckFromIndex`/`thinkBtp` (no `ride()` — avoids BGM/voice side effects).
-2. `initInLoadAfter()` once per slot on first mount; then remove puppet tongue from 敵グループ.
+2. `initInLoadAfter()` is **never** called on network puppets (see multi-Yoshi invisible fix below). Remotes settle `stageInitDone` after a one-shot tongue enemy-group scrub; riding meshes already exist from `TYoshi::init`.
 3. Each frame: sync juice, color (`thinkBtp` matches current BCK), translation, host Yoshi BCK frame (`pingMs >> 8`).
-4. **Mounted calc subset** of `TYoshi::calcAnim`: mirror rig + tongue `calcAnim` (no `thinkUpper`).
-5. **Draw**: retail `TYoshi::entry` for tev/color + tongue `entry`; tongue `viewCalc` in view pass.
+4. **Mounted calc subset** of `TYoshi::calcAnim`: mirror rig + tongue `calcAnim`; staged `thinkUpper` only while spray/tongue needs mouth open (plus one closing frame). LOD-skip body frames still run this Yoshi subset so crowd demotion cannot detach riders.
+5. **Draw**: retail `TYoshi::entry` for tev/color + tongue when the mirror+tongue rig is ready; tongue `viewCalc` in view pass. (BindShadow circle requests from entry are acceptable once remotes stop allocating `TMirrorActor` heaps.)
 6. While host sprays juice: staged FLUDD nozzle pressure from `pingMs` high byte.
 7. Dismount: reset companion to `STATE_EGG`.
 8. `syncRemoteAnimAux` uses `unpackYoshiTongueHand` while `onYoshi()`.
@@ -75,4 +75,24 @@ Remote clients crashed because `syncRemoteAnimation` ran **before** Yoshi mount 
 
 Fix: reorder apply so Yoshi mount precedes animation sync; fallback to `ANIMATION_IDLE` if mount is not ready.
 
-Sources: doldecomp `Yoshi.cpp`, `Tongue.cpp`, BSE `stage.cpp`, SMSO `remote_actor.cpp`, `yoshi_sync.cpp`, `world_sync.cpp`.
+## Crash fix (2026-07-24) — multi-mounted remotes
+
+Having **two or more** remotes on real Yoshi crashed some clients inconsistently:
+
+1. **Enemy-group tongue remove used a UTF-8 `敵グループ` literal** while retail name refs are Shift-JIS. `initInLoadAfter` (DOL) still pushed tongues onto the group; our remove never found it. One puppet tongue on retail `movement`/`findTarget` sometimes survived; two+ amplified stage mutation / UAF.
+2. **`HoldRemotePublishMaxDuration` could release on the first Active tick** after a long load (timer armed at stage exit, Loading skipped the ceiling check, then MaxDuration fired without Active grace) — remounting Connected remotes into a half-settled stage while mounted Yoshi called `initInLoadAfter`.
+
+Fixes: Shift-JIS enemy-group bytes (same pattern as `kPlayerGroupName`); remove-all duplicate tongue entries; settle `stageInitDone` only after a successful remove; never re-call `initInLoadAfter` on remove retry; MaxDuration only stops Loading from wiping Active grace (never skip grace); draw/`entry` gated on a complete mirror+tongue rig.
+
+## Invisible fix (2026-07-26) — 5+ remotes on Yoshi
+
+**Symptom:** Around five concurrent Yoshi riders, Mario and Yoshi meshes vanished (often noticed first on the host).
+
+**Root cause:** Remote mount called retail `TYoshi::initInLoadAfter()`, which allocates **five `TMirrorActor`s per Yoshi** (body + 2 hands + tongue + tip), each creating a second `J3DModel` and pushing into `鏡シーン`. Five riders ≈ 25 mirror models — stage/mirror heap pressure corrupts or stalls the shared J3D draw path so `entryModels` / Yoshi packets drop for everyone on that client (host has local + all remotes, so it hits the cliff first).
+
+**Fix:**
+1. Remotes **never** call `initInLoadAfter` (meshes already from `TYoshi::init`; no mirror reflections for puppets; tongue never joins `敵グループ`).
+2. LOD-skip frames still run `calcRemoteYoshiAnim` while mounted so crowd budget demotion cannot detach riders.
+3. Juice draw-gate hardened so packed juice cannot land in retail's blink-hide windows.
+
+Sources: doldecomp `Yoshi.cpp`, `Tongue.cpp`, `MirrorActor.cpp`, BSE `stage.cpp`, SMSO `remote_actor.cpp`, `yoshi_sync.cpp`, `world_sync.cpp`.

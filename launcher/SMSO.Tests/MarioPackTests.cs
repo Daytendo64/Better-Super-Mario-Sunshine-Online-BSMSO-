@@ -1057,6 +1057,89 @@ public class MarioPackTests
     }
 
     [Fact]
+    public void SeedBundledModels_WithoutLibraryJson_SkipsDisplayNamedPacksAndWarns()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "bsmso-seed-nolibrary-" + Guid.NewGuid().ToString("N"));
+        var bundled = Path.Combine(root, "bundled");
+        var library = Path.Combine(root, "library");
+        Directory.CreateDirectory(bundled);
+        Directory.CreateDirectory(library);
+        var previous = ModelLibrary.LibraryDirectoryOverride;
+        try
+        {
+            ModelLibrary.LibraryDirectoryOverride = library;
+            File.WriteAllBytes(Path.Combine(bundled, "Luigi.arc"), new byte[] { 1, 2, 3, 4 });
+
+            var logs = new List<string>();
+            var updated = ModelLibrary.SeedBundledModelsFrom(bundled, logs.Add);
+            Assert.Equal(0, updated);
+            Assert.False(File.Exists(Path.Combine(library, "Luigi.arc")));
+            Assert.Contains(logs, line => line.Contains("library.json", StringComparison.OrdinalIgnoreCase));
+            Assert.Contains(logs, line => line.Contains("Skipped", StringComparison.OrdinalIgnoreCase));
+        }
+        finally
+        {
+            ModelLibrary.LibraryDirectoryOverride = previous;
+            try { Directory.Delete(root, recursive: true); } catch { /* best-effort */ }
+        }
+    }
+
+    [Fact]
+    public void EnsureAllLibraryPacksPresentDetailed_ReportsCompleteAfterInstall()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "bsmso-pack-sync-" + Guid.NewGuid().ToString("N"));
+        var library = Path.Combine(root, "library");
+        var game = Path.Combine(root, "game");
+        Directory.CreateDirectory(library);
+        Directory.CreateDirectory(Path.Combine(game, "files"));
+        Directory.CreateDirectory(Path.Combine(game, "sys"));
+        var previous = ModelLibrary.LibraryDirectoryOverride;
+        try
+        {
+            ModelLibrary.LibraryDirectoryOverride = library;
+            const string id = "11223344";
+            File.WriteAllText(Path.Combine(library, ModelLibrary.LibraryFileName),
+                """{"11223344":"Sync Test"}""");
+            File.WriteAllBytes(Path.Combine(library, "Sync Test.arc"), BuildInitSafePack(3));
+
+            var result = MarioPackInstaller.EnsureAllLibraryPacksPresentDetailed(game);
+            Assert.Equal(1, result.LibraryPackCount);
+            Assert.Equal(1, result.NewlyInstalled);
+            Assert.Equal(0, result.MissingAfterSync);
+            Assert.True(result.IsComplete);
+            Assert.False(result.HasWarning);
+            Assert.True(File.Exists(MarioPackInstaller.GetInstalledPackPath(game, id)));
+
+            var second = MarioPackInstaller.EnsureAllLibraryPacksPresentDetailed(game);
+            Assert.Equal(0, second.NewlyInstalled);
+            Assert.Equal(0, second.MissingAfterSync);
+            Assert.True(second.IsComplete);
+        }
+        finally
+        {
+            ModelLibrary.LibraryDirectoryOverride = previous;
+            try { Directory.Delete(root, recursive: true); } catch { /* best-effort */ }
+        }
+    }
+
+    [Fact]
+    public void AppendPackSyncMessage_SurfacesWarningWhenPacksIncomplete()
+    {
+        var incomplete = new LibraryPackSyncResult(
+            LibraryPackCount: 2,
+            NewlyInstalled: 0,
+            AlreadyPresent: 0,
+            MissingAfterSync: 2,
+            SkippedUnsafe: 0,
+            DeferredBecauseDolphin: false,
+            BundledSourceAvailable: true,
+            Summary: "WARNING: Only 0/2 custom model pack(s) present.");
+        var message = ModuleInstaller.AppendPackSyncMessage("Installed OK", incomplete);
+        Assert.Contains("WARNING — custom Mario packs incomplete", message, StringComparison.Ordinal);
+        Assert.Contains("0/2", message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void InstallPacksIntoGameRoot_UsesRevisionStampAndAtomicReplacement()
     {
         var root = Path.Combine(Path.GetTempPath(), "bsmso-install-cache-" + Guid.NewGuid().ToString("N"));
@@ -1065,9 +1148,11 @@ public class MarioPackTests
         Directory.CreateDirectory(library);
         Directory.CreateDirectory(game);
         var previous = ModelLibrary.LibraryDirectoryOverride;
+        var previousProbe = MarioPackInstaller.DolphinRunningProbeOverride;
         try
         {
             ModelLibrary.LibraryDirectoryOverride = library;
+            MarioPackInstaller.DolphinRunningProbeOverride = () => false;
             const string id = "11223344";
             File.WriteAllText(Path.Combine(library, ModelLibrary.LibraryFileName),
                 """{"11223344":"Install Test"}""");
@@ -1106,6 +1191,7 @@ public class MarioPackTests
         finally
         {
             ModelLibrary.LibraryDirectoryOverride = previous;
+            MarioPackInstaller.DolphinRunningProbeOverride = previousProbe;
             try { Directory.Delete(root, recursive: true); } catch { /* best-effort */ }
         }
     }

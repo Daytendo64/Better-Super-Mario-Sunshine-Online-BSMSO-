@@ -9,6 +9,7 @@ using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
 using SMSO.Net;
+using SMSO.Net.MarioPack;
 
 namespace SMSO.Launcher;
 
@@ -63,6 +64,12 @@ internal static class ModuleInstaller
         Timeout = TimeSpan.FromMinutes(2),
     };
 
+    /// <summary>
+    /// Cross-process gate so two launcher instances cannot partially overwrite the same
+    /// extracted tree / disc image mid-Install (partial Kuribo trees black-screen boot).
+    /// </summary>
+    private static readonly Mutex InstallMutex = new(false, @"Local\BSMSO.ModuleInstall");
+
     public static ModuleInstallStatus GetInstallStatus(string isoPath)
     {
         if (string.IsNullOrWhiteSpace(isoPath))
@@ -77,6 +84,39 @@ internal static class ModuleInstaller
 
         var trimmed = isoPath.Trim().Trim('"');
         var kind = ModuleInstallValidator.ClassifyInstallTarget(trimmed);
+        var profile = GameProfileDetector.Detect(trimmed);
+
+        if (profile.IsEclipse)
+        {
+            if (kind == ModuleInstallTargetKind.CompressedDiscImage)
+            {
+                return new ModuleInstallStatus
+                {
+                    CanInstall = false,
+                    TargetKind = kind,
+                    DiscImagePath = trimmed,
+                    Message = "Compressed .gcz is not supported.\nConvert to .iso/.gcm, or set Game ISO to an extracted folder.",
+                };
+            }
+
+            string? eclipseRoot = null;
+            if (kind == ModuleInstallTargetKind.ExtractedFolder &&
+                ModuleInstallValidator.TryResolveGameRoot(trimmed, out var resolvedRoot))
+            {
+                eclipseRoot = resolvedRoot;
+            }
+            else if (kind == ModuleInstallTargetKind.DiscImage &&
+                     ModuleInstallValidator.TryResolveGameRoot(trimmed, out var siblingRoot))
+            {
+                eclipseRoot = siblingRoot;
+            }
+
+            return GetEclipseInstallStatus(
+                kind,
+                kind == ModuleInstallTargetKind.DiscImage ? trimmed : null,
+                profile,
+                eclipseRoot);
+        }
 
         if (kind == ModuleInstallTargetKind.CompressedDiscImage)
         {
@@ -107,7 +147,8 @@ internal static class ModuleInstaller
             else if (discHasModule)
             {
                 discMessage =
-                    $"BSE / Kuribo modules present in disc image (build {ProtocolConstants.ModBuildId}):\n{fullDisc}\n" +
+                    ModuleVersionMessages.EverythingUpToDateReadyToPlayWithBuild(ProtocolConstants.ModBuildId) +
+                    $"\nBSE / Kuribo modules present in disc image:\n{fullDisc}\n" +
                     "Re-run Install / patch modules to rewrite the image if needed.";
             }
             else
@@ -172,51 +213,250 @@ internal static class ModuleInstaller
         };
     }
 
-    public static async Task<(bool Success, string Message)> InstallAsync(
+    private static ModuleInstallStatus GetEclipseInstallStatus(
+        ModuleInstallTargetKind kind,
+        string? discImagePath,
+        GameProfile profile,
+        string? gameRoot)
+    {
+        var bsmsInstalled = false;
+        var needsUpdate = false;
+        BseRuntimeProbe? probe = null;
+        if (gameRoot != null)
+        {
+            probe = ModuleInstallValidator.ProbeBseRuntime(gameRoot);
+            if (probe.ModsDirectoryExists)
+                RemoveLegacyModsFolderMarker(probe.ModsDirectory);
+            bsmsInstalled = probe.BsmsInstalled;
+            needsUpdate = bsmsInstalled && IsExtractedModuleStale(probe);
+        }
+        else if (discImagePath != null &&
+                 ModuleInstallValidator.TryResolveGameRoot(discImagePath, out var sibling) &&
+                 sibling != null)
+        {
+            probe = ModuleInstallValidator.ProbeBseRuntime(sibling);
+            bsmsInstalled = probe.BsmsInstalled;
+            needsUpdate = bsmsInstalled && IsExtractedModuleStale(probe);
+        }
+
+        var blocked = profile.BlockingIssues.Count > 0;
+        var message = profile.StatusMessage;
+        if (!blocked)
+        {
+            if (needsUpdate)
+                message = ModuleVersionMessages.UpdateRequired + "\n" + (gameRoot ?? discImagePath ?? "") +
+                          "\n\n" + profile.StatusMessage;
+            else if (bsmsInstalled)
+                message = ModuleVersionMessages.EverythingUpToDateReadyToPlayWithBuild(ProtocolConstants.ModBuildId) +
+                          "\n\n" + profile.StatusMessage;
+        }
+
+        return new ModuleInstallStatus
+        {
+            CanInstall = !blocked,
+            TargetKind = kind,
+            ModsDirectoryExists = probe?.ModsDirectoryExists ?? false,
+            ModsDirectory = probe?.ModsDirectory,
+            GameRoot = gameRoot,
+            DiscImagePath = discImagePath,
+            KuriboKernelInstalled = probe?.KuriboKernelInstalled ?? false,
+            MainDolInstalled = probe?.MainDolInstalled ?? false,
+            BootBinInstalled = probe?.BootBinInstalled ?? false,
+            BseInstalled = probe?.BseInstalled ?? false,
+            MovesetInstalled = probe?.MovesetInstalled ?? false,
+            BsmsInstalled = bsmsInstalled,
+            IsComplete = bsmsInstalled && !needsUpdate && !blocked,
+            NeedsUpdate = needsUpdate,
+            Message = message,
+        };
+    }
+
+    public static async Task<(bool Success, string Message, bool ModelsWarning)> InstallAsync(
         string isoPath,
         Action<string>? progress = null,
         Action<string>? log = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        bool patchBseMoveset = false,
+        Func<string, bool, Task<(string Message, bool ModelsWarning)>>? postInstallUnderLock = null,
+        string? discOutputPath = null)
+    {
+        var locked = false;
+        try
+        {
+            try
+            {
+                locked = InstallMutex.WaitOne(TimeSpan.FromSeconds(0));
+            }
+            catch (AbandonedMutexException)
+            {
+                locked = true;
+            }
+
+            if (!locked)
+            {
+                return (false,
+                    "Another BSMSO Install / patch is already running on this PC.\n" +
+                    "Wait for it to finish, then retry — parallel installs can leave a partial Kuribo tree that black-screens boot.",
+                    false);
+            }
+
+            var result = await InstallAsyncCore(
+                    isoPath, progress, log, cancellationToken, patchBseMoveset, discOutputPath)
+                .ConfigureAwait(false);
+
+            // Keep the mutex through optional UI post-pass (kxe sync / pack retry) so a
+            // second launcher cannot patch the same tree mid-follow-up.
+            if (result.Success && postInstallUnderLock != null)
+            {
+                try
+                {
+                    var post = await postInstallUnderLock(result.Message, result.ModelsWarning)
+                        .ConfigureAwait(false);
+                    result = (true, post.Message, post.ModelsWarning);
+                }
+                catch (Exception ex)
+                {
+                    log?.Invoke($"WARNING: Post-Install pack/sync step failed: {ex.Message}");
+                    result = (true,
+                        result.Message +
+                        "\n\nWARNING — post-Install model/disc sync failed:\n" +
+                        ex.Message +
+                        "\nRe-run Install / patch modules with Dolphin closed.",
+                        true);
+                }
+            }
+
+            return result;
+        }
+        finally
+        {
+            if (locked)
+            {
+                try { InstallMutex.ReleaseMutex(); }
+                catch (ApplicationException) { /* not owned */ }
+            }
+        }
+    }
+
+    private static async Task<(bool Success, string Message, bool ModelsWarning)> InstallAsyncCore(
+        string isoPath,
+        Action<string>? progress,
+        Action<string>? log,
+        CancellationToken cancellationToken,
+        bool patchBseMoveset,
+        string? discOutputPath = null)
     {
         var status = GetInstallStatus(isoPath);
         if (!status.CanInstall)
-            return (false, status.Message);
+            return (false, status.Message, false);
+
+        var profile = GameProfileDetector.Detect(isoPath);
+        if (profile.IsEclipse)
+        {
+            return await Task.Run(
+                    () => InstallEclipseAdditive(status, profile, patchBseMoveset, progress, log),
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
 
         if (!TryFindSourceModule(ModuleVersionMessages.ModuleFileName, out var bsmsSource) || bsmsSource == null)
         {
             return (false,
                 $"{ModuleVersionMessages.ModuleFileName} not found next to the launcher or in dist\\. " +
-                "Place it beside BSMSO.Launcher.exe, or build with tools\\build.ps1.");
+                "Place it beside BSMSO.Launcher.exe (ships in the release zip), or build with tools\\build.ps1.",
+                false);
         }
 
-        if (!TryFindSourceModule(ModuleVersionMessages.MovesetModuleFileName, out var movesetSource) ||
-            movesetSource == null)
+        var launcherDir = GetLauncherExecutableDirectory();
+        var bsmsBesideLauncher = !string.IsNullOrWhiteSpace(launcherDir) &&
+            string.Equals(
+                Path.GetDirectoryName(Path.GetFullPath(bsmsSource)),
+                launcherDir,
+                StringComparison.OrdinalIgnoreCase);
+        if (!bsmsBesideLauncher)
         {
-            return (false,
-                $"{ModuleVersionMessages.MovesetModuleFileName} not found next to the launcher or in dist\\. " +
-                "Place it beside BSMSO.Launcher.exe (ships in the release zip).");
+            log?.Invoke(
+                $"WARNING: {ModuleVersionMessages.ModuleFileName} is not beside the launcher — " +
+                $"using {bsmsSource}. For reliable Update module, keep _BSMSO.kxe next to BSMSO.Launcher.exe.");
         }
+        else
+        {
+            log?.Invoke($"Using {ModuleVersionMessages.ModuleFileName}: {bsmsSource}");
+        }
+
+        string? movesetSource = null;
+        if (patchBseMoveset)
+        {
+            if (!TryFindSourceModule(ModuleVersionMessages.MovesetModuleFileName, out movesetSource) ||
+                movesetSource == null)
+            {
+                return (false,
+                    $"{ModuleVersionMessages.MovesetModuleFileName} not found next to the launcher or in dist\\. " +
+                    "Place it beside BSMSO.Launcher.exe (ships in the release zip), or turn off Patch BSE moveset.",
+                    false);
+            }
+
+            var movesetSize = new FileInfo(movesetSource).Length;
+            if (movesetSize != OfficialMovesetSizeBytes)
+            {
+                return (false,
+                    $"{ModuleVersionMessages.MovesetModuleFileName} is {movesetSize} bytes " +
+                    $"(expected {OfficialMovesetSizeBytes}). " +
+                    "Wrong/corrupt Moveset black-screens boot after Kuribo loads BSE. " +
+                    "Restore the release-zip Moveset or turn off Patch BSE moveset.",
+                    false);
+            }
+        }
+
+        // Seed AppData from release CustomModels/ BEFORE any disc/game pack copy.
+        // Open-time seed alone is not enough: first Install must not race an empty library.
+        progress?.Invoke("Seeding custom Mario library…");
+        ModelLibrary.SeedBundledModels(log);
 
         progress?.Invoke("Preparing Better Sunshine Engine…");
         log?.Invoke("Ensuring official BetterSunshineEngine v4.0.0 runtime payload (Kuribo!, main.dol, boot.bin)…");
         var ensure = await EnsureOfficialBsePayloadCachedAsync(log, cancellationToken).ConfigureAwait(false);
         if (!ensure.Success || ensure.Payload == null)
-            return (false, ensure.Message);
+            return (false, ensure.Message, false);
 
         var payload = ensure.Payload;
         string bseSource = payload.BseKxePath;
         if (TryFindSourceModule(ModuleVersionMessages.BseModuleFileName, out var localBse) && localBse != null)
         {
-            // Prefer a local .kxe beside the launcher/dist, but still install Kuribo + DOL from the official payload.
-            bseSource = localBse;
-            log?.Invoke($"Using local {ModuleVersionMessages.BseModuleFileName}: {bseSource}");
+            var localSize = new FileInfo(localBse).Length;
+            if (localSize == OfficialBseSizeBytes)
+            {
+                // Prefer a local release-size .kxe beside the launcher/dist.
+                bseSource = localBse;
+                log?.Invoke($"Using local {ModuleVersionMessages.BseModuleFileName}: {bseSource}");
+            }
+            else
+            {
+                // DEBUG/dev BSE (e.g. 603424) black-screens; never install it.
+                log?.Invoke(
+                    $"Ignoring local {ModuleVersionMessages.BseModuleFileName} ({localSize} bytes) — " +
+                    $"expected release size {OfficialBseSizeBytes}; using official payload.");
+            }
         }
         else
         {
             log?.Invoke($"Using official {ModuleVersionMessages.BseModuleFileName}: {bseSource}");
         }
 
-        log?.Invoke($"Using {ModuleVersionMessages.MovesetModuleFileName}: {movesetSource}");
+        var bseSourceSize = new FileInfo(bseSource).Length;
+        if (bseSourceSize != OfficialBseSizeBytes)
+        {
+            return (false,
+                $"{ModuleVersionMessages.BseModuleFileName} source is {bseSourceSize} bytes " +
+                $"(expected {OfficialBseSizeBytes}). " +
+                "DEBUG/dev BSE black-screens boot. Re-download the official v4.0.0 release payload.",
+                false);
+        }
+
+        if (patchBseMoveset)
+            log?.Invoke($"Using {ModuleVersionMessages.MovesetModuleFileName}: {movesetSource}");
+        else
+            log?.Invoke($"Skipping {ModuleVersionMessages.MovesetModuleFileName} (Patch BSE moveset off).");
 
         if (status.TargetKind == ModuleInstallTargetKind.DiscImage)
         {
@@ -229,12 +469,14 @@ internal static class ModuleInstaller
                     bsmsSource,
                     progress,
                     log,
-                    cancellationToken)
+                    cancellationToken,
+                    patchBseMoveset,
+                    discOutputPath)
                 .ConfigureAwait(false);
         }
 
         if (string.IsNullOrWhiteSpace(status.GameRoot))
-            return (false, status.Message);
+            return (false, status.Message, false);
 
         var gameRoot = status.GameRoot;
         progress?.Invoke("Installing BSE runtime…");
@@ -245,27 +487,182 @@ internal static class ModuleInstaller
             movesetSource,
             bsmsSource,
             patchGameId: true,
-            log);
+            log,
+            patchBseMoveset);
         if (!install.Success)
-            return install;
+            return (install.Success, install.Message, false);
 
         // Drop leftover shared icon.png banners so other Dolphin games in the same folder
         // don't pick up BSMSO art (Launch Dolphin also does this).
         DolphinConfigService.EnsureBsmsGameBanner(gameRoot, log, out _);
 
+        progress?.Invoke("Installing disc data overlays…");
+        DiscDataInstaller.EnsureBundledDiscDataPresent(gameRoot, log);
+
         progress?.Invoke("Installing custom Mario packs…");
-        MarioPackInstaller.EnsureAllLibraryPacksPresent(gameRoot, log);
+        var packSync = MarioPackInstaller.EnsureAllLibraryPacksPresentDetailed(gameRoot, log);
+
+        // Release BSMSO only dropped BetterSunshineMoveset.kxe — it never injected
+        // better_movement.prm. That PRM raises gravity/jump multipliers (~1.04×+) and is
+        // what made Moveset-ON feel heavier than the release build. Always strip it;
+        // Moveset.kxe alone keeps 1.0 multipliers (release-matching jump feel).
+        progress?.Invoke("Ensuring release-matching movement params…");
+        MarioPackInstaller.RemoveBetterMovementPrm(gameRoot, log);
 
         var probe = ModuleInstallValidator.ProbeBseRuntime(gameRoot);
-        return (true,
+        var sizeCheck = ModuleInstallValidator.ValidateInstalledRuntimeSizes(probe, patchBseMoveset);
+        if (sizeCheck != null)
+            return (false, sizeCheck, packSync.HasWarning);
+
+        var movesetLine = probe.MovesetInstalled && probe.MovesetPath != null
+            ? $"{ModuleVersionMessages.MovesetModuleFileName} ({new FileInfo(probe.MovesetPath).Length} bytes)\n"
+            : $"{ModuleVersionMessages.MovesetModuleFileName}: skipped\n";
+        var message =
             $"Installed BSE / Kuribo runtime into:\n{gameRoot}\n\n" +
             $"KuriboKernel.bin ({new FileInfo(probe.KernelPath!).Length} bytes)\n" +
             $"sys\\main.dol ({new FileInfo(probe.MainDolPath!).Length} bytes)\n" +
             $"sys\\boot.bin ({new FileInfo(probe.BootBinPath!).Length} bytes) → {GameIdentity.BsmsGameId}\n" +
             $"{ModuleVersionMessages.BseModuleFileName} ({new FileInfo(probe.BsePath!).Length} bytes)\n" +
-            $"{ModuleVersionMessages.MovesetModuleFileName} ({new FileInfo(probe.MovesetPath!).Length} bytes)\n" +
+            movesetLine +
             $"{ModuleVersionMessages.ModuleFileName} ({new FileInfo(probe.BsmsPath!).Length} bytes)\n\n" +
-            "Restart Dolphin to load the updated modules.");
+            "Restart Dolphin to load the updated modules.";
+        message = AppendPackSyncMessage(message, packSync);
+        return (true, message, packSync.HasWarning);
+    }
+
+    internal static string AppendPackSyncMessage(string message, LibraryPackSyncResult packs)
+    {
+        if (packs.LibraryPackCount == 0 && !packs.BundledSourceAvailable)
+        {
+            return message +
+                   "\n\nCustom Mario packs: none in AppData library (retail Mario only).";
+        }
+
+        if (packs.HasWarning)
+        {
+            return message +
+                   "\n\nWARNING — custom Mario packs incomplete:\n" +
+                   packs.Summary +
+                   "\n\nClose Dolphin if it is open, confirm CustomModels\\library.json ships beside the launcher, " +
+                   "then re-run Install / patch modules.";
+        }
+
+        return message + "\n\nCustom Mario packs: " + packs.Summary;
+    }
+
+    /// <summary>
+    /// Eclipse support (Phase 0): additive-only install. Drops <c>_BSMSO.kxe</c> next to
+    /// Eclipse's own Kuribo modules and syncs Mario packs — never replaces Eclipse's BSE,
+    /// Moveset, main.dol, boot.bin, or game id. Disc images are backed up first.
+    /// </summary>
+    internal static (bool Success, string Message, bool ModelsWarning) InstallEclipseAdditive(
+        ModuleInstallStatus status,
+        GameProfile profile,
+        bool patchBseMoveset,
+        Action<string>? progress,
+        Action<string>? log)
+    {
+        if (profile.BlockingIssues.Count > 0)
+            return (false, profile.StatusMessage, false);
+
+        if (!TryFindSourceModule(ModuleVersionMessages.ModuleFileName, out var bsmsSource) || bsmsSource == null)
+        {
+            return (false,
+                $"{ModuleVersionMessages.ModuleFileName} not found next to the launcher or in dist\\. " +
+                "Place it beside BSMSO.Launcher.exe (ships in the release zip), or build with tools\\build.ps1.",
+                false);
+        }
+
+        if (patchBseMoveset)
+        {
+            log?.Invoke(
+                "Patch BSE moveset is ON but Eclipse ships its own Moveset — BSMSO will NOT replace it. " +
+                "The toggle only applies to vanilla installs.");
+        }
+
+        progress?.Invoke("Seeding custom Mario library…");
+        ModelLibrary.SeedBundledModels(log);
+
+        string? gameRoot = status.GameRoot;
+        if (gameRoot == null && status.DiscImagePath != null &&
+            ModuleInstallValidator.TryResolveGameRoot(status.DiscImagePath, out var sibling))
+        {
+            gameRoot = sibling;
+        }
+
+        if (gameRoot == null || !Directory.Exists(gameRoot))
+        {
+            if (status.DiscImagePath == null)
+                return (false, "Could not resolve an extracted Eclipse game root for the additive install.", false);
+
+            // Disc image with no sibling extract: back up, extract, add modules, rebuild.
+            return PatchEclipseDiscImage(status.DiscImagePath, bsmsSource, progress, log);
+        }
+
+        var modsDir = Path.Combine(gameRoot, "files", "Kuribo!", "Mods");
+        Directory.CreateDirectory(modsDir);
+
+        progress?.Invoke("Installing BSMSO online module (additive)…");
+        var bsmsDest = Path.Combine(modsDir, ModuleVersionMessages.ModuleFileName);
+        File.Copy(bsmsSource, bsmsDest, overwrite: true);
+        log?.Invoke(
+            $"Installed {ModuleVersionMessages.ModuleFileName} ({new FileInfo(bsmsDest).Length} bytes) → {bsmsDest} " +
+            "(Eclipse BSE / Moveset / main.dol / boot.bin untouched)");
+
+        if (!FilesMatch(bsmsSource, bsmsDest))
+        {
+            return (false,
+                $"{ModuleVersionMessages.ModuleFileName} copy verification failed.\n" +
+                $"Source:\n{bsmsSource}\nDest:\n{bsmsDest}",
+                false);
+        }
+
+        progress?.Invoke("Installing custom Mario packs…");
+        var packSync = MarioPackInstaller.EnsureAllLibraryPacksPresentDetailed(gameRoot, log);
+
+        WriteModBuildIdMarker(modsDir, log);
+
+        var message =
+            $"Installed BSMSO online support into Super Mario Eclipse (additive):\n{gameRoot}\n\n" +
+            $"{ModuleVersionMessages.ModuleFileName} ({new FileInfo(bsmsDest).Length} bytes)\n" +
+            "Untouched: BetterSunshineEngine.kxe, BetterSunshineMoveset.kxe, SuperMarioEclipse.kxe, sys\\main.dol, sys\\boot.bin.\n\n" +
+            "Restart Dolphin to load the updated modules.";
+        message = AppendPackSyncMessage(message, packSync);
+        return (true, message, packSync.HasWarning);
+    }
+
+    private static (bool Success, string Message, bool ModelsWarning) PatchEclipseDiscImage(
+        string discImagePath,
+        string bsmsSource,
+        Action<string>? progress,
+        Action<string>? log)
+    {
+        var fullDiscPath = Path.GetFullPath(discImagePath.Trim().Trim('"'));
+        var backupPath = fullDiscPath + ".bsmso-backup";
+        try
+        {
+            if (!File.Exists(backupPath))
+            {
+                progress?.Invoke("Backing up Eclipse disc image…");
+                File.Copy(fullDiscPath, backupPath);
+                log?.Invoke($"Backup: {backupPath}");
+            }
+            else
+            {
+                log?.Invoke($"Backup already exists (kept): {backupPath}");
+            }
+        }
+        catch (Exception ex)
+        {
+            return (false, $"Could not back up the Eclipse disc image — refusing to patch without a backup.\n{ex.Message}", false);
+        }
+
+        return DiscImagePatcher.PatchEclipseAdditiveAsync(
+            fullDiscPath,
+            bsmsSource,
+            progress,
+            log,
+            CancellationToken.None).GetAwaiter().GetResult();
     }
 
     /// <summary>
@@ -277,10 +674,11 @@ internal static class ModuleInstaller
         string gameRoot,
         OfficialBsePayload payload,
         string bseSource,
-        string movesetSource,
+        string? movesetSource,
         string bsmsSource,
         bool patchGameId,
-        Action<string>? log = null)
+        Action<string>? log = null,
+        bool patchBseMoveset = false)
     {
         if (string.IsNullOrWhiteSpace(gameRoot) || !Directory.Exists(gameRoot))
             return (false, $"Game root not found:\n{gameRoot}");
@@ -322,17 +720,48 @@ internal static class ModuleInstaller
             if (!bseCopy.Success)
                 return bseCopy;
 
-            File.Copy(movesetSource, Path.Combine(modsDest, ModuleVersionMessages.MovesetModuleFileName),
-                overwrite: true);
-            log?.Invoke(
-                $"Installed {ModuleVersionMessages.MovesetModuleFileName} " +
-                $"({new FileInfo(movesetSource).Length} bytes) → " +
-                $"{Path.Combine(modsDest, ModuleVersionMessages.MovesetModuleFileName)}");
+            var movesetDest = Path.Combine(modsDest, ModuleVersionMessages.MovesetModuleFileName);
+            if (patchBseMoveset)
+            {
+                if (string.IsNullOrWhiteSpace(movesetSource) || !File.Exists(movesetSource))
+                {
+                    return (false,
+                        $"{ModuleVersionMessages.MovesetModuleFileName} source missing for moveset install.");
+                }
+
+                var movesetSourceSize = new FileInfo(movesetSource).Length;
+                if (movesetSourceSize != OfficialMovesetSizeBytes)
+                {
+                    return (false,
+                        $"Refusing to install {ModuleVersionMessages.MovesetModuleFileName} " +
+                        $"({movesetSourceSize} bytes; expected {OfficialMovesetSizeBytes}). " +
+                        "Wrong/corrupt Moveset black-screens boot after BSE loads.");
+                }
+
+                File.Copy(movesetSource, movesetDest, overwrite: true);
+                log?.Invoke(
+                    $"Installed {ModuleVersionMessages.MovesetModuleFileName} " +
+                    $"({new FileInfo(movesetSource).Length} bytes) → {movesetDest}");
+            }
+            else if (File.Exists(movesetDest))
+            {
+                File.Delete(movesetDest);
+                log?.Invoke($"Removed {ModuleVersionMessages.MovesetModuleFileName} (Patch BSE moveset off).");
+            }
 
             File.Copy(bsmsSource, Path.Combine(modsDest, ModuleVersionMessages.ModuleFileName), overwrite: true);
             log?.Invoke(
                 $"Installed {ModuleVersionMessages.ModuleFileName} " +
-                $"({new FileInfo(bsmsSource).Length} bytes) → {Path.Combine(modsDest, ModuleVersionMessages.ModuleFileName)}");
+                $"({new FileInfo(bsmsSource).Length} bytes) from {bsmsSource} → " +
+                $"{Path.Combine(modsDest, ModuleVersionMessages.ModuleFileName)}");
+
+            var installedBsms = Path.Combine(modsDest, ModuleVersionMessages.ModuleFileName);
+            if (!FilesMatch(bsmsSource, installedBsms))
+            {
+                return (false,
+                    $"{ModuleVersionMessages.ModuleFileName} copy verification failed.\n" +
+                    $"Source:\n{bsmsSource}\nDest:\n{installedBsms}");
+            }
 
             var mainDest = Path.Combine(sysDir, "main.dol");
             var bootDest = Path.Combine(sysDir, "boot.bin");
@@ -362,6 +791,12 @@ internal static class ModuleInstaller
             if (!File.Exists(kernelDest))
                 return (false, $"KuriboKernel.bin missing after install:\n{kernelDest}");
 
+            var probe = ModuleInstallValidator.ProbeBseRuntime(gameRoot);
+            var sizeCheck = ModuleInstallValidator.ValidateInstalledRuntimeSizes(probe, patchBseMoveset);
+            if (sizeCheck != null)
+                return (false, sizeCheck);
+
+            // Only stamp the launcher build after the installed kxe matches the Install source.
             WriteModBuildIdMarker(modsDest, log);
             return (true, "OK");
         }
@@ -382,6 +817,18 @@ internal static class ModuleInstaller
         var bseDest = Path.Combine(modsDir, ModuleVersionMessages.BseModuleFileName);
         try
         {
+            if (!File.Exists(bseSource))
+                return (false, $"BetterSunshineEngine.kxe source missing:\n{bseSource}");
+
+            var sourceSize = new FileInfo(bseSource).Length;
+            if (sourceSize != OfficialBseSizeBytes)
+            {
+                return (false,
+                    $"Refusing to install {ModuleVersionMessages.BseModuleFileName} " +
+                    $"({sourceSize} bytes; expected {OfficialBseSizeBytes}). " +
+                    "DEBUG/dev BSE black-screens boot after Kuribo.");
+            }
+
             Directory.CreateDirectory(modsDir);
             if (File.Exists(bseDest))
             {
@@ -432,6 +879,13 @@ internal static class ModuleInstaller
             File.Copy(bsmsSource, bsmsDest, overwrite: true);
             log?.Invoke(
                 $"Installed {ModuleVersionMessages.ModuleFileName} ({new FileInfo(bsmsDest).Length} bytes) → {bsmsDest}");
+            if (!FilesMatch(bsmsSource, bsmsDest))
+            {
+                return (false,
+                    $"{ModuleVersionMessages.ModuleFileName} copy verification failed.\n" +
+                    $"Source:\n{bsmsSource}\nDest:\n{bsmsDest}");
+            }
+
             WriteModBuildIdMarker(modsDir, log);
             return (true, "OK");
         }
@@ -443,11 +897,14 @@ internal static class ModuleInstaller
 
     /// <summary>
     /// Overwrite Kuribo Mods .kxe files from the ones shipped next to the
-    /// launcher/zip (when present and different). Runs on launch so a zip update
-    /// picks up a new <c>_BSMSO.kxe</c> without requiring Install Modules again.
+    /// launcher/zip (when present and different). Used by Install / patch modules
+    /// after the full runtime install — not on launcher open or Launch Dolphin.
     /// Does not re-download BSE or rewrite main.dol — only syncs local kxe files.
     /// </summary>
-    public static BundledModuleSyncResult SyncBundledModulesIntoGame(string isoPath, Action<string>? log = null)
+    public static BundledModuleSyncResult SyncBundledModulesIntoGame(
+        string isoPath,
+        Action<string>? log = null,
+        bool patchBseMoveset = false)
     {
         var result = new BundledModuleSyncResult();
         var trimmed = isoPath?.Trim().Trim('"') ?? string.Empty;
@@ -466,15 +923,85 @@ internal static class ModuleInstaller
         var hasBundledBsmso = TryFindSourceModule(ModuleVersionMessages.ModuleFileName, out var bundledBsmso)
                               && bundledBsmso != null;
 
-        foreach (var name in new[]
-                 {
-                     ModuleVersionMessages.ModuleFileName,
-                     ModuleVersionMessages.MovesetModuleFileName,
-                     ModuleVersionMessages.BseModuleFileName,
-                 })
+        var names = new List<string>
+        {
+            ModuleVersionMessages.ModuleFileName,
+            ModuleVersionMessages.BseModuleFileName,
+        };
+        if (patchBseMoveset)
+            names.Insert(1, ModuleVersionMessages.MovesetModuleFileName);
+        else
+        {
+            // Share the Moveset/PRM disc mutex with MarioPackInstaller so a sibling
+            // instance cannot re-inject Moveset.kxe while this instance strips it.
+            var movesetDest = Path.Combine(modsDir, ModuleVersionMessages.MovesetModuleFileName);
+            if (File.Exists(movesetDest))
+            {
+                Mutex? gate = null;
+                var locked = false;
+                try
+                {
+                    gate = new Mutex(false, @"Local\BSMSO.BetterMovementDisc");
+                    try
+                    {
+                        locked = gate.WaitOne(TimeSpan.FromSeconds(30));
+                    }
+                    catch (AbandonedMutexException)
+                    {
+                        locked = true;
+                    }
+
+                    if (!locked)
+                    {
+                        log?.Invoke(
+                            $"Timed out waiting to remove {ModuleVersionMessages.MovesetModuleFileName} — retry Install.");
+                    }
+                    else if (File.Exists(movesetDest))
+                    {
+                        File.Delete(movesetDest);
+                        log?.Invoke(
+                            $"Removed {ModuleVersionMessages.MovesetModuleFileName} (Patch BSE moveset off).");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    log?.Invoke($"Could not remove {ModuleVersionMessages.MovesetModuleFileName}: {ex.Message}");
+                }
+                finally
+                {
+                    if (locked)
+                    {
+                        try { gate?.ReleaseMutex(); }
+                        catch (ApplicationException) { /* not owned */ }
+                    }
+
+                    gate?.Dispose();
+                }
+            }
+        }
+
+        foreach (var name in names)
         {
             if (!TryFindSourceModule(name, out var source) || source == null)
                 continue;
+
+            var sourceSize = new FileInfo(source).Length;
+            if (name == ModuleVersionMessages.BseModuleFileName && sourceSize != OfficialBseSizeBytes)
+            {
+                log?.Invoke(
+                    $"Skipped syncing {name}: local file is {sourceSize} bytes " +
+                    $"(expected {OfficialBseSizeBytes} release). DEBUG BSE black-screens boot.");
+                continue;
+            }
+
+            if (name == ModuleVersionMessages.MovesetModuleFileName &&
+                sourceSize != OfficialMovesetSizeBytes)
+            {
+                log?.Invoke(
+                    $"Skipped syncing {name}: local file is {sourceSize} bytes " +
+                    $"(expected {OfficialMovesetSizeBytes}). Wrong Moveset black-screens boot.");
+                continue;
+            }
 
             var dest = Path.Combine(modsDir, name);
             try
@@ -528,9 +1055,11 @@ internal static class ModuleInstaller
             bsmsoMatches = true;
         }
 
-        // Keep the ModBuildId sidecar in sync only when we verified against a bundled kxe.
-        if (hasBundledBsmso && bsmsoMatches &&
-            File.Exists(Path.Combine(modsDir, ModuleVersionMessages.ModuleFileName)))
+        // Keep the ModBuildId sidecar in sync only when the installed _BSMSO.kxe
+        // byte-matches the chosen bundled source (never stamp a new build over a stale kxe).
+        if (hasBundledBsmso && bsmsoMatches && bundledBsmso != null &&
+            File.Exists(Path.Combine(modsDir, ModuleVersionMessages.ModuleFileName)) &&
+            FilesMatch(bundledBsmso, Path.Combine(modsDir, ModuleVersionMessages.ModuleFileName)))
         {
             WriteModBuildIdMarker(modsDir, log);
         }
@@ -547,17 +1076,119 @@ internal static class ModuleInstaller
     public static bool TryFindSourceModule(string fileName, out string? path)
     {
         path = null;
+        var isBsmsModule = string.Equals(
+            fileName, ModuleVersionMessages.ModuleFileName, StringComparison.OrdinalIgnoreCase);
+        var appData = GetSmsoAppDataDirectory();
+        var candidates = new List<(string Path, DateTime WriteUtc, long Length)>();
         foreach (var dir in EnumerateSearchDirectories())
         {
+            // Never take _BSMSO.kxe from AppData — that path is for BSE staging only and
+            // historically served a stale module while Update stamped a new build id.
+            if (isBsmsModule &&
+                !string.IsNullOrWhiteSpace(appData) &&
+                dir.StartsWith(Path.GetFullPath(appData), StringComparison.OrdinalIgnoreCase))
+                continue;
+
             var candidate = Path.Combine(dir, fileName);
-            if (File.Exists(candidate))
+            if (!File.Exists(candidate))
+                continue;
+            try
             {
-                path = candidate;
+                var info = new FileInfo(candidate);
+                candidates.Add((info.FullName, info.LastWriteTimeUtc, info.Length));
+            }
+            catch
+            {
+                // skip unreadable
+            }
+        }
+
+        if (candidates.Count == 0)
+            return false;
+
+        static string NormDir(string? d) =>
+            string.IsNullOrWhiteSpace(d)
+                ? ""
+                : Path.GetFullPath(d).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+
+        // 1) Beside the running launcher exe (release zip layout).
+        var exeDir = NormDir(GetLauncherExecutableDirectory());
+        if (exeDir.Length > 0)
+        {
+            var besideExe = candidates.FirstOrDefault(c =>
+                string.Equals(NormDir(Path.GetDirectoryName(c.Path)), exeDir, StringComparison.OrdinalIgnoreCase));
+            if (besideExe.Path != null)
+            {
+                path = besideExe.Path;
                 return true;
             }
         }
 
-        return false;
+        // 2) Beside AppContext.BaseDirectory (tests / unpack layouts).
+        try
+        {
+            var baseDir = NormDir(AppContext.BaseDirectory);
+            if (baseDir.Length > 0)
+            {
+                var besideBase = candidates.FirstOrDefault(c =>
+                    string.Equals(NormDir(Path.GetDirectoryName(c.Path)), baseDir, StringComparison.OrdinalIgnoreCase));
+                if (besideBase.Path != null)
+                {
+                    path = besideBase.Path;
+                    return true;
+                }
+            }
+        }
+        catch
+        {
+            // ignore
+        }
+
+        // 3) Repo / publish fallback: newest write time wins (then largest size).
+        candidates.Sort((a, b) =>
+        {
+            var byTime = b.WriteUtc.CompareTo(a.WriteUtc);
+            return byTime != 0 ? byTime : b.Length.CompareTo(a.Length);
+        });
+        path = candidates[0].Path;
+        return true;
+    }
+
+    internal static string? GetLauncherExecutableDirectory()
+    {
+        try
+        {
+            var exe = Environment.ProcessPath;
+            if (!string.IsNullOrWhiteSpace(exe))
+            {
+                var dir = Path.GetDirectoryName(exe);
+                if (!string.IsNullOrWhiteSpace(dir))
+                    return Path.GetFullPath(dir)
+                        .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            }
+        }
+        catch
+        {
+            // fall through
+        }
+
+        try
+        {
+            var loc = Assembly.GetExecutingAssembly().Location;
+            if (!string.IsNullOrWhiteSpace(loc))
+            {
+                var dir = Path.GetDirectoryName(loc);
+                if (!string.IsNullOrWhiteSpace(dir))
+                    return Path.GetFullPath(dir)
+                        .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            }
+        }
+        catch
+        {
+            // ignore
+        }
+
+        return null;
     }
 
     /// <summary>
@@ -763,17 +1394,19 @@ internal static class ModuleInstaller
             missing.Add("sys\\boot.bin (BSE)");
         if (!probe.BseInstalled)
             missing.Add(ModuleVersionMessages.BseModuleFileName);
-        if (!probe.MovesetInstalled)
-            missing.Add(ModuleVersionMessages.MovesetModuleFileName);
         if (!probe.BsmsInstalled)
             missing.Add(ModuleVersionMessages.ModuleFileName);
 
         if (missing.Count == 0)
         {
+            var movesetNote = probe.MovesetInstalled
+                ? ModuleVersionMessages.MovesetModuleFileName
+                : $"{ModuleVersionMessages.MovesetModuleFileName} (optional, not installed)";
             return
-                $"BSE / Kuribo runtime installed (build {ProtocolConstants.ModBuildId}):\n{gameRoot}\n" +
+                ModuleVersionMessages.EverythingUpToDateReadyToPlayWithBuild(ProtocolConstants.ModBuildId) +
+                $"\nBSE / Kuribo runtime installed:\n{gameRoot}\n" +
                 $"KuriboKernel.bin, sys\\main.dol, sys\\boot.bin, " +
-                $"{ModuleVersionMessages.BseModuleFileName}, {ModuleVersionMessages.MovesetModuleFileName}, " +
+                $"{ModuleVersionMessages.BseModuleFileName}, {movesetNote}, " +
                 $"{ModuleVersionMessages.ModuleFileName}";
         }
 
@@ -793,6 +1426,9 @@ internal static class ModuleInstaller
 
     private static IEnumerable<string> EnumerateSearchDirectories()
     {
+        // Ordered list — first existing path with the file wins for BSE size checks;
+        // TryFindSourceModule may still prefer exe-adjacent / newest among all hits.
+        var ordered = new List<string>();
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         void Add(string? dir)
@@ -802,8 +1438,9 @@ internal static class ModuleInstaller
             try
             {
                 var full = Path.GetFullPath(dir);
-                if (Directory.Exists(full))
-                    seen.Add(full);
+                if (!Directory.Exists(full) || !seen.Add(full))
+                    return;
+                ordered.Add(full);
             }
             catch
             {
@@ -811,9 +1448,16 @@ internal static class ModuleInstaller
             }
         }
 
-        var exeDir = Path.GetDirectoryName(Environment.ProcessPath)
-                     ?? Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
+        var exeDir = GetLauncherExecutableDirectory();
         Add(exeDir);
+        try
+        {
+            Add(AppContext.BaseDirectory);
+        }
+        catch
+        {
+            // ignore
+        }
 
         // Nested publish layouts: walk a few parents from the exe.
         var walk = exeDir;
@@ -836,10 +1480,11 @@ internal static class ModuleInstaller
             walk = Path.GetDirectoryName(walk);
         }
 
+        // AppData is last — BSE staging only; never prefer a stale _BSMSO.kxe here.
         Add(GetSmsoAppDataDirectory());
         Add(GetOfficialBseStagingDirectory());
 
-        return seen;
+        return ordered;
     }
 
     internal static string GetSmsoAppDataDirectory() =>

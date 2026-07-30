@@ -10,6 +10,10 @@ struct RemoteYoshiSlot {
     bool mounted;
     bool hatched;
     bool stageInitDone;
+    /// True after one remote stage-settle attempt this mount cycle.
+    /// Remotes never call TYoshi::initInLoadAfter (duplicate TMirrorActor /
+    /// mirror-heap exhaustion with 5+ concurrent riders).
+    bool stageInitAttempted;
     u8 type;
     bool hostSpraying;
     u8 sprayPressureEnc;
@@ -17,6 +21,8 @@ struct RemoteYoshiSlot {
     u8 lastMouthActorEnc;
     u8 lastYoshiBck;
     u32 lastFruitEatEventId;
+    /// Last thinkUpper pass left the mouth eat mtx armed — need one closing frame.
+    bool thinkUpperMouthWasOpen;
 };
 
 namespace JDrama {
@@ -51,7 +57,7 @@ void exportYoshiTongueProgressPingLow(TMario *mario, PlayerSnapshot &snap);
 void exportYoshiBckFramePingHigh(TMario *mario, PlayerSnapshot &snap);
 void syncRemoteYoshiFromSnapshot(TMario *body, RemoteYoshiSlot &slot, const PlayerSnapshot &snap);
 void performRemoteYoshiDraw(TMario *body, u32 flags, JDrama::TGraphics *graphics, bool drawBody);
-void calcRemoteYoshiAnim(TMario *body, const RemoteYoshiSlot *slot);
+void calcRemoteYoshiAnim(TMario *body, RemoteYoshiSlot *slot);
 
 // Tongue emit matrix after mounted calc + mTongue->calcAnim (doldecomp getTongueMtx).
 Mtx *getRemoteYoshiSprayEmitMtx(TMario *body);

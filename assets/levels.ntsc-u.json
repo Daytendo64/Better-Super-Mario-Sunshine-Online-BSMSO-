@@ -134,6 +134,14 @@
       "episodes": [{ "episodeId": 0, "displayName": "Episode 1 \u2014 Father and Son Shine!" }]
     },
     {
+      "courseId": 16,
+      "displayName": "Noki Bay \u2014 Undersea",
+      "warpable": true,
+      "episodes": [
+        { "episodeId": 0, "displayName": "Undersea" }
+      ]
+    },
+    {
       "courseId": 47,
       "displayName": "Bianco Hills \u2014 Hillside Cave Secret",
       "warpable": true,
@@ -171,6 +179,8 @@
       "episodes": [
         { "episodeId": 0, "displayName": "Hotel Lobby" },
         { "episodeId": 2, "displayName": "Episode 3 \u2014 Mysterious Hotel Delfino" },
+        { "episodeId": 3, "displayName": "Episode 4 \u2014 Casino path (hotel)" },
+        { "episodeId": 4, "displayName": "Episode 5 \u2014 King Boo path (hotel)" },
         { "episodeId": 6, "displayName": "Episode 7 \u2014 Shadow Mario Checks In" },
         { "episodeId": 7, "displayName": "Episode 8 \u2014 Red Coins in the Hotel" }
       ]
@@ -231,6 +241,48 @@
       "displayName": "Gelato Beach \u2014 Sand Castle Secret",
       "warpable": true,
       "episodes": [{ "episodeId": 0, "displayName": "Episode 1 \u2014 Dune Bud Sand Castle Secret" }]
+    },
+    {
+      "courseId": 33,
+      "displayName": "Gelato Beach \u2014 The Sand Bird is Born",
+      "warpable": true,
+      "episodes": [{ "episodeId": 0, "displayName": "Episode 1 \u2014 The Sand Bird is Born" }]
+    },
+    {
+      "courseId": 44,
+      "displayName": "Noki Bay \u2014 Red Coins in a Bottle",
+      "warpable": true,
+      "episodes": [{ "episodeId": 0, "displayName": "Episode 1 \u2014 Red Coins in a Bottle" }]
+    },
+    {
+      "courseId": 55,
+      "displayName": "Bianco Hills \u2014 Down with Petey Piranha!",
+      "warpable": true,
+      "episodes": [{ "episodeId": 0, "displayName": "Episode 1 \u2014 Down with Petey Piranha!" }]
+    },
+    {
+      "courseId": 57,
+      "displayName": "Noki Bay \u2014 Eely-Mouth's Dentist",
+      "warpable": true,
+      "episodes": [{ "episodeId": 0, "displayName": "Episode 1 \u2014 Eely-Mouth's Dentist" }]
+    },
+    {
+      "courseId": 58,
+      "displayName": "Pinna Park \u2014 Roller Coaster",
+      "warpable": true,
+      "episodes": [{ "episodeId": 0, "displayName": "Episode 1 \u2014 Mecha-Bowser Appears!" }]
+    },
+    {
+      "courseId": 59,
+      "displayName": "Ricco Harbor \u2014 Gooper Blooper Breaks Out",
+      "warpable": true,
+      "episodes": [{ "episodeId": 0, "displayName": "Episode 1 \u2014 Gooper Blooper Breaks Out" }]
+    },
+    {
+      "courseId": 60,
+      "displayName": "Corona Mountain \u2014 Father and Son Shine!",
+      "warpable": true,
+      "episodes": [{ "episodeId": 0, "displayName": "Episode 1 \u2014 Father and Son Shine!" }]
     },
     {
       "courseId": 20,

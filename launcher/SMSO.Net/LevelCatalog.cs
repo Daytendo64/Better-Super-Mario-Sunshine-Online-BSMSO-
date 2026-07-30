@@ -27,6 +27,24 @@ public sealed class LevelCatalog
     }
 
     /// <summary>
+    /// True when two episode ids name the same co-op progress stage for <paramref name="courseId"/>.
+    /// Matches server occupancy / heal / live-red peer rules: plaza is one hub, casino uses
+    /// catalog↔mission aliases, everything else compares <see cref="NormalizeEpisodeFromGame"/>.
+    /// </summary>
+    public static bool EpisodesEquivalent(byte courseId, byte episodeA, byte episodeB)
+    {
+        if (episodeA == episodeB)
+            return true;
+        // All Delfino Plaza scenarios share one hub for co-op progress / mission heals.
+        if (courseId == DelfinoPlazaMapping.AreaId)
+            return true;
+        if (courseId == SirenaCasinoMapping.AreaId)
+            return SirenaCasinoMapping.EpisodesEquivalent(episodeA, episodeB);
+        return NormalizeEpisodeFromGame(courseId, episodeA) ==
+               NormalizeEpisodeFromGame(courseId, episodeB);
+    }
+
+    /// <summary>
     /// Maps an in-game scenario index (<c>mEpisodeID</c>) to a catalog episode id for roster/display.
     /// Plaza and hotel interiors use dedicated scenario↔catalog tables; other courses usually match 1:1.
     /// When <paramref name="catalog"/> is provided, unknown ids on single-episode courses (secrets,
@@ -56,6 +74,11 @@ public sealed class LevelCatalog
                  SirenaCasinoMapping.TryScenarioToCatalog(gameScenarioId, out catalogId))
         {
             // mapped
+        }
+        else if (courseId == RiccoHarborMapping.AreaId &&
+                 RiccoHarborMapping.TryScenarioToCatalog(gameScenarioId, out catalogId))
+        {
+            // mapped (ricco8 → Ep1 mid-fight)
         }
         else
         {
@@ -117,7 +140,10 @@ public sealed class LevelCatalog
     }
 
     /// <summary>
-    /// Shadow Mario and hotel red coins play in area 7 even when selected from Sirena Beach (area 6).
+    /// Shadow Mario and hotel red coins play in area 7 even when selected from Sirena
+    /// Beach (area 6). Keeps teleport course ids aligned with red-coin / NPC authority
+    /// keys under <see cref="SirenaHotelInteriorMapping.AreaId"/>. Other beach episodes
+    /// stay on sirenaN (same pattern as Pinna beach vs park).
     /// </summary>
     public static bool TryResolveWarpDestination(byte courseId, byte catalogEpisodeId, out byte areaId,
         out byte missionScenario)
@@ -134,6 +160,28 @@ public sealed class LevelCatalog
         return false;
     }
 
+    /// <summary>
+    /// Resolves a launcher/host warp target. Beach hotel missions redirect to area 7 while
+    /// preserving catalog episode ids (6/7) so the module hotel load table picks delfino3/4.
+    /// </summary>
+    public static void ResolveWarpDestination(byte courseId, byte catalogEpisodeId, out byte areaId,
+        out byte episodeId)
+    {
+        if (TryResolveWarpDestination(courseId, catalogEpisodeId, out areaId, out _))
+        {
+            episodeId = catalogEpisodeId;
+            return;
+        }
+
+        areaId = courseId;
+        episodeId = catalogEpisodeId;
+    }
+
+    /// <summary>
+    /// Human-readable course label for Connected Players / warp UI.
+    /// Prefer catalog entries in <c>levels.ntsc-u.json</c> for every playable
+    /// area (secrets, hotel/casino/park interiors, undersea, boss arenas).
+    /// </summary>
     public string GetCourseName(byte courseId)
     {
         if (courseId == 15)
@@ -185,6 +233,15 @@ public sealed class LevelCatalog
 
         if (courseId == SirenaCasinoMapping.AreaId &&
             SirenaCasinoMapping.TryScenarioToCatalog(catalogEpisodeId, out mapped) &&
+            mapped != catalogEpisodeId)
+        {
+            match = course.Episodes.FirstOrDefault(e => e.EpisodeId == mapped);
+            if (match != null)
+                return match.DisplayName;
+        }
+
+        if (courseId == RiccoHarborMapping.AreaId &&
+            RiccoHarborMapping.TryScenarioToCatalog(catalogEpisodeId, out mapped) &&
             mapped != catalogEpisodeId)
         {
             match = course.Episodes.FirstOrDefault(e => e.EpisodeId == mapped);

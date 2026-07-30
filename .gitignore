@@ -36,3 +36,7 @@ nul
 *.kxe
 !dist/_BSMSO.kxe
 !dist/_SMSO.kxe
+
+# Embedded scratch repos (not submodules)
+tools/_moveset-src/
+tools/_research-moveset/

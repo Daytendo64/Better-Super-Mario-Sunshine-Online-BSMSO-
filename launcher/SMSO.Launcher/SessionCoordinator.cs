@@ -35,6 +35,7 @@ public sealed class SessionCoordinator : IDisposable
     private volatile bool _shuttingDown;
     private int _clientGeneration;
     private int _sessionEndHandling;
+    private volatile SessionLifecyclePhase _phase = SessionLifecyclePhase.Idle;
     private int _gameCloseCheckGeneration;
     private CancellationTokenSource? _gameCloseCts;
     private CancellationTokenSource? _worldReplayCts;
@@ -42,8 +43,45 @@ public sealed class SessionCoordinator : IDisposable
     private const int GameCloseGraceMs = 1500;
     private PlayerSnapshot _lastLocalSnapshot;
     private bool _hasLastLocalSnapshot;
+    private byte _lastProgressResyncStage = 0xFF;
+    private byte _lastProgressResyncEpisode = 0xFF;
+    private DateTime _lastStageEnterProgressResyncUtc = DateTime.MinValue;
+    private static readonly TimeSpan StageEnterProgressResyncDebounce = TimeSpan.FromSeconds(8);
+    /// <summary>
+    /// Cheap client-driven heal while parked on a stage. Advertises only the seq the module
+    /// has actually applied (not launcher <c>_lastAppliedProgressSeq</c>, which advances on
+    /// Push / Unchanged) so a backed-up apply cannot soft-kill ownership via Unchanged silence.
+    /// </summary>
+    private static readonly TimeSpan ProgressCatchupInterval = TimeSpan.FromSeconds(20);
+    private DateTime _lastProgressCatchupUtc = DateTime.MinValue;
+    private readonly AuthorityHealGovernor _authorityHeal = new();
     private readonly List<WorldEventPacket> _pendingEpisodeWorldEvents = new();
     private readonly object _pendingEpisodeWorldEventsLock = new();
+    /// <summary>
+    /// Off-stage episode queue bound. Coalesce red/NPC; hard-drop fruit; never retain
+    /// ownership (ownership is live-applied). Authorities rebuild red/NPC on stage-enter.
+    /// </summary>
+    private const int MaxPendingEpisodeWorldEvents = 64;
+    /// <summary>Grep-friendly heal telemetry counters (Phase 3).</summary>
+    private int _telemetryCacheHeal;
+    private int _telemetryTcpForceRetry;
+    private int _telemetryCircuitOpen;
+    /// <summary>
+    /// Independent of OnLocalSnapshot — guarantees force-timeout restage/expand even if
+    /// the bridge poll path stalls (2026-07-21 soft-death).
+    /// </summary>
+    private Timer? _forceHealWatchdog;
+    private readonly object _forceHealWatchdogLock = new();
+    /// <summary>
+    /// Serializes world-progress / stage-enter / force-heal mutations across
+    /// <see cref="OnLocalSnapshot"/> (bridge thread-pool),
+    /// <see cref="OnWorldProgressSnapshotReceived"/> (NetClient thread-pool),
+    /// force-heal watchdog, warp, and module-request paths. Without this, overlapping
+    /// callbacks can skip/duplicate force heals or filter mission bits to the wrong stage.
+    /// </summary>
+    private readonly object _worldProgressLock = new();
+    private uint _lastAppliedProgressSeq;
+    private readonly ProgressOwnershipTracker _appliedProgress = new();
     private volatile bool _acceptWorldEventApplies;
     private readonly HashSet<string> _ensuredMarioPackIds = new(StringComparer.OrdinalIgnoreCase);
     private readonly object _packEnsureLock = new();
@@ -61,9 +99,13 @@ public sealed class SessionCoordinator : IDisposable
     public event Action<string>? DisconnectNotice;
     /// <summary>Fired when the host warps everyone (or this client via warp-all) to a stage.</summary>
     public event Action<byte, byte>? WarpEveryoneReceived;
+    /// <summary>Fired when Host/Connect/Disconnect lifecycle phase changes (UI button gating).</summary>
+    public event Action<SessionLifecyclePhase>? PhaseChanged;
 
     public bool IsHosting => _server?.IsRunning == true;
     public bool IsConnected => _client?.IsConnected == true;
+    /// <summary>Authoritative session phase for UI — prefer over <see cref="IsConnected"/>.</summary>
+    public SessionLifecyclePhase Phase => _phase;
     public bool AllowClientTeleport { get; private set; }
     public bool ClientTeleportPolicyKnown { get; private set; }
     public bool SyncFlagsEnabled { get; private set; }
@@ -91,7 +133,9 @@ public sealed class SessionCoordinator : IDisposable
         _bridgeWorker.LocalSnapshotReady += OnLocalSnapshot;
         _bridgeWorker.ModuleProgressResyncRequested += OnModuleProgressResyncRequested;
         _bridgeWorker.LocalMarioVoiceReady += OnLocalMarioVoice;
-        _bridgeWorker.LocalWorldEventReady += OnLocalWorldEvent;
+        // Tracked (not fire-and-forget): the bridge holds the Dolphin localPending lane and
+        // retries until this reports the frame actually reached the server.
+        _bridgeWorker.LocalWorldEventSendAsync = SendLocalWorldEventAsync;
         UpdateSyncSettingsState(_config.Config.SyncFlags, _config.Config.SyncObjects, _config.Config.SyncProgress);
     }
 
@@ -115,50 +159,112 @@ public sealed class SessionCoordinator : IDisposable
 
         PlayerNameValidator.ValidateOrThrow(_config.Config.Username);
 
-        StatusChanged?.Invoke("Starting server...");
-        await DisconnectAsync(endSession: true).ConfigureAwait(true);
+        var hostProfile = GameProfileDetector.Detect(_config.Config.IsoPath);
+        if (hostProfile.Kind == GameProfileKind.Unknown)
+        {
+            throw new InvalidOperationException(
+                "Cannot host: the Game ISO path is not a recognized Super Mario Sunshine or " +
+                "Super Mario Eclipse target. Set Paths → Game ISO first.");
+        }
 
+        await _networkOpLock.WaitAsync().ConfigureAwait(true);
         try
         {
+            // Hold the network lock for the entire stop→bind→self-join so StatusChanged
+            // "Disconnected" cannot re-enable Host/Connect mid-rehost (double-Host race).
+            SetPhase(SessionLifecyclePhase.Hosting);
+            StatusChanged?.Invoke("Starting server...");
+
+            ResetHideSeekIfActiveOnServer();
+            await TearDownClientAsync(DisconnectReason.UserRequest, sendGoodbye: true)
+                .ConfigureAwait(true);
+            ForceGameModeToNormalLocally();
+            StopServer();
+
             var port = _config.Config.ServerPort;
             var levels = _levels;
             var maxPlayers = _config.Config.MaxPlayers;
+            var expectedProfile = (ushort)hostProfile.Id;
 
-            await Task.Run(() =>
+            try
             {
-                _server = new GameServer(levels) { MaxPlayers = maxPlayers };
-                _server.Log += m => Log?.Invoke(m);
-                _server.Start(port);
-                _config.Config.AllowClientTeleporting = false;
-                _server.SetAllowClientTeleport(false);
-                _server.SetHideSeekGraceDurationMs(_config.Config.HideSeekGraceSeconds * 1000);
-                ApplyConfiguredSyncSettings();
-            }).ConfigureAwait(true);
+                await Task.Run(() =>
+                {
+                    _server = new GameServer(levels)
+                    {
+                        MaxPlayers = maxPlayers,
+                        ExpectedGameProfileId = expectedProfile,
+                    };
+                    _server.Log += m => Log?.Invoke(m);
+                    _server.Start(port);
+                    _config.Config.AllowClientTeleporting = false;
+                    _server.SetAllowClientTeleport(false);
+                    _server.SetHideSeekGraceDurationMs(_config.Config.HideSeekGraceSeconds * 1000);
+                    ApplyConfiguredSyncSettings();
+                }).ConfigureAwait(true);
 
-            await ConnectClientAsync("127.0.0.1", port, isHost: true).ConfigureAwait(true);
+                StatusChanged?.Invoke("Waiting for listener...");
+                await _server!.WaitUntilAcceptingAsync(timeoutMs: 2000).ConfigureAwait(true);
 
-            HostingStateChanged?.Invoke();
-            Log?.Invoke($"Hosting on port {port}");
+                StatusChanged?.Invoke("Connecting as host...");
+                await ConnectClientCoreAsync("127.0.0.1", port, isHost: true).ConfigureAwait(true);
+
+                SetPhase(SessionLifecyclePhase.Hosted);
+                HostingStateChanged?.Invoke();
+                Log?.Invoke(
+                    $"Hosting on port {port} (build {ProtocolConstants.ModBuildId}, " +
+                    $"profile: {hostProfile.DisplayName})");
+            }
+            catch (SocketException ex) when (
+                ex.SocketErrorCode is SocketError.AddressAlreadyInUse
+                    or SocketError.AccessDenied
+                    or SocketError.AddressNotAvailable)
+            {
+                StopServer();
+                SetPhase(SessionLifecyclePhase.Idle);
+                StatusChanged?.Invoke("Disconnected");
+                throw new InvalidOperationException(
+                    $"Port {_config.Config.ServerPort} is already in use or blocked ({ex.SocketErrorCode}). " +
+                    "Stop any old BSMSO.ServerHost.exe / previous host, wait a second, then Host again.", ex);
+            }
+            catch (SocketException ex)
+            {
+                // Self-join to 127.0.0.1 can fail with ConnectionRefused/TimedOut even after a
+                // successful bind — do not mislabel those as "port in use" (looks like Radmin/VPN).
+                StopServer();
+                SetPhase(SessionLifecyclePhase.Idle);
+                StatusChanged?.Invoke("Disconnected");
+                throw new InvalidOperationException(
+                    $"Could not finish hosting ({ex.SocketErrorCode}): local join to 127.0.0.1:{port} failed. " +
+                    "Wait a second and Host again.", ex);
+            }
+            catch
+            {
+                StopServer();
+                SetPhase(SessionLifecyclePhase.Idle);
+                StatusChanged?.Invoke("Disconnected");
+                throw;
+            }
         }
-        catch (SocketException ex)
+        finally
         {
-            StopServer();
-            throw new InvalidOperationException(
-                $"Port {_config.Config.ServerPort} is already in use or blocked ({ex.SocketErrorCode}).", ex);
-        }
-        catch
-        {
-            StopServer();
-            throw;
+            _networkOpLock.Release();
         }
     }
 
     public async Task ConnectAsync()
     {
-        if (IsHosting)
+        if (IsHosting || _phase is SessionLifecyclePhase.Hosting or SessionLifecyclePhase.Hosted)
         {
-            Log?.Invoke("Already hosting — use Disconnect first to join another server.");
-            return;
+            throw new InvalidOperationException(
+                "Already hosting — use Disconnect first to join another server.");
+        }
+
+        if (SessionLifecycle.IsTransient(_phase) ||
+            _phase is SessionLifecyclePhase.Connected)
+        {
+            throw new InvalidOperationException(
+                $"Cannot connect while session is {SessionLifecycle.ToLogLabel(_phase)}.");
         }
 
         PlayerNameValidator.ValidateOrThrow(_config.Config.Username);
@@ -174,102 +280,175 @@ public sealed class SessionCoordinator : IDisposable
         await _networkOpLock.WaitAsync().ConfigureAwait(true);
         try
         {
-            await TearDownClientAsync(DisconnectReason.UserRequest, sendGoodbye: true).ConfigureAwait(true);
-
-            var generation = Interlocked.Increment(ref _clientGeneration);
-            var client = new NetClient();
-            client.Log += m => Log?.Invoke(m);
-            client.JoinRejected += reason =>
-            {
-                if (reason == JoinRejectReason.NameTaken)
-                    Log?.Invoke($"Join rejected: username '{_config.Config.Username}' is already in use — set a unique name in Settings (e.g. Player{InstanceIndex + 1})");
-                else if (reason == JoinRejectReason.InvalidName)
-                    Log?.Invoke($"Join rejected: {PlayerNameValidator.InvalidNameHint}");
-                else if (reason == JoinRejectReason.VersionMismatch)
-                    Log?.Invoke(NetJoinRejectedException.GetUserMessage(reason));
-                else
-                    Log?.Invoke($"Join rejected: {reason}");
-            };
-            client.JoinAccepted += () =>
-            {
-                if (generation != Volatile.Read(ref _clientGeneration))
-                    return;
-
-                try
-                {
-                    _bridgeWorker.SetConnected(true, client.AssignedSlot, _config.Config.Username, isHost);
-                    _acceptWorldEventApplies = true;
-                    if (isHost)
-                        ApplyConfiguredSyncSettings();
-                    RefreshPlayerAppearance();
-                    StatusChanged?.Invoke(isHost ? "Hosting" : "Connected");
-                    Log?.Invoke(isHost
-                        ? $"Joined own server as slot {client.AssignedSlot}"
-                        : $"Connected as slot {client.AssignedSlot}");
-                }
-                catch (Exception ex)
-                {
-                    Log?.Invoke($"Join setup error: {ex.Message}");
-                }
-            };
-            client.RosterUpdated += OnRosterUpdated;
-            client.WarpCommandReceived += OnWarpCommand;
-            client.SnapshotReceived += OnSnapshotReceived;
-            client.MarioVoiceEventReceived += OnMarioVoiceEventReceived;
-            client.WorldEventReceived += OnWorldEventReceived;
-            client.WorldStateReplayReceived += OnWorldStateReplayReceived;
-            client.SyncSettingsReceived += (f, o, p) =>
-            {
-                UpdateSyncSettingsState(f, o, p);
-                _bridgeWorker.ApplySyncSettings(f, o, p);
-                Log?.Invoke($"Sync settings from host: flags={f} objects={o} progress={p}");
-            };
-            client.ClientTeleportSettingsReceived += allowed =>
-            {
-                AllowClientTeleport = allowed;
-                ClientTeleportPolicyKnown = true;
-                ClientTeleportPolicyChanged?.Invoke();
-            };
-            client.GameModeStateReceived += state => ApplyGameModeState(state);
-            client.Disconnected += reason =>
-            {
-                if (generation != Volatile.Read(ref _clientGeneration) || _shuttingDown)
-                    return;
-
-                var message = DisconnectMessages.GetUserMessage(reason);
-                Log?.Invoke(message);
-                DisconnectNotice?.Invoke(message);
-                _ = HandleUnexpectedDisconnectAsync(isHost, reason);
-            };
-
-            _client = client;
-            StatusChanged?.Invoke("Connecting");
-            try
-            {
-                await client.ConnectAsync(host, port, _config.Config.Username,
-                    marioModelId: _config.Config.SelectedMarioModelId).ConfigureAwait(true);
-                FlushSnapshotsAfterConnect();
-            }
-            catch (NetJoinRejectedException ex)
-            {
-                await TearDownClientAsync(DisconnectReason.UserRequest, sendGoodbye: false).ConfigureAwait(true);
-                if (isHost)
-                    StopServer();
-                StatusChanged?.Invoke("Disconnected");
-                throw new InvalidOperationException(ex.Message, ex);
-            }
-            catch
-            {
-                await TearDownClientAsync(DisconnectReason.UserRequest, sendGoodbye: false).ConfigureAwait(true);
-                if (isHost)
-                    StopServer();
-                StatusChanged?.Invoke("Disconnected");
-                throw;
-            }
+            await ConnectClientCoreAsync(host, port, isHost).ConfigureAwait(true);
         }
         finally
         {
             _networkOpLock.Release();
+        }
+    }
+
+    /// <summary>Assumes <see cref="_networkOpLock"/> is already held.</summary>
+    private async Task ConnectClientCoreAsync(string host, int port, bool isHost)
+    {
+        SetPhase(isHost ? SessionLifecyclePhase.Hosting : SessionLifecyclePhase.Connecting);
+        await TearDownClientAsync(DisconnectReason.UserRequest, sendGoodbye: true).ConfigureAwait(true);
+
+        var generation = Interlocked.Increment(ref _clientGeneration);
+        var client = new NetClient();
+        client.Log += m => Log?.Invoke(m);
+        client.JoinRejected += reason =>
+        {
+            if (generation != Volatile.Read(ref _clientGeneration))
+                return;
+            if (reason == JoinRejectReason.NameTaken)
+                Log?.Invoke($"Join rejected: username '{_config.Config.Username}' is already in use — set a unique name in Settings (e.g. Player{InstanceIndex + 1})");
+            else if (reason == JoinRejectReason.InvalidName)
+                Log?.Invoke($"Join rejected: {PlayerNameValidator.InvalidNameHint}");
+            else if (reason == JoinRejectReason.VersionMismatch)
+                Log?.Invoke(NetJoinRejectedException.GetUserMessage(reason));
+            else
+                Log?.Invoke($"Join rejected: {reason}");
+        };
+        client.JoinAccepted += () =>
+        {
+            if (generation != Volatile.Read(ref _clientGeneration))
+                return;
+
+            try
+            {
+                _bridgeWorker.SetConnected(true, client.AssignedSlot, _config.Config.Username, isHost);
+                _acceptWorldEventApplies = true;
+                if (isHost)
+                    ApplyConfiguredSyncSettings();
+                RefreshPlayerAppearance();
+                StatusChanged?.Invoke(isHost ? "Hosting" : "Connected");
+                Log?.Invoke(isHost
+                    ? $"Joined own server as slot {client.AssignedSlot}"
+                    : $"Connected as slot {client.AssignedSlot}");
+            }
+            catch (Exception ex)
+            {
+                Log?.Invoke($"Join setup error: {ex.Message}");
+            }
+        };
+        client.RosterUpdated += entries =>
+        {
+            if (generation != Volatile.Read(ref _clientGeneration))
+                return;
+            OnRosterUpdated(entries);
+        };
+        client.WarpCommandReceived += (target, course, episode, requester) =>
+        {
+            if (generation != Volatile.Read(ref _clientGeneration))
+                return;
+            OnWarpCommand(target, course, episode, requester);
+        };
+        client.SnapshotReceived += (slot, snap) =>
+        {
+            if (generation != Volatile.Read(ref _clientGeneration))
+                return;
+            OnSnapshotReceived(slot, snap);
+        };
+        client.MarioVoiceEventReceived += (slot, voice) =>
+        {
+            if (generation != Volatile.Read(ref _clientGeneration))
+                return;
+            OnMarioVoiceEventReceived(slot, voice);
+        };
+        client.WorldEventReceived += worldEvent =>
+        {
+            if (generation != Volatile.Read(ref _clientGeneration) || !_acceptWorldEventApplies)
+                return;
+            OnWorldEventReceived(worldEvent);
+        };
+        client.WorldStateReplayReceived += events =>
+        {
+            if (generation != Volatile.Read(ref _clientGeneration) || !_acceptWorldEventApplies)
+                return;
+            OnWorldStateReplayReceived(events);
+        };
+        client.WorldProgressSnapshotReceived += snapshot =>
+        {
+            if (generation != Volatile.Read(ref _clientGeneration) || !_acceptWorldEventApplies)
+                return;
+            OnWorldProgressSnapshotReceived(snapshot);
+        };
+        client.SyncSettingsReceived += (f, o, p) =>
+        {
+            if (generation != Volatile.Read(ref _clientGeneration))
+                return;
+            UpdateSyncSettingsState(f, o, p);
+            _bridgeWorker.ApplySyncSettings(f, o, p);
+            Log?.Invoke($"Sync settings from host: flags={f} objects={o} progress={p}");
+        };
+        client.ClientTeleportSettingsReceived += allowed =>
+        {
+            if (generation != Volatile.Read(ref _clientGeneration))
+                return;
+            AllowClientTeleport = allowed;
+            ClientTeleportPolicyKnown = true;
+            ClientTeleportPolicyChanged?.Invoke();
+        };
+        client.GameModeStateReceived += state =>
+        {
+            if (generation != Volatile.Read(ref _clientGeneration))
+                return;
+            ApplyGameModeState(state);
+        };
+        client.Disconnected += reason =>
+        {
+            if (generation != Volatile.Read(ref _clientGeneration) || _shuttingDown)
+                return;
+
+            var message = DisconnectMessages.GetUserMessage(reason);
+            Log?.Invoke(message);
+            DisconnectNotice?.Invoke(message);
+            _ = HandleUnexpectedDisconnectAsync(isHost, reason);
+        };
+
+        _client = client;
+        StatusChanged?.Invoke("Connecting");
+        try
+        {
+            await client.ConnectAsync(host, port, _config.Config.Username,
+                marioModelId: _config.Config.SelectedMarioModelId,
+                gameProfileId: (ushort)GameProfileDetector.Detect(_config.Config.IsoPath).Id).ConfigureAwait(true);
+            FlushSnapshotsAfterConnect();
+            SetPhase(isHost ? SessionLifecyclePhase.Hosted : SessionLifecyclePhase.Connected);
+        }
+        catch (NetJoinRejectedException ex)
+        {
+            await TearDownClientAsync(DisconnectReason.UserRequest, sendGoodbye: false).ConfigureAwait(true);
+            if (isHost)
+                StopServer();
+            SetPhase(SessionLifecyclePhase.Idle);
+            StatusChanged?.Invoke("Disconnected");
+            throw new InvalidOperationException(ex.Message, ex);
+        }
+        catch
+        {
+            await TearDownClientAsync(DisconnectReason.UserRequest, sendGoodbye: false).ConfigureAwait(true);
+            if (isHost)
+                StopServer();
+            SetPhase(SessionLifecyclePhase.Idle);
+            StatusChanged?.Invoke("Disconnected");
+            throw;
+        }
+    }
+
+    private void SetPhase(SessionLifecyclePhase phase)
+    {
+        if (_phase == phase)
+            return;
+        _phase = phase;
+        try
+        {
+            PhaseChanged?.Invoke(phase);
+        }
+        catch (Exception ex)
+        {
+            Log?.Invoke($"PhaseChanged handler error: {ex.Message}");
         }
     }
 
@@ -285,23 +464,22 @@ public sealed class SessionCoordinator : IDisposable
             _bridgeWorker.SetConnected(true, client.AssignedSlot, _config.Config.Username, IsHosting);
             _acceptWorldEventApplies = true;
 
-            if (_hasLastLocalSnapshot)
+            PlayerSnapshot? flushSnap = null;
+            lock (_worldProgressLock)
             {
-                var snap = _lastLocalSnapshot;
-                snap.Connected = 1;
-                SendLocalSnapshot(snap);
+                if (_hasLastLocalSnapshot)
+                {
+                    var snap = _lastLocalSnapshot;
+                    snap.Connected = 1;
+                    flushSnap = snap;
+                }
             }
+
+            if (flushSnap is { } readySnap)
+                SendLocalSnapshot(readySnap);
 
             client.SendSnapshotNow();
             _bridgeWorker.FlushRemoteSnapshotsToDolphin();
-            // #region agent log
-            AgentDebugLog.Write("D", "SessionCoordinator.FlushSnapshotsAfterConnect", "post-connect flush", new
-            {
-                slot = client.AssignedSlot,
-                hasLastLocalSnapshot = _hasLastLocalSnapshot,
-                linkState = _bridgeWorker.LinkState.ToString(),
-            });
-            // #endregion
         }
         catch (Exception ex) when (!_shuttingDown)
         {
@@ -314,15 +492,19 @@ public sealed class SessionCoordinator : IDisposable
         await _networkOpLock.WaitAsync().ConfigureAwait(true);
         try
         {
+            SetPhase(endSession && IsHosting
+                ? SessionLifecyclePhase.Stopping
+                : SessionLifecyclePhase.Disconnecting);
             ResetHideSeekIfActiveOnServer();
             await TearDownClientAsync(reason, sendGoodbye: true).ConfigureAwait(true);
             ForceGameModeToNormalLocally();
+            if (endSession)
+                StopServer();
+            SetPhase(SessionLifecyclePhase.Idle);
             StatusChanged?.Invoke("Disconnected");
         }
         finally
         {
-            if (endSession)
-                StopServer();
             _networkOpLock.Release();
         }
     }
@@ -372,6 +554,16 @@ public sealed class SessionCoordinator : IDisposable
         _acceptWorldEventApplies = false;
 
         _bridgeWorker.SetConnected(false, 0, "", false);
+        // Mirror ClearPendingWorldProgressApplies: a rehost/reconnect while Dolphin stays
+        // open must drop the progress snapshot lane and launcher seq so join heals with
+        // seq=1 are not rejected against a stale moduleAppliedSeq / lastApplied.
+        lock (_worldProgressLock)
+        {
+            ClearPendingWorldProgressAppliesUnlocked();
+            _lastProgressResyncStage = 0xFF;
+            _lastProgressResyncEpisode = 0xFF;
+            _lastStageEnterProgressResyncUtc = DateTime.MinValue;
+        }
         AllowClientTeleport = false;
         ClientTeleportPolicyKnown = false;
         _remoteSnapshots.Clear();
@@ -433,11 +625,19 @@ public sealed class SessionCoordinator : IDisposable
             if (_shuttingDown)
                 return;
 
+            // Stale callback after intentional TearDown / successful reconnect.
+            if (_client == null &&
+                _phase is SessionLifecyclePhase.Idle or SessionLifecyclePhase.Disconnecting
+                    or SessionLifecyclePhase.Stopping)
+                return;
+
+            SetPhase(stopServer ? SessionLifecyclePhase.Stopping : SessionLifecyclePhase.Disconnecting);
             ResetHideSeekIfActiveOnServer();
             await TearDownClientAsync(reason, sendGoodbye: false).ConfigureAwait(false);
             if (stopServer)
                 StopServer();
             ForceGameModeToNormalLocally();
+            SetPhase(SessionLifecyclePhase.Idle);
             StatusChanged?.Invoke("Disconnected");
         }
         finally
@@ -454,7 +654,8 @@ public sealed class SessionCoordinator : IDisposable
             if (_server.IsRunning)
             {
                 _server.NotifyShutdown();
-                Thread.Sleep(75);
+                // Give writers a moment to flush ServerShutdown before linger-0 close.
+                Thread.Sleep(150);
             }
         }
         catch { /* ignore */ }
@@ -469,6 +670,17 @@ public sealed class SessionCoordinator : IDisposable
         var syncFlags = _config.Config.SyncFlags;
         var syncObjects = _config.Config.SyncObjects;
         var syncProgress = _config.Config.SyncProgress;
+        if (GameProfileDetector.Detect(_config.Config.IsoPath).IsEclipse &&
+            (syncFlags || syncObjects || syncProgress))
+        {
+            // Keep the local bridge + UI state honest with the server-side Eclipse coercion.
+            syncFlags = false;
+            syncObjects = false;
+            syncProgress = false;
+            Log?.Invoke(
+                "Flag/Object/Progress sync disabled for Super Mario Eclipse (Phase 1) — " +
+                "Eclipse collectible maps are not measured yet.");
+        }
         _server?.SetSyncSettings(syncFlags, syncObjects, syncProgress);
         _bridgeWorker.ApplySyncSettings(syncFlags, syncObjects, syncProgress);
         UpdateSyncSettingsState(syncFlags, syncObjects, syncProgress);
@@ -519,14 +731,24 @@ public sealed class SessionCoordinator : IDisposable
 
         ApplyDolphinPathsFromConfig(dolphinPath);
 
-        if (!DolphinConfigService.EnsureBsmsGameIdentity(isoPath, m => Log?.Invoke(m), out _, out error))
-            return false;
+        var launchProfile = GameProfileDetector.Detect(isoPath);
+        if (launchProfile.IsEclipse)
+        {
+            // Eclipse keeps its own identity (GMSE04) — never patch it to GMSE90, and skip
+            // the GMSE90-keyed BSMSO banner/cover writes.
+            Log?.Invoke("Super Mario Eclipse detected — game id, banner, and cover left untouched.");
+        }
+        else
+        {
+            if (!DolphinConfigService.EnsureBsmsGameIdentity(isoPath, m => Log?.Invoke(m), out _, out error))
+                return false;
 
-        if (!DolphinConfigService.EnsureBsmsGameBanner(isoPath, m => Log?.Invoke(m), out var bannerError))
-            Log?.Invoke($"Warning: {bannerError}");
+            if (!DolphinConfigService.EnsureBsmsGameBanner(isoPath, m => Log?.Invoke(m), out var bannerError))
+                Log?.Invoke($"Warning: {bannerError}");
 
-        if (!DolphinConfigService.EnsureBsmsGameCover(dolphinPath, m => Log?.Invoke(m), out var coverError))
-            Log?.Invoke($"Warning: {coverError}");
+            if (!DolphinConfigService.EnsureBsmsGameCover(dolphinPath, m => Log?.Invoke(m), out var coverError))
+                Log?.Invoke($"Warning: {coverError}");
+        }
 
         DolphinConfigService.ClearDolphinGameListCache(dolphinPath, m => Log?.Invoke(m));
 
@@ -540,16 +762,8 @@ public sealed class SessionCoordinator : IDisposable
         if (!_config.Config.ApplyRecommendedDolphinSettings)
             Log?.Invoke("Skipped recommended Dolphin performance profile (disabled in Connection).");
 
-        // Ensure custom packs are on the disc/folder before Dolphin opens the image.
-        try
-        {
-            MarioPackInstaller.EnsureAllLibraryPacksPresent(isoPath, m => Log?.Invoke(m));
-        }
-        catch (Exception ex)
-        {
-            Log?.Invoke($"Custom model install before launch skipped: {ex.Message}");
-        }
-
+        // Disc/Kuribo Mods / model packs / Moveset PRM are Install-only — Launch must
+        // not rewrite the shared game tree (multi-instance races re-injected Moveset).
         ApplySelectedMarioModelToBridge();
 
         if (!DolphinProcessMonitor.TryLaunchDolphin(dolphinPath, isoPath, out var processId, out error))
@@ -585,6 +799,8 @@ public sealed class SessionCoordinator : IDisposable
             Log?.Invoke($"Invalid warp target: course={courseId} episode={episodeId}");
             return;
         }
+
+        LevelCatalog.ResolveWarpDestination(courseId, episodeId, out courseId, out episodeId);
 
         var selfSlot = LocalSlot;
         if (IsHosting)
@@ -692,6 +908,8 @@ public sealed class SessionCoordinator : IDisposable
             return;
         }
 
+        LevelCatalog.ResolveWarpDestination(courseId, episodeId, out courseId, out episodeId);
+
         // WarpCommand broadcast (including back to host) applies the bridge intent once.
         _server?.RequestWarp(LocalSlot, targetSlot, courseId, episodeId);
     }
@@ -787,6 +1005,42 @@ public sealed class SessionCoordinator : IDisposable
         ApplyGameModeState(_server.GetGameModeState());
     }
 
+    public void ResetSessionProgress()
+    {
+        if (!IsHosting || _server == null)
+            return;
+
+        // Drop queued pre-reset ownership events before the broadcast so a stale
+        // ShineCollected cannot re-apply after the module clears FlagManager.
+        ClearPendingWorldProgressApplies();
+        _server.ResetSessionProgress();
+    }
+
+    private void ClearPendingWorldProgressApplies()
+    {
+        lock (_worldProgressLock)
+            ClearPendingWorldProgressAppliesUnlocked();
+    }
+
+    private void ClearPendingWorldProgressAppliesUnlocked()
+    {
+        // Cancel any in-flight DrainWorldEventReplayAsync so a captured ready[] cannot
+        // re-apply pre-clear events after SessionProgressReset / empty snapshot.
+        CancelWorldEventReplay("pending progress clear");
+        _bridgeWorker.ClearPendingIncomingWorldEvents();
+        _bridgeWorker.ClearProgressSnapshot();
+        lock (_pendingEpisodeWorldEventsLock)
+            _pendingEpisodeWorldEvents.Clear();
+        _appliedProgress.Clear();
+        _lastAppliedProgressSeq = 0;
+        _lastProgressCatchupUtc = DateTime.MinValue;
+        _authorityHeal.Reset();
+        DisarmForceHealWatchdog();
+    }
+
+    /// <summary>Legacy name — forwards to <see cref="ResetSessionProgress"/>.</summary>
+    public void ResetShineBlueProgress() => ResetSessionProgress();
+
     private void ApplyGameModeState(GameModeStatePacket state)
     {
         if (!IsConnected)
@@ -857,6 +1111,13 @@ public sealed class SessionCoordinator : IDisposable
                 _bridgeWorker.SetRemoteMarioModelId(entry.Slot, entry.MarioModelId);
             }
 
+            // Always adopt roster slots for UDP gatekeeping. Gating this on IsConnected
+            // dropped the JoinAccepted roster when TCP briefly reported disconnected
+            // during rehost, so OnSnapshotReceived forever ignored remotes until restart.
+            _activeRosterSlots.Clear();
+            foreach (var entry in entries)
+                _activeRosterSlots.Add(entry.Slot);
+
             if (IsConnected)
             {
                 if (_sessionHasSeenRoster)
@@ -874,10 +1135,6 @@ public sealed class SessionCoordinator : IDisposable
                         ResetRemotePlayerForSlot(entry.Slot);
                     }
                 }
-
-                _activeRosterSlots.Clear();
-                foreach (var entry in entries)
-                    _activeRosterSlots.Add(entry.Slot);
 
                 var activeSlots = _activeRosterSlots;
                 if (_sessionHasSeenRoster)
@@ -919,7 +1176,10 @@ public sealed class SessionCoordinator : IDisposable
         if (joinedPlayers != null)
         {
             foreach (var (slot, name) in joinedPlayers)
+            {
                 _bridgeWorker.EnqueueRosterHudEvent(RosterHudEventKind.Connected, slot, name);
+                Log?.Invoke($"{name} connected.");
+            }
         }
 
         foreach (var entry in rosterCopy)
@@ -978,7 +1238,8 @@ public sealed class SessionCoordinator : IDisposable
                 {
                     try
                     {
-                        MarioPackInstaller.EnsurePackPresent(path, id, m => Log?.Invoke(m));
+                        MarioPackInstaller.EnsurePackPresent(
+                            path, id, m => Log?.Invoke(m), replaceExisting: !IsDolphinRunning);
                         lock (_packEnsureLock)
                             _ensuredMarioPackIds.Add(id);
                     }
@@ -1013,6 +1274,10 @@ public sealed class SessionCoordinator : IDisposable
         _ = requesterSlot;
         if (targetSlot != ProtocolConstants.WarpAllSlots && targetSlot != LocalSlot) return;
 
+        // Defense: older hosts may still broadcast beach catalog 6/7; remap so flush /
+        // progress keys match hotel interior authority (area 7).
+        LevelCatalog.ResolveWarpDestination(courseId, episodeId, out courseId, out episodeId);
+
         if (targetSlot == ProtocolConstants.WarpAllSlots)
             WarpEveryoneReceived?.Invoke(courseId, episodeId);
 
@@ -1022,8 +1287,11 @@ public sealed class SessionCoordinator : IDisposable
             return;
         }
 
-        FlushPendingEpisodeWorldEvents(courseId, episodeId);
-        RequestWorldProgressResync($"warp {courseId}/{episodeId}");
+        lock (_worldProgressLock)
+        {
+            FlushPendingEpisodeWorldEvents(courseId, episodeId);
+            RequestWorldProgressResyncUnlocked($"warp {courseId}/{episodeId}", forceFull: true);
+        }
     }
 
     private void OnSnapshotReceived(byte slot, PlayerSnapshot snap)
@@ -1122,6 +1390,7 @@ public sealed class SessionCoordinator : IDisposable
     {
         var modelId = CharacterPack.NormalizeModelId(_config.Config.SelectedMarioModelId);
         _bridgeWorker.ApplyLocalMarioModelId(modelId);
+        ApplyMusicVolumeToBridge();
         var isoPath = _config.Config.IsoPath;
         if (string.IsNullOrWhiteSpace(isoPath) || modelId.Length == 0)
             return;
@@ -1137,7 +1406,8 @@ public sealed class SessionCoordinator : IDisposable
         {
             try
             {
-                MarioPackInstaller.EnsurePackPresent(isoPath, modelId, m => Log?.Invoke(m));
+                MarioPackInstaller.EnsurePackPresent(
+                    isoPath, modelId, m => Log?.Invoke(m), replaceExisting: !IsDolphinRunning);
                 lock (_packEnsureLock)
                     _ensuredMarioPackIds.Add(modelId);
             }
@@ -1146,6 +1416,18 @@ public sealed class SessionCoordinator : IDisposable
                 Log?.Invoke($"Model pack install skipped: {ex.Message}");
             }
         });
+    }
+
+    public void ApplyMusicVolumeToBridge()
+    {
+        _bridgeWorker.ApplyMusicVolume(_config.Config.MusicVolumePercent);
+    }
+
+    public void SetMusicVolumePercent(int percent)
+    {
+        _config.Config.MusicVolumePercent = Math.Clamp(percent, 0, 100);
+        _config.SaveDebounced();
+        _bridgeWorker.ApplyMusicVolume(_config.Config.MusicVolumePercent);
     }
 
     public void NotifyLocalMarioModelChanged(string? modelId)
@@ -1163,63 +1445,449 @@ public sealed class SessionCoordinator : IDisposable
 
     private void OnLocalSnapshot(PlayerSnapshot snap)
     {
-        var logicalStage = YoshiSnapshotCodec.LogicalStageId(snap, snap.StageId);
-        var logicalEpisode = YoshiSnapshotCodec.LogicalEpisodeId(snap, snap.EpisodeId);
-        var firstSnapshot = !_hasLastLocalSnapshot;
-        var lastLogicalStage = _hasLastLocalSnapshot
-            ? YoshiSnapshotCodec.LogicalStageId(_lastLocalSnapshot, _lastLocalSnapshot.StageId)
-            : logicalStage;
-        var lastLogicalEpisode = _hasLastLocalSnapshot
-            ? YoshiSnapshotCodec.LogicalEpisodeId(_lastLocalSnapshot, _lastLocalSnapshot.EpisodeId)
-            : logicalEpisode;
-
-        var stageChanged = _hasLastLocalSnapshot &&
-                           (logicalStage != lastLogicalStage || logicalEpisode != lastLogicalEpisode);
-
-        // Same-stage death reload does not change course/episode, so stageChanged is false —
-        // but the module clears its red-coin mask on stageInit. Detect revive (Dead vfx
-        // clearing) and force an immediate progress catch-up instead of waiting ~45s.
-        var wasDead = _hasLastLocalSnapshot &&
-                      (_lastLocalSnapshot.VfxFlags & (ushort)VfxFlags.Dead) != 0;
-        var isDead = (snap.VfxFlags & (ushort)VfxFlags.Dead) != 0;
-        var sameStageRevive = _hasLastLocalSnapshot && !stageChanged && !firstSnapshot &&
-                              wasDead && !isDead && logicalStage != 0;
-
-        _lastLocalSnapshot = snap;
-        _hasLastLocalSnapshot = true;
-        if (firstSnapshot || stageChanged)
+        lock (_worldProgressLock)
         {
-            FlushPendingEpisodeWorldEvents(logicalStage, logicalEpisode);
-            RequestWorldProgressResync(
-                $"{(firstSnapshot ? "initial-stage" : "stage-enter")} {logicalStage}/{logicalEpisode}");
+            var logicalStage = YoshiSnapshotCodec.LogicalStageId(snap, snap.StageId);
+            var logicalEpisode = YoshiSnapshotCodec.LogicalEpisodeId(snap, snap.EpisodeId);
+            var firstSnapshot = !_hasLastLocalSnapshot;
+            var lastLogicalStage = _hasLastLocalSnapshot
+                ? YoshiSnapshotCodec.LogicalStageId(_lastLocalSnapshot, _lastLocalSnapshot.StageId)
+                : logicalStage;
+            var lastLogicalEpisode = _hasLastLocalSnapshot
+                ? YoshiSnapshotCodec.LogicalEpisodeId(_lastLocalSnapshot, _lastLocalSnapshot.EpisodeId)
+                : logicalEpisode;
+
+            // Plaza/casino episode drift (decideNextScenario) is NOT a stage load — treating it
+            // as stage-enter spammed WorldProgressRequest ("stage-enter 1/5") and flooded
+            // authority replays under 10-player hub play.
+            var leftProgressStage = _hasLastLocalSnapshot &&
+                                    !SameProgressResyncStage(logicalStage, logicalEpisode,
+                                        lastLogicalStage, lastLogicalEpisode);
+
+            // Same-stage death reload does not change course/episode, so leftProgressStage is false —
+            // but the module clears its red-coin mask on stageInit. Detect revive (Dead vfx
+            // clearing) and force an immediate progress catch-up instead of waiting ~45s.
+            var wasDead = _hasLastLocalSnapshot &&
+                          (_lastLocalSnapshot.VfxFlags & (ushort)VfxFlags.Dead) != 0;
+            var isDead = (snap.VfxFlags & (ushort)VfxFlags.Dead) != 0;
+            var sameStageRevive = _hasLastLocalSnapshot && !leftProgressStage && !firstSnapshot &&
+                                  wasDead && !isDead && logicalStage != 0;
+
+            _lastLocalSnapshot = snap;
+            _hasLastLocalSnapshot = true;
+            if (firstSnapshot || leftProgressStage)
+            {
+                FlushPendingEpisodeWorldEvents(logicalStage, logicalEpisode);
+                MaybeRequestStageEnterProgressResync(logicalStage, logicalEpisode, firstSnapshot);
+            }
+            else if (sameStageRevive)
+            {
+                // stageInit cleared local red/NPC masks; must force a full mailbox rewrite
+                // even when server progressSeq is unchanged.
+                RequestWorldProgressResyncUnlocked(
+                    $"same-stage-revive {logicalStage}/{logicalEpisode}", forceFull: true);
+            }
+            else
+            {
+                MaybeRequestProgressCatchup();
+            }
         }
-        else if (sameStageRevive)
-        {
-            RequestWorldProgressResync($"same-stage-revive {logicalStage}/{logicalEpisode}");
-        }
+
         SendLocalSnapshot(snap);
         // BridgeWorker's poll loop flushes immediately after this callback with
         // the already-read mailbox. Forcing here performed a second
         // ReadProcessMemory plus duplicate serialization every 60 Hz tick.
     }
 
-    private void RequestWorldProgressResync(string reason)
+    private void MaybeRequestProgressCatchup()
     {
         if (_client?.IsConnected != true)
             return;
-        Log?.Invoke($"World sync: requesting progress resync ({reason})");
-        _ = _client.SendWorldProgressRequestAsync();
+
+        var now = DateTime.UtcNow;
+
+        // Authority-first: never storm TCP forever. On timeout restage from the cached
+        // authority snapshot (or open a short circuit). This closes the Jul-20 soft-death
+        // where force-progress-retry looped 100+ times with an empty mailbox.
+        if (_authorityHeal.ForceReplyTimedOut(now))
+        {
+            HandleForceProgressTimeoutUnlocked(now);
+            return;
+        }
+
+        if (now - _lastProgressCatchupUtc < ProgressCatchupInterval)
+            return;
+        // Avoid stacking on top of a recent stage-enter flood.
+        if (now - _lastStageEnterProgressResyncUtc < TimeSpan.FromSeconds(5))
+            return;
+
+        _lastProgressCatchupUtc = now;
+
+        // Without a mailbox ack we cannot prove module apply — skip rather than advertise
+        // launcher lastApplied (Unchanged silence soft-kills ownership mid-run).
+        if (!_bridgeWorker.TryGetProgressSnapshotAck(out var hostSeq, out var moduleAppliedSeq))
+            return;
+
+        if (ProgressMailboxHealPending(hostSeq, moduleAppliedSeq))
+        {
+            // Prefer re-push of the still-pending heal; escalate to force-full if the
+            // working buffer no longer has a payload to rewrite.
+            if (_bridgeWorker.TryRepushPendingProgressSnapshot())
+            {
+                Log?.Invoke(
+                    $"World sync: re-pushed pending progress snapshot hostSeq={hostSeq} (moduleApplied={moduleAppliedSeq})");
+                return;
+            }
+
+            RequestWorldProgressResyncUnlocked("periodic-catchup-pending-apply", forceFull: true);
+            return;
+        }
+
+        // Non-force: advertise only what Dolphin has bulk-applied (never synthetic cache seq).
+        RequestWorldProgressResyncUnlocked("periodic-catchup", forceFull: false,
+            advertiseSeq: PeriodicCatchupAdvertiseSeq(moduleAppliedSeq, _lastAppliedProgressSeq));
+    }
+
+    private void HandleForceProgressTimeout(DateTime now)
+    {
+        // Callers that already hold _worldProgressLock (OnLocalSnapshot) rely on Monitor
+        // reentrancy; the watchdog takes the lock here.
+        lock (_worldProgressLock)
+            HandleForceProgressTimeoutUnlocked(now);
+    }
+
+    private void HandleForceProgressTimeoutUnlocked(DateTime now)
+    {
+        var decision = _authorityHeal.OnForceTimeout(now);
+        switch (decision.Action)
+        {
+            case ForceTimeoutDecision.Kind.RestageFromCacheAndClearAwait:
+                Log?.Invoke(
+                    $"World sync: force-timeout cache-restage attempt={_authorityHeal.TcpForceAttempts}/{AuthorityHealGovernor.MaxTcpForceAttempts} hostSeq={decision.HostSeq}");
+                if (decision.Snapshot != null)
+                {
+                    if (TryRestageAuthoritySnapshot(decision.Snapshot, decision.HostSeq,
+                            "force-timeout-cache"))
+                    {
+                        var cacheHeal = Interlocked.Increment(ref _telemetryCacheHeal);
+                        Log?.Invoke(
+                            $"World sync: cacheHeal={cacheHeal} force-timeout healed from authority cache hostSeq={decision.HostSeq}");
+                    }
+                    else
+                    {
+                        // Mirror RequestWorldProgressResync: serialize/mailbox miss must
+                        // still expand so force-timeout never leaves ownership unhealed.
+                        Log?.Invoke(
+                            "World sync: force-timeout expand-from-cache — restage missed");
+                        ApplyProgressSnapshotViaEvents(decision.Snapshot);
+                    }
+                }
+
+                // Build 33: governor already cleared await. Do NOT re-arm the watchdog —
+                // that was the 2s restage storm when TCP stayed silent after stage-enter.
+                // Build 36: no best-effort seq=0 TCP after cache restage — that force-reheal
+                // storm (×players on every warp) was the mid-run TCP flood.
+                DisarmForceHealWatchdog();
+                break;
+
+            case ForceTimeoutDecision.Kind.RetryTcp:
+            {
+                var tcpRetry = Interlocked.Increment(ref _telemetryTcpForceRetry);
+                Log?.Invoke(
+                    $"World sync: tcpForceRetry={tcpRetry} attempt={decision.Attempt}/{AuthorityHealGovernor.MaxTcpForceAttempts}");
+                // Do not re-enter BeginForce — that would reset the attempt counter.
+                if (AuthorityHealGovernor.ShouldClearMailboxBeforeForceTcp(
+                        _authorityHeal.HasAuthorityCache()))
+                    _bridgeWorker.ClearProgressSnapshot();
+                ArmForceHealWatchdog();
+                Log?.Invoke("World sync: requesting progress resync (force-progress-retry) seq=0 force");
+                _ = _client?.SendWorldProgressRequestAsync(0);
+                break;
+            }
+
+            case ForceTimeoutDecision.Kind.OpenCircuit:
+            {
+                var circuitOpen = Interlocked.Increment(ref _telemetryCircuitOpen);
+                Log?.Invoke(
+                    $"World sync: circuitOpen={circuitOpen} for {AuthorityHealGovernor.CircuitCooldown.TotalSeconds:0}s — abandon TCP storm, heal from expand if cache returns");
+                if (_authorityHeal.PeekAuthorityCache() is { } cached)
+                    ApplyProgressSnapshotViaEvents(cached);
+                break;
+            }
+        }
+    }
+
+    private void RequestWorldProgressResync(string reason, bool forceFull = false,
+        uint? advertiseSeq = null)
+    {
+        lock (_worldProgressLock)
+            RequestWorldProgressResyncUnlocked(reason, forceFull, advertiseSeq);
+    }
+
+    private void RequestWorldProgressResyncUnlocked(string reason, bool forceFull = false,
+        uint? advertiseSeq = null)
+    {
+        if (_client?.IsConnected != true)
+            return;
+
+        if (forceFull)
+        {
+            var plan = _authorityHeal.BeginForce(DateTime.UtcNow);
+            switch (plan.Action)
+            {
+                case ForceHealPlan.Kind.CircuitBlocked:
+                    Log?.Invoke(
+                        $"World sync: skipped force resync ({reason}) — heal circuit open");
+                    return;
+
+                case ForceHealPlan.Kind.RestageFromCache:
+                    // Never ClearProgressSnapshot when authority is cached — that empty
+                    // window is the force-progress soft-death. Push forces moduleApplied=0
+                    // so same-seq reheal still applies. Build 33: restage IS the heal —
+                    // NoteForceSatisfied and do not arm the watchdog. Best-effort TCP
+                    // refresh below must not re-create the 2s await storm.
+                    if (plan.Snapshot != null)
+                    {
+                        if (TryRestageAuthoritySnapshot(plan.Snapshot, plan.HostSeq, reason))
+                        {
+                            var cacheHeal = Interlocked.Increment(ref _telemetryCacheHeal);
+                            Log?.Invoke(
+                                $"World sync: cacheHeal={cacheHeal} restaged authority ({reason}) hostSeq={plan.HostSeq}");
+                            _authorityHeal.NoteForceSatisfied();
+                        }
+                        else
+                        {
+                            // Mailbox write failed — expand immediately so stage-enter
+                            // force always applies ownership within this call.
+                            Log?.Invoke(
+                                $"World sync: stage-enter force expand-from-cache ({reason}) — mailbox write missed");
+                            ApplyProgressSnapshotViaEvents(plan.Snapshot);
+                        }
+                    }
+                    DisarmForceHealWatchdog();
+                    // Build 36: cache restage completed the heal — do NOT send best-effort
+                    // seq=0 TCP. That was amplifying force-reheal traffic on every stage-enter
+                    // (4 peers × warps → progressSeq hundreds with few shines).
+                    return;
+
+                case ForceHealPlan.Kind.ClearAndRequestTcp:
+                    // First heal of the session — no cache yet. Await TCP body rewrite.
+                    if (AuthorityHealGovernor.ShouldClearMailboxBeforeForceTcp(hasAuthorityCache: false))
+                        _bridgeWorker.ClearProgressSnapshot();
+                    ArmForceHealWatchdog();
+                    break;
+            }
+
+            if (!plan.RequestTcpRefresh)
+                return;
+        }
+
+        var proofSeq = advertiseSeq ?? _lastAppliedProgressSeq;
+        var seq = ClientProgressRequestSeq(proofSeq, forceFull);
+        Log?.Invoke(
+            $"World sync: requesting progress resync ({reason}) seq={seq}{(forceFull ? " force" : "")}");
+        _ = _client.SendWorldProgressRequestAsync(seq);
+    }
+
+    /// <summary>
+    /// Fire force-timeout handling even when LocalSnapshotReady stops ticking.
+    /// </summary>
+    private void ArmForceHealWatchdog()
+    {
+        lock (_forceHealWatchdogLock)
+        {
+            _forceHealWatchdog?.Dispose();
+            _forceHealWatchdog = new Timer(_ =>
+            {
+                try
+                {
+                    var now = DateTime.UtcNow;
+                    if (_authorityHeal.ForceReplyTimedOut(now))
+                        HandleForceProgressTimeout(now);
+                }
+                catch (Exception ex)
+                {
+                    Log?.Invoke($"World sync: force-heal watchdog error: {ex.Message}");
+                }
+            }, null, AuthorityHealGovernor.ForceReplyTimeout, Timeout.InfiniteTimeSpan);
+        }
+    }
+
+    private void DisarmForceHealWatchdog()
+    {
+        lock (_forceHealWatchdogLock)
+        {
+            _forceHealWatchdog?.Dispose();
+            _forceHealWatchdog = null;
+        }
+    }
+
+    /// <summary>
+    /// Write a cached authority snapshot into the progress mailbox with a synthetic hostSeq.
+    /// </summary>
+    private bool TryRestageAuthoritySnapshot(WorldProgressSnapshot snapshot, uint hostSeq, string reason)
+    {
+        var stageId = (byte)0;
+        var episodeId = (byte)0;
+        var hasStage = _hasLastLocalSnapshot;
+        if (hasStage)
+        {
+            stageId = YoshiSnapshotCodec.LogicalStageId(_lastLocalSnapshot, _lastLocalSnapshot.StageId);
+            episodeId = YoshiSnapshotCodec.LogicalEpisodeId(_lastLocalSnapshot, _lastLocalSnapshot.EpisodeId);
+        }
+
+        var mailboxSnap = snapshot.WithMissionFilteredToStage(stageId, episodeId, hasStage);
+        byte[] payload;
+        try
+        {
+            payload = PacketSerializer.BuildWorldProgressSnapshotPayload(mailboxSnap);
+        }
+        catch (Exception ex)
+        {
+            Log?.Invoke($"World sync: authority cache serialize failed ({reason}): {ex.Message}");
+            return false;
+        }
+
+        if (payload.Length > ProtocolConstants.CommProgressSnapshotMaxPayload)
+        {
+            ApplyProgressSnapshotViaEvents(snapshot);
+            return true;
+        }
+
+        _bridgeWorker.ClearNonOwnershipIncomingWorldEvents();
+        var wrote = _bridgeWorker.PushProgressSnapshot(hostSeq == 0 ? 1 : hostSeq, payload);
+        if (!wrote)
+        {
+            Log?.Invoke($"World sync: authority cache mailbox write failed ({reason}) — expand");
+            ApplyProgressSnapshotViaEvents(snapshot);
+            return true;
+        }
+
+        _appliedProgress.NoteSnapshotEvents(mailboxSnap.ExpandToWorldEvents(), replaceMission: true);
+        if (hasStage)
+        {
+            _appliedProgress.PruneMissionToStage(stageId, episodeId);
+            FlushPendingEpisodeWorldEvents(stageId, episodeId);
+        }
+
+        Log?.Invoke(
+            $"World sync: authority cache → mailbox ({reason}) hostSeq={hostSeq} bytes={payload.Length}");
+        return true;
+    }
+
+    /// <summary>Force-full heals advertise seq 0 so the server cannot reply unchanged.</summary>
+    internal static uint ClientProgressRequestSeq(uint lastAppliedProgressSeq, bool forceFull)
+        => forceFull ? 0u : lastAppliedProgressSeq;
+
+    /// <summary>
+    /// True when the launcher has written a progress heal the module has not yet applied.
+    /// Periodic catch-up must not advertise launcher lastApplied in this state — the server
+    /// would reply Unchanged and ownership heal soft-dies until stage-enter force-full.
+    /// </summary>
+    internal static bool ProgressMailboxHealPending(uint hostSeq, uint moduleAppliedSeq)
+        => hostSeq > moduleAppliedSeq;
+
+    /// <summary>
+    /// Non-force periodic catch-up advertises only what Dolphin bulk-applied — but never a
+    /// legacy synthetic cache-heal hostSeq (0x60000000 band). Those poisoned server proof
+    /// seq and left catch-up advertising garbage after stage-enter restage (2026-07-21).
+    /// </summary>
+    internal static uint PeriodicCatchupAdvertiseSeq(uint moduleAppliedSeq,
+        uint lastRealProgressSeq = 0)
+    {
+        if (AuthorityHealGovernor.IsCacheHealHostSeq(moduleAppliedSeq))
+            return lastRealProgressSeq;
+        return moduleAppliedSeq;
+    }
+
+    /// <summary>
+    /// True when a failed <c>ApplyWorldEventToBridge</c> during episode flush should stop
+    /// the whole ready batch. Only session teardown aborts; episode re-queue / HipDrop drop
+    /// must <c>continue</c> so later gold/red/NPC events still drain.
+    /// </summary>
+    internal static bool ShouldAbortWorldEventDrainOnApplyFailure(bool acceptWorldEventApplies)
+        => !acceptWorldEventApplies;
+
+    /// <summary>
+    /// Force-full must not clear the mailbox when an authority cache can restage — that
+    /// empty window is the force-progress soft-death. Only clear on the first heal
+    /// (no cache yet). Cache age does not matter.
+    /// </summary>
+    internal static bool ShouldClearMailboxBeforeForceTcp(bool hasAuthorityCache)
+        => AuthorityHealGovernor.ShouldClearMailboxBeforeForceTcp(hasAuthorityCache);
+
+    /// <summary>
+    /// Force-full previously cleared the progress mailbox before the TCP request. Only a
+    /// real (changed) snapshot rewrites that lane — an Unchanged ack must not clear the
+    /// await flag, or a stale periodic-catch-up reply soft-kills ownership heal until
+    /// the next stage-enter.
+    /// </summary>
+    internal static bool ClearsForceProgressAwait(bool snapshotUnchanged)
+        => AuthorityHealGovernor.ClearsForceProgressAwait(snapshotUnchanged);
+
+    /// <summary>
+    /// Build 27: force-timeout cache restage must expand when restage returns false
+    /// (serialize miss), matching <c>RequestWorldProgressResync</c>.
+    /// </summary>
+    internal static bool ForceTimeoutRestageExpandsOnFailure => true;
+
+    /// <summary>
+    /// Build 27: progress-snapshot serialize failure must expand via events rather than
+    /// returning and leaving force-await hung until the watchdog timeout.
+    /// </summary>
+    internal static bool ProgressSnapshotSerializeFailureExpands => true;
+
+    /// <summary>
+    /// True when two snapshots are the same co-op progress stage. Plaza scenarios share one
+    /// hub; casino catalog↔mission aliases match. Used so decideNextScenario mid-visit does
+    /// not look like a stage-enter resync.
+    /// </summary>
+    internal static bool SameProgressResyncStage(byte stageA, byte episodeA, byte stageB,
+        byte episodeB)
+    {
+        if (stageA != stageB)
+            return false;
+        return LevelCatalog.EpisodesEquivalent(stageA, episodeA, episodeB);
+    }
+
+    private void MaybeRequestStageEnterProgressResync(byte stageId, byte episodeId, bool firstSnapshot)
+    {
+        // Ignore transient zero-area snapshots during boot/load — they caused
+        // stage-enter 0/1 → 1/5 double requests and flushed episode queues wrongly.
+        if (!firstSnapshot && stageId == 0)
+            return;
+
+        var now = DateTime.UtcNow;
+        if (!firstSnapshot &&
+            SameProgressResyncStage(stageId, episodeId, _lastProgressResyncStage,
+                _lastProgressResyncEpisode) &&
+            now - _lastStageEnterProgressResyncUtc < StageEnterProgressResyncDebounce)
+        {
+            Log?.Invoke(
+                $"World sync: skipped duplicate progress resync (stage-enter {stageId}/{episodeId})");
+            return;
+        }
+
+        _lastProgressResyncStage = stageId;
+        _lastProgressResyncEpisode = episodeId;
+        _lastStageEnterProgressResyncUtc = now;
+        RequestWorldProgressResyncUnlocked(
+            $"{(firstSnapshot ? "initial-stage" : "stage-enter")} {stageId}/{episodeId}",
+            forceFull: true);
     }
 
     private DateTime _lastModuleProgressResyncUtc = DateTime.MinValue;
 
     private void OnModuleProgressResyncRequested()
     {
-        // Module holds BF_REQUEST_PROGRESS for several frames — debounce to one TCP request.
-        if ((DateTime.UtcNow - _lastModuleProgressResyncUtc).TotalMilliseconds < 2000)
-            return;
-        _lastModuleProgressResyncUtc = DateTime.UtcNow;
-        RequestWorldProgressResync("module-request-progress");
+        lock (_worldProgressLock)
+        {
+            // Module holds BF_REQUEST_PROGRESS for several frames — debounce to one TCP request.
+            if ((DateTime.UtcNow - _lastModuleProgressResyncUtc).TotalMilliseconds < 2000)
+                return;
+            _lastModuleProgressResyncUtc = DateTime.UtcNow;
+            RequestWorldProgressResyncUnlocked("module-request-progress", forceFull: true);
+        }
     }
 
     private void OnLocalMarioVoice(MarioVoiceEvent voiceEvent)
@@ -1230,14 +1898,29 @@ public sealed class SessionCoordinator : IDisposable
         _ = _client.SendMarioVoiceEventAsync(voiceEvent);
     }
 
-    private void OnLocalWorldEvent(WorldEventRequest worldEvent)
+    /// <summary>
+    /// Publishes one durable world event and reports whether it reached the server. False
+    /// keeps the event queued in <see cref="BridgeWorker"/> (retry, then reconnect replay);
+    /// the server's authorities heal *from* their own state, so a mutation they never
+    /// received is unrecoverable for the rest of the session.
+    /// </summary>
+    private async Task<bool> SendLocalWorldEventAsync(WorldEventRequest worldEvent)
     {
-        if (_client?.IsConnected != true || worldEvent.IsEmpty)
-            return;
+        if (worldEvent.IsEmpty)
+            return true;
+
+        // Phase A TCP durable-only: never send fruit / react / hip-drop / gold. Dropping
+        // these is intentional policy, not a failure — ack so the lane clears.
+        if (!WorldEventTcpPolicy.ShouldSendLocalWorldEvent(worldEvent.Type))
+            return true;
+
+        var client = _client;
+        if (client?.IsConnected != true)
+            return false;
 
         Log?.Invoke(
             $"World sync: sending type={worldEvent.Type} course={worldEvent.CourseId}/{worldEvent.EpisodeId} payload0={worldEvent.Payload0} reserved={worldEvent.Reserved} payload1={worldEvent.Payload1}");
-        _ = _client.SendWorldEventAsync(worldEvent);
+        return await client.TrySendWorldEventAsync(worldEvent).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -1253,7 +1936,7 @@ public sealed class SessionCoordinator : IDisposable
         worldEvent.Type is WorldEventType.GoldCoinCollected
             or WorldEventType.RedCoinCollected
             or WorldEventType.NpcCleaned
-            or WorldEventType.GraffitiCleaned
+            // GraffitiCleaned intentionally omitted — goop sync permanently disabled.
             or WorldEventType.MarioFruitKicked
             or WorldEventType.MarioFruitPicked
             or WorldEventType.MarioFruitThrown
@@ -1279,30 +1962,195 @@ public sealed class SessionCoordinator : IDisposable
 
     private void OnWorldEventReceived(WorldEventPacket worldEvent)
     {
-        ApplyWorldEventToBridge(worldEvent);
+        lock (_worldProgressLock)
+        {
+            // Phase A: ignore ephemeral leftovers from mixed-build peers — never wedge mission.
+            if (WorldEventTcpPolicy.IsNonNetworkedEphemeral(worldEvent.Type))
+                return;
+
+            if (worldEvent.Type == WorldEventType.SessionProgressReset)
+                ClearPendingWorldProgressAppliesUnlocked();
+
+            // Note only after a real bridge enqueue. Queued-off-stage mission events must not
+            // be marked applied — a later heal would filter them from expand while the pending
+            // episode queue (previously wiped on heal) had already dropped them.
+            if (ApplyWorldEventToBridge(worldEvent) &&
+                worldEvent.Type != WorldEventType.SessionProgressReset)
+                _appliedProgress.NoteLiveEvent(worldEvent);
+        }
+    }
+
+    private void OnWorldProgressSnapshotReceived(WorldProgressSnapshot snapshot)
+    {
+        lock (_worldProgressLock)
+            OnWorldProgressSnapshotReceivedUnlocked(snapshot);
+    }
+
+    private void OnWorldProgressSnapshotReceivedUnlocked(WorldProgressSnapshot snapshot)
+    {
+        if (snapshot.Unchanged)
+        {
+            // Stale unchanged replies (e.g. late periodic catch-up) must not satisfy a
+            // force-full await — mailbox was cleared and still needs a body rewrite.
+            if (_authorityHeal.IsAwaitingForce)
+            {
+                Log?.Invoke(
+                    $"World sync: ignoring unchanged progress ack while awaiting force-full seq={snapshot.ProgressSeq}");
+                return;
+            }
+
+            // Refresh cache stamp only — Unchanged must not clear force-await.
+            _authorityHeal.NoteAuthoritySnapshot(snapshot, DateTime.UtcNow);
+
+            if (snapshot.ProgressSeq != 0)
+                _lastAppliedProgressSeq = snapshot.ProgressSeq;
+            Log?.Invoke(
+                $"World sync: progress snapshot unchanged seq={snapshot.ProgressSeq}");
+            return;
+        }
+
+        // Authority-first: cache the full server snapshot for local restage / circuit heal.
+        // Do NOT clear force-await here — NoteAuthoritySnapshot only caches; await clears
+        // via NoteForceSatisfied after a successful mailbox write or expand fallback.
+        _authorityHeal.NoteAuthoritySnapshot(snapshot, DateTime.UtcNow);
+
+        // Track full authority for live delta filtering, then bulk-apply via mailbox lane
+        // (O(1) heal) instead of expanding into N single-slot drains.
+        var stageId = (byte)0;
+        var episodeId = (byte)0;
+        var hasStage = _hasLastLocalSnapshot;
+        if (hasStage)
+        {
+            stageId = YoshiSnapshotCodec.LogicalStageId(_lastLocalSnapshot, _lastLocalSnapshot.StageId);
+            episodeId = YoshiSnapshotCodec.LogicalEpisodeId(_lastLocalSnapshot, _lastLocalSnapshot.EpisodeId);
+        }
+
+        var mailboxSnap = snapshot.WithMissionFilteredToStage(stageId, episodeId, hasStage);
+        byte[] payload;
+        try
+        {
+            payload = PacketSerializer.BuildWorldProgressSnapshotPayload(mailboxSnap);
+        }
+        catch (Exception ex)
+        {
+            // Expand immediately — leaving force-await for timeout only delays ownership
+            // heal and skips the same fallback RequestWorldProgressResync already uses.
+            Log?.Invoke($"World sync: progress snapshot serialize failed: {ex.Message} — expand");
+            ApplyProgressSnapshotViaEvents(snapshot);
+            return;
+        }
+
+        if (payload.Length > ProtocolConstants.CommProgressSnapshotMaxPayload)
+        {
+            Log?.Invoke(
+                $"World sync: progress snapshot too large for mailbox ({payload.Length} > {ProtocolConstants.CommProgressSnapshotMaxPayload}) — falling back to event expand");
+            ApplyProgressSnapshotViaEvents(snapshot);
+            return;
+        }
+
+        // Do NOT wipe _pendingEpisodeWorldEvents — gold / fruit / NpcReact / non-hub
+        // TriggerFlag are absent from WorldProgressSnapshot and would be permanently lost.
+        // Do NOT CancelWorldEventReplay here — that races stage-enter drains of those events.
+        // Only strip ephemeral bridge spam; ownership/mission pending stays.
+        _bridgeWorker.ClearNonOwnershipIncomingWorldEvents();
+
+        var wrote = _bridgeWorker.PushProgressSnapshot(snapshot.ProgressSeq == 0 ? 1 : snapshot.ProgressSeq,
+            payload);
+        if (wrote)
+        {
+            _authorityHeal.NoteForceSatisfied();
+            DisarmForceHealWatchdog();
+            if (snapshot.ProgressSeq != 0)
+                _lastAppliedProgressSeq = snapshot.ProgressSeq;
+
+            // Note only what the mailbox actually carries. Ownership is always included;
+            // off-stage mission rows were filtered out of mailboxSnap and must stay
+            // eligible for a later stage-enter heal / expand fallback.
+            // Replace mission notes from the heal so tracker masks cannot grow unbounded.
+            _appliedProgress.NoteSnapshotEvents(mailboxSnap.ExpandToWorldEvents(), replaceMission: true);
+            if (hasStage)
+                _appliedProgress.PruneMissionToStage(stageId, episodeId);
+
+            // Re-drive any deferred episode events still waiting (heal must not strand them).
+            if (hasStage)
+                FlushPendingEpisodeWorldEvents(stageId, episodeId);
+        }
+        else
+        {
+            Log?.Invoke("World sync: progress snapshot mailbox write failed — falling back to event expand");
+            ApplyProgressSnapshotViaEvents(snapshot);
+            return;
+        }
+
+        Log?.Invoke(
+            $"World sync: progress snapshot → mailbox seq={snapshot.ProgressSeq} bytes={payload.Length} ownership≈{snapshot.OwnershipEventCount} mission≈{mailboxSnap.MissionEventCount}");
+    }
+
+    private void ApplyProgressSnapshotViaEvents(WorldProgressSnapshot snapshot)
+    {
+        var events = snapshot.ExpandToWorldEvents();
+        // Never filter ownership on heal expand — optimistic live notes / lost mailbox
+        // applies must not permanently suppress shine/blue/story from authority heals.
+        var delta = _appliedProgress.FilterNewEvents(events, filterOwnership: false);
+        // Preserve deferred episode queue (gold/fruit/triggers not in snapshot).
+        _bridgeWorker.ClearNonOwnershipIncomingWorldEvents();
+
+        var anyApplied = false;
+        foreach (var worldEvent in delta.OrderBy(e => IsLiveOwnershipWorldEvent(e) ? 0 : 1)
+                     .ThenBy(e => e.EventId))
+        {
+            if (!ApplyWorldEventToBridge(worldEvent, forceApply: false))
+                continue;
+            _appliedProgress.NoteLiveEvent(worldEvent);
+            anyApplied = true;
+        }
+
+        // Count expand as a successful force-full apply even when delta was empty
+        // (authority already reflected) — mailbox path was unavailable but we tried.
+        _authorityHeal.NoteForceSatisfied();
+        DisarmForceHealWatchdog();
+        if (snapshot.ProgressSeq != 0)
+            _lastAppliedProgressSeq = snapshot.ProgressSeq;
+
+        if (_hasLastLocalSnapshot)
+        {
+            var stageId = YoshiSnapshotCodec.LogicalStageId(_lastLocalSnapshot, _lastLocalSnapshot.StageId);
+            var episodeId = YoshiSnapshotCodec.LogicalEpisodeId(_lastLocalSnapshot, _lastLocalSnapshot.EpisodeId);
+            _appliedProgress.PruneMissionToStage(stageId, episodeId);
+            FlushPendingEpisodeWorldEvents(stageId, episodeId);
+        }
+
+        if (!anyApplied && delta.Count > 0)
+            Log?.Invoke(
+                $"World sync: progress expand queued/deferred {delta.Count} events (none pushed live)");
     }
 
     private void OnWorldStateReplayReceived(WorldEventPacket[] events)
     {
-        Log?.Invoke($"World sync: received {events.Length} replayed/resync events from server");
+        lock (_worldProgressLock)
+            OnWorldStateReplayReceivedUnlocked(events);
+    }
+
+    private void OnWorldStateReplayReceivedUnlocked(WorldEventPacket[] events)
+    {
+        Log?.Invoke($"World sync: received {events.Length} legacy replayed/resync events from server");
+
+        // Legacy WorldStateReplay path (older hosts). Same heal policy as compact snapshots:
+        // drop ephemeral only — never clear ownership pending or the deferred episode queue.
+        _bridgeWorker.ClearNonOwnershipIncomingWorldEvents();
+
         if (events.Length == 0)
             return;
 
-        // Full authority replay replaces pending state — clear queues + Dolphin incoming
-        // so a stuck durable visual retry cannot block live shine/blue ownership applies.
-        _bridgeWorker.ClearPendingIncomingWorldEvents();
-        lock (_pendingEpisodeWorldEventsLock)
-            _pendingEpisodeWorldEvents.Clear();
-
-        // Apply live ownership flags first (shine/blue/story), then episode-scoped visuals.
-        // Avoid forceApply so FlushPendingEpisodeWorldEvents can re-deliver on stage entry
-        // after the module resets per-stage red-coin trackers (late join).
-        foreach (var worldEvent in events.OrderBy(e => IsLiveOwnershipWorldEvent(e) ? 0 : 1)
+        var delta = _appliedProgress.FilterNewEvents(events, filterOwnership: false);
+        foreach (var worldEvent in delta.OrderBy(e => IsLiveOwnershipWorldEvent(e) ? 0 : 1)
                      .ThenBy(e => e.EventId))
-            ApplyWorldEventToBridge(worldEvent, forceApply: false);
+        {
+            if (!ApplyWorldEventToBridge(worldEvent, forceApply: false))
+                continue;
+            _appliedProgress.NoteLiveEvent(worldEvent);
+        }
 
-        // Also kick a drained apply for any events that match the current stage so red-coin
-        // switch recovery runs promptly after a mid-run resync.
         if (_hasLastLocalSnapshot)
         {
             var stageId = YoshiSnapshotCodec.LogicalStageId(_lastLocalSnapshot, _lastLocalSnapshot.StageId);
@@ -1322,14 +2170,22 @@ public sealed class SessionCoordinator : IDisposable
             if (!_acceptWorldEventApplies)
                 return;
 
-            ApplyWorldEventToBridge(worldEvent, forceApply: true);
+            // false also means intentional episode-scoped re-queue (FlushPending used the
+            // destination stage while _lastLocalSnapshot is still the previous one) or a
+            // live-only HipDrop drop. Do not abort the rest of the ready batch.
+            if (!ApplyWorldEventToBridge(worldEvent, forceApply: false))
+                continue;
+
+            _appliedProgress.NoteLiveEvent(worldEvent);
 
             // Remove only after a successful push so a cancelled drain (resync /
             // overlapping flush) can re-deliver undelivered episode events.
             lock (_pendingEpisodeWorldEventsLock)
                 _pendingEpisodeWorldEvents.RemoveAll(pending => pending.EventId == worldEvent.EventId);
 
-            var deadline = DateTime.UtcNow.AddSeconds(5);
+            // Brief pace only — dual ownership mailbox means we must not block 5s/event
+            // behind mission applies (that previously stalled stage-enter for minutes).
+            var deadline = DateTime.UtcNow.AddMilliseconds(120);
             while (!ct.IsCancellationRequested && DateTime.UtcNow < deadline)
             {
                 if (_bridgeWorker.TryGetLastAppliedEventId(out var lastApplied) &&
@@ -1340,7 +2196,7 @@ public sealed class SessionCoordinator : IDisposable
 
                 try
                 {
-                    await Task.Delay(16, ct).ConfigureAwait(false);
+                    await Task.Delay(16, ct);
                 }
                 catch (OperationCanceledException)
                 {
@@ -1353,15 +2209,15 @@ public sealed class SessionCoordinator : IDisposable
             Log?.Invoke($"World sync: replay drain finished ({events.Length} events)");
     }
 
-    private void ApplyWorldEventToBridge(WorldEventPacket worldEvent, bool forceApply = false)
+    private bool ApplyWorldEventToBridge(WorldEventPacket worldEvent, bool forceApply = false)
     {
         if (worldEvent.EventId == 0)
-            return;
+            return false;
 
         // Drop applies after disconnect so a cancelled drain / late TCP packet cannot
         // resurrect collectible state into an offline session.
         if (!_acceptWorldEventApplies)
-            return;
+            return false;
 
         if (!forceApply &&
             IsEpisodeScopedWorldEvent(worldEvent) &&
@@ -1370,17 +2226,29 @@ public sealed class SessionCoordinator : IDisposable
                  YoshiSnapshotCodec.LogicalStageId(_lastLocalSnapshot, _lastLocalSnapshot.StageId),
                  YoshiSnapshotCodec.LogicalEpisodeId(_lastLocalSnapshot, _lastLocalSnapshot.EpisodeId))))
         {
+            // Hard-drop fruit / NPC react / gold off-stage — never queue (Phase 3).
+            // Red/NPC coalesce into the pending-episode ring; ownership is never deferred here.
+            if (IsHardDropPendingEpisodeEvent(worldEvent.Type))
+            {
+                Log?.Invoke(
+                    $"World sync: drop off-stage ephemeral eventId={worldEvent.EventId} type={worldEvent.Type}");
+                return false;
+            }
+
             lock (_pendingEpisodeWorldEventsLock)
             {
                 if (_pendingEpisodeWorldEvents.All(pending => pending.EventId != worldEvent.EventId))
+                {
                     _pendingEpisodeWorldEvents.Add(worldEvent);
+                    PrunePendingEpisodeWorldEventsUnlocked();
+                }
             }
             var localStage = _hasLastLocalSnapshot
                 ? $"{_lastLocalSnapshot.StageId}/{_lastLocalSnapshot.EpisodeId}"
                 : "not-ready";
             Log?.Invoke(
                 $"World sync: queued episode-local eventId={worldEvent.EventId} type={worldEvent.Type} — local stage {localStage}, event {worldEvent.CourseId}/{worldEvent.EpisodeId}");
-            return;
+            return false;
         }
 
         // HipDrop is live-only: never queue for later stage-enter flush (would hide virgin
@@ -1391,90 +2259,54 @@ public sealed class SessionCoordinator : IDisposable
             {
                 Log?.Invoke(
                     $"World sync: drop HipDropObject eventId={worldEvent.EventId} — local stage not-ready");
-                return;
+                return false;
             }
 
             var localStage = YoshiSnapshotCodec.LogicalStageId(_lastLocalSnapshot, _lastLocalSnapshot.StageId);
             var localEpisode = YoshiSnapshotCodec.LogicalEpisodeId(_lastLocalSnapshot,
                 _lastLocalSnapshot.EpisodeId);
             var stageOk = worldEvent.CourseId == localStage;
-            var episodeOk = worldEvent.EpisodeId == localEpisode ||
-                            (localStage == SirenaCasinoMapping.AreaId &&
-                             SirenaCasinoMapping.EpisodesEquivalent(worldEvent.EpisodeId, localEpisode));
+            var episodeOk = LevelCatalog.EpisodesEquivalent(localStage, worldEvent.EpisodeId,
+                localEpisode);
             if (!stageOk || !episodeOk)
             {
                 Log?.Invoke(
                     $"World sync: drop HipDropObject eventId={worldEvent.EventId} — local stage {localStage}/{localEpisode}, event {worldEvent.CourseId}/{worldEvent.EpisodeId}");
-                return;
+                return false;
             }
         }
 
         Log?.Invoke(
             $"World sync: applying eventId={worldEvent.EventId} type={worldEvent.Type} course={worldEvent.CourseId}/{worldEvent.EpisodeId} payload0={worldEvent.Payload0} reserved={worldEvent.Reserved} payload1={worldEvent.Payload1}{(forceApply ? " (forced)" : "")}");
         _bridgeWorker.PushIncomingWorldEvent(worldEvent);
+        return true;
     }
 
     /// <summary>
-    /// Live apply gate for episode-scoped events. Exact episode match, plus casino
-    /// catalog↔mission aliases (module sameStage) and graffiti plaza/casino aliases so
-    /// co-op partners on the same physical stage get live red-coin hides — not a queue
-    /// that only flushes on reload.
+    /// Live apply gate for episode-scoped events. Uses the same plaza / casino / hotel /
+    /// Ricco / Pinna equivalence as server <c>StagesEquivalent</c> so catalog-normalized
+    /// broadcasts apply while the local snapshot still shows director mission ids.
     /// </summary>
-    private static bool MatchesEpisodeScopedApply(WorldEventPacket worldEvent, byte stageId,
+    internal static bool MatchesEpisodeScopedApply(WorldEventPacket worldEvent, byte stageId,
         byte episodeId)
     {
         if (worldEvent.CourseId != stageId)
             return false;
-        if (worldEvent.EpisodeId == episodeId)
-            return true;
-
-        if (worldEvent.Type == WorldEventType.GraffitiCleaned)
-            return GraffitiEpisodesEquivalent(stageId, worldEvent.EpisodeId, episodeId);
-
-        // Red coins / gold / NPC clean / fruit / NPC react: same casino episode aliases as
-        // MatchesPendingEpisodeFlush and module red_coin_sync::sameStage.
-        if (stageId == SirenaCasinoMapping.AreaId &&
-            SirenaCasinoMapping.EpisodesEquivalent(worldEvent.EpisodeId, episodeId))
-            return true;
-
-        return false;
+        return LevelCatalog.EpisodesEquivalent(stageId, worldEvent.EpisodeId, episodeId);
     }
 
-    /// <summary>
-    /// Plaza: all dolpic episodes share one physical pollution canvas (no soft-reload).
-    /// Casino: catalog 0/1 ↔ beach mission 3/4.
-    /// </summary>
-    private static bool GraffitiEpisodesEquivalent(byte courseId, byte a, byte b)
-    {
-        if (a == b)
-            return true;
-        if (courseId == StoryFlagAuthority.PlazaAreaId)
-            return true;
-        if (courseId == SirenaCasinoMapping.AreaId)
-            return SirenaCasinoMapping.EpisodesEquivalent(a, b);
-        return false;
-    }
-
-    private static bool MatchesPendingEpisodeFlush(WorldEventPacket worldEvent, byte stageId,
+    internal static bool MatchesPendingEpisodeFlush(WorldEventPacket worldEvent, byte stageId,
         byte episodeId)
     {
         if (worldEvent.CourseId != stageId)
             return false;
-        if (worldEvent.EpisodeId == episodeId)
-            return true;
-
-        // Graffiti: plaza hub episode aliases + casino catalog↔mission (same as module apply).
-        if (worldEvent.Type == WorldEventType.GraffitiCleaned &&
-            GraffitiEpisodesEquivalent(stageId, worldEvent.EpisodeId, episodeId))
-            return true;
-
-        // Sirena casino: module publishes mission 3/4; warp flush uses catalog 0/1.
-        if (stageId == SirenaCasinoMapping.AreaId &&
-            SirenaCasinoMapping.EpisodesEquivalent(worldEvent.EpisodeId, episodeId))
+        if (LevelCatalog.EpisodesEquivalent(stageId, worldEvent.EpisodeId, episodeId))
             return true;
 
         // StoryFlagAuthority coalesces plaza Type5 to PlazaHubEpisode (0xFF). Drain those
-        // (and any allowlist plaza hub triggers) on any local plaza visit.
+        // (and any allowlist plaza hub triggers) on any local plaza visit. Plaza already
+        // matches via EpisodesEquivalent; this covers allowlisted hub triggers whose
+        // course/episode encoding may still need the explicit IsPlazaHubTrigger check.
         return stageId == StoryFlagAuthority.PlazaAreaId &&
                worldEvent.Type == WorldEventType.TriggerFlag &&
                (worldEvent.EpisodeId == StoryFlagAuthority.PlazaHubEpisode ||
@@ -1511,6 +2343,44 @@ public sealed class SessionCoordinator : IDisposable
         var ct = BeginWorldEventReplay();
         _ = DrainWorldEventReplayAsync(ready, ct);
     }
+
+    /// <summary>
+    /// Bound the off-stage queue. Hard-drop fruit/gold/react; coalesce red/NPC;
+    /// never retain more than <see cref="MaxPendingEpisodeWorldEvents"/>. Ownership is
+    /// never queued here (live-applied), so this path cannot block shine/blue/story.
+    /// </summary>
+    private void PrunePendingEpisodeWorldEventsUnlocked()
+    {
+        // Always hard-drop fruit / gold / NPC react — even under the soft cap.
+        _pendingEpisodeWorldEvents.RemoveAll(e => IsHardDropPendingEpisodeEvent(e.Type));
+
+        // Always coalesce red/NPC to latest mask per (stage, type, index).
+        var seen = new HashSet<(WorldEventType Type, byte Course, byte Episode, byte Index)>();
+        for (var i = _pendingEpisodeWorldEvents.Count - 1; i >= 0; i--)
+        {
+            var e = _pendingEpisodeWorldEvents[i];
+            if (e.Type is not (WorldEventType.RedCoinCollected or WorldEventType.NpcCleaned))
+                continue;
+            var key = (e.Type, e.CourseId, e.EpisodeId, e.Reserved);
+            if (!seen.Add(key))
+                _pendingEpisodeWorldEvents.RemoveAt(i);
+        }
+
+        while (_pendingEpisodeWorldEvents.Count > MaxPendingEpisodeWorldEvents)
+            _pendingEpisodeWorldEvents.RemoveAt(0);
+    }
+
+    private static bool IsHardDropPendingEpisodeEvent(WorldEventType type) =>
+        type is WorldEventType.MarioFruitKicked
+            or WorldEventType.MarioFruitPicked
+            or WorldEventType.MarioFruitThrown
+            or WorldEventType.MarioFruitDropped
+            or WorldEventType.MarioFruitSync
+            or WorldEventType.YoshiFruitTaken
+            or WorldEventType.NpcReact
+            or WorldEventType.GoldCoinCollected
+            or WorldEventType.HipDropObject
+            or WorldEventType.GraffitiCleaned;
 
     private void SendLocalSnapshot(PlayerSnapshot snap)
     {
@@ -1791,6 +2661,7 @@ public sealed class SessionCoordinator : IDisposable
     public void Dispose()
     {
         Shutdown();
+        DisarmForceHealWatchdog();
         _bridgeWorker.Dispose();
         _bridge.Dispose();
         _monitor.Dispose();

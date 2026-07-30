@@ -7,7 +7,7 @@
 namespace smso {
 
 constexpr u32 COMM_MAGIC = 0x534D534F; // "SMSO"
-constexpr u16 COMM_VERSION = 11;
+constexpr u16 COMM_VERSION = 15;
 // Legacy scan hint for the launcher; the live buffer lives in module BSS.
 constexpr u32 COMM_GUEST_ADDRESS = 0x817FC000;
 // Maximum connected players (slots 0..MAX_PLAYERS-1). roleBySlot and roster logic key off this.
@@ -44,8 +44,14 @@ enum GameModeFlags : u8 {
 constexpr u32 COMM_GAME_MODE_STATE_SIZE = 11 + MAX_PLAYERS;
 constexpr u32 COMM_GAME_MODE_STATE_OFFSET = COMM_MARIO_VOICE_EVENTS_OFFSET + COMM_MARIO_VOICE_EVENTS_SIZE;
 constexpr u32 COMM_WORLD_EVENT_SIZE = 19;
-constexpr u32 COMM_WORLD_SYNC_SIZE = COMM_WORLD_EVENT_SIZE * 2 + 4;
+// Dual outbound (ownership + mission) + dual inbound + lastAppliedEventId.
+// Comm v14: same separation outbound that v13 did inbound.
+constexpr u32 COMM_WORLD_SYNC_SIZE = COMM_WORLD_EVENT_SIZE * 4 + 4;
 constexpr u32 COMM_WORLD_SYNC_OFFSET = COMM_GAME_MODE_STATE_OFFSET + COMM_GAME_MODE_STATE_SIZE;
+constexpr u32 COMM_LOCAL_PENDING_OWNERSHIP_OFFSET = COMM_WORLD_SYNC_OFFSET;
+constexpr u32 COMM_LOCAL_PENDING_MISSION_OFFSET = COMM_WORLD_SYNC_OFFSET + COMM_WORLD_EVENT_SIZE;
+constexpr u32 COMM_INCOMING_OWNERSHIP_OFFSET = COMM_WORLD_SYNC_OFFSET + COMM_WORLD_EVENT_SIZE * 2;
+constexpr u32 COMM_INCOMING_WORLD_EVENT_OFFSET = COMM_WORLD_SYNC_OFFSET + COMM_WORLD_EVENT_SIZE * 3;
 constexpr u32 COMM_ROSTER_HUD_EVENT_SIZE = 20;
 // One slot per player so a full-lobby connect/disconnect wave cannot overwrite unread HUD events.
 constexpr u32 COMM_ROSTER_HUD_RING_SLOTS = MAX_PLAYERS;
@@ -53,7 +59,17 @@ constexpr u32 COMM_ROSTER_HUD_SYNC_SIZE = 2 + COMM_ROSTER_HUD_RING_SLOTS * COMM_
 constexpr u32 COMM_ROSTER_HUD_OFFSET = COMM_WORLD_SYNC_OFFSET + COMM_WORLD_SYNC_SIZE;
 constexpr u32 COMM_MARIO_MODEL_IDS_OFFSET = COMM_ROSTER_HUD_OFFSET + COMM_ROSTER_HUD_SYNC_SIZE;
 constexpr u32 COMM_MARIO_MODEL_IDS_SIZE = MARIO_MODEL_ID_SIZE * (MAX_REMOTE_SLOTS + 1);
-constexpr u32 COMM_BUFFER_SIZE = COMM_MARIO_MODEL_IDS_OFFSET + COMM_MARIO_MODEL_IDS_SIZE;
+// Latest-wins compact progress heal. Payload is LE WorldProgressSnapshot TCP body.
+constexpr u32 COMM_PROGRESS_SNAPSHOT_HEADER_SIZE = 12;
+constexpr u32 COMM_PROGRESS_SNAPSHOT_MAX_PAYLOAD = 4096;
+constexpr u32 COMM_PROGRESS_SNAPSHOT_SIZE =
+    COMM_PROGRESS_SNAPSHOT_HEADER_SIZE + COMM_PROGRESS_SNAPSHOT_MAX_PAYLOAD;
+constexpr u32 COMM_PROGRESS_SNAPSHOT_OFFSET = COMM_MARIO_MODEL_IDS_OFFSET + COMM_MARIO_MODEL_IDS_SIZE;
+// Launcher → module: in-game BGM / streamed music volume (0–100 percent). Independent of SFX.
+constexpr u32 COMM_MUSIC_VOLUME_OFFSET = COMM_PROGRESS_SNAPSHOT_OFFSET + COMM_PROGRESS_SNAPSHOT_SIZE;
+constexpr u32 COMM_MUSIC_VOLUME_SIZE = 1;
+constexpr u8 COMM_MUSIC_VOLUME_DEFAULT = 100;
+constexpr u32 COMM_BUFFER_SIZE = COMM_MUSIC_VOLUME_OFFSET + COMM_MUSIC_VOLUME_SIZE;
 // localNameTagAppearance starts right after remoteSnapshots[10] (48 + 64 + 64*10 = 752).
 constexpr u32 COMM_NAME_TAG_APPEARANCES_OFFSET = 752;
 // local(10) + remote[10](100) = 110.
@@ -606,13 +622,15 @@ enum WorldEventType : u8 {
     // payload1 = packed NPC world position. Gated by BF_SYNC_EVENT|BF_SYNC_MISSION.
     // Apply forces clean+unsunk so checkMonteClear / mission HUD catch up on late join.
     WE_NPC_CLEANED = 17,
-    // Surface graffiti / goop cleaned via TPollutionManager::clean. Durable, grow-only
-    // per stage cell. payload0 = quantized radius (units/8), payload1 = packed XYZ,
-    // payload2 = 32u 3D cell pack: bits0-9=cellX, 10-19=cellY, 20-29=cellZ (signed
-    // 10-bit), bit30=valid. XZ-only cells collapsed vertical wall M into one stamp.
-    // Remote applies retail stamp(0) all planes (walls+ground); late-join via snapshot.
-    // Gated by BF_SYNC_EVENT|MISSION.
+    // LEGACY — graffiti/goop sync permanently disabled (2026-07-19). Enum kept for
+    // wire compatibility; module never publishes; server rejects; not durable.
     WE_GRAFFITI_CLEANED = 18,
+    // Host mid-session "new file" session progress clear. Non-durable command —
+    // not in WorldEventRelay history. Clears shine/blue/story/secret/plaza Type5 /
+    // nozzles + server-side red/NPC authorities. Actors stay until stage reload.
+    // Legacy name: ShineBlueProgressReset.
+    WE_SESSION_PROGRESS_RESET = 19,
+    WE_SHINE_BLUE_PROGRESS_RESET = WE_SESSION_PROGRESS_RESET,
 };
 
 struct CommWorldEvent {
@@ -630,8 +648,10 @@ struct CommWorldEvent {
 static_assert(sizeof(CommWorldEvent) == COMM_WORLD_EVENT_SIZE, "CommWorldEvent size mismatch");
 
 struct WorldSyncState {
-    CommWorldEvent localPending;
-    CommWorldEvent incoming;
+    CommWorldEvent localPendingOwnership; // shine/blue/story/secret/trigger/episode/reset
+    CommWorldEvent localPendingMission;   // red/NPC/gold/fruit/hip-drop/NPC react
+    CommWorldEvent incomingOwnership;     // shine/blue/story/secret/trigger/session reset
+    CommWorldEvent incoming;              // mission + ephemeral
     u32 lastAppliedEventId;
 };
 
@@ -657,6 +677,18 @@ struct RosterHudSync {
 
 static_assert(sizeof(RosterHudEvent) == COMM_ROSTER_HUD_EVENT_SIZE, "RosterHudEvent size mismatch");
 static_assert(sizeof(RosterHudSync) == COMM_ROSTER_HUD_SYNC_SIZE, "RosterHudSync size mismatch");
+
+struct ProgressSnapshotMailbox {
+    u32 hostSeq;          // bridge writes when a newer heal arrives
+    u32 moduleAppliedSeq; // module writes after bulk apply
+    u16 payloadLen;
+    u8 flags;
+    u8 reserved;
+    u8 payload[COMM_PROGRESS_SNAPSHOT_MAX_PAYLOAD];
+};
+
+static_assert(sizeof(ProgressSnapshotMailbox) == COMM_PROGRESS_SNAPSHOT_SIZE,
+              "ProgressSnapshotMailbox size mismatch");
 
 struct CommBuffer {
     u32 magic;
@@ -684,6 +716,9 @@ struct CommBuffer {
     RosterHudSync rosterHud;
     char localMarioModelId[MARIO_MODEL_ID_SIZE];
     char remoteMarioModelIds[MAX_REMOTE_SLOTS][MARIO_MODEL_ID_SIZE];
+    ProgressSnapshotMailbox progressSnapshot;
+    // 0–100 percent. Launcher-authored; module applies via MSBgm track volume slot 3.
+    u8 musicVolume;
 };
 
 #pragma pack(pop)
@@ -701,6 +736,10 @@ static_assert(offsetof(CommBuffer, gameModeState) == COMM_GAME_MODE_STATE_OFFSET
               "game mode state offset mismatch");
 static_assert(offsetof(CommBuffer, localMarioModelId) == COMM_MARIO_MODEL_IDS_OFFSET,
               "mario model ids offset mismatch");
+static_assert(offsetof(CommBuffer, progressSnapshot) == COMM_PROGRESS_SNAPSHOT_OFFSET,
+              "progress snapshot offset mismatch");
+static_assert(offsetof(CommBuffer, musicVolume) == COMM_MUSIC_VOLUME_OFFSET,
+              "musicVolume offset mismatch");
 
 inline bool marioModelIdIsEmpty(const char id[MARIO_MODEL_ID_SIZE]) {
     if (!id)

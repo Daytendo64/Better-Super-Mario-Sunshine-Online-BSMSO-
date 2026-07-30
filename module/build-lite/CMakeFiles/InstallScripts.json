@@ -1,0 +1,9 @@
+{
+	"InstallScripts" : 
+	[
+		"C:/Users/young/OneDrive/Desktop/SMSOBB/module/build-lite/cmake_install.cmake",
+		"C:/Users/young/OneDrive/Desktop/SMSOBB/module/build-lite/lib/BetterSunshineEngine/cmake_install.cmake",
+		"C:/Users/young/OneDrive/Desktop/SMSOBB/module/build-lite/lib/BetterSunshineEngine/lib/sms_interface/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

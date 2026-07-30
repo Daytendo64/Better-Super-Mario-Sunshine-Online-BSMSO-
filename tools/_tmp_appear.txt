@@ -1,0 +1,158 @@
+PATH C:\Users\young\OneDrive\Desktop\SMSOBB\module\src\red_coin_sync.cpp
+/// Vanilla floating red-coin count digit: TGCConsole2::startAppearRedCoin @ 0x8014A9BC
+/// arms mIsRedCoinCard; perform() drives processAppearRed @ 0x801455CC.
+/// processDownCoin @ 0x801466F0 is the *gold* coin digit animator — do not use for reds.
+using StartAppearRedCoinFn = void (*)(TGCConsole2 *);
+
+static StartAppearRedCoinFn gStartAppearRedCoin = nullptr;
+static u32 gCoinRedVtable = 0;
+static u32 gCoinEmptyVtable = 0;
+
+/// perform() caches last drawn red count at TGCConsole2+0x448; only runs the
+/// digit changeTexture + get-emitter + appear path when getFlag(0x60000) differs.
+constexpr u32 kRedCoinCountCacheOff = 0x448;
+====
+PATH C:\Users\young\OneDrive\Desktop\SMSOBB\module\src\red_coin_sync.cpp
+/// Show / restart the floating red count digit for `count` (1–8).
+/// perform() skips startAppearRedCoin when the card pane is already visible (typical
+/// after a local switch arm), so remotes that only wrote mRedCoinCount got x N/8 on
+/// the card but never re-armed processAppearRed — the large floating digit.
+static void triggerRedCoinCollectPopup(TGCConsole2 *console, u32 count) {
+    if (!console || !gStartAppearRedCoin || count == 0 || count > kMaxStageRedCoins)
+        return;
+
+    auto *cache = reinterpret_cast<s32 *>(reinterpret_cast<u8 *>(console) + kRedCoinCountCacheOff);
+    if (static_cast<u32>(*cache) == count)
+        *cache = static_cast<s32>(count - 1);
+
+    console->mRedCoinCardTimer = 0;
+    gStartAppearRedCoin(console);
+    OSReport("[SMSOBB] red-coin popup count=%u\n", count);
+}
+
+static void catchUpRedCoinHudIfArmed(TFlagManager *fm) {
+    if (!fm || !sPendingHudCatchUp)
+        return;
+    if (!isLocalRedCoinMissionLive(fm))
+        return;
+
+    TGCConsole2 *console = gpMarDirector ? gpMarDirector->mGCConsole : nullptr;
+    const u32 resolvedCount = static_cast<u32>(popCountMask(sCollectedMask));
+    if (resolvedCount == 0) {
+        sPendingHudCatchUp = false;
+        return;
+    }
+
+    fm->Type6Flag.mRedCoinCount = static_cast<s32>(resolvedCount);
+    sLastRedCoinCount = resolvedCount;
+    // One popup for the catch-up total — do not fan out per index.
+    triggerRedCoinCollectPopup(console, resolvedCount);
+
+    sPendingHudCatchUp = false;
+    reconci
+====
+PATH None
+    // Red-coin switch arming is local-only. Collection sync may remember/hide coins, but must
+    // not write mRedCoinCount or re-arm startAppearRedCoin until this client has armed the
+    // mission (local switch press or live pre-placed coins). Otherwise durable replay /
+    // periodic resync after a stage reload reopens the red-coin HUD with no switch press.
+    const u8 publishHudSlot = payload0 & 0xF;
+    const u32 targetCount = (payload0 >> 4) & 0xF;
+    const bool missionLive = isLocalRedCoinMissionLive(fm);
+====
+PATH None
+void initRedCoinSync() {
+    gStartAppearRedCoin =
+        reinterpret_cast<StartAppearRedCoinFn>(SMS_PORT_REGION(0x8014A9BC, 0x8013F64C, 0, 0));
+    gCoinRedVtable = SMS_PORT_REGION(0x803C9BB4, 0x803C13A4, 0, 0);
+    gCoinEmptyVtable = SMS_PORT_REGION(0x803C9D98, 0x803C1588, 0, 0);
+====
+PATH None
+    public const ushort ModBuildId = 64;
+====
+PATH None
+        Assert.Equal(64, ProtocolConstants.ModBuildId);
+====
+PATH None
+## Stage reload / HUD rule
+
+After a stage reload, vanilla clears the switch bit and red-coin count. Durable `RedCoinCollected` history (and the ~45s progress resync) may still re-apply. Apply must **not** write `Type6Flag.mRedCoinCount` or re-arm `startAppearRedCoin` until the local mission is live:
+
+- `mRedCoinSwitchPressed`, or
+- live `TCoinRed` actors (pre-placed), or
+- the red-coin HUD card already shown (`mIsRedCoinCard`)
+
+Until then, apply only remembers collected indices for later hide/reconcile. When the local player arms the mission, a one-shot HUD catch-up fills the count and shows one popup for the total. Trackers also reset on every `stageInit` (not only course/episode ID changes) so same-episode reloads do not keep stale state; durable mask events then re-apply and rebind to the new actors **only when co-op persistence applies** (see death-reset rule below).
+
+### Floating red count digit (ModBuildId 64)
+
+The large floating red number after a collect is **not** `processDownCoin` (that animates gold-coin HUD digits @ `0x801466F0`). Vanilla path:
+
+1. `TCoinRed::taken` → `incFlag(0x60000)` (`Type6Flag.mRedCoinCount`)
+2. `TGCConsole2::perform` sees `getFlag(0x60000)` ≠ cache @ console+`0x448` → `changeTexture` on the card digit + `createEmitter` (effect 508)
+3. If the red card pane is **not** visible → `startAppearRedCoin` @ `0x8014A9BC` (sets `mIsRedCoinCard`)
+4. While `mIsRedCoinCard` → `processAppearRed` @ `0x801455CC` animates the floating digit into the card
+
+**W
+====
+PATH C:\Users\young\OneDrive\Desktop\SMSOBB\module\src\red_coin_sync.cpp
+    // Red-coin switch arming is local-only. Collection sync may remember/hide coins, but must
+    // not write mRedCoinCount or re-arm startAppearRedCoin until this client has armed the
+    // mission (local switch press or live pre-placed coins). Otherwise durable replay /
+    // periodic resync after a stage reload reopens the red-coin HUD with no switch press.
+    const u8 publishHudSlot = payload0 & 0xF;
+    const u32 targetCount = (payload0 >> 4) & 0xF;
+    const bool missionLive = isLocalRedCoinMissionLive(fm);
+====
+PATH C:\Users\young\OneDrive\Desktop\SMSOBB\module\src\red_coin_sync.cpp
+void initRedCoinSync() {
+    gStartAppearRedCoin =
+        reinterpret_cast<StartAppearRedCoinFn>(SMS_PORT_REGION(0x8014A9BC, 0x8013F64C, 0, 0));
+    gCoinRedVtable = SMS_PORT_REGION(0x803C9BB4, 0x803C13A4, 0, 0);
+    gCoinEmptyVtable = SMS_PORT_REGION(0x803C9D98, 0x803C1588, 0, 0);
+====
+PATH C:\Users\young\OneDrive\Desktop\SMSOBB\launcher\SMSO.Net\ProtocolConstants.cs
+    public const ushort ModBuildId = 64;
+====
+PATH C:\Users\young\OneDrive\Desktop\SMSOBB\launcher\SMSO.Tests\CollectibleAuthorityTests.cs
+        Assert.Equal(64, ProtocolConstants.ModBuildId);
+====
+PATH C:\Users\young\OneDrive\Desktop\SMSOBB\docs\research\07-red-coin-episodes.md
+## Stage reload / HUD rule
+
+After a stage reload, vanilla clears the switch bit and red-coin count. Durable `RedCoinCollected` history (and the ~45s progress resync) may still re-apply. Apply must **not** write `Type6Flag.mRedCoinCount` or re-arm `startAppearRedCoin` until the local mission is live:
+
+- `mRedCoinSwitchPressed`, or
+- live `TCoinRed` actors (pre-placed), or
+- the red-coin HUD card already shown (`mIsRedCoinCard`)
+
+Until then, apply only remembers collected indices for later hide/reconcile. When the local player arms the mission, a one-shot HUD catch-up fills the count and shows one popup for the total. Trackers also reset on every `stageInit` (not only course/episode ID changes) so same-episode reloads do not keep stale state; durable mask events then re-apply and rebind to the new actors **only when co-op persistence applies** (see death-reset rule below).
+
+### Floating red count digit (ModBuildId 64)
+
+The large floating red number after a collect is **not** `processDownCoin` (that animates gold-coin HUD digits @ `0x801466F0`). Vanilla path:
+
+1. `TCoinRed::taken` → `incFlag(0x60000)` (`Type6Flag.mRedCoinCount`)
+2. `TGCConsole2::perform` sees `getFlag(0x60000)` ≠ cache @ console+`0x448` → `changeTexture` on the card digit + `createEmitter` (effect 508)
+3. If the red card pane is **not** visible → `startAppearRedCoin` @ `0x8014A9BC` (sets `mIsRedCoinCard`)
+4. While `mIsRedCoinCard` → `processAppearRed` @ `0x801455CC` animates the floating digit into the card
+
+**W
+====
+PATH C:\Users\young\OneDrive\Desktop\SMSOBB\docs\research\07-red-coin-episodes.md
+Never call or patch `taken__8TCoinRed` @ `0x801BE428`. Remote hide path:
+
+1. `makeObjDead()`
+2. taken byte @ `0x152` = 1
+3. clip flags (no vtable swap)
+4. `Type6Flag.mRedCoinCount` = authoritative count
+5. `startAppearRedCoin` @ `0x8014A9BC` (re-arm floating digit; see ModBuildId 64 note above)
+====
+PATH C:\Users\young\OneDrive\Desktop\SMSOBB\launcher\SMSO.Net\ProtocolConstants.cs
+    /// Build 64: red-coin floating count digit — re-arm startAppearRedCoin on remote
+    /// apply / HUD catch-up (perform skips it when the card pane is already visible).
+    /// Still coalesced ownership-push / snapshot apply only; no per-collect TCP.
+    /// Build 63: red/blue remote collect FX — packed-pos epsilon + fingerprint hide harden.
+    /// Build 62: red/blue remote collect FX — resolve blue coin pos before hide; stop
+    /// OR-ing full red mask mid snapshot-expand (sibling FX was skipped). Still snapshot-only.
+====

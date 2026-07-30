@@ -78,6 +78,8 @@
 
     { "courseId": 52, "episodeId": 0, "title": "Father and Son Shine!", "format": "single" },
 
+    { "courseId": 16, "episodeId": 0, "title": "Undersea", "format": "hub" },
+
     { "courseId": 47, "episodeId": 0, "title": "Red Coins of the Hillside Cave", "format": "single" },
     { "courseId": 46, "episodeId": 0, "title": "Red Coins of the Dirty Lake", "format": "single" },
     { "courseId": 48, "episodeId": 0, "title": "The Secret of Ricco Tower", "format": "single" },
@@ -89,6 +91,8 @@
     { "courseId": 13, "episodeId": 7, "title": "Roller Coaster Balloons", "format": "numbered", "expectedScenario": 5 },
     { "courseId": 7, "episodeId": 0, "title": "Hotel Lobby", "format": "hub", "expectedScenario": 0 },
     { "courseId": 7, "episodeId": 2, "title": "Mysterious Hotel Delfino", "format": "numbered", "expectedScenario": 2 },
+    { "courseId": 7, "episodeId": 3, "title": "Casino path (hotel)", "format": "numbered", "expectedScenario": 3 },
+    { "courseId": 7, "episodeId": 4, "title": "King Boo path (hotel)", "format": "numbered", "expectedScenario": 4 },
     { "courseId": 7, "episodeId": 6, "title": "Shadow Mario Checks In", "format": "numbered", "expectedScenario": 6 },
     { "courseId": 7, "episodeId": 7, "title": "Red Coins in the Hotel", "format": "numbered", "expectedScenario": 4 },
     { "courseId": 56, "episodeId": 0, "title": "King Boo Down Below", "format": "single" },
@@ -101,6 +105,13 @@
     { "courseId": 42, "episodeId": 0, "title": "Red Coin Chucksters", "format": "single" },
     { "courseId": 31, "episodeId": 0, "title": "The Shell's Secret", "format": "single" },
     { "courseId": 32, "episodeId": 0, "title": "Dune Bud Sand Castle Secret", "format": "single" },
+    { "courseId": 33, "episodeId": 0, "title": "The Sand Bird is Born", "format": "single" },
+    { "courseId": 44, "episodeId": 0, "title": "Red Coins in a Bottle", "format": "single" },
+    { "courseId": 55, "episodeId": 0, "title": "Down with Petey Piranha!", "format": "single" },
+    { "courseId": 57, "episodeId": 0, "title": "Eely-Mouth's Dentist", "format": "single" },
+    { "courseId": 58, "episodeId": 0, "title": "Mecha-Bowser Appears!", "format": "single" },
+    { "courseId": 59, "episodeId": 0, "title": "Gooper Blooper Breaks Out", "format": "single" },
+    { "courseId": 60, "episodeId": 0, "title": "Father and Son Shine!", "format": "single" },
     { "courseId": 20, "episodeId": 0, "title": "Delfino Airstrip Dilemma", "format": "single" },
     { "courseId": 21, "episodeId": 0, "title": "Super Slide", "format": "single" },
     { "courseId": 22, "episodeId": 0, "title": "Pachinko Game", "format": "single" },

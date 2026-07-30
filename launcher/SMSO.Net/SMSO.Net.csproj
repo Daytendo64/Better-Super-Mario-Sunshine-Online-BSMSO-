@@ -14,6 +14,9 @@
     <!-- Tall-character BodyAngleFree.prm override (Luigi / Nightendo / Waluigi / Wario). -->
     <EmbeddedResource Include="MarioPack\bodyanglefree2.prm"
                       LogicalName="SMSO.Net.MarioPack.bodyanglefree2.prm" />
+    <!-- Official BetterSunshineMoveset movement retune (injected into mario RARC root). -->
+    <EmbeddedResource Include="MarioPack\better_movement.prm"
+                      LogicalName="SMSO.Net.MarioPack.better_movement.prm" />
   </ItemGroup>
 
   <ItemGroup>

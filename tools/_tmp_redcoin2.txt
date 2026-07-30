@@ -1,0 +1,102 @@
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=64 shinesChanged=0
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=64 shinesChanged=0
+PL.cpp:306 N [SMSOBB] red-coin stage-enter co-op course=1/8 (no mission-reset)
+PL.cpp:306 N [SMSOBB] red-coin stage-enter co-op course=1/8 (no mission-reset)
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=64 shinesChanged=0
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=64 shinesChanged=0
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=64 shinesChanged=0
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=64 shinesChanged=0
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=64 shinesChanged=0
+PL.cpp:306 N [SMSOBB] red-coin co-op peer joined 窶・resume persist course=1/8
+PL.cpp:306 N [SMSOBB] red-coin co-op peer joined 窶・resume persist course=1/8
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=64 shinesChanged=0
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=64 shinesChanged=0
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=64 shinesChanged=0
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=64 shinesChanged=0
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=64 shinesChanged=0
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=69 shinesChanged=0
+PL.cpp:306 N [SMSOBB] red-coin snapshot ready count=8 mask=0x00 final=0
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=69 shinesChanged=0
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=69 shinesChanged=0
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=69 shinesChanged=0
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=69 shinesChanged=0
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=69 shinesChanged=0
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=69 shinesChanged=0
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=69 shinesChanged=0
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=69 shinesChanged=0
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=69 shinesChanged=0
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=69 shinesChanged=0
+PL.cpp:306 N [SMSOBB] red-coin co-op peer joined 窶・resume persist course=2/7
+PL.cpp:306 N [SMSOBB] red-coin snapshot ready count=8 mask=0x00 final=0
+PL.cpp:306 N [SMSOBB] red-coin snapshot ready count=8 mask=0x00 final=0
+PL.cpp:306 N [SMSOBB] red-coin snapshot ready count=8 mask=0x00 final=0
+PL.cpp:306 N [SMSOBB] red-coin co-op peer joined 窶・resume persist course=2/7
+PL.cpp:306 N [SMSOBB] red-coin co-op peer joined 窶・resume persist course=2/7
+PL.cpp:306 N [SMSOBB] red-coin co-op peer joined 窶・resume persist course=2/7
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=69 shinesChanged=0
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=49 shinesChanged=0
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=64 shinesChanged=0
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=49 shinesChanged=0
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=49 shinesChanged=0
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=64 shinesChanged=0
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=64 shinesChanged=0
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=64 shinesChanged=0
+PL.cpp:306 N [SMSOBB] red-coin co-op peer joined 窶・resume persist course=1/8
+PL.cpp:306 N [SMSOBB] red-coin co-op peer joined 窶・resume persist course=1/8
+PL.cpp:306 N [SMSOBB] blue apply-flag course=1 idx=14 changed=1 localCourse=1
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=73 shinesChanged=0
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=73 shinesChanged=0
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=73 shinesChanged=0
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=73 shinesChanged=0
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=73 shinesChanged=0
+PL.cpp:306 N [SMSOBB] red-coin co-op peer joined 窶・resume persist course=23/0
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=73 shinesChanged=0
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=73 shinesChanged=0
+PL.cpp:306 N [SMSOBB] red-coin snapshot ready count=2 mask=0x00 final=0
+PL.cpp:306 N [SMSOBB] red-coin co-op peer joined 窶・resume persist course=23/0
+PL.cpp:306 N [SMSOBB] red-coin snapshot ready count=2 mask=0x00 final=0
+PL.cpp:306 N [SMSOBB] red-coin collect i=1 mask=0x02 count=1
+PL.cpp:306 N [SMSOBB] red-coin apply i=1 mask=0x02 count=1 live=1 already=0 pos=1
+PL.cpp:306 N [SMSOBB] red-coin hide-by-index i=1 mask=0x02 count=1
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=108 shinesChanged=0
+PL.cpp:306 N [SMSOBB] red-coin apply i=1 mask=0x02 count=1 live=1 already=1 pos=1
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=108 shinesChanged=0
+PL.cpp:306 N [SMSOBB] red-coin snapshot expand count=3 (+1) mask=0x02
+PL.cpp:306 N [SMSOBB] red-coin collect i=2 mask=0x06 count=2
+PL.cpp:306 N [SMSOBB] red-coin apply i=1 mask=0x02 count=2 live=1 already=1 pos=1
+PL.cpp:306 N [SMSOBB] red-coin apply i=2 mask=0x06 count=2 live=1 already=0 pos=1
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=108 shinesChanged=0
+PL.cpp:306 N [SMSOBB] red-coin apply i=1 mask=0x06 count=2 live=1 already=1 pos=1
+PL.cpp:306 N [SMSOBB] red-coin apply i=2 mask=0x06 count=2 live=1 already=1 pos=1
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=108 shinesChanged=0
+PL.cpp:306 N [SMSOBB] red-coin snapshot expand count=4 (+1) mask=0x06
+PL.cpp:306 N [SMSOBB] red-coin hide-by-index i=2 mask=0x06 count=2
+PL.cpp:306 N [SMSOBB] red-coin apply i=1 mask=0x06 count=2 live=1 already=1 pos=1
+PL.cpp:306 N [SMSOBB] red-coin apply i=2 mask=0x06 count=2 live=1 already=1 pos=1
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=108 shinesChanged=0
+PL.cpp:306 N [SMSOBB] red-coin apply i=1 mask=0x06 count=2 live=1 already=1 pos=1
+PL.cpp:306 N [SMSOBB] red-coin apply i=2 mask=0x06 count=2 live=1 already=1 pos=1
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=108 shinesChanged=0
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=73 shinesChanged=0
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=73 shinesChanged=0
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=73 shinesChanged=0
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=73 shinesChanged=0
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=73 shinesChanged=0
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=73 shinesChanged=0
+PL.cpp:306 N [SMSOBB] red-coin snapshot ready count=8 mask=0x00 final=0
+PL.cpp:306 N [SMSOBB] red-coin snapshot ready count=8 mask=0x00 final=0
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=73 shinesChanged=0
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=73 shinesChanged=0
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=73 shinesChanged=0
+PL.cpp:306 N [SMSOBB] red-coin co-op peer joined 窶・resume persist course=23/0
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=73 shinesChanged=0
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=73 shinesChanged=0
+PL.cpp:306 N [SMSOBB] red-coin co-op peer joined 窶・resume persist course=23/0
+PL.cpp:306 N [SMSOBB] red-coin snapshot ready count=2 mask=0x00 final=0
+PL.cpp:306 N [SMSOBB] red-coin snapshot ready count=2 mask=0x00 final=0
+PL.cpp:306 N [SMSOBB] red-coin collect i=1 mask=0x02 count=1
+PL.cpp:306 N [SMSOBB] red-coin apply i=1 mask=0x02 count=1 live=1 already=0 pos=1
+PL.cpp:306 N [SMSOBB] red-coin hide-by-index i=1 mask=0x02 count=1
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=108 shinesChanged=0
+PL.cpp:306 N [SMSOBB] red-coin apply i=1 mask=0x02 count=1 live=1 already=1 pos=1
+PL.cpp:306 N [SMSOBB] progress snapshot bulk-applied bytes=108 shinesChanged=0

@@ -6,6 +6,8 @@ public static class GameIdentity
 {
     public const string BsmsGameId = "GMSE90";
     public const string VanillaNtscUGameId = "GMSE01";
+    /// <summary>Super Mario Eclipse disc id (official xdelta ISO).</summary>
+    public const string MarioEclipseGameId = "GMSE04";
 
     public static bool TryResolveBootBinPath(string gamePath, out string bootBinPath)
     {

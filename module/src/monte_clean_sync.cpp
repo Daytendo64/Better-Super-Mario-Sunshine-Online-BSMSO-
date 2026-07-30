@@ -1,5 +1,6 @@
 #include "monte_clean_sync.hpp"
 
+#include "episode_equiv.hpp"
 #include "world_sync.hpp"
 
 #include <Dolphin/OS.h>
@@ -246,26 +247,28 @@ static u8 popCountMask(u16 mask) {
     return count;
 }
 
-static void publishLocalMonteClean(u8 stableIndex, const TVec3f &pos) {
+static bool publishLocalMonteClean(u8 stableIndex, const TVec3f &pos, u16 maskAfter) {
     if (sApplyingRemote)
-        return;
+        return false;
 
     smso::CommBuffer *buf = smso::getCommBuffer();
     if (!monteCleanPublishEnabled(buf))
-        return;
+        return false;
 
     const u32 packed = smso::packCollectibleWorldPos(pos.x, pos.y, pos.z);
     if (!smso::isValidPackedWorldPos(packed))
-        return;
+        return false;
 
-    const u8 localCount = popCountMask(sCleanedMask);
+    const u8 localCount = popCountMask(maskAfter);
     const u8 payload0 = static_cast<u8>((localCount << 4) | (stableIndex & 0xFu));
-    smso::enqueueLocalWorldEvent(static_cast<u8>(smso::WE_NPC_CLEANED), currentCourseId(),
-                                 currentEpisodeId(), payload0, stableIndex, packed);
+    if (!smso::enqueueLocalWorldEvent(static_cast<u8>(smso::WE_NPC_CLEANED), currentCourseId(),
+                                      currentEpisodeId(), payload0, stableIndex, packed))
+        return false;
     if (kMonteCleanHotPathOsReport) {
         OSReport("[SMSOBB] monte-clean publish idx=%u count=%u pos=(%.0f,%.0f,%.0f)\n",
                  stableIndex, localCount, pos.x, pos.y, pos.z);
     }
+    return true;
 }
 
 static TBaseNPC *findMonteNear(const TVec3f &pos, f32 eps) {
@@ -336,13 +339,18 @@ static void scanLocalMonteCleans() {
 
         if (entry.wasClear)
             continue;
-        entry.wasClear = true;
 
-        if ((sCleanedMask & bit) != 0)
+        if ((sCleanedMask & bit) != 0) {
+            entry.wasClear = true;
             continue;
+        }
 
-        sCleanedMask |= bit;
-        publishLocalMonteClean(entry.stableIndex, entry.initialPos);
+        const u16 maskAfter = static_cast<u16>(sCleanedMask | bit);
+        if (!publishLocalMonteClean(entry.stableIndex, entry.initialPos, maskAfter))
+            continue; // leave wasClear false so we retry when the outbound queue drains
+
+        sCleanedMask = maskAfter;
+        entry.wasClear = true;
     }
 }
 
@@ -427,7 +435,10 @@ bool applyMonteCleanWorldEvent(const CommWorldEvent &event) {
         return false;
 
     // Episode-scoped: launcher defers off-stage; consume here so the durable mailbox advances.
-    if (event.courseId != currentCourseId() || event.episodeId != currentEpisodeId())
+    // Use catalog↔mission equivalence (hotel / Ricco / Pinna / casino) so heal/replay
+    // ids that differ from director mEpisodeID still apply instead of silently dropping.
+    if (!smso::episode_equiv::sameStage(event.courseId, event.episodeId, currentCourseId(),
+                                        currentEpisodeId()))
         return true;
 
     const u8 stableIndex = event.reserved < kMaxStageMonteCleans

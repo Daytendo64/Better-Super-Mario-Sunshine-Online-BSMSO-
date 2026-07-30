@@ -20,6 +20,11 @@ Radmin VPN gives every player a virtual LAN address so the host does not need to
 
 Do not use the host's public/Wi‑Fi IP when playing over Radmin — use the Radmin VPN IP only.
 
+**Host worked, friends can't join?** That is usually the wrong IP or firewall — not a Host bind failure.
+- Clients must use the host's **Radmin IP** (`26.x.x.x`), not Wi‑Fi/public IP.
+- Allow **BSMSO.Launcher.exe** on Private **and** Public profiles (Radmin often uses Public).
+- If Host itself fails with "port already in use", stop leftover `BSMSO.ServerHost.exe` / another BSMSO host, or change the port in Settings (Steam and other apps also use 27015).
+
 ## Port forwarding (alternative)
 
 For WAN play without VPN software:
@@ -45,11 +50,14 @@ dist\server\BSMSO.ServerHost.exe 27015
 
 Forward the same ports to the machine running ServerHost (or run it on the same Radmin VPN network).
 
+The dedicated server prints its **ModBuildId** on startup. After a zip update, replace `BSMSO.ServerHost.exe` as well as the launcher — an old ServerHost still listening is the most common "can't connect / VersionMismatch" failure.
+
 ## Connecting
 
 1. Enter host IP and port in Settings
 2. Choose a unique username (3–16 alphanumeric characters + underscore)
 3. Launch Dolphin manually, then click **Connect**
+4. If connect fails immediately after the host clicked Host, wait ~1s and retry (listener bind / AcceptLoop)
 
 ## Firewall
 

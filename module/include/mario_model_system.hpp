@@ -29,9 +29,12 @@ namespace smso {
 // body). If a remote pack soft-fails or an id arrives/changes after apply, the
 // remote path retries same-stage (visible retail kept until rebuild succeeds).
 //
-// Gameplay archive reads use DVDReadAsyncPrio. Synchronous SMSLoadArchive is
-// restricted to stage/loading initialization fallback. Body construction is a
-// separate safe-window phase; activation is pointer-only.
+// Gameplay archive reads use DVDReadAsyncPrio (exact FST length, never rounded
+// past EOF — DirectoryBlob over-reads raise the retail disc-error fatal).
+// DVD/FST/validation failures quarantine the pack id for the boot and soft-fail
+// to retail with no retry stampede. Synchronous SMSLoadArchive is restricted to
+// stage/loading initialization fallback. Body construction is a separate
+// safe-window phase; activation is pointer-only.
 
 void initMarioModelSystem();
 // True when the previous stage never ran clearMarioModelSystem (soft reload /
@@ -78,6 +81,10 @@ void ensureLocalBodyAngleFreeParams(TMario *mario);
 
 // Call before TMario::initValues / initModel for the given network slot.
 // Slot MAX_REMOTE_SLOTS (or localSlot from CommBuffer) selects the local pack.
+// Returns true whenever a usable "mario" volume is live, which includes the
+// soft-fail where the slot's pack was rejected and retail was mounted instead.
+// In that case the slot is rebound to retail, so marioSlotHasCustomPack() —
+// not this return value — tells callers what actually backs initValues.
 bool setActiveMarioArchive(u32 slot);
 
 // Re-read CommBuffer and resolve/cache the pack for a remote slot (never local).

@@ -1,0 +1,28 @@
+﻿idx 7981925 size 7919837586
+OSREPORT]: [SMSOBB] story-flag baseline merge started
+
+
+OSREPORT]: [SMSO] Remote actors session reconnect (heap=0x82890000 pool=0 reserved=1)
+
+
+OSREPORT]: [BSMSO] Demand async pack priority=2 slot=0 id='36de327c'
+
+
+OSREPORT]: [BSMSO] Demand async pack priority=2 slot=1 id='78044865'
+
+
+OSREPORT]: [BSMSO] Remote model id slot=1 '' -> '78044865' reapply requested (same-stage body rebuild when pack/heap ready)
+
+
+28:32:992 Core\HW\DVD\FileMonitor.cpp:85 W[FileMon]:   1,440 kB data/bsmso_models/36de327c.arc
+
+28:33:001 Core\HW\DVD\FileMonitor.cpp:85 W[FileMon]:   1,403 kB data/bsmso_models/78044865.arc
+
+28:33:685 Core\HW\DVD\DVDThread.cpp:276 E[MASTER]: Warning: The disc could not be read (at 0x6ca8000 - 0x6caeae0).
+
+OSREPORT]: [BSMSO] Async pack failed state=6 slot=0 id='36de327c': RARC/body/cap validation rejected
+
+
+OSREPORT]: [BSMSO] Demand async pack priority=1 slot=0 id='36de327c'
+
+

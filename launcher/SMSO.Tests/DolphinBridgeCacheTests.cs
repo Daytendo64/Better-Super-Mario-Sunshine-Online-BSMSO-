@@ -422,6 +422,61 @@ public sealed class DolphinBridgeCacheTests
     }
 
     [Fact]
+    public void AdoptLiveBuffer_PastMaxDuration_StillRequiresActiveGrace()
+    {
+        using var worker = new BridgeWorker(new DolphinBridge());
+        worker.SetConnected(true, 0, "host-zero", isHost: true);
+
+        var snapshot = new PlayerSnapshot
+        {
+            Connected = 1,
+            Slot = 1,
+            ActionId = 42,
+            Name = new byte[16],
+        };
+        snapshot.SetName("peer-one");
+        worker.DebugSeedRemoteNametag(1, snapshot, NameTagAppearance.CreateDefault());
+
+        var priorLive = CommBuffer.CreateDefault();
+        priorLive.RemoteSnapshots = CommBuffer.CreateRemoteArray();
+        priorLive.RemoteSnapshots[1] = snapshot;
+        priorLive.DolphinState = DolphinState.Active;
+        priorLive.LocalSnapshot = new PlayerSnapshot
+        {
+            Connected = 1,
+            Slot = 0,
+            StageId = 2,
+            EpisodeId = 7,
+            Name = new byte[16],
+        };
+        worker.DebugAdoptLiveBuffer(priorLive);
+
+        var exitLive = CommBuffer.CreateDefault();
+        exitLive.RemoteSnapshots = CommBuffer.CreateRemoteArray();
+        exitLive.RemoteNameTagAppearances = CommBuffer.CreateRemoteAppearanceArray();
+        exitLive.DolphinState = DolphinState.Loading;
+        exitLive.LocalSnapshot = priorLive.LocalSnapshot;
+        worker.DebugAdoptLiveBuffer(exitLive);
+        Assert.True(worker.DebugHoldRemotePublishForStageExit);
+
+        // Long plaza/load (>3s): MaxDuration elapses while still Loading.
+        worker.DebugBackdateHoldRemotePublishSinceUtc(TimeSpan.FromSeconds(5));
+        worker.DebugAdoptLiveBuffer(exitLive);
+        Assert.True(worker.DebugHoldRemotePublishForStageExit);
+
+        // First Active tick after a long load must NOT republish (Bugbot: Yoshi tear-down).
+        exitLive.DolphinState = DolphinState.Active;
+        worker.DebugAdoptLiveBuffer(exitLive);
+        Assert.True(worker.DebugHoldRemotePublishForStageExit);
+        Assert.Equal((byte)0, worker.DebugGetWorkingBuffer().RemoteSnapshots[1].Connected);
+
+        for (int i = 0; i < 40 && worker.DebugHoldRemotePublishForStageExit; i++)
+            worker.DebugAdoptLiveBuffer(exitLive);
+        Assert.False(worker.DebugHoldRemotePublishForStageExit);
+        Assert.Equal((byte)1, worker.DebugGetWorkingBuffer().RemoteSnapshots[1].Connected);
+    }
+
+    [Fact]
     public void StageIdentityChange_WhileLoading_KeepsRemoteHoldUntilActive()
     {
         using var worker = new BridgeWorker(new DolphinBridge());
@@ -521,5 +576,112 @@ public sealed class DolphinBridgeCacheTests
 
         Assert.Equal("Player", worker.DebugGetRemotePureName(1));
         Assert.Equal("Playe", packed.GetPureName());
+    }
+
+    [Fact]
+    public void SetConnected_False_ClearsHoldAndRemoteSnapshots()
+    {
+        // Regression (ModBuildId 50): disconnect used to adopt while _sessionConnected was
+        // still true (could arm HoldRemotePublish) and left Connected remotes in the
+        // working buffer until a later ClearRemoteSnapshots — rehost then suppressed
+        // remotes until Dolphin restart.
+        using var worker = new BridgeWorker(new DolphinBridge());
+        worker.SetConnected(true, 0, "host-zero", isHost: true);
+
+        var snapshot = new PlayerSnapshot
+        {
+            Connected = 1,
+            Slot = 1,
+            ActionId = 7,
+            Name = new byte[16],
+        };
+        snapshot.SetName("peer-one");
+        worker.DebugSeedRemoteNametag(1, snapshot, NameTagAppearance.CreateDefault());
+
+        var priorLive = CommBuffer.CreateDefault();
+        priorLive.RemoteSnapshots = CommBuffer.CreateRemoteArray();
+        priorLive.RemoteSnapshots[1] = snapshot;
+        priorLive.DolphinState = DolphinState.Active;
+        priorLive.LocalSnapshot = new PlayerSnapshot
+        {
+            Connected = 1,
+            Slot = 0,
+            StageId = 1,
+            EpisodeId = 0,
+            Name = new byte[16],
+        };
+        worker.DebugAdoptLiveBuffer(priorLive);
+
+        var exitLive = CommBuffer.CreateDefault();
+        exitLive.RemoteSnapshots = CommBuffer.CreateRemoteArray();
+        exitLive.DolphinState = DolphinState.Loading;
+        exitLive.LocalSnapshot = priorLive.LocalSnapshot;
+        worker.DebugAdoptLiveBuffer(exitLive);
+        Assert.True(worker.DebugHoldRemotePublishForStageExit);
+
+        worker.SetConnected(false, 0, "", false);
+
+        Assert.False(worker.DebugHoldRemotePublishForStageExit);
+        var cleared = worker.DebugGetWorkingBuffer();
+        Assert.Equal((byte)0, cleared.RemoteSnapshots[1].Connected);
+        Assert.Equal(0, (int)(cleared.BridgeFlags & BridgeFlags.Connected));
+    }
+
+    [Fact]
+    public void SetConnected_True_FreshConnect_ClearsHoldSoRemotesCanRepublish()
+    {
+        using var worker = new BridgeWorker(new DolphinBridge());
+        worker.SetConnected(true, 0, "host-zero", isHost: true);
+
+        var snapshot = new PlayerSnapshot
+        {
+            Connected = 1,
+            Slot = 1,
+            ActionId = 9,
+            Name = new byte[16],
+        };
+        snapshot.SetName("peer-one");
+        worker.DebugSeedRemoteNametag(1, snapshot, NameTagAppearance.CreateDefault());
+
+        var priorLive = CommBuffer.CreateDefault();
+        priorLive.RemoteSnapshots = CommBuffer.CreateRemoteArray();
+        priorLive.RemoteSnapshots[1] = snapshot;
+        priorLive.DolphinState = DolphinState.Active;
+        priorLive.LocalSnapshot = new PlayerSnapshot
+        {
+            Connected = 1,
+            Slot = 0,
+            StageId = 1,
+            EpisodeId = 0,
+            Name = new byte[16],
+        };
+        worker.DebugAdoptLiveBuffer(priorLive);
+
+        var exitLive = CommBuffer.CreateDefault();
+        exitLive.RemoteSnapshots = CommBuffer.CreateRemoteArray();
+        exitLive.DolphinState = DolphinState.Loading;
+        exitLive.LocalSnapshot = priorLive.LocalSnapshot;
+        worker.DebugAdoptLiveBuffer(exitLive);
+        Assert.True(worker.DebugHoldRemotePublishForStageExit);
+
+        // Rehost without going through ClearRemoteSnapshots (SetConnected owns the reset).
+        worker.SetConnected(false, 0, "", false);
+        worker.SetConnected(true, 0, "host-zero", isHost: true);
+
+        Assert.False(worker.DebugHoldRemotePublishForStageExit);
+        Assert.Equal((byte)0, worker.DebugGetWorkingBuffer().RemoteSnapshots[1].Connected);
+        Assert.NotEqual(0, (int)(worker.DebugGetWorkingBuffer().BridgeFlags & BridgeFlags.Connected));
+
+        // New lobby remote must be publishable (no stuck hold).
+        snapshot.ActionId = 11;
+        worker.DebugSeedRemoteNametag(1, snapshot, NameTagAppearance.CreateDefault());
+        var activeLive = priorLive;
+        activeLive.RemoteSnapshots = CommBuffer.CreateRemoteArray();
+        activeLive.DolphinState = DolphinState.Active;
+        worker.DebugAdoptLiveBuffer(activeLive);
+
+        Assert.False(worker.DebugHoldRemotePublishForStageExit);
+        Assert.Equal((byte)1, worker.DebugGetWorkingBuffer().RemoteSnapshots[1].Connected);
+        Assert.Equal((ushort)11, worker.DebugGetWorkingBuffer().RemoteSnapshots[1].ActionId);
     }
 }

@@ -36,6 +36,7 @@ public partial class MainWindow : Window
     private bool _suppressMaxPlayersSave;
     private bool _suppressHideSeekGraceSave;
     private bool _syncingMarioModelCombo;
+    private bool _syncingMusicVolumeSlider;
     private bool _marioModelInstallInProgress;
     private bool _restartRequiredForModUpdate;
     /// When true, a newer `_BSMSO.kxe` was synced while Dolphin was still running
@@ -43,11 +44,19 @@ public partial class MainWindow : Window
     /// until Dolphin has fully stopped (then a fresh ModuleReady means the new kxe).
     private bool _restartGateAwaitingDolphinStop;
     private bool _updateRequired;
+    private bool _launcherUpdateRequired;
+    private string? _launcherUpdateDownloadUrl;
+    private string _launcherUpdateMessage = "";
     private bool _tagRunning;
     private static readonly Random _random = new();
     private readonly Dictionary<byte, int> _randomTagExemptRoundsBySlot = new();
     private readonly Queue<byte> _recentRandomLevelCourseIds = new();
     private DispatcherTimer? _clientWarpStatusClearTimer;
+    /// <summary>
+    /// True while Random Level / warp-all is showing the destination on Hide&amp;Seek
+    /// status lines. Suppresses FormatHideSeekStatus overwrites until the notice expires.
+    /// </summary>
+    private bool _hideSeekWarpStatusActive;
     private DispatcherTimer? _tagElapsedUiTimer;
     private bool _tagElapsedLive;
     private uint _tagElapsedBaseMs;
@@ -72,9 +81,10 @@ public partial class MainWindow : Window
             : (BuildFeatures.ClientLite
                 ? $"BSMSO Lite — Better Super Mario Sunshine Online ({_config.InstanceLabel})"
                 : $"BSMSO — Better Super Mario Sunshine Online ({_config.InstanceLabel})");
+        var productVersion = LauncherUpdateChecker.ResolveProductVersionLabel();
         VersionText.Text = BuildFeatures.ClientLite
-            ? $"BSMSO Lite v1.0 | build {ProtocolConstants.ModBuildId} | comm v{ProtocolConstants.CommVersion} | {_config.InstanceLabel} | .NET {Environment.Version}"
-            : $"BSMSO v1.0 | build {ProtocolConstants.ModBuildId} | comm v{ProtocolConstants.CommVersion} | {_config.InstanceLabel} | .NET {Environment.Version}";
+            ? $"BSMSO Lite v{productVersion} | build {ProtocolConstants.ModBuildId} | comm v{ProtocolConstants.CommVersion} | {_config.InstanceLabel} | .NET {Environment.Version}"
+            : $"BSMSO v{productVersion} | build {ProtocolConstants.ModBuildId} | comm v{ProtocolConstants.CommVersion} | {_config.InstanceLabel} | .NET {Environment.Version}";
         UpdateConnectionUi();
         UpdateDolphinUi();
         UpdateSessionStatusColor();
@@ -92,8 +102,9 @@ public partial class MainWindow : Window
         };
 
         WireAutoSaveFields();
-        BindRosterColumnStretch(ClientRosterList, 1.1, 1.8, 1.8, 0.9);
-        BindRosterColumnStretch(ServerRosterList, 1.0, 1.6, 1.6, 0.5, 0.9);
+        BindRosterColumnStretch(ClientRosterList, 1.0, 1.5, 1.5, 1.1, 0.8);
+        BindRosterColumnStretch(ServerRosterList, 0.9, 1.4, 1.4, 1.0, 0.5, 0.8);
+        _ = CheckForLauncherUpdateAsync();
     }
 
     private static void BindRosterColumnStretch(ListView listView, params double[] weights)
@@ -172,7 +183,8 @@ public partial class MainWindow : Window
             if (status == "Disconnected")
             {
                 ClearRoster();
-                MainTabControl.SelectedItem = SettingsTab;
+                // Stay on the current tab (usually Client Actions). Forcing Settings
+                // made disconnect feel like a bounce — users had to click Client again.
             }
             else if (status == "Hosting")
                 MainTabControl.SelectedItem = ServerTab;
@@ -181,6 +193,7 @@ public partial class MainWindow : Window
             UpdateConnectionUi();
             UpdateSessionStatusColor();
         });
+        _session.PhaseChanged += _ => RunOnUiThread(UpdateConnectionUi);
         _session.DisconnectNotice += message => RunOnUiThread(() =>
         {
             LogLine.Text = message;
@@ -273,38 +286,19 @@ public partial class MainWindow : Window
             persist: false);
         // Release zips ship CustomModels/ next to the launcher; sync AppData so
         // the dropdown matches the packager's library (overwrites on zip updates).
+        // Disc/Kuribo Mods are NOT touched on open — use Install / patch modules.
         ModelLibrary.SeedBundledModels(m => _config.Log(m));
         RefreshMarioModelCombo();
-        if (!string.IsNullOrWhiteSpace(_config.Config.IsoPath))
-        {
-            var isoPath = _config.Config.IsoPath;
-            // Disc extract/rebuild must not freeze the WPF UI thread on startup.
-            _ = Task.Run(() =>
-            {
-                try
-                {
-                    // Zip updates: force-sync _BSMSO.kxe / Moveset / BSE from beside
-                    // the launcher into Kuribo Mods, then refresh model packs.
-                    var sync = ModuleInstaller.SyncBundledModulesIntoGame(isoPath, m =>
-                        Dispatcher.BeginInvoke(() => _config.Log(m)));
-                    MarioPackInstaller.EnsureAllLibraryPacksPresent(isoPath, m =>
-                        Dispatcher.BeginInvoke(() => _config.Log(m)));
-                    Dispatcher.BeginInvoke(() => ApplyBundledModuleSyncResult(sync));
-                }
-                catch (Exception ex)
-                {
-                    Dispatcher.BeginInvoke(() =>
-                        _config.Log($"Custom model install skipped: {ex.Message}"));
-                }
-            });
-        }
 
         // Push the saved model id into the bridge immediately so solo Launch Dolphin
         // mounts the configured pack on the first stage (not retail until combo change).
         _session.ApplySelectedMarioModelToBridge();
+        ApplyMusicVolumeToUi(_config.Config.MusicVolumePercent);
 
         AllowClientTeleportToggle.IsChecked = _config.Config.AllowClientTeleporting;
         ApplyRecommendedDolphinSettingsToggle.IsChecked = _config.Config.ApplyRecommendedDolphinSettings;
+        if (PatchBseMovesetToggle != null)
+            PatchBseMovesetToggle.IsChecked = _config.Config.PatchBseMoveset;
         WorldSyncToggle.IsChecked = IsWorldSyncEnabled(
             _config.Config.SyncFlags,
             _config.Config.SyncObjects,
@@ -335,7 +329,52 @@ public partial class MainWindow : Window
         _config.Config.HideSeekGraceSeconds = ReadHideSeekGraceSecondsFromUi();
         _config.Config.ApplyRecommendedDolphinSettings =
             ApplyRecommendedDolphinSettingsToggle.IsChecked == true;
+        if (PatchBseMovesetToggle != null)
+            _config.Config.PatchBseMoveset = PatchBseMovesetToggle.IsChecked == true;
+        _config.Config.MusicVolumePercent = ReadMusicVolumePercentFromUi();
         _config.SaveDebounced();
+    }
+
+    private int ReadMusicVolumePercentFromUi()
+    {
+        var slider = ClientMusicVolumeSlider ?? ServerMusicVolumeSlider;
+        if (slider == null)
+            return Math.Clamp(_config.Config.MusicVolumePercent, 0, 100);
+        return (int)Math.Clamp(Math.Round(slider.Value), 0, 100);
+    }
+
+    private void ApplyMusicVolumeToUi(int percent)
+    {
+        percent = Math.Clamp(percent, 0, 100);
+        _syncingMusicVolumeSlider = true;
+        try
+        {
+            if (ClientMusicVolumeSlider != null)
+                ClientMusicVolumeSlider.Value = percent;
+            if (ServerMusicVolumeSlider != null)
+                ServerMusicVolumeSlider.Value = percent;
+            var label = $"{percent}%";
+            if (ClientMusicVolumeValueText != null)
+                ClientMusicVolumeValueText.Text = label;
+            if (ServerMusicVolumeValueText != null)
+                ServerMusicVolumeValueText.Text = label;
+        }
+        finally
+        {
+            _syncingMusicVolumeSlider = false;
+        }
+    }
+
+    private void MusicVolumeSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
+    {
+        if (!IsLoaded || _syncingMusicVolumeSlider)
+            return;
+        if (sender is not Slider slider)
+            return;
+
+        var percent = (int)Math.Clamp(Math.Round(slider.Value), 0, 100);
+        ApplyMusicVolumeToUi(percent);
+        _session.SetMusicVolumePercent(percent);
     }
 
     private void PopulateMaxPlayersCombo(int selected)
@@ -445,6 +484,10 @@ public partial class MainWindow : Window
         _session.SetHideSeekGraceSeconds(seconds);
         if (persist)
             _config.SaveDebounced();
+
+        // A grace already counting down is never re-armed, so say when this takes effect.
+        if (_tagRunning && HideSeekStatusText != null)
+            HideSeekStatusText.Text = $"Hider timer set to {seconds}s — applies next Start Tag.";
     }
 
     private void HideSeekGraceSecondsCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -685,12 +728,16 @@ public partial class MainWindow : Window
             if (row == null)
             {
                 row = new RosterViewModel { Slot = entry.Slot };
-                _rosterItems.Add(row);
+                // Keep list ordered by network slot so 1..N ordinals stay stable and sorted.
+                var insertAt = _rosterItems.TakeWhile(r => r.Slot < entry.Slot).Count();
+                _rosterItems.Insert(insertAt, row);
             }
 
             row.Username = entry.Username;
             row.StageId = entry.StageId;
             row.EpisodeId = entry.EpisodeId;
+            row.MarioModelId = CharacterPack.NormalizeModelId(entry.MarioModelId);
+            row.ModelName = ModelLibrary.ResolveDisplayName(row.MarioModelId);
             if (entry.State is DolphinState.Booting or DolphinState.Loading or DolphinState.Warping)
             {
                 row.LevelName = "Loading...";
@@ -708,10 +755,12 @@ public partial class MainWindow : Window
             row.PingMs = entry.PingMs.ToString();
         }
 
+        // Connected Players shows 1..N among currently connected players (no slot gaps).
+        for (var i = 0; i < _rosterItems.Count; i++)
+            _rosterItems[i].Ordinal = i + 1;
+
         if (!_lastRosterSlots.SequenceEqual(slotSet))
         {
-            var rosterShrunk = slotSet.Length < _lastRosterSlots.Length &&
-                               slotSet.All(_lastRosterSlots.Contains);
             _lastRosterSlots = slotSet;
             _warpTargets.Clear();
             foreach (var entry in ordered)
@@ -722,7 +771,7 @@ public partial class MainWindow : Window
 
             if (GameModeCombo.SelectedIndex == 1)
             {
-                SyncHideSeekRoleListsFromRoster(rosterShrunk: rosterShrunk);
+                SyncHideSeekRoleListsFromRoster();
                 UpdateStartStopTagButtonState();
             }
 
@@ -761,43 +810,138 @@ public partial class MainWindow : Window
     {
         SaveConfigFromUi();
         var isoPath = IsoPathBox.Text.Trim().Trim('"');
+        string? discOutputPath = null;
+        var targetKind = ModuleInstallValidator.ClassifyInstallTarget(isoPath);
+        if (targetKind == ModuleInstallTargetKind.DiscImage)
+        {
+            var suggested = DiscImagePatcher.SuggestPatchedDiscFileName(isoPath);
+            var saveDlg = new SaveFileDialog
+            {
+                Title = "Save patched disc image",
+                Filter = "Disc image|*.iso;*.gcm|ISO|*.iso|GCM|*.gcm",
+                FileName = Path.GetFileName(suggested),
+                InitialDirectory = Path.GetDirectoryName(suggested) is { Length: > 0 } dir && Directory.Exists(dir)
+                    ? dir
+                    : Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+                AddExtension = true,
+                DefaultExt = Path.GetExtension(suggested).TrimStart('.'),
+                OverwritePrompt = true
+            };
+            if (saveDlg.ShowDialog(this) != true)
+            {
+                UpdateModuleInstallUi();
+                return;
+            }
+
+            discOutputPath = saveDlg.FileName.Trim().Trim('"');
+            var outExt = Path.GetExtension(discOutputPath);
+            if (!outExt.Equals(".iso", StringComparison.OrdinalIgnoreCase) &&
+                !outExt.Equals(".gcm", StringComparison.OrdinalIgnoreCase))
+            {
+                MessageBox.Show(
+                    "Patched disc must be saved as .iso or .gcm.",
+                    "BSMSO", MessageBoxButton.OK, MessageBoxImage.Warning);
+                UpdateModuleInstallUi();
+                return;
+            }
+        }
+
+        // Post-Install sync / pack retry target the patched output when Install wrote a new file.
+        var effectiveGamePath = !string.IsNullOrWhiteSpace(discOutputPath) ? discOutputPath! : isoPath;
+
         InstallModulesButton.IsEnabled = false;
         OpenModsFolderButton.IsEnabled = false;
         ModuleInstallStatusText.Text = "Installing modules…";
         try
         {
-            var (success, message) = await ModuleInstaller.InstallAsync(
+            var (success, message, modelsWarning) = await ModuleInstaller.InstallAsync(
                     isoPath,
                     progress: status => Dispatcher.Invoke(() => ModuleInstallStatusText.Text = status),
-                    log: m => _config.Log(m))
-                .ConfigureAwait(true);
-            if (success)
-            {
-                ModelLibrary.SeedBundledModels(m => _config.Log(m));
-                try
-                {
-                    await Task.Run(() =>
+                    log: m => _config.Log(m),
+                    patchBseMoveset: _config.Config.PatchBseMoveset,
+                    discOutputPath: discOutputPath,
+                    postInstallUnderLock: async (installMessage, installModelsWarning) =>
+                    {
+                        // Runs while Install mutex is still held (second launcher can't race).
+                        // Refresh dropdown from AppData (Install already seeded + copied packs).
+                        // Keep a best-effort extracted-tree sync for kxe/disc-data only — do not
+                        // reintroduce Launch/open auto disc writes beyond this Install click.
+                        var sync = ModuleInstaller.SyncBundledModulesIntoGame(
+                            effectiveGamePath,
+                            m => _config.Log(m),
+                            patchBseMoveset: _config.Config.PatchBseMoveset);
+                        DiscDataInstaller.EnsureBundledDiscDataPresent(effectiveGamePath, m => _config.Log(m));
+                        // Safety net: if InstallAsync warned about packs, retry once now
+                        // that Dolphin may have closed / AppData is warm.
+                        var packRetry = MarioPackInstaller.EnsureAllLibraryPacksPresentDetailed(
+                            effectiveGamePath, m => _config.Log(m));
+                        var msg = installMessage;
+                        var warn = installModelsWarning || packRetry.HasWarning;
+                        if (packRetry.HasWarning &&
+                            msg.IndexOf("WARNING — custom Mario packs", StringComparison.Ordinal) < 0)
                         {
-                            var sync = ModuleInstaller.SyncBundledModulesIntoGame(isoPath, m => _config.Log(m));
-                            MarioPackInstaller.EnsureAllLibraryPacksPresent(isoPath, m => _config.Log(m));
-                            Dispatcher.Invoke(() => ApplyBundledModuleSyncResult(sync));
-                        })
-                        .ConfigureAwait(true);
-                }
-                catch (Exception packEx)
+                            msg = ModuleInstaller.AppendPackSyncMessage(msg, packRetry);
+                        }
+
+                        MarioPackInstaller.RemoveBetterMovementPrm(effectiveGamePath, m => _config.Log(m));
+                        MarioPackInstaller.ProbeBetterMovementPresence(effectiveGamePath, m => _config.Log(m));
+
+                        await Dispatcher.InvokeAsync(() => ApplyBundledModuleSyncResult(sync));
+                        return (msg, warn);
+                    })
+                .ConfigureAwait(true);
+            var installSuccess = success;
+            var installMessage = message;
+            var installModelsWarning = modelsWarning;
+            if (installSuccess)
+            {
+                Dispatcher.Invoke(() =>
                 {
-                    _config.Log($"Custom model install after modules skipped: {packEx.Message}");
-                }
-                Dispatcher.Invoke(() => RefreshMarioModelCombo());
+                    // Point Game ISO at the patched image so Launch uses the new file.
+                    if (!string.IsNullOrWhiteSpace(discOutputPath) &&
+                        !string.Equals(IsoPathBox.Text.Trim().Trim('"'), discOutputPath,
+                            StringComparison.OrdinalIgnoreCase))
+                    {
+                        IsoPathBox.Text = discOutputPath;
+                        SaveConfigFromUi();
+                        _config.Log($"Game ISO path updated to patched disc: {discOutputPath}");
+                    }
+
+                    RefreshMarioModelCombo();
+                });
             }
-            _config.Log(success ? $"Module install succeeded: {message}" : $"Module install failed: {message}");
-            var title = success
-                ? (message.StartsWith("Patched disc image", StringComparison.Ordinal)
-                    ? "BSMSO — Disc image patched"
-                    : "BSMSO — Modules installed")
-                : "BSMSO — Install failed";
-            MessageBox.Show(message, title,
-                MessageBoxButton.OK, success ? MessageBoxImage.Information : MessageBoxImage.Error);
+
+            _config.Log(
+                installSuccess
+                    ? (installModelsWarning
+                        ? $"Module install succeeded with model warnings: {installMessage}"
+                        : $"Module install succeeded: {installMessage}")
+                    : $"Module install failed: {installMessage}");
+
+            string title;
+            MessageBoxImage icon;
+            if (!installSuccess)
+            {
+                title = "BSMSO — Install failed";
+                icon = MessageBoxImage.Error;
+            }
+            else if (installModelsWarning)
+            {
+                title = "BSMSO — Modules installed (model packs incomplete)";
+                icon = MessageBoxImage.Warning;
+            }
+            else if (installMessage.StartsWith("Patched disc image", StringComparison.Ordinal))
+            {
+                title = "BSMSO — Disc image patched";
+                icon = MessageBoxImage.Information;
+            }
+            else
+            {
+                title = "BSMSO — Modules installed";
+                icon = MessageBoxImage.Information;
+            }
+
+            MessageBox.Show(installMessage, title, MessageBoxButton.OK, icon);
         }
         catch (Exception ex)
         {
@@ -819,7 +963,7 @@ public partial class MainWindow : Window
         if (kind == ModuleInstallTargetKind.DiscImage || kind == ModuleInstallTargetKind.CompressedDiscImage)
         {
             MessageBox.Show(
-                "Mods live inside the disc image for .iso/.gcm paths.\n\n" +
+                "Mods are inside the disc image for .iso/.gcm paths.\n\n" +
                 "Use Install / patch modules to update them, or set Game ISO to an extracted folder to browse Mods on disk.",
                 "BSMSO", MessageBoxButton.OK, MessageBoxImage.Information);
             return;
@@ -829,7 +973,7 @@ public partial class MainWindow : Window
             modsDir == null)
         {
             MessageBox.Show(
-                "Could not resolve the Mods folder from the Game ISO path. Set Paths → Game ISO to your extracted SMS folder (or sys\\main.dol), or use Install / patch modules on a .iso/.gcm.",
+                "Could not find Mods from the Game ISO path. Set Paths → Game ISO to your extracted SMS folder (or sys\\main.dol), or Install / patch modules on a .iso/.gcm.",
                 "BSMSO", MessageBoxButton.OK, MessageBoxImage.Information);
             return;
         }
@@ -905,12 +1049,25 @@ public partial class MainWindow : Window
         var status = ModuleInstaller.GetInstallStatus(IsoPathBox.Text.Trim().Trim('"'));
         var needsUpdate = status.NeedsUpdate || _updateRequired;
 
+        if (GameProfileText != null)
+        {
+            var profile = GameProfileDetector.Detect(IsoPathBox.Text.Trim().Trim('"'));
+            GameProfileText.Text = "Game profile: " + profile.DisplayName +
+                (profile.GameId != null ? $" ({profile.GameId})" : "") +
+                (profile.IsEclipse ? " — additive Install only" : "");
+        }
+
         if (_restartRequiredForModUpdate)
             ModuleInstallStatusText.Text = ModuleVersionMessages.RestartRequiredForUpdate;
         else if (needsUpdate)
             ModuleInstallStatusText.Text = string.IsNullOrWhiteSpace(status.Message) || !status.NeedsUpdate
                 ? ModuleVersionMessages.UpdateRequired
                 : status.Message;
+        else if (status.IsComplete && !IsLauncherUpdateRequired())
+            ModuleInstallStatusText.Text = PreferUpToDateInstallMessage(status.Message);
+        else if (IsLauncherUpdateRequired())
+            // Modules may be current, but never claim "everything" is up to date.
+            ModuleInstallStatusText.Text = StripEverythingUpToDateLead(status.Message);
         else
             ModuleInstallStatusText.Text = status.Message;
 
@@ -919,13 +1076,40 @@ public partial class MainWindow : Window
             : ModuleVersionMessages.InstallModuleButtonLabel;
         InstallModulesButton.ToolTip = needsUpdate
             ? ModuleVersionMessages.UpdateRequired
-            : "Install or reinstall BSE / Kuribo runtime and _BSMSO.kxe into the Game ISO path.";
+            : "Install or reinstall BSE / Kuribo and _BSMSO.kxe into the Game ISO path.";
         InstallModulesButton.IsEnabled = status.CanInstall;
         InstallModulesButton.Opacity = status.CanInstall ? 1.0 : 0.45;
         var canOpenMods = status.TargetKind == ModuleInstallTargetKind.ExtractedFolder &&
                           !string.IsNullOrWhiteSpace(status.ModsDirectory);
         OpenModsFolderButton.IsEnabled = canOpenMods;
         OpenModsFolderButton.Opacity = canOpenMods ? 1.0 : 0.45;
+    }
+
+    /// <summary>
+    /// Ensure the install status line leads with a clear ready-to-play message when
+    /// modules are current and the launcher itself does not require an update.
+    /// </summary>
+    private static string PreferUpToDateInstallMessage(string statusMessage)
+    {
+        var ready = ModuleVersionMessages.EverythingUpToDateReadyToPlayWithBuild(ProtocolConstants.ModBuildId);
+        if (string.IsNullOrWhiteSpace(statusMessage))
+            return ready;
+        if (statusMessage.StartsWith(ModuleVersionMessages.EverythingUpToDateReadyToPlay, StringComparison.Ordinal))
+            return statusMessage;
+        return ready + "\n" + statusMessage;
+    }
+
+    private static string StripEverythingUpToDateLead(string statusMessage)
+    {
+        if (string.IsNullOrWhiteSpace(statusMessage))
+            return statusMessage;
+        if (!statusMessage.StartsWith(ModuleVersionMessages.EverythingUpToDateReadyToPlay, StringComparison.Ordinal))
+            return statusMessage;
+
+        var newline = statusMessage.IndexOf('\n');
+        if (newline < 0)
+            return "Modules match this launcher — get a newer BSMSO zip for the launcher update.";
+        return statusMessage[(newline + 1)..].TrimStart();
     }
 
     private bool IsModuleUpdateRequired()
@@ -937,10 +1121,132 @@ public partial class MainWindow : Window
         return status.NeedsUpdate;
     }
 
-    private async void Host_Click(object sender, RoutedEventArgs e)
+    private bool IsLauncherUpdateRequired() => _launcherUpdateRequired;
+
+    private bool ModulesCurrentAndLauncherCurrent()
     {
-        SaveConfigFromUi();
-        _config.Save();
+        if (IsLauncherUpdateRequired() || _restartRequiredForModUpdate || IsModuleUpdateRequired())
+            return false;
+        var status = ModuleInstaller.GetInstallStatus(IsoPathBox.Text.Trim().Trim('"'));
+        return status.IsComplete && !status.NeedsUpdate;
+    }
+
+    private async Task CheckForLauncherUpdateAsync()
+    {
+        try
+        {
+            var result = await LauncherUpdateChecker.CheckAsync(_config.Config.UpdateManifestUrl)
+                .ConfigureAwait(true);
+            SafeRunOnUiThread(() => ApplyLauncherUpdateCheckResult(result));
+        }
+        catch (Exception ex)
+        {
+            SafeRunOnUiThread(() =>
+            {
+                if (LogLine != null)
+                    LogLine.Text = $"Launcher update check failed: {ex.Message}";
+            });
+        }
+    }
+
+    private void ApplyLauncherUpdateCheckResult(LauncherUpdateCheckResult result)
+    {
+        _launcherUpdateRequired = result.UpdateRequired;
+        var rawUrl = result.Manifest?.DownloadUrl;
+        _launcherUpdateDownloadUrl =
+            TryGetSafeHttpsDownloadUri(rawUrl, out var safeUri) && safeUri != null
+                ? safeUri.AbsoluteUri
+                : null;
+        _launcherUpdateMessage = result.UpdateRequired ? result.UserMessage : "";
+
+        if (LauncherUpdateBanner != null)
+        {
+            LauncherUpdateBanner.Visibility =
+                result.UpdateRequired ? Visibility.Visible : Visibility.Collapsed;
+            if (LauncherUpdateBannerText != null && result.UpdateRequired)
+                LauncherUpdateBannerText.Text = result.UserMessage;
+            if (LauncherUpdateOpenButton != null)
+            {
+                var hasUrl = result.UpdateRequired &&
+                             !string.IsNullOrWhiteSpace(_launcherUpdateDownloadUrl);
+                LauncherUpdateOpenButton.Visibility =
+                    hasUrl ? Visibility.Visible : Visibility.Collapsed;
+            }
+        }
+
+        if (LogLine != null)
+        {
+            if (result.UpdateRequired)
+                LogLine.Text = result.UserMessage;
+            else if (!result.CheckedSuccessfully && !string.IsNullOrWhiteSpace(result.Detail))
+                LogLine.Text = $"Launcher update check skipped: {result.Detail}";
+        }
+
+        UpdateDolphinUi();
+    }
+
+    private void LauncherUpdateOpen_Click(object sender, RoutedEventArgs e)
+    {
+        var url = _launcherUpdateDownloadUrl;
+        if (string.IsNullOrWhiteSpace(url))
+            return;
+        if (!TryGetSafeHttpsDownloadUri(url, out var uri) || uri == null)
+        {
+            MessageBox.Show(
+                "Download link is missing or not a safe https URL.",
+                "BSMSO",
+                MessageBoxButton.OK,
+                MessageBoxImage.Warning);
+            return;
+        }
+
+        try
+        {
+            Process.Start(new ProcessStartInfo(uri.AbsoluteUri) { UseShellExecute = true });
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(
+                $"Could not open download page:\n{ex.Message}",
+                "BSMSO",
+                MessageBoxButton.OK,
+                MessageBoxImage.Warning);
+        }
+    }
+
+    /// <summary>
+    /// Manifest / config can supply any string; only allow http(s) absolute URIs
+    /// so shell-execute cannot be pointed at file:, ms-msdt:, etc.
+    /// </summary>
+    private static bool TryGetSafeHttpsDownloadUri(string? url, out Uri? uri)
+    {
+        uri = null;
+        if (string.IsNullOrWhiteSpace(url))
+            return false;
+        if (!Uri.TryCreate(url.Trim(), UriKind.Absolute, out var parsed) || parsed == null)
+            return false;
+        if (parsed.Scheme != Uri.UriSchemeHttps && parsed.Scheme != Uri.UriSchemeHttp)
+            return false;
+        if (string.IsNullOrWhiteSpace(parsed.Host))
+            return false;
+        uri = parsed;
+        return true;
+    }
+
+    private bool TryShowUpdateGateMessage()
+    {
+        if (IsLauncherUpdateRequired())
+        {
+            MessageBox.Show(
+                _launcherUpdateMessage.Length > 0
+                    ? _launcherUpdateMessage
+                    : ModuleVersionMessages.LauncherUpdateRequiredGeneric,
+                "BSMSO",
+                MessageBoxButton.OK,
+                MessageBoxImage.Warning);
+            return true;
+        }
+
         if (_restartRequiredForModUpdate || IsModuleUpdateRequired())
         {
             MessageBox.Show(
@@ -950,12 +1256,26 @@ public partial class MainWindow : Window
                 "BSMSO",
                 MessageBoxButton.OK,
                 MessageBoxImage.Warning);
+            return true;
+        }
+
+        return false;
+    }
+
+    private async void Host_Click(object sender, RoutedEventArgs e)
+    {
+        SaveConfigFromUi();
+        _config.Save();
+        if (TryShowUpdateGateMessage())
+        {
             UpdateConnectionUi();
             return;
         }
         if (_session.DolphinLinkState != DolphinLinkState.ModuleReady)
         {
-            MessageBox.Show($"Launch Dolphin with {ModuleVersionMessages.ModuleFileName} loaded and wait until BSMSO is linked to the game before hosting.", "BSMSO", MessageBoxButton.OK, MessageBoxImage.Information);
+            MessageBox.Show(
+                $"Launch Dolphin with {ModuleVersionMessages.ModuleFileName} loaded and wait for the BSMSO link before hosting.",
+                "BSMSO", MessageBoxButton.OK, MessageBoxImage.Information);
             UpdateConnectionUi();
             return;
         }
@@ -980,21 +1300,16 @@ public partial class MainWindow : Window
     private async void Connect_Click(object sender, RoutedEventArgs e)
     {
         SaveConfigFromUi();
-        if (_restartRequiredForModUpdate || IsModuleUpdateRequired())
+        if (TryShowUpdateGateMessage())
         {
-            MessageBox.Show(
-                _restartRequiredForModUpdate
-                    ? ModuleVersionMessages.RestartRequiredForUpdate
-                    : ModuleVersionMessages.UpdateRequired,
-                "BSMSO",
-                MessageBoxButton.OK,
-                MessageBoxImage.Warning);
             UpdateConnectionUi();
             return;
         }
         if (_session.DolphinLinkState != DolphinLinkState.ModuleReady)
         {
-            MessageBox.Show($"Launch Dolphin with {ModuleVersionMessages.ModuleFileName} loaded and wait until BSMSO is linked to the game before connecting.", "BSMSO", MessageBoxButton.OK, MessageBoxImage.Information);
+            MessageBox.Show(
+                $"Launch Dolphin with {ModuleVersionMessages.ModuleFileName} loaded and wait for the BSMSO link before connecting.",
+                "BSMSO", MessageBoxButton.OK, MessageBoxImage.Information);
             UpdateConnectionUi();
             return;
         }
@@ -1033,10 +1348,62 @@ public partial class MainWindow : Window
     private void LaunchDolphin_Click(object sender, RoutedEventArgs e)
     {
         SaveConfigFromUi();
+        if (TryShowUpdateGateMessage())
+        {
+            UpdateDolphinUi();
+            return;
+        }
+
         if (!TryGetValidatedLaunchPaths(out var dolphin, out var iso, out var validationError))
         {
             MessageBox.Show(validationError, "BSMSO — Paths Required", MessageBoxButton.OK, MessageBoxImage.Error);
             return;
+        }
+
+        // Warn about leftover better_movement.prm on Launch (never auto-inject).
+        // PRM raises gravity/jump multipliers — heaviness vs release even with Moveset ON.
+        try
+        {
+            var bootBlock = ModuleInstallValidator.ValidateBootReadyModules(
+                iso, _config.Config.PatchBseMoveset);
+            if (bootBlock != null)
+            {
+                _config.Log($"Launch blocked — boot validation failed: {bootBlock}");
+                MessageBox.Show(
+                    bootBlock + "\n\nFix the install before launching Dolphin.",
+                    "BSMSO — Modules not boot-ready",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Error);
+                UpdateDolphinUi();
+                return;
+            }
+
+            var presence = MarioPackInstaller.ProbeBetterMovementPresence(iso, m => _config.Log(m));
+            if (!_config.Config.PatchBseMoveset &&
+                (presence.MovesetKxePresent || presence.ArchiveHits > 0 || presence.LooseHits > 0))
+            {
+                _config.Log(
+                    "WARNING: Patch BSE moveset is OFF but movement leftovers remain. " +
+                    "Click Install / patch modules (with the toggle off), then restart Dolphin. " +
+                    presence.Summary);
+                if (ModuleInstallStatusText != null)
+                    ModuleInstallStatusText.Text =
+                        "Moveset leftovers detected — Install with Patch BSE moveset OFF, then restart Dolphin.";
+            }
+            else if (presence.ArchiveHits > 0 || presence.LooseHits > 0)
+            {
+                _config.Log(
+                    "WARNING: better_movement.prm still on disc (makes jumps heavier than the release zip). " +
+                    "Click Install / patch modules to strip it — Moveset.kxe alone is enough. " +
+                    presence.Summary);
+                if (ModuleInstallStatusText != null)
+                    ModuleInstallStatusText.Text =
+                        "better_movement.prm leftover — Install to strip (release-matching Moveset feel).";
+            }
+        }
+        catch (Exception ex)
+        {
+            _config.Log($"Moveset presence check skipped: {ex.Message}");
         }
 
         if (!_session.TryLaunchDolphin(dolphin, iso, out var error))
@@ -1054,19 +1421,19 @@ public partial class MainWindow : Window
 
         if (string.IsNullOrWhiteSpace(dolphin) && string.IsNullOrWhiteSpace(iso))
         {
-            error = "Set the Dolphin executable and game ISO paths in the Paths section below before launching.";
+            error = "Set Dolphin and Game ISO paths in Paths before launching.";
             return false;
         }
 
         if (string.IsNullOrWhiteSpace(dolphin))
         {
-            error = "Set the Dolphin executable path in the Paths section below before launching.";
+            error = "Set the Dolphin path in Paths before launching.";
             return false;
         }
 
         if (string.IsNullOrWhiteSpace(iso))
         {
-            error = "Set the game ISO path in the Paths section below before launching.";
+            error = "Set the Game ISO path in Paths before launching.";
             return false;
         }
 
@@ -1081,12 +1448,12 @@ public partial class MainWindow : Window
             if (Directory.Exists(iso))
             {
                 error =
-                    $"Extracted game folder is missing sys\\main.dol:\n{iso}\n\nBrowse to sys\\main.dol or fix the folder contents.";
+                    $"Extracted folder is missing sys\\main.dol:\n{iso}\n\nBrowse to sys\\main.dol or fix the folder.";
             }
             else
             {
                 error =
-                    $"Game path not found or unsupported:\n{iso}\n\nUse a .iso/.gcm file, sys\\main.dol, or an extracted folder containing sys\\main.dol.";
+                    $"Game path not found or unsupported:\n{iso}\n\nUse a .iso/.gcm, sys\\main.dol, or an extracted folder with sys\\main.dol.";
             }
             return false;
         }
@@ -1100,9 +1467,25 @@ public partial class MainWindow : Window
         var running = _session.IsDolphinRunning;
         var link = _session.DolphinLinkState;
         var pathsOk = TryGetValidatedLaunchPaths(out _, out _, out _);
+        // Block launch while disc modules are stale — force Update module first.
+        // Also block when a newer launcher zip is available (remote ModBuildId).
+        // Restart-after-update still allows Launch once Dolphin is closed.
+        var moduleUpdateBlocksLaunch = IsModuleUpdateRequired() || IsLauncherUpdateRequired();
+        var canLaunch = !running && pathsOk && !moduleUpdateBlocksLaunch;
 
-        LaunchDolphinButton.IsEnabled = !running && pathsOk;
-        LaunchDolphinButton.Opacity = LaunchDolphinButton.IsEnabled ? 1.0 : 0.45;
+        LaunchDolphinButton.IsEnabled = canLaunch;
+        LaunchDolphinButton.Opacity = canLaunch ? 1.0 : 0.45;
+        LaunchDolphinButton.ToolTip = IsLauncherUpdateRequired()
+            ? (_launcherUpdateMessage.Length > 0
+                ? _launcherUpdateMessage
+                : ModuleVersionMessages.LauncherUpdateRequiredGeneric)
+            : IsModuleUpdateRequired()
+                ? ModuleVersionMessages.UpdateRequired
+                : running
+                    ? "Dolphin is already running from this launcher."
+                    : pathsOk
+                        ? "Launch Dolphin with _BSMSO.kxe installed."
+                        : "Set Dolphin and Game ISO paths before launching.";
 
         var processText = running ? "Open" : "Not running";
         var linkText = link switch
@@ -1112,9 +1495,9 @@ public partial class MainWindow : Window
             DolphinLinkState.Running => "Running (not attached)",
             _ => "Disconnected",
         };
-        var ok = (Brush)FindResource("SmsStatusOk");
-        var bad = (Brush)FindResource("SmsStatusBad");
-        var warn = (Brush)FindResource("SmsStatusWarn");
+        var ok = StatusBrush("SmsStatusOk", StatusOkFallback);
+        var bad = StatusBrush("SmsStatusBad", StatusBadFallback);
+        var warn = StatusBrush("SmsStatusWarn", StatusWarnFallback);
 
         DolphinProcessBadge.Text = processText;
         DolphinProcessBadge.Foreground = running ? ok : bad;
@@ -1130,37 +1513,77 @@ public partial class MainWindow : Window
         var linkError = _session.DolphinLinkError;
         var searchSeconds = _session.DolphinMailboxSearchDuration.TotalSeconds;
         ClearModUpdateGatesIfReady();
+        var upToDatePrefix = ModulesCurrentAndLauncherCurrent()
+            ? ModuleVersionMessages.EverythingUpToDateReadyToPlayWithBuild(ProtocolConstants.ModBuildId) + " "
+            : "";
         DolphinDetailText.Text = link switch
         {
+            _ when IsLauncherUpdateRequired() =>
+                (_launcherUpdateMessage.Length > 0
+                    ? _launcherUpdateMessage
+                    : ModuleVersionMessages.LauncherUpdateRequiredGeneric),
             _ when _restartRequiredForModUpdate => ModuleVersionMessages.RestartRequiredForUpdate,
             _ when IsModuleUpdateRequired() => ModuleVersionMessages.UpdateRequired,
             DolphinLinkState.ModuleReady when !string.IsNullOrWhiteSpace(moduleInstallWarning) => moduleInstallWarning,
             DolphinLinkState.ModuleReady =>
-                "BSMSO link active — warps and player sync enabled.",
+                upToDatePrefix + "BSMSO linked — warps and player sync enabled.",
             DolphinLinkState.Attached when !string.IsNullOrWhiteSpace(linkError) && searchSeconds >= 3 =>
                 linkError,
             DolphinLinkState.Attached when searchSeconds < 3 =>
-                $"Attached to Dolphin — waiting for game to boot and load {ModuleVersionMessages.ModuleFileName}.",
+                $"Attached to Dolphin — waiting for the game to load {ModuleVersionMessages.ModuleFileName}.",
             DolphinLinkState.Attached =>
-                "Searching for BSMSO mailbox — enter a stage in-game if you have not yet.",
+                "Searching for BSMSO mailbox — enter a stage if you have not yet.",
             DolphinLinkState.Running when !string.IsNullOrWhiteSpace(linkError) =>
                 linkError,
             DolphinLinkState.Running when running =>
-                "Dolphin is running — linking automatically.",
+                upToDatePrefix + "Dolphin is running — linking automatically.",
             _ when !string.IsNullOrWhiteSpace(moduleInstallWarning) => moduleInstallWarning,
-            _ => running
-                ? $"Dolphin is open — link will restore when the game loads {ModuleVersionMessages.ModuleFileName}."
-                : "Launch Dolphin here before hosting or connecting (button enables when paths are set).",
+            _ when running =>
+                upToDatePrefix +
+                $"Dolphin is open — link restores when the game loads {ModuleVersionMessages.ModuleFileName}.",
+            _ =>
+                upToDatePrefix +
+                "Launch Dolphin here before hosting or connecting (enabled when paths are set).",
         };
         UpdateModuleInstallUi();
         UpdateConnectionUi();
     }
 
+    private static readonly Brush StatusOkFallback = CreateFallbackBrush(0x34, 0xD3, 0x99);
+    private static readonly Brush StatusBadFallback = CreateFallbackBrush(0xF8, 0x71, 0x71);
+    private static readonly Brush StatusWarnFallback = CreateFallbackBrush(0xFB, 0xBF, 0x24);
+
+    private static Brush CreateFallbackBrush(byte r, byte g, byte b)
+    {
+        var brush = new SolidColorBrush(Color.FromRgb(r, g, b));
+        brush.Freeze();
+        return brush;
+    }
+
+    /// Theme brushes live in the application resource dictionary, which is no
+    /// longer reachable once the window leaves the visual tree during shutdown.
+    /// FindResource then raises through the dispatcher's exception wrapper and
+    /// returns a non-Brush sentinel, so a plain cast throws on a queued UI
+    /// update. Resolve leniently and fall back to the theme's literal colors.
+    private Brush StatusBrush(string key, Brush fallback)
+    {
+        try
+        {
+            return TryFindResource(key) as Brush
+                   ?? Application.Current?.TryFindResource(key) as Brush
+                   ?? fallback;
+        }
+        catch (Exception)
+        {
+            return fallback;
+        }
+    }
+
     private void UpdateSessionStatusColor()
     {
-        var ok = (Brush)FindResource("SmsStatusOk");
-        var bad = (Brush)FindResource("SmsStatusBad");
-        var warn = (Brush)FindResource("SmsStatusWarn");
+        var ok = StatusBrush("SmsStatusOk", StatusOkFallback);
+        var bad = StatusBrush("SmsStatusBad", StatusBadFallback);
+        var warn = StatusBrush("SmsStatusWarn", StatusWarnFallback);
         var text = StatusBadge.Text;
         var brush = text is "Connected" or "Hosting" ? ok :
             text == "Connecting" ? warn : bad;
@@ -1170,24 +1593,26 @@ public partial class MainWindow : Window
 
     private void UpdateConnectionUi()
     {
-        var connected = _session.IsConnected;
-        var hosting = _session.IsHosting;
+        var phase = _session.Phase;
         var gameLinked = _session.DolphinLinkState == DolphinLinkState.ModuleReady;
-        var sessionActive = connected || hosting;
-        var modGateBlocked = _restartRequiredForModUpdate || IsModuleUpdateRequired();
-        var canHostOrConnect = gameLinked && !sessionActive && !modGateBlocked;
-        DisconnectButton.IsEnabled = sessionActive;
+        var modGateBlocked = _restartRequiredForModUpdate || IsModuleUpdateRequired() ||
+                             IsLauncherUpdateRequired();
+        // Prefer lifecycle phase over TcpClient.Connected / IsRunning — those stay sticky
+        // across half-closed sockets and mid-HostAsync gaps.
+        var canHostOrConnect = gameLinked && SessionLifecycle.CanHostOrConnect(phase) && !modGateBlocked;
+        var canDisconnect = SessionLifecycle.CanDisconnect(phase);
+        DisconnectButton.IsEnabled = canDisconnect;
         ConnectButton.IsEnabled = canHostOrConnect;
         HostButton.IsEnabled = canHostOrConnect;
         ConnectButton.Opacity = ConnectButton.IsEnabled ? 1.0 : 0.45;
         HostButton.Opacity = HostButton.IsEnabled ? 1.0 : 0.45;
         DisconnectButton.Opacity = DisconnectButton.IsEnabled ? 1.0 : 0.45;
         GameLinkOverlay.Visibility = gameLinked ? Visibility.Collapsed : Visibility.Visible;
-        var clientActionsActive = connected;
+        var clientActionsActive = phase is SessionLifecyclePhase.Connected or SessionLifecyclePhase.Hosted;
         ClientActionsPanel.IsEnabled = clientActionsActive;
         ClientActionsPanel.Opacity = clientActionsActive ? 1.0 : 0.45;
         ClientActionsOverlay.Visibility = clientActionsActive ? Visibility.Collapsed : Visibility.Visible;
-        var serverActionsActive = hosting && connected;
+        var serverActionsActive = phase == SessionLifecyclePhase.Hosted;
         ServerActionsPanel.IsEnabled = serverActionsActive;
         ServerActionsPanel.Opacity = serverActionsActive ? 1.0 : 0.45;
         ServerActionsOverlay.Visibility = serverActionsActive ? Visibility.Collapsed : Visibility.Visible;
@@ -1209,18 +1634,18 @@ public partial class MainWindow : Window
         if (_session.IsHosting)
         {
             ClientWorldSyncStatusText.Text = WorldSyncToggle.IsChecked == true
-                ? "World sync is enabled for this session (host control in Server Actions)."
-                : "World sync is off — enable Sync collectibles under Server Actions.";
+                ? "World sync on for this session (host control in Server Actions)."
+                : "World sync off — enable Sync collectibles under Server Actions.";
             return;
         }
 
         if (!IsWorldSyncEnabled(_session.SyncFlagsEnabled, _session.SyncObjectsEnabled, _session.SyncProgressEnabled))
         {
-            ClientWorldSyncStatusText.Text = "World sync is off on the host — collectibles will not update for other players.";
+            ClientWorldSyncStatusText.Text = "World sync is off on the host — collectibles won’t update for others.";
             return;
         }
 
-        ClientWorldSyncStatusText.Text = "World sync is on — shines and blue coins update everywhere; yellow and red coins only when you share a course and episode.";
+        ClientWorldSyncStatusText.Text = "World sync on — shines/blues everywhere; yellow/red coins only on the same course and episode.";
     }
 
     private static bool IsWorldSyncEnabled(bool syncFlags, bool syncObjects, bool syncProgress) =>
@@ -1272,7 +1697,7 @@ public partial class MainWindow : Window
         ClientEpisodeCombo.IsEnabled = teleportActive;
         ClientWarpButton.IsEnabled = teleportActive;
         ClientTeleportOverlay.Visibility = showOverlay ? Visibility.Visible : Visibility.Collapsed;
-        ClientTeleportOverlayText.Text = "The host needs to enable client teleporting to use this.";
+        ClientTeleportOverlayText.Text = "Host must enable client teleporting.";
 
 #if !BSMSO_CLIENT_LITE
         // Game Modes on Client Actions is always view-only; dim when disconnected.
@@ -1347,6 +1772,29 @@ public partial class MainWindow : Window
         _config.Config.ApplyRecommendedDolphinSettings =
             ApplyRecommendedDolphinSettingsToggle.IsChecked == true;
         _config.SaveDebounced();
+    }
+
+    private void PatchBseMoveset_Changed(object sender, RoutedEventArgs e)
+    {
+        if (!IsLoaded || PatchBseMovesetToggle == null) return;
+        var enabled = PatchBseMovesetToggle.IsChecked == true;
+        _config.Config.PatchBseMoveset = enabled;
+        _config.SaveDebounced();
+
+        var tip = enabled
+            ? "Patch BSE moveset is on. Click Install / patch modules again to add Moveset, then restart Dolphin."
+            : "Patch BSE moveset is off. Click Install / patch modules again to remove Moveset (vanilla moveset only), then restart Dolphin.";
+        if (ModuleInstallStatusText != null)
+            ModuleInstallStatusText.Text = tip;
+        _config.Log(tip);
+
+        var result = MessageBox.Show(
+            tip + "\n\nInstall now?",
+            "BSMSO — Install again",
+            MessageBoxButton.YesNo,
+            MessageBoxImage.Information);
+        if (result == MessageBoxResult.Yes)
+            InstallModules_Click(sender, e);
     }
 
     private void WorldSync_Changed(object sender, RoutedEventArgs e)
@@ -1725,11 +2173,13 @@ public partial class MainWindow : Window
                 _tagRunning = false;
                 StartStopTagButton.Content = "Start Tag";
                 HideSeekStatusText.Text = string.Empty;
+                _hideSeekWarpStatusActive = false;
             }
 
             _tagRunning = state.TagActive;
             StartStopTagButton.Content = state.TagActive ? "Stop Tag" : "Start Tag";
-            HideSeekStatusText.Text = FormatHideSeekStatus(state, forClient: false);
+            if (!_hideSeekWarpStatusActive)
+                HideSeekStatusText.Text = FormatHideSeekStatus(state, forClient: false);
             UpdateStartStopTagButtonState();
             ApplyClientGameModeView(state);
             SyncTagElapsedUi(state);
@@ -1767,13 +2217,15 @@ public partial class MainWindow : Window
 
             ClientHideSeekHidersList.ItemsSource = hiders;
             ClientHideSeekSeekersList.ItemsSource = seekers;
-            ClientHideSeekStatusText.Text = FormatHideSeekStatus(state, forClient: true);
+            if (!_hideSeekWarpStatusActive)
+                ClientHideSeekStatusText.Text = FormatHideSeekStatus(state, forClient: true);
         }
         else
         {
             ClientHideSeekHidersList.ItemsSource = null;
             ClientHideSeekSeekersList.ItemsSource = null;
             ClientHideSeekStatusText.Text = string.Empty;
+            _hideSeekWarpStatusActive = false;
         }
 #endif
     }
@@ -1865,7 +2317,7 @@ public partial class MainWindow : Window
         ApplyGameModeStateToUi(GameModeStatePacket.CreateDefault());
     }
 
-    private void SyncHideSeekRoleListsFromRoster(bool forceAllHiders = false, bool rosterShrunk = false)
+    private void SyncHideSeekRoleListsFromRoster(bool forceAllHiders = false)
     {
         if (_suppressHideSeekUiSync || GameModeCombo.SelectedIndex != 1)
             return;
@@ -1888,7 +2340,13 @@ public partial class MainWindow : Window
         {
             if (known.Contains(row.Slot))
                 continue;
-            hiders.Add(row);
+
+            // Prefer server role so a rejoining seeker is not demoted to hider in the UI.
+            var gm = _session.GameModeState;
+            if (row.Slot < gm.Roles.Length && gm.Roles[row.Slot] == HideSeekRole.Seeker)
+                seekers.Add(row);
+            else
+                hiders.Add(row);
         }
 
         for (var i = hiders.Count - 1; i >= 0; i--)
@@ -1913,12 +2371,49 @@ public partial class MainWindow : Window
             }
         }
 
-        // During an active tag round, roster shrink only removes departed players from the UI.
-        // Do not push role updates to the server — that would stop tag for everyone.
-        if (_tagRunning && rosterShrunk)
+        // During an active tag round, only update list membership — never auto-push.
+        // Pushing on roster growth used to default rejoins to Hider and stop tag via SetRoles.
+        if (_tagRunning)
+        {
+            RealignHideSeekListsToServerRoles(hiders, seekers);
             return;
+        }
 
         PushHideSeekRolesToServer();
+    }
+
+    /// <summary>
+    /// Mid-tag the server owns the roles (a reclaimed slot is forced back to Hider), and
+    /// the host UI never pushes. Mirror the server state into the lists so the host is not
+    /// looking at a stale side for a player who joined or was reassigned during the round.
+    /// </summary>
+    private void RealignHideSeekListsToServerRoles(
+        ObservableCollection<RosterViewModel> hiders,
+        ObservableCollection<RosterViewModel> seekers)
+    {
+        var state = _session.GameModeState;
+        if (state.GameMode != GameMode.HideSeek)
+            return;
+
+        foreach (var row in hiders.ToArray())
+        {
+            if (state.GetRole(row.Slot) != (byte)HideSeekRole.Seeker)
+                continue;
+
+            hiders.Remove(row);
+            if (!seekers.Any(s => s.Slot == row.Slot))
+                seekers.Add(row);
+        }
+
+        foreach (var row in seekers.ToArray())
+        {
+            if (state.GetRole(row.Slot) != (byte)HideSeekRole.Hider)
+                continue;
+
+            seekers.Remove(row);
+            if (!hiders.Any(h => h.Slot == row.Slot))
+                hiders.Add(row);
+        }
     }
 
     private void PushHideSeekRolesToServer()
@@ -2014,6 +2509,29 @@ public partial class MainWindow : Window
         HideSeekStatusText.Text = "Everyone reset to hiders. Timer cleared.";
     }
 
+    private void ResetFlagsButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (!_session.IsHosting)
+            return;
+
+        var confirm = MessageBox.Show(
+            "Reset ALL session progress for everyone (new-file style)?\n\n" +
+            "Clears shines, blues, story, secrets, nozzles, plaza gates,\n" +
+            "red coins, NPC cleans, and graffiti.\n\n" +
+            "Cutscene-watched flags and options are kept.\n" +
+            "Re-enter a stage to respawn actors.",
+            "BSMSO — Reset Session Progress",
+            MessageBoxButton.OKCancel,
+            MessageBoxImage.Warning);
+
+        if (confirm != MessageBoxResult.OK)
+            return;
+
+        _session.ResetSessionProgress();
+        ClientTeleportStatusText.Text =
+            "Session progress reset. Re-enter stages to respawn collectibles.";
+    }
+
     private void RandomTagButton_Click(object sender, RoutedEventArgs e)
     {
         if (!_session.IsHosting || GameModeCombo.SelectedIndex != 1)
@@ -2056,13 +2574,11 @@ public partial class MainWindow : Window
         // Pinna: always warp to Park Area (course 13), never the beach (course 5).
         // Catalog ep 7 maps to pinnaParco5 (scenario 5) via PinnaParkInteriorMapping —
         // raw scenario 7 is Episode 1 post–Mecha-Bowser shine spawn, not balloons.
-        // Sirena: stay on the beach (area 6). Catalog eps 6–7 remap to hotel interior
-        // (area 7) via TryResolveWarpDestination and can hang Random Level loads;
-        // default Episode 8 would also hit that path, so override to Episode 5.
+        // Sirena Beach ep 7/8 catalog remaps to Hotel Interior (area 7) via
+        // LevelCatalog.ResolveWarpDestination (authority keys match delfino3/4).
         var episodeOverrides = new Dictionary<byte, byte>
         {
             { 13, 7 }, // Pinna Park Area -> Episode 8 catalog (→ scenario 5 / pinnaParco5)
-            { 6, 4 },  // Sirena Beach -> Episode 5 (King Boo Down Below catalog id; not hotel)
             { 9, 5 },  // Noki Bay -> Episode 6
         };
 
@@ -2070,7 +2586,8 @@ public partial class MainWindow : Window
             overrides.TryGetValue(c.CourseId, out var ep) ? ep : defaultEpisodeId;
 
         bool HasTargetEpisode(CourseEntry c) =>
-            c.CourseId != 5 && // Pinna beach — use Park Area (13) instead
+            c.CourseId != 5 &&  // Pinna beach — use Park Area (13) instead
+            c.CourseId != 16 && // Noki Undersea — excluded from random pool
             c.Warpable &&
             c.Episodes.Any(ep => ep.EpisodeId == TargetEpisode(c, episodeOverrides));
 
@@ -2105,9 +2622,18 @@ public partial class MainWindow : Window
         var courseName = _levels?.GetCourseName(courseId) ?? $"Course {courseId}";
         var episodeLabel = _levels?.GetEpisodeDisplayName(courseId, episodeId) ?? $"Episode {episodeId + 1}";
         var text = $"Warping everyone to {courseName} — {episodeLabel}";
+
+        // Host Hide & Seek status (Server Actions Game Modes panel).
         HideSeekStatusText.Text = text;
 
-        // Client: keep waiting/tag status separate; warp notice is its own line.
+        // Client Hide & Seek status (Client Actions Game Modes panel).
+        // ClientWarpStatusText alone is under Teleport and is often covered by the
+        // client-teleport overlay, so clients never saw the destination there.
+        if (ClientHideSeekStatusText != null)
+            ClientHideSeekStatusText.Text = text;
+        _hideSeekWarpStatusActive = true;
+
+        // Also surface under Teleport when that panel is usable (overlay off).
         ClientWarpStatusText.Text = text;
         ClientWarpStatusText.Visibility = Visibility.Visible;
         _clientWarpStatusClearTimer?.Stop();
@@ -2127,6 +2653,19 @@ public partial class MainWindow : Window
         _clientWarpStatusClearTimer?.Stop();
         ClientWarpStatusText.Text = string.Empty;
         ClientWarpStatusText.Visibility = Visibility.Collapsed;
+
+        if (!_hideSeekWarpStatusActive)
+            return;
+
+        _hideSeekWarpStatusActive = false;
+        var state = _session.GameModeState;
+        if (state.GameMode != GameMode.HideSeek)
+            return;
+
+        if (HideSeekStatusText != null)
+            HideSeekStatusText.Text = FormatHideSeekStatus(state, forClient: false);
+        if (ClientHideSeekStatusText != null)
+            ClientHideSeekStatusText.Text = FormatHideSeekStatus(state, forClient: true);
     }
 
     private void HideSeekRoleList_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
@@ -2216,6 +2755,8 @@ public partial class MainWindow : Window
         SaveConfigFromUi();
         _config.Save();
         _session.Shutdown();
+        // Releases this launcher's instance-index lock so the slot is reusable immediately.
+        _config.Dispose();
     }
 
     protected override void OnClosed(EventArgs e)
