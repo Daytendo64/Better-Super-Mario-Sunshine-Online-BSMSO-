@@ -29,3 +29,7 @@ Each player runs their own Dolphin instance. A dedicated server relays player st
 Default port: **27015** (TCP + UDP).
 
 See `docs/install-guide.md` and `docs/network-setup.md` for full setup.
+
+## AI
+
+The only thing that ai is used for is help with code, none of the custom assets, such as the custom models, stages. and future assets will be made by others who help contribute to this mod and NOT by ai.
