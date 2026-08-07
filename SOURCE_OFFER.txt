@@ -1,0 +1,30 @@
+# Corresponding Source offer (GPL-3.0)
+
+BSMSO redistributes GPL-licensed binaries, including:
+
+- `_BSMSO.kxe` (BSMSO game module)
+- `BetterSunshineEngine.kxe` (upstream Better Sunshine Engine)
+- `BetterSunshineMoveset.kxe` (upstream Better Sunshine Moveset)
+
+## How to obtain Corresponding Source
+
+1. **Preferred — public Git repository**  
+   https://github.com/Daytendo64/Better-Super-Mario-Sunshine-Online-BSMSO-
+
+   Build instructions are in `README.md` (`tools/build.ps1`, submodule init for
+   Better Sunshine Engine). Tag / commit matching a release should match the
+   `ModBuildId` in `launcher/SMSO.Net/ProtocolConstants.cs` and
+   `assets/latest-build.json`.
+
+2. **Upstream sources (unmodified redistributed `.kxe` files)**  
+   - Better Sunshine Engine: https://github.com/DotKuribo/BetterSunshineEngine  
+   - Better Sunshine Moveset: https://github.com/JoshuaMKW/BetterSunshineMoveset  
+
+3. **Written offer**  
+   If the Git repository is unavailable, for at least three (3) years after you
+   obtain this binary package, you may request Corresponding Source for the
+   GPL-covered works in this distribution by opening an issue on the repository
+   above or contacting the maintainer through the GameBanana mod page listed in
+   `latest-build.json` (`releaseNotesUrl`).
+
+This offer is made in accordance with GPL-3.0 section 6.
